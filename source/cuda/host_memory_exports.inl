@@ -1,0 +1,7 @@
+DRIVER_API(cuMemAllocHost, (void** output, size_t bytes), driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null host allocation output"); auto owner = current(); *output = allocate_host(bytes, 0, owner))
+DRIVER_API(cuMemHostAlloc, (void** output, size_t bytes, unsigned flags), driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null host allocation output"); auto owner = current(); *output = allocate_host(bytes, flags, owner))
+DRIVER_API(cuMemFreeHost, (void* pointer), driver_ready(); current(); release_host(pointer, false))
+DRIVER_API(cuMemHostRegister, (void* pointer, size_t bytes, unsigned flags), driver_ready(); register_host(pointer, bytes, flags, current()))
+DRIVER_API(cuMemHostUnregister, (void* pointer), driver_ready(); current(); release_host(pointer, true))
+DRIVER_API(cuMemHostGetFlags, (unsigned* output, void* pointer), driver_ready(); current(); require(output, CUDA_ERROR_INVALID_VALUE, "null host flags output"); *output = get_host_flags(pointer))
+DRIVER_API(cuMemHostGetDevicePointer, (CUdeviceptr* output, void* pointer, unsigned flags), driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null host device pointer output"); *output = host_device_pointer(pointer, flags, current()))
