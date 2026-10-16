@@ -127,12 +127,13 @@ std::string emit_native_module(const llvm::Module& input) {
         }
         if (shared > 32768) throw std::runtime_error("native static shared memory exceeds 32 KiB");
         shared=llvm::alignTo(shared,16);
-        bool collectives=false;
+        bool collectives=native_atomic_polling(f),named_barriers=false;
         for(const auto& bb:f) for(const auto& input:bb) if(auto* call=llvm::dyn_cast<llvm::CallInst>(&input);call && call->getCalledFunction()) {
             auto* function=call->getCalledFunction(); auto name=function->hasFnAttribute("cudavm.cuda.origin")?function->getFnAttribute("cudavm.cuda.origin").getValueAsString():function->getName();
-            auto operation=native_collective(name); collectives|=operation>=0;
+            auto operation=native_collective(name); collectives|=operation>=0; named_barriers|=operation>=36;
         }
         if(collectives) shared+=native_collective_shared_bytes;
+        if(named_barriers) shared+=native_named_barrier_shared_bytes;
         if(shared>32768) throw std::runtime_error("native shared storage and collective scratch exceed 32 KiB");
         entry.shared_bytes = uint32_t(shared);
         uint64_t local=0;

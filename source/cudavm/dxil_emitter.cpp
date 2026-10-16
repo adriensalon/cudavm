@@ -8,6 +8,9 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Analysis/DXILResource.h>
+#include <llvm/PassInfo.h>
+#include <llvm/PassRegistry.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Support/raw_ostream.h>
@@ -20,6 +23,32 @@ extern "C" void LLVMInitializeDirectXTarget();
 extern "C" void LLVMInitializeDirectXTargetMC();
 extern "C" void LLVMInitializeDirectXAsmPrinter();
 namespace cudavm {
+struct directx_coherent_resources : llvm::ModulePass {
+    static char ID;
+    directx_coherent_resources():llvm::ModulePass(ID) {}
+    void getAnalysisUsage(llvm::AnalysisUsage& usage) const override {
+        usage.addRequired<llvm::DXILResourceWrapperPass>();usage.setPreservesAll();
+    }
+    bool runOnModule(llvm::Module&) override {
+        // The CUDA arena and its representation/SC mutexes communicate across
+        // workgroups. DeviceMemoryBarrier requires a globally coherent UAV for
+        // this visibility. Set both the resource metadata and annotate props
+        // through LLVM's shared resource analysis before either is serialized.
+        for(auto& resource:getAnalysis<llvm::DXILResourceWrapperPass>().getResourceMap().uavs()) resource.GloballyCoherent=true;
+        return false;
+    }
+};
+char directx_coherent_resources::ID;
+struct directx_pass_manager : llvm::legacy::PassManager {
+    bool coherent_resources=false;
+    void add(llvm::Pass* pass) override {
+        auto* info=llvm::PassRegistry::getPassRegistry()->getPassInfo(pass->getPassID());
+        if(info && llvm::StringRef(info->getPassArgument())=="dxil-translate-metadata") {
+            llvm::legacy::PassManager::add(new directx_coherent_resources());coherent_resources=true;
+        }
+        llvm::legacy::PassManager::add(pass);
+    }
+};
 std::unique_ptr<llvm::Module> lower_native_dxil(const llvm::Module& input,const std::string& symbol,const std::array<unsigned,3>& block) {
     uint64_t threads=1; for(auto dimension:block) { if(!dimension || dimension>1024) throw std::runtime_error("invalid native DXIL block shape"); threads*=dimension; }
     if(threads>1024 || block[2]>64) throw std::runtime_error("native DXIL block exceeds compute shader limits");
@@ -43,8 +72,9 @@ std::string emit_native_dxil(const llvm::Module& input) {
     std::unique_ptr<llvm::TargetMachine> machine(target->createTargetMachine(module->getTargetTriple(),"","",settings,std::nullopt));
     if(!machine) throw std::runtime_error("native DXIL target machine creation failed");
     module->setDataLayout(machine->createDataLayout());
-    llvm::SmallVector<char,0> storage; llvm::raw_svector_ostream out(storage); llvm::legacy::PassManager passes;
+    llvm::SmallVector<char,0> storage; llvm::raw_svector_ostream out(storage); directx_pass_manager passes;
     if(machine->addPassesToEmitFile(passes,out,nullptr,llvm::CodeGenFileType::ObjectFile)) throw std::runtime_error("native DXIL container emission is unavailable");
+    if(!passes.coherent_resources) throw std::runtime_error("native DXIL pipeline lacks the CUDA resource-coherence hook");
     passes.run(*module);
     std::string bytes(storage.begin(),storage.end()); cudavm::validate_dxil_container(bytes); return bytes;
 }

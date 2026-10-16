@@ -12,6 +12,113 @@ llvm::LoadInst* collective_load(llvm::Value* pointer) {
 void collective_store(llvm::Value* contents,llvm::Value* pointer) {
     b.CreateAlignedStore(contents,pointer,llvm::Align(4))->setVolatile(true);
 }
+llvm::Function* make_named_arrival() {
+    auto* function=llvm::Function::Create(llvm::FunctionType::get(b.getInt32Ty(),{b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()},false),llvm::GlobalValue::InternalLinkage,"cudavm.barrier.arrive",*result);
+    function->addFnAttr(llvm::Attribute::NoInline);
+    auto* first=llvm::BasicBlock::Create(b.getContext(),"entry",function);
+    auto* retry=llvm::BasicBlock::Create(b.getContext(),"retry",function);
+    auto* done=llvm::BasicBlock::Create(b.getContext(),"done",function);
+    b.SetInsertPoint(first);
+    auto* id=function->getArg(0);
+    auto counts=[&](){return collective_pointer(named_barrier_state,id);};
+    auto* expected=collective_pointer(named_barrier_state,b.CreateAdd(id,b.getInt32(16)));
+    auto* generation=collective_load(collective_pointer(named_barrier_state,b.CreateAdd(id,b.getInt32(32))));
+    auto scope=dxil?llvm::SyncScope::System:b.getContext().getOrInsertSyncScopeID("workgroup");
+    b.CreateAtomicCmpXchg(expected,b.getInt32(0),function->getArg(1),llvm::Align(4),llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,scope);
+    auto* scan=llvm::BasicBlock::Create(b.getContext(),"warp.scan",function);
+    auto* sample=llvm::BasicBlock::Create(b.getContext(),"warp.sample",function);
+    auto* scanned=llvm::BasicBlock::Create(b.getContext(),"warp.scanned",function);
+    auto* base=b.CreateAnd(function->getArg(2),b.getInt32(~31u));
+    auto* warp_end=b.CreateAdd(base,b.getInt32(32));
+    auto* end=b.CreateSelect(b.CreateICmpULT(function->getArg(3),warp_end),function->getArg(3),warp_end);
+    b.CreateBr(scan);b.SetInsertPoint(scan);
+    auto* index=b.CreatePHI(b.getInt32Ty(),2);index->addIncoming(base,first);
+    auto* live=b.CreatePHI(b.getInt32Ty(),2);live->addIncoming(b.getInt32(0),first);
+    auto* prior=b.CreatePHI(b.getInt1Ty(),2);prior->addIncoming(b.getFalse(),first);
+    b.CreateCondBr(b.CreateICmpULT(index,end),sample,scanned);b.SetInsertPoint(sample);
+    auto* present=b.CreateICmpNE(collective_load(collective_pointer(collective_pc,index)),b.getInt32(0));
+    live->addIncoming(b.CreateAdd(live,b.CreateZExt(present,b.getInt32Ty())),sample);
+    prior->addIncoming(b.CreateOr(prior,b.CreateAnd(present,b.CreateICmpULT(index,function->getArg(2)))),sample);
+    index->addIncoming(b.CreateAdd(index,b.getInt32(1)),sample);b.CreateBr(scan);b.SetInsertPoint(scanned);
+    // Counted CTA barriers credit whole CUDA warps. Credit exited/absent lanes
+    // once, via the first live lane, while implicit counts track live threads.
+    auto* credit=b.CreateSelect(b.CreateAnd(b.CreateICmpNE(function->getArg(1),b.getInt32(0)),b.CreateNot(prior)),b.CreateSub(b.getInt32(33),live),b.getInt32(1));
+    auto* initial=b.CreateAtomicCmpXchg(counts(),b.getInt32(0),b.getInt32(0),llvm::Align(4),llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,scope);
+    auto* initial_count=b.CreateExtractValue(initial,0);
+    b.CreateBr(retry);b.SetInsertPoint(retry);
+    auto* previous=b.CreatePHI(b.getInt32Ty(),2);previous->addIncoming(initial_count,scanned);
+    auto* exchange=b.CreateAtomicCmpXchg(counts(),previous,b.CreateAdd(previous,credit),llvm::Align(4),llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,scope);
+    previous->addIncoming(b.CreateExtractValue(exchange,0),retry);
+    b.CreateCondBr(b.CreateExtractValue(exchange,1),done,retry);
+    b.SetInsertPoint(done);b.CreateRet(generation);
+    return function;
+}
+llvm::Function* make_named_advance() {
+    auto* function=llvm::Function::Create(llvm::FunctionType::get(b.getVoidTy(),{b.getInt32Ty()},false),llvm::GlobalValue::InternalLinkage,"cudavm.barrier.advance",*result);
+    function->addFnAttr(llvm::Attribute::NoInline);
+    auto* first=llvm::BasicBlock::Create(b.getContext(),"entry",function);
+    auto* head=llvm::BasicBlock::Create(b.getContext(),"scan",function);
+    auto* check=llvm::BasicBlock::Create(b.getContext(),"check",function);
+    auto* release=llvm::BasicBlock::Create(b.getContext(),"release",function);
+    auto* next=llvm::BasicBlock::Create(b.getContext(),"next",function);
+    auto* done=llvm::BasicBlock::Create(b.getContext(),"done",function);
+    b.SetInsertPoint(first);b.CreateBr(head);b.SetInsertPoint(head);
+    auto* id=b.CreatePHI(b.getInt32Ty(),2);id->addIncoming(b.getInt32(0),first);
+    b.CreateCondBr(b.CreateICmpULT(id,b.getInt32(16)),check,done);b.SetInsertPoint(check);
+    // The uniform scheduler barriers bracket the leader's phase transitions.
+    // No arrival or waiter observes a partly reset generation. Recreate native
+    // pointers within each block for the target's pointer-SSA legalization.
+    auto* arrived=collective_load(collective_pointer(named_barrier_state,id));
+    auto* expected=collective_load(collective_pointer(named_barrier_state,b.CreateAdd(id,b.getInt32(16))));
+    auto* required=b.CreateSelect(b.CreateICmpEQ(expected,b.getInt32(0)),function->getArg(0),expected);
+    b.CreateCondBr(b.CreateAnd(b.CreateICmpNE(arrived,b.getInt32(0)),b.CreateICmpUGE(arrived,required)),release,next);
+    b.SetInsertPoint(release);
+    collective_store(b.getInt32(0),collective_pointer(named_barrier_state,id));
+    collective_store(b.getInt32(0),collective_pointer(named_barrier_state,b.CreateAdd(id,b.getInt32(16))));
+    auto* phase=collective_pointer(named_barrier_state,b.CreateAdd(id,b.getInt32(32)));
+    collective_store(b.CreateAdd(collective_load(phase),b.getInt32(1)),phase);
+    b.CreateBr(next);b.SetInsertPoint(next);id->addIncoming(b.CreateAdd(id,b.getInt32(1)),next);b.CreateBr(head);
+    b.SetInsertPoint(done);b.CreateRetVoid();return function;
+}
+llvm::Function* make_named_initialize() {
+    auto* function=llvm::Function::Create(llvm::FunctionType::get(b.getVoidTy(),{b.getInt32Ty(),b.getInt32Ty()},false),llvm::GlobalValue::InternalLinkage,"cudavm.barrier.initialize",*result);
+    function->addFnAttr(llvm::Attribute::NoInline);
+    auto* first=llvm::BasicBlock::Create(b.getContext(),"entry",function);
+    auto* head=llvm::BasicBlock::Create(b.getContext(),"scan",function);
+    auto* body=llvm::BasicBlock::Create(b.getContext(),"clear",function);
+    auto* done=llvm::BasicBlock::Create(b.getContext(),"done",function);
+    b.SetInsertPoint(first);b.CreateBr(head);b.SetInsertPoint(head);
+    auto* index=b.CreatePHI(b.getInt32Ty(),2);index->addIncoming(function->getArg(0),first);
+    b.CreateCondBr(b.CreateICmpULT(index,b.getInt32(48)),body,done);b.SetInsertPoint(body);
+    collective_store(b.getInt32(0),collective_pointer(named_barrier_state,index));
+    index->addIncoming(b.CreateAdd(index,function->getArg(1)),body);b.CreateBr(head);
+    b.SetInsertPoint(done);b.CreateRetVoid();return function;
+}
+llvm::Function* make_named_warp_poll(const std::vector<unsigned>& states) {
+    auto* function=llvm::Function::Create(llvm::FunctionType::get(b.getInt1Ty(),{b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()},false),llvm::GlobalValue::InternalLinkage,"cudavm.barrier.warp.ready",*result);
+    auto* first=llvm::BasicBlock::Create(b.getContext(),"entry",function);
+    auto* head=llvm::BasicBlock::Create(b.getContext(),"scan",function);
+    auto* body=llvm::BasicBlock::Create(b.getContext(),"peer",function);
+    auto* check=llvm::BasicBlock::Create(b.getContext(),"barrier",function);
+    auto* next=llvm::BasicBlock::Create(b.getContext(),"next",function);
+    auto* done=llvm::BasicBlock::Create(b.getContext(),"done",function);
+    b.SetInsertPoint(first);
+    auto* base=b.CreateAnd(function->getArg(0),b.getInt32(~31u));auto* warp_end=b.CreateAdd(base,b.getInt32(32));
+    auto* end=b.CreateSelect(b.CreateICmpULT(function->getArg(1),warp_end),function->getArg(1),warp_end);
+    b.CreateBr(head);b.SetInsertPoint(head);
+    auto* index=b.CreatePHI(b.getInt32Ty(),2);index->addIncoming(base,first);
+    auto* ready=b.CreatePHI(b.getInt1Ty(),2);ready->addIncoming(b.getTrue(),first);
+    b.CreateCondBr(b.CreateICmpULT(index,end),body,done);b.SetInsertPoint(body);
+    auto* pc=collective_load(collective_pointer(collective_pc,index));
+    auto* retired=b.CreateICmpEQ(pc,b.getInt32(0));
+    llvm::Value* waiting=b.getFalse();for(auto state:states)waiting=b.CreateOr(waiting,b.CreateICmpEQ(pc,b.getInt32(state)));
+    b.CreateCondBr(waiting,check,next);b.SetInsertPoint(check);
+    auto* same=b.CreateICmpEQ(collective_load(collective_pointer(collective_masks,index)),function->getArg(2));
+    b.CreateBr(next);b.SetInsertPoint(next);
+    auto* agrees=b.CreatePHI(b.getInt1Ty(),2);agrees->addIncoming(retired,body);agrees->addIncoming(same,check);
+    ready->addIncoming(b.CreateAnd(ready,agrees),next);index->addIncoming(b.CreateAdd(index,b.getInt32(1)),next);b.CreateBr(head);
+    b.SetInsertPoint(done);b.CreateRet(ready);return function;
+}
 llvm::Function* make_collective_poll() {
     auto* poll=llvm::Function::Create(llvm::FunctionType::get(b.getInt64Ty(),arguments({b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()}),false),llvm::GlobalValue::InternalLinkage,"cudavm.collective.poll",*result);
     auto* first=llvm::BasicBlock::Create(b.getContext(),"entry",poll);
@@ -53,15 +160,29 @@ llvm::Function* make_collective_poll() {
 }
 void make_continuations() {
     if(!kernel_entry) fail(kernel,"collective helper must be inlined into its CUDA kernel");
-    struct rendezvous {llvm::CallInst* call;llvm::BasicBlock* wait;unsigned operation;};
+    struct rendezvous {llvm::CallInst* call;llvm::BasicBlock* wait;unsigned operation;llvm::AllocaInst* generation=nullptr;llvm::BasicBlock* warp_wait=nullptr;llvm::BasicBlock* arrival=nullptr;};
     std::vector<rendezvous> sites;
     for(auto& bb:*entry) for(auto& input:bb) if(auto* call=llvm::dyn_cast<llvm::CallInst>(&input))
         if(auto* f=call->getCalledFunction();f && f->hasFnAttribute("cudavm.collective"))
             sites.push_back({call,nullptr,unsigned(std::stoul(f->getFnAttribute("cudavm.collective").getValueAsString().str()))});
+    auto saved=b.saveIP();
+    auto* named_arrival=named_barriers?make_named_arrival():nullptr;
+    auto* named_advance=named_barriers?make_named_advance():nullptr;
+    auto* named_initialize=named_barriers?make_named_initialize():nullptr;
+    b.restoreIP(saved);
     for(auto& site:sites) {
         auto* arrival=site.call->getParent();
         site.wait=arrival->splitBasicBlock(site.call,"collective.wait");
         site.wait->splitBasicBlock(site.call->getNextNode(),"collective.resume");
+        if(site.operation>=36) {
+            site.warp_wait=site.wait;
+            site.arrival=site.warp_wait->splitBasicBlock(site.call,"barrier.arrival");
+            site.wait=site.arrival->splitBasicBlock(site.call,"barrier.wait");
+            b.SetInsertPoint(&*entry->getEntryBlock().getFirstInsertionPt());
+            site.generation=b.CreateAlloca(b.getInt32Ty(),nullptr,"barrier.generation");
+            b.SetInsertPoint(site.arrival->getTerminator());
+            b.CreateStore(b.CreateCall(named_arrival,{site.call->getArgOperand(0),site.call->getArgOperand(1),linear_thread(),thread_count()}),site.generation);
+        }
         b.SetInsertPoint(arrival->getTerminator()); auto* id=linear_thread();
         collective_store(site.call->getArgOperand(0),collective_pointer(collective_masks,id));
         collective_store(site.call->getArgOperand(1),collective_pointer(collective_data,id));
@@ -92,7 +213,9 @@ void make_continuations() {
     for(auto* bb:quanta) for(auto& input:*bb) if(auto* slot=llvm::dyn_cast<llvm::AllocaInst>(&input)) slots.push_back(slot);
     for(auto* slot:slots) {slot->removeFromParent();b.Insert(slot);}
     auto* local_pc=b.CreateAlloca(b.getInt32Ty(),nullptr,"continuation.pc");
-    b.CreateStore(b.getInt32(states.at(initial)),local_pc);b.CreateBr(head);
+    b.CreateStore(b.getInt32(states.at(initial)),local_pc);
+    if(named_barriers) b.CreateCall(named_initialize,{linear_thread(),thread_count()});
+    b.CreateBr(head);
     b.SetInsertPoint(head);auto* id=linear_thread();auto* count=thread_count();
     auto* pc=b.CreateLoad(b.getInt32Ty(),local_pc);
     collective_store(pc,collective_pointer(collective_pc,id));group_barrier();
@@ -100,11 +223,16 @@ void make_continuations() {
     b.SetInsertPoint(leader);b.CreateBr(scan);b.SetInsertPoint(scan);
     auto* index=b.CreatePHI(b.getInt32Ty(),2);index->addIncoming(b.getInt32(0),leader);
     auto* any=b.CreatePHI(b.getInt32Ty(),2);any->addIncoming(b.getInt32(0),leader);
+    auto* live_count=b.CreatePHI(b.getInt32Ty(),2);live_count->addIncoming(b.getInt32(0),leader);
     b.CreateCondBr(b.CreateICmpULT(index,count),sample,scanned);
     b.SetInsertPoint(sample);
-    any->addIncoming(b.CreateOr(any,collective_load(collective_pointer(collective_pc,index))),sample);
+    auto* peer_pc=collective_load(collective_pointer(collective_pc,index));
+    any->addIncoming(b.CreateOr(any,peer_pc),sample);
+    live_count->addIncoming(b.CreateAdd(live_count,b.CreateZExt(b.CreateICmpNE(peer_pc,b.getInt32(0)),b.getInt32Ty())),sample);
     index->addIncoming(b.CreateAdd(index,b.getInt32(1)),sample);b.CreateBr(scan);
-    b.SetInsertPoint(scanned);collective_store(any,collective_pointer(collective_control,b.getInt32(0)));b.CreateBr(dispatch);
+    b.SetInsertPoint(scanned);collective_store(any,collective_pointer(collective_control,b.getInt32(0)));
+    if(named_barriers) b.CreateCall(named_advance,{live_count});
+    b.CreateBr(dispatch);
     b.SetInsertPoint(dispatch);group_barrier();
     b.CreateCondBr(b.CreateICmpNE(collective_load(collective_pointer(collective_control,b.getInt32(0))),b.getInt32(0)),select,exit);
     b.SetInsertPoint(select);auto* choice=b.CreateSwitch(pc,latch,unsigned(quanta.size()));
@@ -126,9 +254,29 @@ void make_continuations() {
         b.CreateStore(next,local_pc);b.CreateBr(latch);terminator->eraseFromParent();
     }
     auto* poll=make_collective_poll();
+    std::vector<unsigned> named_wait_states;
+    for(auto& site:sites) if(site.operation>=36)named_wait_states.push_back(states.at(site.warp_wait));
+    auto* named_warp_poll=named_barriers?make_named_warp_poll(named_wait_states):nullptr;
     for(auto& site:sites) {
+        if(site.operation>=36) {
+            b.SetInsertPoint(site.warp_wait->getTerminator());
+            auto* barrier_id=collective_load(collective_pointer(collective_masks,linear_thread()));
+            auto* ready=b.CreateCall(named_warp_poll,{linear_thread(),thread_count(),barrier_id});
+            b.CreateStore(b.CreateSelect(ready,b.getInt32(states.at(site.arrival)),b.getInt32(states.at(site.warp_wait))),local_pc);
+        }
+        if(site.operation==37) continue; // Warp arrival does not wait for other warps.
         auto* execute=site.wait->splitBasicBlock(site.call,"collective.execute");
         auto* branch=site.wait->getTerminator();b.SetInsertPoint(branch);
+        if(site.operation>=36) {
+            auto* barrier_id=collective_load(collective_pointer(collective_masks,linear_thread()));
+            llvm::Value* ready=nullptr;
+            {
+                auto* phase=collective_pointer(named_barrier_state,b.CreateAdd(barrier_id,b.getInt32(32)));
+                ready=b.CreateICmpNE(collective_load(phase),b.CreateLoad(b.getInt32Ty(),site.generation));
+            }
+            b.CreateCondBr(ready,execute,latch);
+            branch->eraseFromParent();continue;
+        }
         auto* mask=collective_load(collective_pointer(collective_masks,linear_thread()));
         std::vector<llvm::Value*> args{mask,b.getInt32(states.at(site.wait)),b.getInt32(site.operation)};
         if(opencl) {args.push_back(entry->getArg(0));args.push_back(entry->getArg(1));}

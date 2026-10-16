@@ -40,6 +40,10 @@ constexpr auto preamble = R"cudavm(
 #define __CUDACC_VER_BUILD__ 1
 #include <vector_types.h>
 #include <__clang_cuda_builtin_vars.h>
+typedef __SIZE_TYPE__ size_t;
+#ifndef NULL
+#define NULL __null
+#endif
 __device__ inline __cuda_builtin_threadIdx_t::operator dim3() const { return dim3(x,y,z); }
 __device__ inline __cuda_builtin_threadIdx_t::operator uint3() const { return uint3{x,y,z}; }
 __device__ inline __cuda_builtin_blockIdx_t::operator dim3() const { return dim3(x,y,z); }
@@ -50,6 +54,18 @@ __device__ inline __cuda_builtin_gridDim_t::operator dim3() const { return dim3(
 __device__ inline __cuda_builtin_gridDim_t::operator uint3() const { return uint3{x,y,z}; }
 extern "C" __device__ void __cudavm_rtc_syncthreads();
 #define __syncthreads() __cudavm_rtc_syncthreads()
+extern "C" __device__ void __trap();
+extern "C" __device__ inline void* memcpy(void* destination,const void* source,__SIZE_TYPE__ bytes) {return __builtin_memcpy(destination,source,bytes);}
+extern "C" __device__ __attribute__((convergent)) void __cudavm_rtc_barrier_sync(unsigned);
+extern "C" __device__ __attribute__((convergent)) void __cudavm_rtc_barrier_count(unsigned,unsigned);
+__device__ inline void __barrier_sync(unsigned id) {__cudavm_rtc_barrier_sync(id);}
+__device__ inline void __barrier_sync_count(unsigned id,unsigned count) {__cudavm_rtc_barrier_count(id,count);}
+extern "C" __device__ void __cudavm_rtc_fence_block();
+extern "C" __device__ void __cudavm_rtc_fence_device();
+extern "C" __device__ void __cudavm_rtc_fence_system();
+__device__ inline void __threadfence_block() {__cudavm_rtc_fence_block();}
+__device__ inline void __threadfence() {__cudavm_rtc_fence_device();}
+__device__ inline void __threadfence_system() {__cudavm_rtc_fence_system();}
 extern "C" __device__ __attribute__((convergent)) int __cudavm_rtc_block_popc(int);
 extern "C" __device__ __attribute__((convergent)) int __cudavm_rtc_block_and(int);
 extern "C" __device__ __attribute__((convergent)) int __cudavm_rtc_block_or(int);
@@ -64,6 +80,15 @@ __device__ inline int __clz(int x) {return x?__builtin_clz(unsigned(x)):32;}
 __device__ inline int __clzll(long long x) {return x?__builtin_clzll(static_cast<unsigned long long>(x)):64;}
 __device__ inline int __ffs(int x) {return __builtin_ffs(x);}
 __device__ inline int __ffsll(long long x) {return __builtin_ffsll(x);}
+__device__ inline unsigned __fns(unsigned mask,unsigned base,int offset) {
+    if(offset==0)return base;
+    unsigned remaining=offset<0?0u-unsigned(offset):unsigned(offset);
+    for(unsigned i=0;i<32;++i) {
+        unsigned lane=offset<0?base-i:base+i;
+        if(lane<32u && (mask&(1u<<lane)) && --remaining==0u)return lane;
+    }
+    return 0xffffffffu;
+}
 __device__ inline unsigned __brev(unsigned x) {return __builtin_bitreverse32(x);}
 __device__ inline unsigned long long __brevll(unsigned long long x) {return __builtin_bitreverse64(x);}
 extern "C" __device__ unsigned __nv_byte_perm(unsigned,unsigned,unsigned);
@@ -82,6 +107,12 @@ __device__ inline unsigned __funnelshift_rc(unsigned lo,unsigned hi,unsigned s) 
 }
 // Use generic Clang atomic builtins, which emit ordinary LLVM atomics without
 // depending on the target-specific NVVM builtin enum or an installed toolkit.
+__device__ inline unsigned atomicAdd(unsigned* p,unsigned v) {return __atomic_fetch_add(p,v,__ATOMIC_RELAXED);}
+__device__ inline unsigned atomicOr(unsigned* p,unsigned v) {return __atomic_fetch_or(p,v,__ATOMIC_RELAXED);}
+__device__ inline unsigned atomicAnd(unsigned* p,unsigned v) {return __atomic_fetch_and(p,v,__ATOMIC_RELAXED);}
+__device__ inline unsigned atomicCAS(unsigned* p,unsigned c,unsigned v) {__atomic_compare_exchange_n(p,&c,v,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED);return c;}
+__device__ inline unsigned min(unsigned a,unsigned b) {return a<b?a:b;}
+__device__ inline unsigned max(unsigned a,unsigned b) {return a>b?a:b;}
 extern "C" __device__ float __cudavm_rtc_atomic_add_float(float*,float);
 extern "C" __device__ double __cudavm_rtc_atomic_add_double(double*,double);
 __device__ inline float atomicAdd(float* p,float v) { return __cudavm_rtc_atomic_add_float(p,v); }
@@ -464,6 +495,7 @@ nvrtc_output compile_nvrtc_source(const std::string& source, const std::string& 
     }
     lower_device_math(*module);
     lower_device_integers(*module);
+    lower_device_synchronization(*module);
     std::vector<llvm::GlobalVariable*> anchors;
     for (auto& global : module->globals())
         if (global.getName().contains("__cudavm_nvrtc_name_")) anchors.push_back(&global);

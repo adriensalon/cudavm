@@ -910,6 +910,18 @@ void lower_device_math(llvm::Module& module) {
     check_ir(module);
 }
 void lower_device_integers(llvm::Module& module) {
+    for(auto name:{"min","max","umin","umax","llmin","llmax","ullmin","ullmax"}) {
+        auto* function=module.getFunction(std::string("__nv_")+name);
+        if(!function || !function->isDeclaration())continue;
+        bool wide=std::string_view(name).find("ll")!=std::string_view::npos;
+        auto* integer=llvm::IntegerType::get(module.getContext(),wide?64:32);
+        if(function->getFunctionType()!=llvm::FunctionType::get(integer,{integer,integer},false)) throw std::runtime_error("invalid CUDA integer min/max signature");
+        llvm::IRBuilder<> builder(llvm::BasicBlock::Create(module.getContext(),"entry",function));
+        bool unsign=std::string_view(name).starts_with('u'),minimum=std::string_view(name).ends_with("min");
+        auto predicate=unsign?(minimum?llvm::CmpInst::ICMP_ULT:llvm::CmpInst::ICMP_UGT):(minimum?llvm::CmpInst::ICMP_SLT:llvm::CmpInst::ICMP_SGT);
+        builder.CreateRet(builder.CreateSelect(builder.CreateICmp(predicate,function->getArg(0),function->getArg(1)),function->getArg(0),function->getArg(1)));
+        function->addFnAttr(llvm::Attribute::AlwaysInline);
+    }
     for(auto operation:device_dpx_operations) {
         std::string name=std::string("__")+operation.name;
         // Clang's pristine CUDA header uses static Itanium-mangled wrappers.
@@ -1341,6 +1353,111 @@ void resolve_weak_device_references(llvm::Module& module) {
     optimize_closed(module, true);
     check_ir(module);
 }
+bool lower_device_atomic_assembly(llvm::CallInst& call,llvm::StringRef text) {
+    llvm::IRBuilder<> b(&call);
+    for(auto scope:{"cta","gpu"}) for(unsigned bits:{32u,64u}) {
+        auto scope_id=b.getContext().getOrInsertSyncScopeID(std::string_view(scope)=="cta"?"block":"device");
+        auto* integer=b.getIntNTy(bits);
+        auto pointer=[&]() -> llvm::Value* {
+            auto* value=call.getArgOperand(0);
+            return value->getType()->isPointerTy()?value:b.CreateIntToPtr(value,b.getPtrTy());
+        };
+        auto size=std::to_string(bits);
+        if(call.arg_size()==1 && call.getType()==integer && (call.getArgOperand(0)->getType()->isPointerTy() || call.getArgOperand(0)->getType()->isIntegerTy(64))) {
+            for(auto order:{"relaxed","acquire"}) if(text==std::string("ld.")+order+"."+scope+".u"+size+"$0,[$1];") {
+                auto* load=b.CreateAlignedLoad(integer,pointer(),llvm::Align(bits/8));
+                load->setAtomic(std::string_view(order)=="acquire"?llvm::AtomicOrdering::Acquire:llvm::AtomicOrdering::Monotonic,scope_id);
+                call.replaceAllUsesWith(load);call.eraseFromParent();return true;
+            }
+        }
+        if(call.arg_size()!=2 || call.getArgOperand(1)->getType()!=integer || (!call.getArgOperand(0)->getType()->isPointerTy() && !call.getArgOperand(0)->getType()->isIntegerTy(64)))continue;
+        if(call.getType()->isVoidTy()) for(auto order:{"relaxed","release"}) if(text==std::string("st.")+order+"."+scope+".u"+size+"[$0],$1;") {
+            auto* store=b.CreateAlignedStore(call.getArgOperand(1),pointer(),llvm::Align(bits/8));
+            store->setAtomic(std::string_view(order)=="release"?llvm::AtomicOrdering::Release:llvm::AtomicOrdering::Monotonic,scope_id);
+            call.eraseFromParent();return true;
+        }
+        for(auto op:{"add","or","and","xor"}) for(auto order:{"relaxed","acquire","release","acq_rel"}) {
+            bool reduction=call.getType()->isVoidTy();
+            if(!reduction && call.getType()!=integer)continue;
+            std::string prefix=std::string(reduction?"red.":"atom.")+op+"."+order+"."+scope;
+            auto suffix=size+(reduction?"[$0],$1;":"$0,[$1],$2;");
+            if(text!=prefix+".u"+suffix && text!=prefix+".b"+suffix)continue;
+            auto mode=std::string_view(order)=="acquire"?llvm::AtomicOrdering::Acquire:std::string_view(order)=="release"?llvm::AtomicOrdering::Release:std::string_view(order)=="acq_rel"?llvm::AtomicOrdering::AcquireRelease:llvm::AtomicOrdering::Monotonic;
+            auto operation=std::string_view(op)=="add"?llvm::AtomicRMWInst::Add:std::string_view(op)=="or"?llvm::AtomicRMWInst::Or:std::string_view(op)=="and"?llvm::AtomicRMWInst::And:llvm::AtomicRMWInst::Xor;
+            auto* rmw=b.CreateAtomicRMW(operation,pointer(),call.getArgOperand(1),llvm::Align(bits/8),mode,scope_id);
+            if(!reduction)call.replaceAllUsesWith(rmw);
+            call.eraseFromParent();return true;
+        }
+    }
+    return false;
+}
+// Recognize only scalar CTA synchronization assembly. Keep all other assembly
+// for the backend's explicit unsupported-operation diagnostic.
+void lower_device_synchronization(llvm::Module& module) {
+    std::vector<llvm::CallInst*> calls;
+    for(auto& f:module) for(auto& bb:f) for(auto& i:bb)
+        if(auto* call=llvm::dyn_cast<llvm::CallInst>(&i)) calls.push_back(call);
+    for(auto* call:calls) {
+        llvm::IRBuilder<> b(call);
+        std::string operation;
+        std::vector<llvm::Value*> args;
+        if(auto* function=call->getCalledFunction()) {
+            auto name=function->getName();
+            if(name=="__trap") {b.CreateIntrinsic(llvm::Intrinsic::trap,llvm::ArrayRef<llvm::Type*>{},llvm::ArrayRef<llvm::Value*>{});call->eraseFromParent();continue;}
+            if(name=="__cudavm_rtc_barrier_sync") operation="llvm.nvvm.barrier.cta.sync.aligned.all";
+            if(name=="__cudavm_rtc_barrier_count") operation="llvm.nvvm.barrier.cta.sync.aligned.count";
+            if(name=="__cudavm_rtc_fence_block") operation="llvm.nvvm.membar.cta";
+            if(name=="__cudavm_rtc_fence_device") operation="llvm.nvvm.membar.gl";
+            if(name=="__cudavm_rtc_fence_system") operation="llvm.nvvm.membar.sys";
+            if(operation.empty()) continue;
+            for(auto& arg:call->args()) args.push_back(arg.get());
+        } else if(call->isInlineAsm()) {
+            auto* assembly=llvm::cast<llvm::InlineAsm>(call->getCalledOperand());
+            if(assembly->isAlignStack() || assembly->getDialect()!=llvm::InlineAsm::AD_ATT) continue;
+            std::string text;
+            for(char c:assembly->getAsmString()) if(c!=' ' && c!='\t' && c!='\n' && c!='\r') text+=c;
+            if(assembly->hasSideEffects() && lower_device_atomic_assembly(*call,text))continue;
+            if(call->getType()->isIntegerTy(32) && call->arg_empty() && assembly->getConstraintString()=="=r") {
+                for(auto reg:{"laneid","lanemask_lt","lanemask_eq","lanemask_le","lanemask_gt","lanemask_ge"}) {
+                    if(text!=std::string("mov.u32$0,%")+reg+";") continue;
+                    std::string name=reg;std::replace(name.begin(),name.end(),'_','.');
+                    auto callee=module.getOrInsertFunction("llvm.nvvm.read.ptx.sreg."+name,llvm::FunctionType::get(b.getInt32Ty(),{},false));
+                    call->replaceAllUsesWith(b.CreateCall(callee));operation="register";break;
+                }
+                if(operation=="register") {call->eraseFromParent();continue;}
+            }
+            if(!call->getType()->isVoidTy())continue;
+            if(text=="membar.cta;") operation="llvm.nvvm.membar.cta";
+            else if(text=="membar.gl;") operation="llvm.nvvm.membar.gl";
+            else if(text=="membar.sys;") operation="llvm.nvvm.membar.sys";
+            else {
+                bool arrive=false,aligned=false;size_t prefix=0;
+                for(auto spelling:{"bar.sync", "bar.arrive", "barrier.sync", "barrier.arrive", "barrier.cta.sync", "barrier.cta.arrive"})
+                    if(text.starts_with(spelling)) {prefix=std::string(spelling).size();arrive=std::string(spelling).ends_with("arrive");aligned=std::string_view(spelling).starts_with("bar.");break;}
+                if(!prefix || text.back()!=';') continue;
+                if(text.substr(prefix).starts_with(".aligned")){prefix+=8;aligned=true;}
+                auto operands=text.substr(prefix,text.size()-prefix-1);
+                bool valid=true;
+                while(!operands.empty()) {
+                    auto comma=operands.find(',');auto token=operands.substr(0,comma);
+                    unsigned number=0;
+                    if(token.starts_with('$') && !llvm::StringRef(token).drop_front().getAsInteger(10,number) && number<call->arg_size()) args.push_back(call->getArgOperand(number));
+                    else if(!llvm::StringRef(token).getAsInteger(10,number)) args.push_back(b.getInt32(number));
+                    else {valid=false;break;}
+                    if(comma==std::string::npos)break;
+                    operands.erase(0,comma+1);
+                }
+                if(!valid || args.empty() || args.size()>2 || (arrive && args.size()!=2)) continue;
+                operation=std::string("llvm.nvvm.barrier.cta.")+(arrive?"arrive":"sync")+(aligned?".aligned.":".")+(args.size()==2?"count":"all");
+            }
+        } else continue;
+        if(operation.empty())continue;
+        std::vector<llvm::Type*> types;
+        for(auto* arg:args) {if(!arg->getType()->isIntegerTy(32)) throw std::runtime_error("CTA barrier requires 32-bit operands");types.push_back(arg->getType());}
+        auto callee=module.getOrInsertFunction(operation,llvm::FunctionType::get(b.getVoidTy(),types,false));
+        auto* replacement=b.CreateCall(callee,args);replacement->setConvergent();call->eraseFromParent();
+    }
+}
 void prepare_portable(llvm::Module& module) {
     if (stage(module) != "clang.cuda.linked") throw std::runtime_error("portable preparation requires linked CUDA IR");
     resolve_device_function_aliases(module, true);
@@ -1358,6 +1475,7 @@ void prepare_portable(llvm::Module& module) {
     lower_device_conversions(module);
     lower_device_math(module);
     lower_device_integers(module);
+    lower_device_synchronization(module);
     import_semantics(module);
     trace(module, "cuda-semantic-import");
     advance(module, "clang.cuda.linked", "cudavm.semantic");

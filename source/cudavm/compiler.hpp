@@ -32,6 +32,7 @@ void prepare_portable(llvm::Module&);
 void lower_device_conversions(llvm::Module&);
 void lower_device_math(llvm::Module&);
 void lower_device_integers(llvm::Module&);
+void lower_device_synchronization(llvm::Module&);
 // Final optional references and canonical target-plus-offset initializers.
 void resolve_weak_device_references(llvm::Module&);
 void normalize_device_relocations(llvm::Module&);
