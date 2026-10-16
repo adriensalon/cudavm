@@ -38,9 +38,17 @@ constexpr auto preamble = R"cudavm(
 #define __CUDACC_VER_MAJOR__ 13
 #define __CUDACC_VER_MINOR__ 4
 #define __CUDACC_VER_BUILD__ 1
+#define __FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__ 1
+#if __has_include(<nv/target>)
+#include <nv/target>
+#endif
 #include <vector_types.h>
 #include <__clang_cuda_builtin_vars.h>
 typedef __SIZE_TYPE__ size_t;
+__device__ inline float2 make_float2(float x,float y) { return float2{x,y}; }
+// NVRTC supplies this utility to the CUDA numeric headers without a host C++
+// standard library. The lvalue overload also coexists with a caller's utility.
+namespace std { template<class T> __device__ constexpr T&& move(T& value) { return static_cast<T&&>(value); } }
 #ifndef NULL
 #define NULL __null
 #endif
@@ -91,6 +99,17 @@ __device__ inline unsigned __fns(unsigned mask,unsigned base,int offset) {
 }
 __device__ inline unsigned __brev(unsigned x) {return __builtin_bitreverse32(x);}
 __device__ inline unsigned long long __brevll(unsigned long long x) {return __builtin_bitreverse64(x);}
+__device__ inline float __uint_as_float(unsigned x) {return __builtin_bit_cast(float,x);}
+__device__ inline float __int_as_float(int x) {return __builtin_bit_cast(float,x);}
+__device__ inline unsigned __float_as_uint(float x) {return __builtin_bit_cast(unsigned,x);}
+__device__ inline int __float_as_int(float x) {return __builtin_bit_cast(int,x);}
+__device__ inline double __longlong_as_double(long long x) {return __builtin_bit_cast(double,x);}
+__device__ inline long long __double_as_longlong(double x) {return __builtin_bit_cast(long long,x);}
+__device__ inline float __fmaf_rn(float x,float y,float z) {return __builtin_elementwise_fma(x,y,z);}
+__device__ inline float __fsub_rn(float x,float y) {return x-y;}
+// Parsed by the half header's optional transcendental wrappers. A caller using
+// it still needs a device implementation, like other unresolved NVRTC calls.
+extern "C" __device__ float tanhf(float);
 extern "C" __device__ unsigned __nv_byte_perm(unsigned,unsigned,unsigned);
 __device__ inline unsigned __byte_perm(unsigned x,unsigned y,unsigned s) {return __nv_byte_perm(x,y,s);}
 __device__ inline unsigned __funnelshift_l(unsigned lo,unsigned hi,unsigned s) {
@@ -161,6 +180,14 @@ struct nvrtc_consumer : clang::ASTConsumer, clang::RecursiveASTVisitor<nvrtc_con
         return !compiler.getDiagnostics().hasErrorOccurred();
     }
     bool VisitFunctionDecl(clang::FunctionDecl* function) {
+        auto& sources=compiler.getSourceManager();
+        auto file=sources.getFilename(sources.getSpellingLoc(function->getLocation()));
+        // Modern CUDA headers normally obtain these definitions from NVIDIA's
+        // NVRTC builtins library. Compile their provided source here and retain
+        // only used inline definitions, like the AOT CUDA header path.
+        if((file.ends_with("cuda_fp16.hpp") || file.ends_with("cuda_fp16.h"))
+            && function->hasAttr<clang::CUDADeviceAttr>() && function->isThisDeclarationADefinition())
+            function->setImplicitlyInline();
         if (function->isImplicit() || !function->doesThisDeclarationHaveABody()
             || compiler.getSourceManager().isInSystemHeader(function->getLocation())) return true;
         if (!function->hasAttr<clang::CUDADeviceAttr>() && !function->hasAttr<clang::CUDAGlobalAttr>()) {

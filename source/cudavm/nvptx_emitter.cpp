@@ -52,9 +52,15 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
     auto* target = llvm::TargetRegistry::lookupTarget(module->getTargetTriple(), error);
     if (!target) throw std::runtime_error(error);
     llvm::TargetOptions settings;
-    // LLVM chooses the minimum PTX dialect for the explicitly requested SM.
-    // Driver JIT compatibility is checked by loading the emitted artifact.
-    std::unique_ptr<llvm::TargetMachine> machine(target->createTargetMachine(module->getTargetTriple(), architecture, "", settings, std::nullopt));
+    // Inline instructions from CUDA headers also impose a PTX dialect floor.
+    // Packed half comparisons with integer results were introduced in PTX 6.5,
+    // after the default 6.3 dialect for SM 75. Preserve lower defaults elsewhere.
+    std::string features;
+    for(const auto& function:*module)for(const auto& block:function)for(const auto& instruction:block)
+        if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->isInlineAsm())
+            if(architecture.starts_with("sm_") && std::stoi(architecture.substr(3))<80
+                && llvm::cast<llvm::InlineAsm>(call->getCalledOperand())->getAsmString().find(".u32.f16x2")!=std::string::npos)features="+ptx65";
+    std::unique_ptr<llvm::TargetMachine> machine(target->createTargetMachine(module->getTargetTriple(), architecture, features, settings, std::nullopt));
     if (!machine) throw std::runtime_error("NVPTX target machine creation failed");
     module->setDataLayout(machine->createDataLayout());
     if (target_data_layout) {

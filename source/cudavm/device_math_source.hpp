@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include "device_numeric_source.hpp"
+#include "device_half_source.hpp"
 
 namespace cudavm {
 // One scalar implementation is compiled as C++, as CUDA device code in the
@@ -224,7 +225,7 @@ CV_MATH_FN float cvMathCos(float x) {return cvMathTrig(x,1u);}
 #undef CV_FLOAT
 
 inline std::string device_math_header() {
-    return native_numeric_header()+std::string("#pragma clang system_header\n"
+    return native_numeric_header()+device_half_header()+std::string("#pragma clang system_header\n"
         "#define CV_MATH_FN __device__ inline\n#define CV_MATH_PRECISE\n"
         "#define CV_MATH_CONTRACT _Pragma(\"clang fp contract(off)\")\n"
         "#define CV_BITS(x) __builtin_bit_cast(unsigned, (x))\n"

@@ -14,6 +14,7 @@
 #include <llvm/IR/Dominators.h>
 #include <llvm/Analysis/PostDominators.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicsSPIRV.h>
 #include <llvm/IR/IntrinsicsDirectX.h>
@@ -40,18 +41,37 @@
 #include <llvm/Transforms/Utils/Local.h>
 namespace cudavm {
 namespace {
+#include "shader_half.inl"
 void scalar_math(llvm::Module& module) {
     auto* divide = module.getFunction("__cudavm_native_divide");
     auto* compare = module.getFunction("__cudavm_native_compare");
     auto* square_root = module.getFunction("__cudavm_native_sqrt");
     auto* maximum = module.getFunction("__cudavm_native_max");
     auto* integral = module.getFunction("__cudavm_native_integral");
-    auto numeric=[&](const std::string& name){return module.getFunction("__cudavm_native_word_"+name);};
+    auto numeric=[&](const std::string& name){
+        auto* function=module.getFunction("__cudavm_native_word_"+name);
+        if(name.find("f16")!=std::string::npos && (!function || function->isDeclaration()))
+            throw std::runtime_error("missing half numeric helper: "+name);
+        return function;
+    };
     std::vector<llvm::Instruction*> work;
     for (auto& function : module) for (auto& bb : function) for (auto& instruction : bb) work.push_back(&instruction);
     for (auto* instruction : work) {
         llvm::IRBuilder<> builder(instruction); llvm::Value* replacement = nullptr;
         auto bits=[&](llvm::Value* value){return builder.CreateBitCast(value,value->getType()->isDoubleTy()?builder.getInt64Ty():builder.getInt32Ty());};
+        auto half_bits=[&](llvm::Value* value){return builder.CreateZExt(builder.CreateBitCast(value,builder.getInt16Ty()),builder.getInt32Ty());};
+        auto half_value=[&](llvm::Value* value){return builder.CreateBitCast(builder.CreateTrunc(value,builder.getInt16Ty()),builder.getHalfTy());};
+        auto half_float=[&](llvm::Value* value){return builder.CreateBitCast(builder.CreateCall(numeric("f16_to_f32"),{half_bits(value)}),builder.getFloatTy());};
+        if(instruction->getOpcode()==llvm::Instruction::FNeg && instruction->getType()->isHalfTy())
+            replacement=half_value(builder.CreateXor(half_bits(instruction->getOperand(0)),builder.getInt32(0x8000)));
+        if(auto* binary=llvm::dyn_cast<llvm::BinaryOperator>(instruction);binary && binary->getType()->isHalfTy()) {
+            auto* left=half_bits(binary->getOperand(0));auto* right=half_bits(binary->getOperand(1));
+            if(binary->getOpcode()==llvm::Instruction::FSub)right=builder.CreateXor(right,builder.getInt32(0x8000));
+            if(binary->getOpcode()==llvm::Instruction::FAdd || binary->getOpcode()==llvm::Instruction::FSub || binary->getOpcode()==llvm::Instruction::FMul)
+                replacement=half_value(builder.CreateCall(numeric(binary->getOpcode()==llvm::Instruction::FMul?"f16_mul":"f16_add"),{left,right}));
+        }
+        if(auto* compare=llvm::dyn_cast<llvm::FCmpInst>(instruction);compare && compare->getOperand(0)->getType()->isHalfTy())
+            replacement=builder.CreateFCmp(compare->getPredicate(),half_float(compare->getOperand(0)),half_float(compare->getOperand(1)));
         if(instruction->getOpcode()==llvm::Instruction::FNeg && instruction->getType()->isDoubleTy()) replacement=builder.CreateBitCast(builder.CreateXor(bits(instruction->getOperand(0)),builder.getInt64(0x8000000000000000ull)),builder.getDoubleTy());
         if(auto* binary=llvm::dyn_cast<llvm::BinaryOperator>(instruction);binary && binary->getType()->isDoubleTy()) {
             const char* operation=binary->getOpcode()==llvm::Instruction::FAdd?"add":binary->getOpcode()==llvm::Instruction::FSub?"sub":binary->getOpcode()==llvm::Instruction::FMul?"mul":binary->getOpcode()==llvm::Instruction::FDiv?"div":nullptr;
@@ -61,6 +81,21 @@ void scalar_math(llvm::Module& module) {
             if(auto* helper=numeric("f64_compare")) replacement=builder.CreateICmpNE(builder.CreateCall(helper,{bits(operation->getOperand(0)),bits(operation->getOperand(1)),builder.getInt32(operation->getPredicate())}),builder.getInt32(0));
         if(auto* cast=llvm::dyn_cast<llvm::CastInst>(instruction)) {
             auto* source=cast->getOperand(0);
+            if(cast->getOpcode()==llvm::Instruction::FPExt && source->getType()->isHalfTy() && cast->getType()->isFloatTy())replacement=half_float(source);
+            if(cast->getOpcode()==llvm::Instruction::FPTrunc && source->getType()->isFloatTy() && cast->getType()->isHalfTy())
+                replacement=half_value(builder.CreateCall(numeric("f32_to_f16"),{bits(source),builder.getInt32(0)}));
+            if(cast->getOpcode()==llvm::Instruction::FPTrunc && source->getType()->isDoubleTy() && cast->getType()->isHalfTy())
+                replacement=half_value(builder.CreateCall(numeric("f64_to_f16"),{bits(source),builder.getInt32(0)}));
+            if(cast->getOpcode()==llvm::Instruction::FPExt && source->getType()->isHalfTy() && cast->getType()->isDoubleTy())
+                replacement=builder.CreateBitCast(builder.CreateCall(numeric("f32_to_f64"),{builder.CreateBitCast(half_float(source),builder.getInt32Ty())}),builder.getDoubleTy());
+            if((cast->getOpcode()==llvm::Instruction::SIToFP || cast->getOpcode()==llvm::Instruction::UIToFP) && cast->getType()->isHalfTy()) {
+                bool unsign=cast->getOpcode()==llvm::Instruction::UIToFP;
+                auto* wide=unsign?builder.CreateZExtOrTrunc(source,builder.getInt64Ty()):builder.CreateSExtOrTrunc(source,builder.getInt64Ty());
+                auto* negative=unsign?builder.getFalse():builder.CreateICmpSLT(wide,builder.getInt64(0));
+                replacement=half_value(builder.CreateCall(numeric("f16_round"),{builder.CreateSelect(negative,builder.CreateNeg(wide),wide),builder.getInt32(0),builder.CreateSelect(negative,builder.getInt32(0x8000),builder.getInt32(0)),builder.getInt32(0)}));
+            }
+            if((cast->getOpcode()==llvm::Instruction::FPToSI || cast->getOpcode()==llvm::Instruction::FPToUI) && source->getType()->isHalfTy())
+                replacement=builder.CreateTruncOrBitCast(builder.CreateCall(numeric("f16_to_integer"),{half_bits(source),builder.getInt32(1),builder.getInt32(cast->getType()->getIntegerBitWidth()),builder.getInt32(cast->getOpcode()==llvm::Instruction::FPToUI)}),cast->getType());
             if(cast->getOpcode()==llvm::Instruction::FPExt && source->getType()->isFloatTy() && cast->getType()->isDoubleTy())
                 if(auto* helper=numeric("f32_to_f64")) replacement=builder.CreateBitCast(builder.CreateCall(helper,{bits(source)}),builder.getDoubleTy());
             if(cast->getOpcode()==llvm::Instruction::FPTrunc && source->getType()->isDoubleTy() && cast->getType()->isFloatTy())
@@ -83,6 +118,8 @@ void scalar_math(llvm::Module& module) {
         if (auto* call = llvm::dyn_cast<llvm::CallInst>(instruction); call && call->getCalledFunction()) {
             auto* function = call->getCalledFunction();
             auto name = function->hasFnAttribute("cudavm.cuda.origin") ? function->getFnAttribute("cudavm.cuda.origin").getValueAsString() : function->getName();
+            if(function->isIntrinsic() && function->getIntrinsicID()==llvm::Intrinsic::fma && call->getType()->isHalfTy())
+                replacement=half_value(builder.CreateCall(numeric("f16_fma"),{half_bits(call->getArgOperand(0)),half_bits(call->getArgOperand(1)),half_bits(call->getArgOperand(2))}));
             if(integral && function->isIntrinsic() && call->getType()->isFloatTy()) {
                 unsigned mode=0;
                 switch(function->getIntrinsicID()) {
@@ -179,6 +216,7 @@ struct lowering {
         if (input->isPointerTy()) return b.getInt64Ty();
         if(input->isFloatTy()) return b.getInt32Ty();
         if(input->isDoubleTy()) return b.getInt64Ty();
+        if(input->isHalfTy()) return b.getInt32Ty();
         if (input->isIntegerTy(8) || input->isIntegerTy(16)) return b.getInt32Ty();
         if (auto* structure = llvm::dyn_cast<llvm::StructType>(input)) {
             std::vector<llvm::Type*> elements; for (auto* element : structure->elements()) elements.push_back(type(element));
@@ -359,8 +397,8 @@ struct lowering {
         }
         if (llvm::isa<llvm::ConstantPointerNull>(input)) return b.getInt64(0);
         if (auto* integer = llvm::dyn_cast<llvm::ConstantInt>(input)) return llvm::ConstantInt::get(type(integer->getType()), integer->getValue().zextOrTrunc(type(integer->getType())->getIntegerBitWidth()));
-        if(auto* floating=llvm::dyn_cast<llvm::ConstantFP>(input);floating && (floating->getType()->isDoubleTy() || floating->getType()->isFloatTy()))
-            return llvm::ConstantInt::get(type(floating->getType()),floating->getValueAPF().bitcastToAPInt());
+        if(auto* floating=llvm::dyn_cast<llvm::ConstantFP>(input);floating && (floating->getType()->isDoubleTy() || floating->getType()->isFloatTy() || floating->getType()->isHalfTy()))
+            return llvm::ConstantInt::get(type(floating->getType()),floating->getValueAPF().bitcastToAPInt().zextOrTrunc(type(floating->getType())->getIntegerBitWidth()));
         if (llvm::isa<llvm::UndefValue>(input) || llvm::isa<llvm::PoisonValue>(input)) return llvm::UndefValue::get(type(input->getType()));
         if (auto* constant = llvm::dyn_cast<llvm::Constant>(input); constant && !constant->getType()->isPointerTy()) return const_cast<llvm::Constant*>(constant);
         fail(*input, "unsupported or non-dominating value");
@@ -382,7 +420,7 @@ struct lowering {
         }
         if(t->isIntegerTy(1)) return b.CreateICmpNE(b.CreateAnd(loaded,b.getInt32(1)),b.getInt32(0));
         if (t->isPointerTy() || t->isIntegerTy()) return loaded;
-        if(t->isDoubleTy() || t->isFloatTy()) return loaded;
+        if(t->isDoubleTy() || t->isFloatTy() || t->isHalfTy()) return loaded;
         if (t->isFloatingPointTy()) return b.CreateBitCast(loaded, t);
         fail(kernel, "aggregate or vector memory access");
     }
@@ -729,6 +767,8 @@ struct lowering {
     llvm::Value* call(const llvm::CallInst& instruction) {
         auto* function = instruction.getCalledFunction();
         if (!function) fail(instruction, "indirect calls or CUDA inline assembly require fallback");
+        if(instruction.getType()->isHalfTy() || llvm::any_of(instruction.args(),[](const auto& argument){return argument->getType()->isHalfTy();}))
+            fail(instruction,"remaining half operation requires explicit native shader lowering");
         auto name = function->hasFnAttribute("cudavm.cuda.origin") ? function->getFnAttribute("cudavm.cuda.origin").getValueAsString() : function->getName();
         if(auto operation=native_collective(name);operation>=0) return collective(instruction,unsigned(operation));
         if(name=="llvm.nvvm.membar.cta" || name=="llvm.nvvm.membar.gl") {
@@ -874,7 +914,6 @@ struct lowering {
         if(alignment.value()<bits/8)fail(input,"shader atomic storage is underaligned");
     }
     void instruction(const llvm::Instruction& input) {
-        if (input.getType()->isHalfTy()) fail(input, "half arithmetic is unsupported");
         if (input.getType()->isVectorTy()) fail(input, "vector values require fallback in this native profile");
         if (auto* integer = llvm::dyn_cast<llvm::IntegerType>(input.getType()); integer && integer->getBitWidth() != 1 && integer->getBitWidth() != 8
             && integer->getBitWidth() != 16 && integer->getBitWidth() != 32 && integer->getBitWidth() != 64)
@@ -1119,6 +1158,7 @@ struct lowering {
 std::unique_ptr<llvm::Module> prepare_native_shader_module(const llvm::Module& input) {
     auto module = llvm::CloneModule(input);
     resolve_device_function_aliases(*module, true); resolve_device_data_aliases(*module, true); normalize_device_relocations(*module);
+    lower_shader_half(*module);
     scalar_math(*module);
     optimize(*module);
     return module;
