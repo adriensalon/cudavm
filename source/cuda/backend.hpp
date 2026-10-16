@@ -115,6 +115,33 @@ struct buffer {
     virtual size_t restore_graph() { return size; }
     virtual void trim_graph() { throw failure(CUDA_ERROR_NOT_SUPPORTED, "graph backing cannot be unmapped"); }
 };
+// Transfer layout for ordinary packed CUDA numeric arrays. Sampling and
+// sparse/compressed image layouts have separate backend contracts.
+inline size_t array_element_bytes(const CUDA_ARRAY3D_DESCRIPTOR& d) {
+    require(d.NumChannels == 1 || d.NumChannels == 2 || d.NumChannels == 4, CUDA_ERROR_INVALID_VALUE, "invalid array channel count");
+    size_t component = 0;
+    switch (d.Format) {
+    case CU_AD_FORMAT_UNSIGNED_INT8: case CU_AD_FORMAT_SIGNED_INT8: component = 1; break;
+    case CU_AD_FORMAT_UNSIGNED_INT16: case CU_AD_FORMAT_SIGNED_INT16: case CU_AD_FORMAT_HALF: component = 2; break;
+    case CU_AD_FORMAT_UNSIGNED_INT32: case CU_AD_FORMAT_SIGNED_INT32: case CU_AD_FORMAT_FLOAT: component = 4; break;
+    default: throw failure(CUDA_ERROR_NOT_SUPPORTED, "array format requires a separate image layout");
+    }
+    return component * d.NumChannels;
+}
+inline CUDA_ARRAY3D_DESCRIPTOR array_level_descriptor(CUDA_ARRAY3D_DESCRIPTOR d, unsigned level) {
+    d.Width = std::max(size_t(1), d.Width >> level);
+    if (d.Height) d.Height = std::max(size_t(1), d.Height >> level);
+    if (d.Depth && !(d.Flags & (CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_CUBEMAP))) d.Depth = std::max(size_t(1), d.Depth >> level);
+    return d;
+}
+inline size_t array_storage_bytes(const CUDA_ARRAY3D_DESCRIPTOR& d) {
+    size_t bytes = array_element_bytes(d);
+    for (auto extent : {d.Width, std::max(size_t(1), d.Height), std::max(size_t(1), d.Depth)}) {
+        require(extent && extent <= std::numeric_limits<size_t>::max() / bytes, CUDA_ERROR_INVALID_VALUE, "array storage size overflow");
+        bytes *= extent;
+    }
+    return bytes;
+}
 // A logical allocation retains its backing and reservation independently of
 // the pool handle. Reuse waits for the frees following queued snapshots;
 // completed cache views with other retained owners remain unavailable.
@@ -389,6 +416,14 @@ struct session {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "external semaphore handle type is unavailable on this device");
     }
     virtual std::unique_ptr<buffer> allocate(size_t bytes) = 0;
+    // Buffer storage implements allocation and byte transfers on shader
+    // adapters. It does not imply native image sampling support.
+    virtual std::shared_ptr<buffer> allocate_array(const CUDA_ARRAY3D_DESCRIPTOR& d) { return allocate(array_storage_bytes(d)); }
+    virtual std::vector<std::shared_ptr<buffer>> allocate_mipmapped_array(const CUDA_ARRAY3D_DESCRIPTOR& d, unsigned levels) {
+        std::vector<std::shared_ptr<buffer>> result;
+        for (unsigned i = 0; i < levels; ++i) result.push_back(allocate_array(array_level_descriptor(d, i)));
+        return result;
+    }
     virtual std::unique_ptr<buffer> allocate_managed(size_t, unsigned) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "native managed memory is unavailable on this adapter");
     }

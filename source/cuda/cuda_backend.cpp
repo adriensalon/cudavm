@@ -96,6 +96,52 @@ struct cuda_buffer : buffer {
     bool is_managed() const override { return managed; }
     size_t physical_size() const override { return imported || mapped_host || module || library ? 0 : size; }
 };
+struct cuda_mipmapped_storage {
+    std::shared_ptr<cuda_context> context;
+    CUmipmappedArray value = nullptr;
+    explicit cuda_mipmapped_storage(std::shared_ptr<cuda_context> owner) : context(std::move(owner)) {}
+    ~cuda_mipmapped_storage() {
+        if (value && context->api->push(context->value) == CUDA_SUCCESS) {
+            context->api->driver.get<decltype(&cuMipmappedArrayDestroy)>("cuMipmappedArrayDestroy")(value);
+            CUcontext previous{}; context->api->pop(&previous);
+        }
+    }
+};
+struct cuda_array_buffer : cuda_buffer {
+    CUarray value = nullptr;
+    CUDA_ARRAY3D_DESCRIPTOR descriptor{};
+    std::shared_ptr<cuda_mipmapped_storage> mipmapped;
+    cuda_array_buffer(std::shared_ptr<cuda_context> owner, const CUDA_ARRAY3D_DESCRIPTOR& d)
+        : cuda_buffer(std::move(owner), array_storage_bytes(d), 0, {}), descriptor(d) {}
+    ~cuda_array_buffer() {
+        if (value && !mipmapped && context->api->push(context->value) == CUDA_SUCCESS) {
+            context->api->driver.get<decltype(&cuArrayDestroy)>("cuArrayDestroy")(value);
+            CUcontext previous{}; context->api->pop(&previous);
+        }
+    }
+};
+CUDA_MEMCPY3D cuda_array_row(buffer* to, size_t destination, void* host_to,
+                           buffer* from, size_t source, const void* host_from, size_t bytes) {
+    CUDA_MEMCPY3D p{};
+    p.srcMemoryType = p.dstMemoryType = CU_MEMORYTYPE_HOST;
+    p.srcHost = host_from; p.dstHost = host_to;
+    p.srcPitch = p.dstPitch = p.WidthInBytes = bytes; p.Height = p.Depth = 1;
+    auto endpoint = [&](buffer* storage, size_t offset, bool target) {
+        if (!storage) return;
+        auto* image = dynamic_cast<cuda_array_buffer*>(storage);
+        auto type = image ? CU_MEMORYTYPE_ARRAY : CU_MEMORYTYPE_DEVICE;
+        size_t x = 0, y = 0, z = 0;
+        if (image) {
+            auto pitch = image->descriptor.Width * array_element_bytes(image->descriptor);
+            auto height = std::max(size_t(1), image->descriptor.Height);
+            x = offset % pitch; y = offset / pitch % height; z = offset / pitch / height;
+        }
+        auto address = image ? 0 : static_cast<cuda_buffer*>(storage)->address + offset;
+        if (target) { p.dstMemoryType = type; p.dstArray = image ? image->value : nullptr; p.dstDevice = address; p.dstXInBytes = x; p.dstY = y; p.dstZ = z; }
+        else { p.srcMemoryType = type; p.srcArray = image ? image->value : nullptr; p.srcDevice = address; p.srcXInBytes = x; p.srcY = y; p.srcZ = z; }
+    };
+    endpoint(to, destination, true); endpoint(from, source, false); return p;
+}
 // Reserve the graph's native address independently of physical memory. This
 // lets a trim unmap idle storage without changing pointers embedded in kernels.
 struct cuda_graph_buffer : cuda_buffer {
@@ -658,6 +704,48 @@ struct cuda_session : session {
         return std::make_shared<cuda_semaphore>(context, d);
     }
     std::unique_ptr<buffer> allocate(size_t size) override { return std::make_unique<cuda_buffer>(context, size); }
+    std::shared_ptr<buffer> allocate_array(const CUDA_ARRAY3D_DESCRIPTOR& d) override {
+        auto result = std::make_shared<cuda_array_buffer>(context, d);
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuArray3DCreate)>("cuArray3DCreate_v2")(&result->value, &d), "cuArray3DCreate_v2");
+        return result;
+    }
+    std::vector<std::shared_ptr<buffer>> allocate_mipmapped_array(const CUDA_ARRAY3D_DESCRIPTOR& d, unsigned levels) override {
+        auto parent = std::make_shared<cuda_mipmapped_storage>(context);
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMipmappedArrayCreate)>("cuMipmappedArrayCreate")(&parent->value, &d, levels), "cuMipmappedArrayCreate");
+        std::vector<std::shared_ptr<buffer>> result;
+        for (unsigned i = 0; i < levels; ++i) {
+            auto level = std::make_shared<cuda_array_buffer>(context, array_level_descriptor(d, i)); level->mipmapped = parent;
+            check(context->api->driver.get<decltype(&cuMipmappedArrayGetLevel)>("cuMipmappedArrayGetLevel")(&level->value, parent->value, i), "cuMipmappedArrayGetLevel");
+            // Native descriptors are authoritative for layer/face dimensions.
+            check(context->api->driver.get<decltype(&cuArray3DGetDescriptor)>("cuArray3DGetDescriptor_v2")(&level->descriptor, level->value), "cuArray3DGetDescriptor_v2");
+            result.push_back(level);
+        }
+        return result;
+    }
+    device_work transfer_array_row(buffer* to, size_t destination, void* host_to, buffer* from, size_t source,
+                                   const void* host_from, size_t bytes, native_queue* queue, bool asynchronous) {
+        auto p = cuda_array_row(to, destination, host_to, from, source, host_from, bytes);
+        auto submit = [&](CUstream stream) {
+            auto& driver = context->api->driver;
+            auto to_context = to ? static_cast<cuda_buffer*>(to)->context : context;
+            auto from_context = from ? static_cast<cuda_buffer*>(from)->context : context;
+            if (to_context != from_context) {
+                CUDA_MEMCPY3D_PEER peer{};
+                peer.srcMemoryType=p.srcMemoryType; peer.srcHost=p.srcHost; peer.srcDevice=p.srcDevice; peer.srcArray=p.srcArray;
+                peer.srcXInBytes=p.srcXInBytes; peer.srcY=p.srcY; peer.srcZ=p.srcZ; peer.srcPitch=p.srcPitch; peer.srcContext=from_context->value;
+                peer.dstMemoryType=p.dstMemoryType; peer.dstHost=p.dstHost; peer.dstDevice=p.dstDevice; peer.dstArray=p.dstArray;
+                peer.dstXInBytes=p.dstXInBytes; peer.dstY=p.dstY; peer.dstZ=p.dstZ; peer.dstPitch=p.dstPitch; peer.dstContext=to_context->value;
+                peer.WidthInBytes=bytes; peer.Height=peer.Depth=1;
+                if (asynchronous) check(driver.get<decltype(&cuMemcpy3DPeerAsync)>("cuMemcpy3DPeerAsync")(&peer,stream), "cuMemcpy3DPeerAsync");
+                else check(driver.get<decltype(&cuMemcpy3DPeer)>("cuMemcpy3DPeer")(&peer), "cuMemcpy3DPeer");
+            } else if (asynchronous) check(driver.get<decltype(&cuMemcpy3DAsync)>("cuMemcpy3DAsync_v2")(&p,stream), "cuMemcpy3DAsync_v2");
+            else check(driver.get<decltype(&cuMemcpy3D)>("cuMemcpy3D_v2")(&p), "cuMemcpy3D_v2");
+        };
+        if (asynchronous) return cuda_enqueue(context, queue, submit);
+        cuda_context_guard guard(*context); submit(nullptr); check(context->api->sync(), "cuCtxSynchronize after array transfer"); return {};
+    }
     std::unique_ptr<buffer> allocate_managed(size_t bytes, unsigned flags) override {
         auto result = std::make_unique<cuda_buffer>(context, bytes, 0, std::shared_ptr<external_memory>{});
         cuda_context_guard guard(*context);
@@ -694,14 +782,17 @@ struct cuda_session : session {
     std::shared_ptr<native_queue> create_queue(int priority) override { return std::make_shared<cuda_queue>(context, priority); }
     device_work enqueue_write(buffer& value, size_t offset, std::span<const std::byte> bytes, native_queue* queue) override {
         if (&value.storage() != &value) return enqueue_write(value.storage(), offset + value.storage_offset(), bytes, queue);
+        if (dynamic_cast<cuda_array_buffer*>(&value)) return transfer_array_row(&value,offset,nullptr,nullptr,0,bytes.data(),bytes.size(),queue,true);
         return cuda_enqueue(context, queue, [&](CUstream stream) { check(context->api->driver.get<decltype(&cuMemcpyHtoDAsync)>("cuMemcpyHtoDAsync_v2")(static_cast<cuda_buffer&>(value).address + offset, bytes.data(), bytes.size(), stream), "cuMemcpyHtoDAsync_v2"); });
     }
     device_work enqueue_read(buffer& value, size_t offset, std::span<std::byte> bytes, native_queue* queue) override {
         if (&value.storage() != &value) return enqueue_read(value.storage(), offset + value.storage_offset(), bytes, queue);
+        if (dynamic_cast<cuda_array_buffer*>(&value)) return transfer_array_row(nullptr,0,bytes.data(),&value,offset,nullptr,bytes.size(),queue,true);
         return cuda_enqueue(context, queue, [&](CUstream stream) { check(context->api->driver.get<decltype(&cuMemcpyDtoHAsync)>("cuMemcpyDtoHAsync_v2")(bytes.data(), static_cast<cuda_buffer&>(value).address + offset, bytes.size(), stream), "cuMemcpyDtoHAsync_v2"); });
     }
     device_work enqueue_copy(buffer& to, size_t destination, buffer& from, size_t source, size_t bytes, native_queue* queue) override {
         if (&to.storage() != &to || &from.storage() != &from) return enqueue_copy(to.storage(), destination + to.storage_offset(), from.storage(), source + from.storage_offset(), bytes, queue);
+        if (dynamic_cast<cuda_array_buffer*>(&to) || dynamic_cast<cuda_array_buffer*>(&from)) return transfer_array_row(&to,destination,nullptr,&from,source,nullptr,bytes,queue,true);
         auto& target = static_cast<cuda_buffer&>(to); auto& input = static_cast<cuda_buffer&>(from);
         return cuda_enqueue(context, queue, [&](CUstream stream) {
             if (target.context != input.context)
@@ -729,6 +820,7 @@ struct cuda_session : session {
     }
     void write_device(buffer& value, size_t offset, std::span<const std::byte> data) override {
         if (&value.storage() != &value) { write_device(value.storage(), offset + value.storage_offset(), data); return; }
+        if (dynamic_cast<cuda_array_buffer*>(&value)) { transfer_array_row(&value,offset,nullptr,nullptr,0,data.data(),data.size(),nullptr,false); return; }
         cuda_context_guard guard(*context);
         check(context->api->write(static_cast<cuda_buffer&>(value).address + offset, data.data(), data.size()), "cuMemcpyHtoD_v2");
         // Pageable HtoD can return after staging while DMA is still pending.
@@ -738,11 +830,13 @@ struct cuda_session : session {
     }
     void read_device(buffer& value, size_t offset, std::span<std::byte> data) override {
         if (&value.storage() != &value) { read_device(value.storage(), offset + value.storage_offset(), data); return; }
+        if (dynamic_cast<cuda_array_buffer*>(&value)) { transfer_array_row(nullptr,0,data.data(),&value,offset,nullptr,data.size(),nullptr,false); return; }
         cuda_context_guard guard(*context);
         check(context->api->read(data.data(), static_cast<cuda_buffer&>(value).address + offset, data.size()), "cuMemcpyDtoH_v2");
     }
     void copy_device(buffer& destination, size_t to, buffer& source, size_t from, size_t size) override {
         if (&destination.storage() != &destination || &source.storage() != &source) { copy_device(destination.storage(), to + destination.storage_offset(), source.storage(), from + source.storage_offset(), size); return; }
+        if (dynamic_cast<cuda_array_buffer*>(&destination) || dynamic_cast<cuda_array_buffer*>(&source)) { transfer_array_row(&destination,to,nullptr,&source,from,nullptr,size,nullptr,false); return; }
         cuda_context_guard guard(*context);
         auto& target = static_cast<cuda_buffer&>(destination); auto& input = static_cast<cuda_buffer&>(source);
         if (target.context != input.context)

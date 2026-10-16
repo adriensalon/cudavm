@@ -198,8 +198,8 @@ graph_operation graph_prepare(const graph_node& node, bool use_node_priority = f
                 global().contexts.contains(from_owner->handle) && global().contexts.contains(to_owner->handle),
                 CUDA_ERROR_INVALID_CONTEXT, "graph copy endpoint context was destroyed");
         result.contexts.push_back(from_owner); result.contexts.push_back(to_owner);
-        auto from = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth, from_owner);
-        auto to = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth, to_owner);
+        auto from = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth, from_owner, true, p.srcArray);
+        auto to = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth, to_owner, true, p.dstArray);
         memory_disjoint(to, from, p.WidthInBytes);
         if (to.host) result.hosts.push_back(to.host);
         if (from.host && from.host != to.host) result.hosts.push_back(from.host);

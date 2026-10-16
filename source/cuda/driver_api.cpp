@@ -102,6 +102,14 @@ struct allocation {
     CUlibrary library = nullptr;
 };
 struct memory_entry { std::shared_ptr<context> owner; std::shared_ptr<external_memory> native; uint64_t size; };
+struct array_entry {
+    std::shared_ptr<context> owner;
+    std::shared_ptr<buffer> native;
+    CUDA_ARRAY3D_DESCRIPTOR descriptor{};
+    CUmipmappedArray parent = nullptr;
+    bool retiring = false;
+};
+struct mipmapped_array_entry { std::shared_ptr<context> owner; std::vector<CUarray> levels; bool retiring = false; };
 struct semaphore_entry { std::shared_ptr<context> owner; std::shared_ptr<external_semaphore> native; CUexternalSemaphoreHandleType type; };
 struct graphics_entry { std::shared_ptr<context> owner; unsigned object, flags; CUdeviceptr mapped = 0; };
 struct global_symbol { CUdeviceptr address; size_t bytes; };
@@ -154,6 +162,9 @@ struct state {
     std::unordered_map<int, primary_record> primary_records;
     std::unordered_map<int, unsigned> primary_flags;
     std::map<CUdeviceptr, allocation> allocations;
+    std::unordered_map<CUarray, std::shared_ptr<array_entry>> arrays;
+    std::unordered_map<CUmipmappedArray, mipmapped_array_entry> mipmapped_arrays;
+    std::uintptr_t next_array = 0xd000000, next_mipmapped_array = 0xe000000;
     // Extracted registry nodes keep earlier allocation generations until their
     // frees retire. A failed dependency can restore a node without allocation.
     std::list<std::map<CUdeviceptr, allocation>::node_type> pool_retiring;
@@ -196,7 +207,7 @@ struct state {
     uint64_t next_graph_id = 1;
     std::uintptr_t next_user_object = 0x9000000;
     // Buffers must be destroyed before native sessions and the backend loader.
-    ~state() { graph_execs.clear(); graph_nodes.clear(); graphs.clear(); graph_live.clear(); graph_cache.clear(); user_objects.clear(); functions.clear(); modules.clear(); allocations.clear(); hosts.clear(); graphics.clear(); memories.clear(); semaphores.clear(); primaries.clear(); contexts.clear(); }
+    ~state() { graph_execs.clear(); graph_nodes.clear(); graphs.clear(); graph_live.clear(); graph_cache.clear(); user_objects.clear(); functions.clear(); modules.clear(); arrays.clear(); mipmapped_arrays.clear(); allocations.clear(); hosts.clear(); graphics.clear(); memories.clear(); semaphores.clear(); primaries.clear(); contexts.clear(); }
 };
 void synchronize_context(const std::shared_ptr<context>&);
 void capture_unsafe(const std::shared_ptr<context>&);
@@ -399,6 +410,8 @@ void destroy(const std::shared_ptr<context>& owner, bool pop_current = true) {
     std::erase_if(global().graph_execs, [&](auto& item) { return item.second.owner.lock() == owner; });
     std::erase_if(global().functions, [&](auto& item) { return item.second.owner == owner; });
     std::erase_if(global().modules, [&](auto& item) { return item.second.owner == owner; });
+    std::erase_if(global().arrays, [&](auto& item) { return item.second->owner == owner; });
+    std::erase_if(global().mipmapped_arrays, [&](auto& item) { return item.second.owner == owner; });
     std::erase_if(global().graph_live, [&](auto& item) { return item.second->owner.lock() == owner; });
     std::erase_if(global().graph_cache, [&](auto& item) { return item.owner == owner; });
     auto& allocations = global().allocations;
@@ -678,6 +691,7 @@ bool capture_wait(CUstream, CUevent, unsigned);
 std::function<void()> graph_prepare_semaphores(const graph_node&);
 bool capture_graph_launch(const std::shared_ptr<context>&, CUstream, const graph_exec&);
 #include "streams.inl"
+#include "arrays.inl"
 #include "memory.inl"
 #include "async_memory.inl"
 #include "launch_state.inl"
@@ -723,6 +737,7 @@ using namespace cudavm;
 #include "interop_exports.inl"
 #include "device_exports.inl"
 #include "memory_exports.inl"
+#include "array_exports.inl"
 #include "host_memory_exports.inl"
 #include "stream_exports.inl"
 #include "memory_operation_exports.inl"
@@ -863,7 +878,7 @@ extern "C" CUDAVM_API int cudavmShutdown() {
         value.streams.clear(); value.events.clear(); value.reset_events.clear();
         value.graph_execs.clear(); value.graph_nodes.clear(); value.graphs.clear();
         value.functions.clear(); value.modules.clear(); value.library_kernels.clear(); value.libraries.clear();
-        value.graph_live.clear(); value.allocations.clear(); value.pool_retiring.clear(); value.hosts.clear(); value.graphics.clear(); value.memories.clear(); value.semaphores.clear();
+        value.graph_live.clear(); value.arrays.clear(); value.mipmapped_arrays.clear(); value.allocations.clear(); value.pool_retiring.clear(); value.hosts.clear(); value.graphics.clear(); value.memories.clear(); value.semaphores.clear();
         value.primaries.clear(); value.primary_records.clear(); value.primary_flags.clear(); value.contexts.clear();
         value.graph_cache.clear(); value.graph_pools.clear();
         value.memory_pools.clear(); value.default_pools.clear(); value.current_pools.clear();

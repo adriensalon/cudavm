@@ -31,17 +31,33 @@ struct memory_box {
     CUdeviceptr base = 0;
     size_t first = 0, pitch = 0, slice = 0, rows = 0, depth = 0, span = 0;
     allocation* device = nullptr;
+    CUarray array = nullptr;
     std::shared_ptr<buffer> storage;
     size_t allocation_offset = 0;
     std::shared_ptr<context> owner;
     std::shared_ptr<host_entry> host;
     size_t offset(size_t row) const { return first + (row / rows) * slice + (row % rows) * pitch; }
     CUdeviceptr address(size_t row) const { return base + offset(row); }
+    bool device_storage() const { return device || array; }
 };
 memory_box memory_endpoint(CUmemorytype type, const void* host, CUdeviceptr device,
                            size_t pitch, size_t slice_height, size_t x, size_t y, size_t z,
-                           size_t width, size_t height, size_t depth, const std::shared_ptr<context>& owner, bool check_pitch = true) {
-    require(type != CU_MEMORYTYPE_ARRAY, CUDA_ERROR_NOT_SUPPORTED, "CUDA array transfers are not implemented");
+                           size_t width, size_t height, size_t depth, const std::shared_ptr<context>& owner, bool check_pitch = true, CUarray array = nullptr) {
+    if (type == CU_MEMORYTYPE_ARRAY) {
+        require(array, CUDA_ERROR_INVALID_VALUE, "null array copy endpoint");
+        auto entry = array_lookup(array, owner); auto& d = entry->descriptor;
+        auto element = array_element_bytes(d), row_bytes = d.Width * element;
+        auto array_height = std::max(size_t(1), d.Height), array_depth = std::max(size_t(1), d.Depth);
+        require(x % element == 0 && x <= row_bytes && width <= row_bytes - x &&
+                y <= array_height && height <= array_height - y && z <= array_depth && depth <= array_depth - z,
+                CUDA_ERROR_INVALID_VALUE, "array copy exceeds extent or element alignment");
+        memory_box result; result.owner = owner; result.storage = entry->native; result.array = array;
+        result.pitch = row_bytes; result.slice = row_bytes * array_height; result.rows = height; result.depth = depth;
+        if (!width || !height || !depth) return result;
+        result.first = z * result.slice + y * row_bytes + x;
+        result.span = (depth - 1) * result.slice + (height - 1) * row_bytes + width;
+        return result;
+    }
     require(type == CU_MEMORYTYPE_HOST || type == CU_MEMORYTYPE_DEVICE || type == CU_MEMORYTYPE_UNIFIED,
             CUDA_ERROR_INVALID_VALUE, "invalid copy memory type");
     memory_box result;
@@ -77,6 +93,7 @@ memory_box memory_endpoint(CUmemorytype type, const void* host, CUdeviceptr devi
     return result;
 }
 void memory_disjoint(const memory_box& to, const memory_box& from, size_t width) {
+    if ((to.array || from.array) && to.array != from.array) return;
     bool shared_host = to.host && to.host == from.host;
     if (!shared_host && to.device != from.device && (to.device || from.device)) return;
     auto address = [&](const memory_box& box, size_t row) {
@@ -100,11 +117,11 @@ void execute_copy_boxes(const memory_box& to, const memory_box& from, size_t wid
     std::unique_lock from_lock(from.owner->execution, std::defer_lock);
     if (to.owner == from.owner) to_lock.lock(); else std::lock(to_lock, from_lock);
     std::vector<std::byte> staging;
-    bool direct = to.device && from.device && to.owner->native->can_copy_direct(*to.storage) && to.owner->native->can_copy_direct(*from.storage);
-    if (to.device && from.device && to.owner != from.owner && !direct) staging.resize(std::min(width, size_t(1024 * 1024)));
+    bool direct = to.device_storage() && from.device_storage() && to.owner->native->can_copy_direct(*to.storage) && to.owner->native->can_copy_direct(*from.storage);
+    if (to.device_storage() && from.device_storage() && to.owner != from.owner && !direct) staging.resize(std::min(width, size_t(1024 * 1024)));
     for (size_t i = 0; i < to.rows * to.depth; ++i) {
         auto destination = to.address(i), source = from.address(i);
-        if (to.device && from.device) {
+        if (to.device_storage() && from.device_storage()) {
             if (to.owner == from.owner || direct) to.owner->native->copy(*to.storage, to.allocation_offset + to.offset(i), *from.storage, from.allocation_offset + from.offset(i), width);
             else {
                 for (size_t position = 0; position < width;) {
@@ -114,8 +131,8 @@ void execute_copy_boxes(const memory_box& to, const memory_box& from, size_t wid
                     position += count;
                 }
             }
-        } else if (to.device) to.owner->native->write(*to.storage, to.allocation_offset + to.offset(i), {reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(source)), width});
-        else if (from.device) from.owner->native->read(*from.storage, from.allocation_offset + from.offset(i), {reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(destination)), width});
+        } else if (to.device_storage()) to.owner->native->write(*to.storage, to.allocation_offset + to.offset(i), {reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(source)), width});
+        else if (from.device_storage()) from.owner->native->read(*from.storage, from.allocation_offset + from.offset(i), {reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(destination)), width});
         else std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(destination)), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source)), width);
     }
 }
@@ -124,13 +141,13 @@ device_work enqueue_copy_boxes(const memory_box& to, const memory_box& from, siz
     if (!width || !to.rows || !to.depth) return {};
     auto owner = executing ? executing : to.owner;
     auto accessible = [&](const memory_box& box) {
-        return !box.device || owner->native->can_copy_direct(*box.storage);
+        return !box.device_storage() || owner->native->can_copy_direct(*box.storage);
     };
     auto foreign_pool = [&](const memory_box& box) {
         return box.storage && box.storage->pool_session && box.storage->pool_session.get() != owner->native.get() && !accessible(box);
     };
     if (((to.owner != owner || from.owner != owner) && (!accessible(to) || !accessible(from))) ||
-        (!to.device && !to.host) || (!from.device && !from.host) || foreign_pool(to) || foreign_pool(from)) {
+        (!to.device_storage() && !to.host) || (!from.device_storage() && !from.host) || foreign_pool(to) || foreign_pool(from)) {
         execute_copy_boxes(to, from, width); return {};
     }
     auto group = std::make_shared<device_group>(); group->tasks.reserve(to.rows * to.depth);
@@ -138,9 +155,9 @@ device_work enqueue_copy_boxes(const memory_box& to, const memory_box& from, siz
     auto& native = *owner->native;
     for (size_t i = 0; i < to.rows * to.depth; ++i) {
         device_work task;
-        if (to.device && from.device) task = native.enqueue_copy(*to.storage, to.allocation_offset + to.offset(i), *from.storage, from.allocation_offset + from.offset(i), width, queue);
-        else if (to.device) task = native.enqueue_write(*to.storage, to.allocation_offset + to.offset(i), {reinterpret_cast<const std::byte*>(static_cast<uintptr_t>(from.address(i))), width}, queue);
-        else if (from.device) task = native.enqueue_read(*from.storage, from.allocation_offset + from.offset(i), {reinterpret_cast<std::byte*>(static_cast<uintptr_t>(to.address(i))), width}, queue);
+        if (to.device_storage() && from.device_storage()) task = native.enqueue_copy(*to.storage, to.allocation_offset + to.offset(i), *from.storage, from.allocation_offset + from.offset(i), width, queue);
+        else if (to.device_storage()) task = native.enqueue_write(*to.storage, to.allocation_offset + to.offset(i), {reinterpret_cast<const std::byte*>(static_cast<uintptr_t>(from.address(i))), width}, queue);
+        else if (from.device_storage()) task = native.enqueue_read(*from.storage, from.allocation_offset + from.offset(i), {reinterpret_cast<std::byte*>(static_cast<uintptr_t>(to.address(i))), width}, queue);
         else std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(to.address(i))), reinterpret_cast<const void*>(static_cast<uintptr_t>(from.address(i))), width);
         group->tasks.push_back(std::move(task));
     }
@@ -157,15 +174,15 @@ void copy_boxes(const memory_box& to, const memory_box& from, size_t width) {
     execute_copy_boxes(to, from, width);
 }
 void copy_2d(const CUDA_MEMCPY2D& p, const std::shared_ptr<context>& owner) {
-    auto from = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, 0, p.srcXInBytes, p.srcY, 0, p.WidthInBytes, p.Height, 1, owner);
-    auto to = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, 0, p.dstXInBytes, p.dstY, 0, p.WidthInBytes, p.Height, 1, owner);
+    auto from = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, 0, p.srcXInBytes, p.srcY, 0, p.WidthInBytes, p.Height, 1, owner, true, p.srcArray);
+    auto to = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, 0, p.dstXInBytes, p.dstY, 0, p.WidthInBytes, p.Height, 1, owner, true, p.dstArray);
     copy_boxes(to, from, p.WidthInBytes);
 }
 template<class Params> void copy_3d(const Params& p, const std::shared_ptr<context>& to_owner, const std::shared_ptr<context>& from_owner) {
     require(!p.srcLOD && !p.dstLOD, CUDA_ERROR_INVALID_VALUE, "copy LOD must be zero");
     if constexpr (requires { p.reserved0; }) require(!p.reserved0 && !p.reserved1, CUDA_ERROR_INVALID_VALUE, "copy reserved pointers must be null");
-    auto from = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth, from_owner);
-    auto to = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth, to_owner);
+    auto from = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth, from_owner, true, p.srcArray);
+    auto to = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth, to_owner, true, p.dstArray);
     copy_boxes(to, from, p.WidthInBytes);
 }
 template<class T> void execute_fill_box(const memory_box& to, T value, size_t bytes) {

@@ -31,12 +31,14 @@ graph_node capture_copy_boxes(const memory_box& to, const memory_box& from, size
         node.type = CU_GRAPH_NODE_TYPE_MEMCPY; node.owner = owner; node.peer_copy = peer;
         if (peer) { node.copy_source = from.owner; node.copy_destination = to.owner; }
         auto& p = node.copy;
-        p.srcMemoryType = from.device ? CU_MEMORYTYPE_DEVICE : CU_MEMORYTYPE_HOST;
+        p.srcMemoryType = from.array ? CU_MEMORYTYPE_ARRAY : from.device ? CU_MEMORYTYPE_DEVICE : CU_MEMORYTYPE_HOST;
         p.srcHost = reinterpret_cast<const void*>(uintptr_t(from.base + from.first)); p.srcDevice = from.base + from.first;
         p.srcPitch = from.pitch; p.srcHeight = from.pitch ? from.slice / from.pitch : 0;
-        p.dstMemoryType = to.device ? CU_MEMORYTYPE_DEVICE : CU_MEMORYTYPE_HOST;
+        p.dstMemoryType = to.array ? CU_MEMORYTYPE_ARRAY : to.device ? CU_MEMORYTYPE_DEVICE : CU_MEMORYTYPE_HOST;
         p.dstHost = reinterpret_cast<void*>(uintptr_t(to.base + to.first)); p.dstDevice = to.base + to.first;
         p.dstPitch = to.pitch; p.dstHeight = to.pitch ? to.slice / to.pitch : 0;
+        if (from.array) { p.srcArray = from.array; p.srcXInBytes = from.first % from.pitch; p.srcY = from.first / from.pitch % p.srcHeight; p.srcZ = from.first / from.slice; }
+        if (to.array) { p.dstArray = to.array; p.dstXInBytes = to.first % to.pitch; p.dstY = to.first / to.pitch % p.dstHeight; p.dstZ = to.first / to.slice; }
         p.WidthInBytes = width; p.Height = to.rows; p.Depth = to.depth;
     }
     return node;
@@ -60,15 +62,15 @@ void async_copy_linear(CUdeviceptr to, const void* to_host, CUmemorytype to_type
 }
 void async_copy_2d(const CUDA_MEMCPY2D& p, CUstream stream, const std::shared_ptr<context>& owner) {
     graph_memory_scope scope(bool(stream_lookup(stream, owner)->capture));
-    auto from = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, 0, p.srcXInBytes, p.srcY, 0, p.WidthInBytes, p.Height, 1, owner);
-    auto to = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, 0, p.dstXInBytes, p.dstY, 0, p.WidthInBytes, p.Height, 1, owner);
+    auto from = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, 0, p.srcXInBytes, p.srcY, 0, p.WidthInBytes, p.Height, 1, owner, true, p.srcArray);
+    auto to = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, 0, p.dstXInBytes, p.dstY, 0, p.WidthInBytes, p.Height, 1, owner, true, p.dstArray);
     async_copy_boxes(to, from, p.WidthInBytes, stream);
 }
 void async_copy_3d(const CUDA_MEMCPY3D& p, CUstream stream, const std::shared_ptr<context>& owner) {
     graph_memory_scope scope(bool(stream_lookup(stream, owner)->capture));
     require(!p.srcLOD && !p.dstLOD && !p.reserved0 && !p.reserved1, CUDA_ERROR_INVALID_VALUE, "invalid 3D copy LOD or reserved fields");
-    auto from = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth, owner);
-    auto to = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth, owner);
+    auto from = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth, owner, true, p.srcArray);
+    auto to = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth, owner, true, p.dstArray);
     async_copy_boxes(to, from, p.WidthInBytes, stream);
 }
 void async_peer_boxes(const memory_box& to, const memory_box& from, size_t width, CUstream stream, const std::shared_ptr<context>& owner) {
@@ -101,8 +103,8 @@ void async_peer_linear(CUdeviceptr to, CUcontext to_context, CUdeviceptr from, C
 void async_peer_3d(const CUDA_MEMCPY3D_PEER& p, CUstream stream) {
     require(!p.srcLOD && !p.dstLOD, CUDA_ERROR_INVALID_VALUE, "copy LOD must be zero");
     auto to_owner = lookup(p.dstContext), from_owner = lookup(p.srcContext), owner = current();
-    auto source = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth, from_owner);
-    auto destination = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth, to_owner);
+    auto source = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth, from_owner, true, p.srcArray);
+    auto destination = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth, to_owner, true, p.dstArray);
     async_peer_boxes(destination, source, p.WidthInBytes, stream, owner);
 }
 template<class T> void async_fill_box(CUdeviceptr pointer, size_t pitch, size_t slice_height, T value,

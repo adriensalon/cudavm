@@ -1,5 +1,13 @@
 // CUDA API versions and exact entry points from the pinned cudaTypedefs.h
 // (and cudaGLTypedefs.h). Keep distinct ABI revisions as separate entries.
+DRIVER_PROCEDURE(cuArrayCreate, 3020, cuArrayCreate_v2)
+DRIVER_PROCEDURE(cuArrayGetDescriptor, 3020, cuArrayGetDescriptor_v2)
+DRIVER_PROCEDURE(cuArray3DCreate, 3020, cuArray3DCreate_v2)
+DRIVER_PROCEDURE(cuArray3DGetDescriptor, 3020, cuArray3DGetDescriptor_v2)
+DRIVER_PROCEDURE(cuArrayDestroy, 2000, cuArrayDestroy)
+DRIVER_PROCEDURE(cuMipmappedArrayCreate, 5000, cuMipmappedArrayCreate)
+DRIVER_PROCEDURE(cuMipmappedArrayGetLevel, 5000, cuMipmappedArrayGetLevel)
+DRIVER_PROCEDURE(cuMipmappedArrayDestroy, 5000, cuMipmappedArrayDestroy)
 DRIVER_PROCEDURE(cuLibraryLoadData, 12000, cuLibraryLoadData)
 DRIVER_PROCEDURE(cuLibraryLoadFromFile, 12000, cuLibraryLoadFromFile)
 DRIVER_PROCEDURE(cuLibraryUnload, 12000, cuLibraryUnload)

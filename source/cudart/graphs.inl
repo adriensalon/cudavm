@@ -30,16 +30,19 @@ CUDA_MEMCPY3D runtime_graph_copy_1d(void* to, const void* from, size_t bytes, cu
     p.WidthInBytes = bytes; p.Height = p.Depth = 1; return p;
 }
 cudaMemcpy3DParms runtime_graph_copy_params(const CUDA_MEMCPY3D& p) {
-    require(p.srcMemoryType != CU_MEMORYTYPE_ARRAY && p.dstMemoryType != CU_MEMORYTYPE_ARRAY, CUDA_ERROR_NOT_SUPPORTED, "CUDA array graph nodes are not implemented");
     cudaMemcpy3DParms result{};
     result.srcPtr = {p.srcMemoryType == CU_MEMORYTYPE_HOST ? const_cast<void*>(p.srcHost) : reinterpret_cast<void*>(uintptr_t(p.srcDevice)), p.srcPitch, p.srcPitch, p.srcHeight ? p.srcHeight : p.Height};
     result.dstPtr = {p.dstMemoryType == CU_MEMORYTYPE_HOST ? p.dstHost : reinterpret_cast<void*>(uintptr_t(p.dstDevice)), p.dstPitch, p.dstPitch, p.dstHeight ? p.dstHeight : p.Height};
     result.srcPos = {p.srcXInBytes, p.srcY, p.srcZ}; result.dstPos = {p.dstXInBytes, p.dstY, p.dstZ};
     result.extent = {p.WidthInBytes, p.Height, p.Depth};
+    size_t element = 1;
+    if (p.srcMemoryType == CU_MEMORYTYPE_ARRAY) { result.srcArray = reinterpret_cast<cudaArray_t>(p.srcArray); result.srcPtr = {}; element = runtime_array_element(result.srcArray); result.srcPos.x /= element; }
+    if (p.dstMemoryType == CU_MEMORYTYPE_ARRAY) { result.dstArray = reinterpret_cast<cudaArray_t>(p.dstArray); result.dstPtr = {}; element = runtime_array_element(result.dstArray); result.dstPos.x /= element; }
+    result.extent.width /= element;
     // Query the description, including after storage is released. Inferring
     // from today's allocation registry would misclassify an old device address.
-    bool to_device = p.dstMemoryType == CU_MEMORYTYPE_DEVICE || (p.dstMemoryType == CU_MEMORYTYPE_UNIFIED && cudavmDriverIsDevicePointer(p.dstDevice));
-    bool from_device = p.srcMemoryType == CU_MEMORYTYPE_DEVICE || (p.srcMemoryType == CU_MEMORYTYPE_UNIFIED && cudavmDriverIsDevicePointer(p.srcDevice));
+    bool to_device = p.dstMemoryType == CU_MEMORYTYPE_ARRAY || p.dstMemoryType == CU_MEMORYTYPE_DEVICE || (p.dstMemoryType == CU_MEMORYTYPE_UNIFIED && cudavmDriverIsDevicePointer(p.dstDevice));
+    bool from_device = p.srcMemoryType == CU_MEMORYTYPE_ARRAY || p.srcMemoryType == CU_MEMORYTYPE_DEVICE || (p.srcMemoryType == CU_MEMORYTYPE_UNIFIED && cudavmDriverIsDevicePointer(p.srcDevice));
     result.kind = to_device ? (from_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice)
                             : (from_device ? cudaMemcpyDeviceToHost : cudaMemcpyHostToHost);
     return result;
