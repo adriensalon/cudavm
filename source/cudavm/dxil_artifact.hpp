@@ -4,10 +4,10 @@
 namespace cudavm {
 inline constexpr std::string_view dxil_artifact_begin = "// CUDAVM-NATIVE-DXIL-V1-BEGIN\n", dxil_artifact_end = "// CUDAVM-NATIVE-DXIL-V1-END";
 struct dxil_variant { std::array<unsigned,3> block; std::string code; };
-inline constexpr std::array<std::array<unsigned,3>,29> dxil_block_shapes{{{1,1,1},{2,1,1},{4,1,1},{8,1,1},{16,1,1},{32,1,1},
+inline constexpr std::array<std::array<unsigned,3>,32> dxil_block_shapes{{{1,1,1},{2,1,1},{4,1,1},{8,1,1},{16,1,1},{32,1,1},
     {64,1,1},{128,1,1},{256,1,1},{512,1,1},{1024,1,1},{4,2,1},{4,2,2},
-    {13,1,1},{45,1,1},{96,1,1},{17,1,1},{33,1,1},{8,4,3},{7,5,3},{8,4,4},{8,3,3},
-    {8,4,1},{4,4,2},{2,2,8},{2,2,1},{1,2,2},{2,1,2},{8,8,1}}};
+    {13,1,1},{45,1,1},{96,1,1},{17,1,1},{31,1,1},{33,1,1},{63,1,1},{8,4,3},{7,5,3},{8,4,4},{8,3,3},
+    {8,4,1},{8,4,2},{4,4,2},{2,2,8},{2,2,1},{1,2,2},{2,1,2},{8,8,1}}};
 inline uint32_t read_dxil_word(std::string_view bytes, size_t& cursor) {
     if (cursor > bytes.size() || bytes.size() - cursor < 4) throw std::runtime_error("truncated native DXIL field");
     uint32_t value = 0; for (unsigned i=0;i<4;++i) value |= uint32_t(static_cast<unsigned char>(bytes[cursor++])) << (i*8); return value;

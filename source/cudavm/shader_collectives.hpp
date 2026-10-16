@@ -15,9 +15,12 @@ inline int native_collective(llvm::StringRef name) {
     const char* reductions[]{"add","min","max","umin","umax","and","or","xor"};
     for(unsigned i=0;i<8;++i) if(name==std::string("llvm.nvvm.redux.sync.")+reductions[i]) return int(12+i);
     if (name=="llvm.nvvm.activemask") return 20;
+    if (name=="llvm.nvvm.barrier0" || name=="llvm.nvvm.barrier.cta.sync.aligned.all") return 35;
     const char* votes[]{"popc","and","or"};
     for(unsigned i=0;i<3;++i) if(name==std::string("llvm.nvvm.barrier0.")+votes[i] || name.starts_with(std::string("llvm.nvvm.barrier.cta.red.")+votes[i]+".")) return int(32+i);
     return -1;
 }
-inline constexpr unsigned native_collective_shared_bytes = 8192;
+// Two words of payload and a program counter/mask per possible CUDA thread,
+// plus the uniform continuation-loop control word (rounded to eight bytes).
+inline constexpr unsigned native_collective_shared_bytes = 16392;
 }

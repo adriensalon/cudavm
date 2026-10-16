@@ -35,6 +35,7 @@
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Utils/LowerSwitch.h>
 #include <llvm/Transforms/Utils/FixIrreducible.h>
+#include <llvm/Transforms/Utils/Local.h>
 namespace cudavm {
 namespace {
 void scalar_math(llvm::Module& module) {
@@ -150,6 +151,7 @@ struct lowering {
     bool partial_stores = false;
     bool dynamic_shared = false, collective_storage = false;
     llvm::GlobalVariable* collective_data = nullptr;
+    llvm::GlobalVariable *collective_pc = nullptr, *collective_masks = nullptr, *collective_control = nullptr;
     std::map<unsigned,llvm::Function*> collective_helpers;
     std::map<std::pair<unsigned,unsigned>, llvm::Function*> atomic_helpers;
     uint32_t shared_bytes = 0;
@@ -499,13 +501,14 @@ struct lowering {
             // A device-scoped 32-bit lock protects each complete 64-bit update,
             // including the compare and both words. Release occurs before retry
             // lanes return to the acquisition loop; no native 64-bit atomic
-            // instruction or stronger shader model is required.
+            // instruction or stronger shader model is required. Acquire/release
+            // supplies the lock ordering; Vulkan forbids SPIR-V SeqCst semantics.
             auto* retry = llvm::BasicBlock::Create(b.getContext(),"acquire",function);
             auto* critical = llvm::BasicBlock::Create(b.getContext(),"update",function);
             auto* joined = llvm::BasicBlock::Create(b.getContext(),"released",function);
             auto* done = llvm::BasicBlock::Create(b.getContext(),"done",function);
             b.CreateBr(retry); b.SetInsertPoint(retry);
-            auto* lock = b.CreateAtomicCmpXchg(word_pointer(0,b.getInt32(0)),b.getInt32(0),b.getInt32(1),llvm::Align(4),llvm::AtomicOrdering::SequentiallyConsistent,llvm::AtomicOrdering::SequentiallyConsistent,scope);
+            auto* lock = b.CreateAtomicCmpXchg(word_pointer(0,b.getInt32(0)),b.getInt32(0),b.getInt32(1),llvm::Align(4),llvm::AtomicOrdering::Acquire,llvm::AtomicOrdering::Monotonic,scope);
             b.CreateCondBr(b.CreateExtractValue(lock,1),critical,joined); b.SetInsertPoint(critical);
             memory_fence();
             auto* previous = pair(call_helper(read,{address}),call_helper(read,{b.CreateAdd(address,b.getInt64(4))}));
@@ -529,7 +532,7 @@ struct lowering {
             call_helper(write,{address,b.CreateTrunc(next,b.getInt32Ty()),b.getInt32(0xffffffffu)});
             call_helper(write,{b.CreateAdd(address,b.getInt64(4)),b.CreateTrunc(b.CreateLShr(next,b.getInt64(32)),b.getInt32Ty()),b.getInt32(0xffffffffu)});
             memory_fence();
-            auto* release = b.CreateStore(b.getInt32(0),word_pointer(0,b.getInt32(0))); release->setAlignment(llvm::Align(4)); release->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent,scope);
+            auto* release = b.CreateStore(b.getInt32(0),word_pointer(0,b.getInt32(0))); release->setAlignment(llvm::Align(4)); release->setAtomic(llvm::AtomicOrdering::Release,scope);
             b.CreateBr(joined); b.SetInsertPoint(joined);
             auto* acquired=b.CreatePHI(b.getInt1Ty(),2);acquired->addIncoming(b.getFalse(),retry);acquired->addIncoming(b.getTrue(),critical);
             auto* observed=b.CreatePHI(b.getInt64Ty(),2);observed->addIncoming(b.getInt64(0),retry);observed->addIncoming(previous,critical);
@@ -573,49 +576,23 @@ struct lowering {
             b.CreateCall(callee,{b.getInt32(80),b.getInt32(11)});
         } else b.CreateIntrinsic(llvm::Intrinsic::spv_group_memory_barrier_with_group_sync,llvm::ArrayRef<llvm::Type*>{},llvm::ArrayRef<llvm::Value*>{});
     }
-    void collective_participation(const llvm::CallInst& call) {
-        llvm::DominatorTree dominators(kernel); llvm::PostDominatorTree postdominators(kernel); llvm::LoopInfo loops(dominators);
-        std::set<const llvm::Value*> visiting;
-        std::function<bool(const llvm::Value*)> uniform=[&](const llvm::Value* input) {
-            if(llvm::isa<llvm::Constant>(input) || llvm::isa<llvm::Argument>(input)) return true;
-            auto* instruction=llvm::dyn_cast<llvm::Instruction>(input); if(!instruction) return false;
-            if(!visiting.insert(input).second) return true;
-            bool result=true;
-            if(llvm::isa<llvm::LoadInst>(instruction) || llvm::isa<llvm::AtomicRMWInst>(instruction) || llvm::isa<llvm::AtomicCmpXchgInst>(instruction)) result=false;
-            else if(auto* operation=llvm::dyn_cast<llvm::CallInst>(instruction)) {
-                auto* function=operation->getCalledFunction(); auto name=function && function->hasFnAttribute("cudavm.cuda.origin")?function->getFnAttribute("cudavm.cuda.origin").getValueAsString():function?function->getName():llvm::StringRef{};
-                result=name.starts_with("llvm.nvvm.read.ptx.sreg.ntid.") || name.starts_with("llvm.nvvm.read.ptx.sreg.nctaid.") || name.starts_with("llvm.nvvm.read.ptx.sreg.ctaid.");
-            } else for(const auto& operand:instruction->operands()) if(!llvm::isa<llvm::BasicBlock>(operand)) result&=uniform(operand.get());
-            visiting.erase(input); return result;
-        };
-        for(const auto& block:kernel) if(auto* branch=llvm::dyn_cast<llvm::BranchInst>(block.getTerminator());branch && branch->isConditional() && !uniform(branch->getCondition())) {
-            if(dominators.dominates(&block,call.getParent()) && !postdominators.dominates(call.getParent(),&block)) fail(call,"native workgroup collective requires uniform control flow");
-            for(auto* loop=loops.getLoopFor(const_cast<llvm::BasicBlock*>(call.getParent()));loop;loop=loop->getParentLoop())
-                if(loop->contains(&block) && (!loop->contains(branch->getSuccessor(0)) || !loop->contains(branch->getSuccessor(1)))) fail(call,"native collective loop requires uniform iteration counts");
-        }
-    }
+    #include "shader_continuations.inl"
     llvm::Value* collective(const llvm::CallInst& call,unsigned operation) {
-        collective_participation(call);
-        if(operation>=32 && call.arg_size()>1) if(auto* id=llvm::dyn_cast<llvm::ConstantInt>(call.getArgOperand(0));!id || !id->isZero()) fail(call,"named native block reductions are unsupported");
-        if(operation==20) {
-            auto* count=b.CreateSub(thread_count(),b.CreateAnd(linear_thread(),b.getInt32(~31u)));
-            return b.CreateSelect(b.CreateICmpUGE(count,b.getInt32(32)),b.getInt32(0xffffffffu),b.CreateSub(b.CreateShl(b.getInt32(1),count),b.getInt32(1)));
-        }
+        if(operation>=32 && call.arg_size()>(operation==35?0u:1u)) if(auto* id=llvm::dyn_cast<llvm::ConstantInt>(call.getArgOperand(0));!id || !id->isZero()) fail(call,"named native block collectives are unsupported");
         auto saved=b.saveIP(); llvm::Function* helper=nullptr;
         if(auto found=collective_helpers.find(operation);found!=collective_helpers.end()) helper=found->second;
         else {
             helper=llvm::Function::Create(llvm::FunctionType::get(operation==10 || operation==11?b.getInt64Ty():b.getInt32Ty(),arguments({b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()}),false),llvm::GlobalValue::InternalLinkage,"cudavm.collective."+std::to_string(operation),*result);
             helper->addFnAttr(llvm::Attribute::Convergent); collective_helpers[operation]=helper;
+            helper->addFnAttr("cudavm.collective",std::to_string(operation));
             auto* first=llvm::BasicBlock::Create(b.getContext(),"entry",helper); b.SetInsertPoint(first);
             auto* id=linear_thread(); auto* lane=b.CreateAnd(id,b.getInt32(31)); auto* base=b.CreateAnd(id,b.getInt32(~31u));
             auto pointer=[&](llvm::Value* index){return b.CreateInBoundsGEP(collective_data->getValueType(),collective_data,{b.getInt32(0),index});};
-            b.CreateAlignedStore(helper->getArg(1),pointer(id),llvm::Align(4));
-            if(operation==9 || operation==11) b.CreateAlignedStore(helper->getArg(2),pointer(b.CreateAdd(id,b.getInt32(1024))),llvm::Align(4));
-            group_barrier(); llvm::Value* answer=b.getInt32(0);
+            llvm::Value* answer=b.getInt32(0);
             if(operation<4) {
                 auto* mask=b.CreateAnd(b.CreateLShr(helper->getArg(3),b.getInt32(8)),b.getInt32(31));
                 auto* minimum=b.CreateAnd(lane,mask); auto* maximum=b.CreateOr(minimum,b.CreateAnd(b.CreateAnd(helper->getArg(3),b.getInt32(31)),b.CreateNot(mask)));
-                auto* offset=helper->getArg(2); llvm::Value* peer=nullptr; llvm::Value* eligible=nullptr;
+                auto* offset=b.CreateAnd(helper->getArg(2),b.getInt32(31)); llvm::Value* peer=nullptr; llvm::Value* eligible=nullptr;
                 if(operation==0) peer=b.CreateOr(minimum,b.CreateAnd(offset,b.CreateNot(mask)));
                 if(operation==1) peer=b.CreateSub(lane,offset);
                 if(operation==2) peer=b.CreateAdd(lane,offset);
@@ -623,7 +600,8 @@ struct lowering {
                 eligible=operation==1?b.CreateAnd(b.CreateICmpUGE(lane,offset),b.CreateICmpUGE(peer,minimum)):b.CreateICmpULE(peer,maximum);
                 auto* selected=b.CreateSelect(eligible,b.CreateAdd(base,peer),id);
                 answer=b.CreateAlignedLoad(b.getInt32Ty(),pointer(selected),llvm::Align(4));
-            } else if(operation==7) answer=b.getInt32(0);
+            } else if(operation==7 || operation==35) answer=b.getInt32(0);
+            else if(operation==20) answer=helper->getArg(0);
             else {
                 auto* loop=llvm::BasicBlock::Create(b.getContext(),"scan",helper); auto* body=llvm::BasicBlock::Create(b.getContext(),"participant",helper); auto* done=llvm::BasicBlock::Create(b.getContext(),"done",helper);
                 auto* count=thread_count(); auto* start=operation>=32?b.getInt32(0):base;
@@ -633,10 +611,13 @@ struct lowering {
                 auto initial=operation==5 || operation==33?1u:operation==13?0x7fffffffu:operation==14?0x80000000u:operation==15 || operation==17?0xffffffffu:0u;
                 auto* total=b.CreatePHI(b.getInt32Ty(),2); total->addIncoming(b.getInt32(initial),first);
                 b.CreateCondBr(b.CreateICmpULT(index,end),body,done); b.SetInsertPoint(body);
+                auto* bit=b.CreateShl(b.getInt32(1),b.CreateAnd(index,b.getInt32(31)));
+                auto* participates=operation>=32?b.CreateICmpNE(collective_load(collective_pointer(collective_pc,index)),b.getInt32(0)):b.CreateICmpNE(b.CreateAnd(helper->getArg(0),bit),b.getInt32(0));
+                auto* sample_block=llvm::BasicBlock::Create(b.getContext(),"sample",helper);
+                auto* advance=llvm::BasicBlock::Create(b.getContext(),"advance",helper);
+                b.CreateCondBr(participates,sample_block,advance); b.SetInsertPoint(sample_block);
                 auto* sample=b.CreateAlignedLoad(b.getInt32Ty(),pointer(index),llvm::Align(4));
                 auto* predicate=b.CreateICmpNE(sample,b.getInt32(0));
-                auto* bit=b.CreateShl(b.getInt32(1),b.CreateAnd(index,b.getInt32(31)));
-                auto* participates=operation>=32?b.getTrue():b.CreateICmpNE(b.CreateAnd(helper->getArg(0),bit),b.getInt32(0));
                 llvm::Value* next=nullptr;
                 if(operation==4) next=b.CreateOr(total,b.CreateSelect(b.CreateAnd(participates,predicate),bit,b.getInt32(0)));
                 else if(operation>=8 && operation<=11) {
@@ -659,18 +640,20 @@ struct lowering {
                 else if(operation==5 || operation==33) next=b.CreateAnd(total,b.CreateZExt(b.CreateOr(b.CreateNot(participates),predicate),b.getInt32Ty()));
                 else if(operation==32) next=b.CreateAdd(total,b.CreateZExt(predicate,b.getInt32Ty()));
                 else next=b.CreateOr(total,b.CreateZExt(b.CreateAnd(participates,predicate),b.getInt32Ty()));
-                index->addIncoming(b.CreateAdd(index,b.getInt32(1)),body); total->addIncoming(next,body); b.CreateBr(loop); b.SetInsertPoint(done); answer=total;
+                b.CreateBr(advance); b.SetInsertPoint(advance);
+                auto* merged=b.CreatePHI(b.getInt32Ty(),2);merged->addIncoming(total,body);merged->addIncoming(next,sample_block);
+                index->addIncoming(b.CreateAdd(index,b.getInt32(1)),advance); total->addIncoming(merged,advance); b.CreateBr(loop); b.SetInsertPoint(done); answer=total;
                 if(operation==10 || operation==11) {
                     auto* all=b.CreateICmpEQ(total,helper->getArg(0));
                     answer=pair(b.CreateSelect(all,total,b.getInt32(0)),b.CreateZExt(all,b.getInt32Ty()));
                 }
             }
-            group_barrier(); b.CreateRet(answer);
+            b.CreateRet(answer);
         }
         b.restoreIP(saved);
         bool reduce=operation>=12 && operation<=19;
-        auto* mask=operation>=32?b.getInt32(0xffffffffu):value(call.getArgOperand(reduce?1:0));
-        llvm::Value* data=operation==7?b.getInt32(0):value(call.getArgOperand(operation>=32?unsigned(call.arg_size()-1):reduce?0:1));
+        auto* mask=operation>=32?b.getInt32(0xffffffffu):operation==20?b.getInt32(0):value(call.getArgOperand(reduce?1:0));
+        llvm::Value* data=operation==7 || operation==20 || operation==35?b.getInt32(0):value(call.getArgOperand(operation>=32?unsigned(call.arg_size()-1):reduce?0:1));
         auto* high=operation==9 || operation==11?b.CreateTrunc(b.CreateLShr(data,b.getInt64(32)),b.getInt32Ty()):b.getInt32(0);
         if(data->getType()->isFloatTy()) data=b.CreateBitCast(data,b.getInt32Ty()); else data=b.CreateZExtOrTrunc(data,b.getInt32Ty());
         std::vector<llvm::Value*> args{mask,data,operation<4?value(call.getArgOperand(2)):high,operation<4?value(call.getArgOperand(3)):b.getInt32(0)};
@@ -708,18 +691,6 @@ struct lowering {
             }
             if (tail.starts_with("ntid.")) return packet(b.getInt32(3 + axis));
             if (tail.starts_with("nctaid.")) return packet(b.getInt32(axis));
-        }
-        if (name == "llvm.nvvm.barrier0" || name == "llvm.nvvm.barrier.cta.sync.aligned.all") {
-            collective_participation(instruction);
-            if (instruction.arg_size() && (!llvm::isa<llvm::ConstantInt>(instruction.getArgOperand(0)) || !llvm::cast<llvm::ConstantInt>(instruction.getArgOperand(0))->isZero()))
-                fail(instruction, "named native CUDA barriers are unsupported");
-            if (dxil) {
-                auto callee = result->getOrInsertFunction("dx.op.barrier", b.getVoidTy(), b.getInt32Ty(), b.getInt32Ty());
-                auto* declaration = llvm::cast<llvm::Function>(callee.getCallee());
-                declaration->addFnAttr(llvm::Attribute::Convergent); declaration->addFnAttr(llvm::Attribute::NoUnwind);
-                return b.CreateCall(callee, {b.getInt32(80), b.getInt32(11)});
-            }
-            return b.CreateIntrinsic(llvm::Intrinsic::spv_group_memory_barrier_with_group_sync, llvm::ArrayRef<llvm::Type*>{}, llvm::ArrayRef<llvm::Value*>{});
         }
         if (function->isIntrinsic()) {
             if(instruction.getType()->isDoubleTy()) fail(instruction,"native double intrinsic requires an exact portable numeric helper");
@@ -917,7 +888,7 @@ struct lowering {
             partial_stores |= stored->getAlign().value() < 4 || stored->getValueOperand()->getType()->isIntegerTy(1) || stored->getValueOperand()->getType()->isIntegerTy(8) || stored->getValueOperand()->getType()->isIntegerTy(16);
         for(const auto& bb:kernel) for(const auto& input:bb) if(auto* call=llvm::dyn_cast<llvm::CallInst>(&input);call && call->getCalledFunction()) {
             auto* function=call->getCalledFunction(); auto name=function->hasFnAttribute("cudavm.cuda.origin")?function->getFnAttribute("cudavm.cuda.origin").getValueAsString():function->getName();
-            auto operation=native_collective(name); collective_storage|=operation>=0 && operation!=20;
+            auto operation=native_collective(name); collective_storage|=operation>=0;
         }
         for (const auto& bb : kernel) for (const auto& input : bb) if (auto* allocation = llvm::dyn_cast<llvm::AllocaInst>(&input)) {
             auto* count = llvm::dyn_cast<llvm::ConstantInt>(allocation->getArraySize()); if (!count) fail(input, "dynamic invocation-private allocation is unsupported");
@@ -969,6 +940,11 @@ struct lowering {
         if(collective_storage) {
             auto* scratch_type=llvm::ArrayType::get(b.getInt32Ty(),2048);
             collective_data=new llvm::GlobalVariable(*result,scratch_type,false,llvm::GlobalValue::InternalLinkage,llvm::UndefValue::get(scratch_type),"cudavm.collective.data",nullptr,llvm::GlobalVariable::NotThreadLocal,3);
+            auto make_state=[&](unsigned words,const char* name){auto* t=llvm::ArrayType::get(b.getInt32Ty(),words);return new llvm::GlobalVariable(*result,t,false,llvm::GlobalValue::InternalLinkage,llvm::UndefValue::get(t),name,nullptr,llvm::GlobalVariable::NotThreadLocal,3);};
+            collective_pc=make_state(1024,"cudavm.collective.pc");
+            collective_masks=make_state(1024,"cudavm.collective.masks");
+            collective_control=new llvm::GlobalVariable(*result,b.getInt32Ty(),false,llvm::GlobalValue::InternalLinkage,llvm::UndefValue::get(b.getInt32Ty()),"cudavm.collective.control",nullptr,llvm::GlobalVariable::NotThreadLocal,3);
+            collective_control->setAlignment(llvm::Align(8));
         }
         if (local_bytes && !opencl) {
             auto* local_type = llvm::ArrayType::get(b.getInt32Ty(), std::max(2u,(local_bytes + 3) / 4));
@@ -1029,6 +1005,7 @@ struct lowering {
                 out->addIncoming(value(phi->getIncomingValue(i)), blocks.at(phi->getIncomingBlock(i)));
             }
         }
+        if(collective_storage) make_continuations();
         return std::move(result);
     }
 };
