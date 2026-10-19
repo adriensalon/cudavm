@@ -1,0 +1,368 @@
+diff --git a/llvm/include/llvm/IR/IntrinsicsDirectX.td b/llvm/include/llvm/IR/IntrinsicsDirectX.td
+index 6e6eb2d0ece9dbc77ad1cbd77eb2e70f3a9b4c73..7f2028bd7c3f34a2f0440223d52689b2cc9c1403 100644
+--- a/llvm/include/llvm/IR/IntrinsicsDirectX.td
++++ b/llvm/include/llvm/IR/IntrinsicsDirectX.td
+@@ -58,6 +58,20 @@ def int_dx_resource_store_rawbuffer
+           [], [llvm_any_ty, llvm_i32_ty, llvm_i32_ty, llvm_any_ty],
+           [IntrWriteMem]>;
+ 
++// Atomic access to an i32 element of a raw or structured resource. These
++// intrinsics keep target-extension resource handles intact until DXIL op
++// lowering converts them to dx.types.Handle.
++def int_dx_resource_atomic_binop_i32
++    : DefaultAttrsIntrinsic<
++          [llvm_i32_ty],
++          [llvm_any_ty, llvm_i32_ty, llvm_i32_ty, llvm_i32_ty, llvm_i32_ty],
++          []>;
++def int_dx_resource_atomic_cmpxchg_i32
++    : DefaultAttrsIntrinsic<
++          [llvm_i32_ty],
++          [llvm_any_ty, llvm_i32_ty, llvm_i32_ty, llvm_i32_ty, llvm_i32_ty],
++          []>;
++
+ // dx.resource.load.cbufferrow encodes the number of elements returned in the
+ // function name. The total size of the return should always be 128 bits.
+ def int_dx_resource_load_cbufferrow_8
+@@ -181,6 +195,8 @@ def int_dx_firstbitlow : DefaultAttrsIntrinsic<[LLVMScalarOrSameVectorWidth<0, l
+ 
+ def int_dx_group_memory_barrier_with_group_sync
+     : DefaultAttrsIntrinsic<[], [], [IntrConvergent]>;
++def int_dx_device_memory_barrier
++    : DefaultAttrsIntrinsic<[], [], [IntrConvergent]>;
+ 
+ def int_dx_load_input
+     : DefaultAttrsIntrinsic<[llvm_any_ty],
+diff --git a/llvm/lib/Target/DirectX/DXIL.td b/llvm/lib/Target/DirectX/DXIL.td
+index 6d04732d92ecf6aad6e6c0801c9c9eafa6150c78..2c2b0f298bc06ee2ad8a7cf6909f0c80c24dfc77 100644
+--- a/llvm/lib/Target/DirectX/DXIL.td
++++ b/llvm/lib/Target/DirectX/DXIL.td
+@@ -910,9 +910,33 @@ def GetDimensions : DXILOp<72, getDimensions> {
+   let stages = [Stages<DXIL1_0, [all_stages]>];
+ }
+ 
++def AtomicBinOp : DXILOp<78, atomicBinOp> {
++  let Doc = "performs an atomic binary operation on a resource";
++  // Handle, AtomicOp, Coord0, Coord1, Coord2, NewValue
++  let arguments =
++      [HandleTy, Int32Ty, Int32Ty, Int32Ty, Int32Ty, OverloadTy];
++  let result = OverloadTy;
++  let overloads = [Overloads<DXIL1_0, [Int32Ty]>];
++  let stages = [Stages<DXIL1_0, [all_stages]>];
++  let attributes = [Attributes<DXIL1_0, []>];
++}
++
++def AtomicCompareExchange : DXILOp<79, atomicCompareExchange> {
++  let Doc = "atomically compares and exchanges a resource value";
++  // Handle, Coord0, Coord1, Coord2, CompareValue, NewValue
++  let arguments =
++      [HandleTy, Int32Ty, Int32Ty, Int32Ty, OverloadTy, OverloadTy];
++  let result = OverloadTy;
++  let overloads = [Overloads<DXIL1_0, [Int32Ty]>];
++  let stages = [Stages<DXIL1_0, [all_stages]>];
++  let attributes = [Attributes<DXIL1_0, []>];
++}
++
+ def Barrier : DXILOp<80, barrier> {
+   let Doc = "inserts a memory barrier in the shader";
+   let intrinsics = [
++    IntrinSelect<int_dx_device_memory_barrier,
++                 [IntrinArgI32<BarrierMode_DeviceMemoryBarrier>]>,
+     IntrinSelect<int_dx_group_memory_barrier_with_group_sync,
+                  [IntrinArgI32<BarrierMode_GroupMemoryBarrierWithGroupSync>]>,
+   ];
+diff --git a/llvm/lib/Target/DirectX/DXILOpLowering.cpp b/llvm/lib/Target/DirectX/DXILOpLowering.cpp
+index 0c0830cc92aa76fbef13f1e0acb29100529d8d90..955c2d53310d075b2cd4915b74ffda396b6d7428 100644
+--- a/llvm/lib/Target/DirectX/DXILOpLowering.cpp
++++ b/llvm/lib/Target/DirectX/DXILOpLowering.cpp
+@@ -600,6 +600,54 @@ public:
+     });
+   }
+ 
++  [[nodiscard]] bool lowerResourceAtomicBinOp(Function &F) {
++    IRBuilder<> &IRB = OpBuilder.getIRB();
++    Type *Int32Ty = IRB.getInt32Ty();
++    return replaceFunction(F, [&](CallInst *CI) -> Error {
++      IRB.SetInsertPoint(CI);
++      Value *Handle =
++          createTmpHandleCast(CI->getArgOperand(0), OpBuilder.getHandleType());
++      Value *Offset = CI->getArgOperand(3);
++      if (isa<PoisonValue>(Offset))
++        Offset = UndefValue::get(Int32Ty);
++      Value *Undef = UndefValue::get(Int32Ty);
++      Expected<CallInst *> OpCall = OpBuilder.tryCreateOp(
++          OpCode::AtomicBinOp,
++          {Handle, CI->getArgOperand(1), CI->getArgOperand(2), Offset, Undef,
++           CI->getArgOperand(4)},
++          CI->getName(), Int32Ty);
++      if (Error E = OpCall.takeError())
++        return E;
++      CI->replaceAllUsesWith(*OpCall);
++      CI->eraseFromParent();
++      return Error::success();
++    });
++  }
++
++  [[nodiscard]] bool lowerResourceAtomicCmpXchg(Function &F) {
++    IRBuilder<> &IRB = OpBuilder.getIRB();
++    Type *Int32Ty = IRB.getInt32Ty();
++    return replaceFunction(F, [&](CallInst *CI) -> Error {
++      IRB.SetInsertPoint(CI);
++      Value *Handle =
++          createTmpHandleCast(CI->getArgOperand(0), OpBuilder.getHandleType());
++      Value *Offset = CI->getArgOperand(2);
++      if (isa<PoisonValue>(Offset))
++        Offset = UndefValue::get(Int32Ty);
++      Value *Undef = UndefValue::get(Int32Ty);
++      Expected<CallInst *> OpCall = OpBuilder.tryCreateOp(
++          OpCode::AtomicCompareExchange,
++          {Handle, CI->getArgOperand(1), Offset, Undef,
++           CI->getArgOperand(3), CI->getArgOperand(4)},
++          CI->getName(), Int32Ty);
++      if (Error E = OpCall.takeError())
++        return E;
++      CI->replaceAllUsesWith(*OpCall);
++      CI->eraseFromParent();
++      return Error::success();
++    });
++  }
++
+   [[nodiscard]] bool lowerCBufferLoad(Function &F) {
+     IRBuilder<> &IRB = OpBuilder.getIRB();
+ 
+@@ -978,6 +1026,12 @@ public:
+       case Intrinsic::dx_resource_store_rawbuffer:
+         HasErrors |= lowerBufferStore(F, /*IsRaw=*/true);
+         break;
++      case Intrinsic::dx_resource_atomic_binop_i32:
++        HasErrors |= lowerResourceAtomicBinOp(F);
++        break;
++      case Intrinsic::dx_resource_atomic_cmpxchg_i32:
++        HasErrors |= lowerResourceAtomicCmpXchg(F);
++        break;
+       case Intrinsic::dx_resource_load_cbufferrow_2:
+       case Intrinsic::dx_resource_load_cbufferrow_4:
+       case Intrinsic::dx_resource_load_cbufferrow_8:
+diff --git a/llvm/lib/Target/DirectX/DXILResourceAccess.cpp b/llvm/lib/Target/DirectX/DXILResourceAccess.cpp
+index 3d75d7455101f4b898b0c259ad1f6f1c25b734dd..4b36af210051aef27494848e4e4deef1f4721e50 100644
+--- a/llvm/lib/Target/DirectX/DXILResourceAccess.cpp
++++ b/llvm/lib/Target/DirectX/DXILResourceAccess.cpp
+@@ -85,6 +85,166 @@ static Value *traverseGEPOffsets(const DataLayout &DL, IRBuilder<> &Builder,
+   llvm_unreachable("GEP of null pointer?");
+ }
+ 
++struct ResourceAtomicAddress {
++  Value *Index;
++  Value *Offset;
++};
++
++static ResourceAtomicAddress
++getResourceAtomicAddress(IntrinsicInst *II, Instruction *Access,
++                         Value *Pointer,
++                         dxil::ResourceTypeInfo &RTI) {
++  const DataLayout &DL = Access->getDataLayout();
++  IRBuilder<> Builder(Access);
++  Value *Index = II->getOperand(1);
++  Value *Offset = traverseGEPOffsets(DL, Builder, Pointer, 1);
++  if (!RTI.isStruct()) {
++    auto *ConstantOffset = dyn_cast<ConstantInt>(Offset);
++    if (!ConstantOffset || !ConstantOffset->isZero())
++      Index = Builder.CreateAdd(Index, Offset);
++    Offset = PoisonValue::get(Builder.getInt32Ty());
++  }
++  return {Index, Offset};
++}
++
++static bool hasAcquireSemantics(AtomicOrdering Ordering) {
++  return Ordering == AtomicOrdering::Acquire ||
++         Ordering == AtomicOrdering::AcquireRelease ||
++         Ordering == AtomicOrdering::SequentiallyConsistent;
++}
++
++static bool hasReleaseSemantics(AtomicOrdering Ordering) {
++  return Ordering == AtomicOrdering::Release ||
++         Ordering == AtomicOrdering::AcquireRelease ||
++         Ordering == AtomicOrdering::SequentiallyConsistent;
++}
++
++static void createDeviceMemoryBarrier(IRBuilder<> &Builder) {
++  Builder.CreateIntrinsic(Intrinsic::dx_device_memory_barrier, {});
++}
++
++static std::pair<unsigned, Value *>
++getDXILAtomicBinOp(IRBuilder<> &Builder, AtomicRMWInst &RMW) {
++  Value *ValueOperand = RMW.getValOperand();
++  switch (RMW.getOperation()) {
++  case AtomicRMWInst::Xchg:
++    return {8, ValueOperand};
++  case AtomicRMWInst::Add:
++    return {0, ValueOperand};
++  case AtomicRMWInst::Sub:
++    return {0, Builder.CreateNeg(ValueOperand)};
++  case AtomicRMWInst::And:
++    return {1, ValueOperand};
++  case AtomicRMWInst::Or:
++    return {2, ValueOperand};
++  case AtomicRMWInst::Xor:
++    return {3, ValueOperand};
++  case AtomicRMWInst::Min:
++    return {4, ValueOperand};
++  case AtomicRMWInst::Max:
++    return {5, ValueOperand};
++  case AtomicRMWInst::UMin:
++    return {6, ValueOperand};
++  case AtomicRMWInst::UMax:
++    return {7, ValueOperand};
++  default:
++    llvm_unreachable("Unsupported DXIL resource atomic operation");
++  }
++}
++
++static CallInst *createResourceAtomicBinOp(IntrinsicInst *II,
++                                           Instruction *Access,
++                                           Value *Pointer, Value *ValueOperand,
++                                           unsigned Operation,
++                                           dxil::ResourceTypeInfo &RTI) {
++  IRBuilder<> Builder(Access);
++  ResourceAtomicAddress Address =
++      getResourceAtomicAddress(II, Access, Pointer, RTI);
++  auto *Call = Builder.CreateIntrinsic(
++      Intrinsic::dx_resource_atomic_binop_i32,
++      {II->getOperand(0)->getType()},
++      {II->getOperand(0), Builder.getInt32(Operation), Address.Index,
++       Address.Offset, ValueOperand});
++  Call->copyMetadata(*Access);
++  return Call;
++}
++
++static void createAtomicLoad(IntrinsicInst *II, LoadInst *LI,
++                             dxil::ResourceTypeInfo &RTI) {
++  assert(LI->getType()->isIntegerTy(32) &&
++         "DXIL resource atomic loads require i32");
++  IRBuilder<> Builder(LI);
++  Value *Result = createResourceAtomicBinOp(
++      II, LI, LI->getPointerOperand(), Builder.getInt32(0), 2, RTI);
++  if (hasAcquireSemantics(LI->getOrdering()))
++    createDeviceMemoryBarrier(Builder);
++  LI->replaceAllUsesWith(Result);
++}
++
++static void createAtomicStore(IntrinsicInst *II, StoreInst *SI,
++                              dxil::ResourceTypeInfo &RTI) {
++  assert(SI->getValueOperand()->getType()->isIntegerTy(32) &&
++         "DXIL resource atomic stores require i32");
++  IRBuilder<> Builder(SI);
++  if (hasReleaseSemantics(SI->getOrdering()))
++    createDeviceMemoryBarrier(Builder);
++  (void)createResourceAtomicBinOp(II, SI, SI->getPointerOperand(),
++                                  SI->getValueOperand(), 8, RTI);
++  if (SI->getOrdering() == AtomicOrdering::SequentiallyConsistent)
++    createDeviceMemoryBarrier(Builder);
++}
++
++static void createAtomicRMW(IntrinsicInst *II, AtomicRMWInst *RMW,
++                            dxil::ResourceTypeInfo &RTI) {
++  assert(RMW->getType()->isIntegerTy(32) &&
++         "DXIL resource atomic RMW requires i32");
++  IRBuilder<> Builder(RMW);
++  if (hasReleaseSemantics(RMW->getOrdering()))
++    createDeviceMemoryBarrier(Builder);
++  auto [Operation, ValueOperand] = getDXILAtomicBinOp(Builder, *RMW);
++  Value *Result = createResourceAtomicBinOp(
++      II, RMW, RMW->getPointerOperand(), ValueOperand, Operation, RTI);
++  if (hasAcquireSemantics(RMW->getOrdering()))
++    createDeviceMemoryBarrier(Builder);
++  RMW->replaceAllUsesWith(Result);
++}
++
++static void createAtomicCmpXchg(IntrinsicInst *II, AtomicCmpXchgInst *CmpXchg,
++                                dxil::ResourceTypeInfo &RTI) {
++  assert(CmpXchg->getCompareOperand()->getType()->isIntegerTy(32) &&
++         "DXIL resource compare-exchange requires i32");
++  IRBuilder<> Builder(CmpXchg);
++  if (hasReleaseSemantics(CmpXchg->getSuccessOrdering()))
++    createDeviceMemoryBarrier(Builder);
++  ResourceAtomicAddress Address = getResourceAtomicAddress(
++      II, CmpXchg, CmpXchg->getPointerOperand(), RTI);
++  auto *Previous = Builder.CreateIntrinsic(
++      Intrinsic::dx_resource_atomic_cmpxchg_i32,
++      {II->getOperand(0)->getType()},
++      {II->getOperand(0), Address.Index, Address.Offset,
++       CmpXchg->getCompareOperand(), CmpXchg->getNewValOperand()});
++  Previous->copyMetadata(*CmpXchg);
++  if (hasAcquireSemantics(CmpXchg->getSuccessOrdering()) ||
++      hasAcquireSemantics(CmpXchg->getFailureOrdering()))
++    createDeviceMemoryBarrier(Builder);
++  Value *Succeeded =
++      Builder.CreateICmpEQ(Previous, CmpXchg->getCompareOperand());
++  SmallVector<ExtractValueInst *> Extracts;
++  for (User *User : CmpXchg->users()) {
++    auto *Extract = dyn_cast<ExtractValueInst>(User);
++    assert(Extract && Extract->getNumIndices() == 1 &&
++           Extract->getIndices()[0] < 2 &&
++           "Unsupported use of resource compare-exchange result");
++    Extracts.push_back(Extract);
++  }
++  for (ExtractValueInst *Extract : Extracts) {
++    Extract->replaceAllUsesWith(Extract->getIndices()[0] == 0
++                                    ? static_cast<Value *>(Previous)
++                                    : Succeeded);
++    Extract->eraseFromParent();
++  }
++}
++
+ static void createTypedBufferStore(IntrinsicInst *II, StoreInst *SI,
+                                    dxil::ResourceTypeInfo &RTI) {
+   const DataLayout &DL = SI->getDataLayout();
+@@ -542,12 +702,24 @@ static void replaceAccess(IntrinsicInst *II, dxil::ResourceTypeInfo &RTI) {
+ 
+     } else if (auto *SI = dyn_cast<StoreInst>(U)) {
+       assert(SI->getValueOperand() != II && "Pointer escaped!");
+-      createStoreIntrinsic(II, SI, RTI);
++      if (SI->isAtomic())
++        createAtomicStore(II, SI, RTI);
++      else
++        createStoreIntrinsic(II, SI, RTI);
+       DeadInsts.push_back(SI);
+ 
+     } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+-      createLoadIntrinsic(II, LI, RTI);
++      if (LI->isAtomic())
++        createAtomicLoad(II, LI, RTI);
++      else
++        createLoadIntrinsic(II, LI, RTI);
+       DeadInsts.push_back(LI);
++    } else if (auto *RMW = dyn_cast<AtomicRMWInst>(U)) {
++      createAtomicRMW(II, RMW, RTI);
++      DeadInsts.push_back(RMW);
++    } else if (auto *CmpXchg = dyn_cast<AtomicCmpXchgInst>(U)) {
++      createAtomicCmpXchg(II, CmpXchg, RTI);
++      DeadInsts.push_back(CmpXchg);
+     } else
+       llvm_unreachable("Unhandled instruction - pointer escaped?");
+   }
+diff --git a/llvm/lib/Target/DirectX/DXILWriter/DXILBitcodeWriter.cpp b/llvm/lib/Target/DirectX/DXILWriter/DXILBitcodeWriter.cpp
+index 48a9085820471d378d6f5938fbbbb6c9aea71c4a..69a8c2d917f6a1e931983f64c926f77a77fa3d15 100644
+--- a/llvm/lib/Target/DirectX/DXILWriter/DXILBitcodeWriter.cpp
++++ b/llvm/lib/Target/DirectX/DXILWriter/DXILBitcodeWriter.cpp
+@@ -138,8 +138,19 @@ public:
+         BitcodeStartBit(Stream.GetCurrentBitNo()),
+         PointerMap(PointerTypeAnalysis::run(M)) {
+     GlobalValueId = VE.getValues().size();
+-    // Enumerate the typed pointers
+-    for (auto El : PointerMap)
++    // PointerMap is keyed by process addresses. Stable type order keeps
++    // equivalent modules byte-identical across independent compiler runs.
++    SmallVector<std::pair<std::string, Type *>, 16> PointerTypes;
++    for (auto El : PointerMap) {
++      std::string Text;
++      raw_string_ostream OS(Text);
++      El.second->print(OS);
++      PointerTypes.emplace_back(std::move(Text), El.second);
++    }
++    llvm::stable_sort(PointerTypes, [](const auto &Left, const auto &Right) {
++      return Left.first < Right.first;
++    });
++    for (auto &El : PointerTypes)
+       VE.EnumerateType(El.second);
+   }
+ 

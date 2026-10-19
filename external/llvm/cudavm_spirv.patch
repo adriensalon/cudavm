@@ -1,0 +1,3518 @@
+diff --git a/llvm/lib/CodeGen/GlobalISel/LegalizerHelper.cpp b/llvm/lib/CodeGen/GlobalISel/LegalizerHelper.cpp
+index e40b34b0b306f18ea48d5e34843541392e6a146e..dca170a2f1b1c2d3d13d27766c71c0c32f205545 100644
+--- a/llvm/lib/CodeGen/GlobalISel/LegalizerHelper.cpp
++++ b/llvm/lib/CodeGen/GlobalISel/LegalizerHelper.cpp
+@@ -5695,6 +5695,53 @@ LegalizerHelper::fewerElementsBitcast(MachineInstr &MI, unsigned int TypeIdx,
+   unsigned NewElemCount =
+       NarrowTy.getSizeInBits() / SrcTy.getScalarSizeInBits();
+   SmallVector<Register> SrcVRegs, BitcastVRegs;
++
++  // CUDAVM: fewerElementsBitcast sub-source-element splitting.
++  // A narrowed destination chunk can be smaller than one source vector
++  // element (for example <4 x s8>, 32 bits, versus s64). The generic helper's
++  // element-count ratio is then zero. Do not unmerge the scalar source element
++  // directly: SPIR-V's G_UNMERGE_VALUES selector only accepts vector sources.
++  // Instead reinterpret each source element as a small vector of chunk-sized
++  // scalars, unmerge that legal vector, then bitcast each scalar chunk to the
++  // requested narrowed destination type.
++  if (NewElemCount == 0) {
++    if (!SrcTy.isVector())
++      return UnableToLegalize;
++
++    const unsigned NarrowBits = NarrowTy.getSizeInBits().getFixedValue();
++    const unsigned SrcScalarBits = SrcTy.getScalarSizeInBits();
++    if (NarrowBits == 0 || SrcScalarBits % NarrowBits != 0)
++      return UnableToLegalize;
++
++    const unsigned ChunksPerSrcElement = SrcScalarBits / NarrowBits;
++    if (ChunksPerSrcElement < 2)
++      return UnableToLegalize;
++
++    LLT SrcElementTy = SrcTy.getElementType();
++    SmallVector<Register> SrcElementRegs;
++    auto SrcUnmerge = MIRBuilder.buildUnmerge(SrcElementTy, SrcReg);
++    getUnmergeResults(SrcElementRegs, *SrcUnmerge);
++
++    LLT ChunkScalarTy = LLT::scalar(NarrowBits);
++    LLT ChunkVectorTy =
++        LLT::fixed_vector(ChunksPerSrcElement, ChunkScalarTy);
++    SmallVector<Register> ChunkRegs;
++    for (Register SrcElementReg : SrcElementRegs) {
++      Register ChunkVectorReg =
++          MIRBuilder.buildBitcast(ChunkVectorTy, SrcElementReg).getReg(0);
++      auto ChunkUnmerge =
++          MIRBuilder.buildUnmerge(ChunkScalarTy, ChunkVectorReg);
++      getUnmergeResults(ChunkRegs, *ChunkUnmerge);
++    }
++
++    for (Register Reg : ChunkRegs)
++      BitcastVRegs.push_back(MIRBuilder.buildBitcast(NarrowTy, Reg).getReg(0));
++
++    MIRBuilder.buildMergeLikeInstr(DstReg, BitcastVRegs);
++    MI.eraseFromParent();
++    return Legalized;
++  }
++
+   if (NewElemCount == 1) {
+     LLT SrcNarrowTy = SrcTy.getElementType();
+ 
+diff --git a/llvm/lib/Target/SPIRV/SPIRVBuiltins.cpp b/llvm/lib/Target/SPIRV/SPIRVBuiltins.cpp
+index 0b3fa1ccd45107bf1bb0f1aec8e539b8d0618f40..1e16c3f90f40172180219b60e342958a93838287 100644
+--- a/llvm/lib/Target/SPIRV/SPIRVBuiltins.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVBuiltins.cpp
+@@ -1258,7 +1258,7 @@ static bool generateExtInst(const SPIRV::IncomingCall *Call,
+       MIRBuilder.buildInstr(SPIRV::OpExtInst)
+           .addDef(Call->ReturnRegister)
+           .addUse(ReturnTypeId)
+-          .addImm(static_cast<uint32_t>(SPIRV::InstructionSet::OpenCL_std))
++          .addImm(static_cast<uint32_t>(Builtin->Set))
+           .addImm(Number);
+ 
+   for (Register Argument : Arguments)
+diff --git a/llvm/lib/Target/SPIRV/SPIRVCombinerHelper.cpp b/llvm/lib/Target/SPIRV/SPIRVCombinerHelper.cpp
+index 693b74c1e06d7af380f875f6a5d278b85da2469b..96d2c403f6e03c7e4e4a6522f156ee62c57fb7d9 100644
+--- a/llvm/lib/Target/SPIRV/SPIRVCombinerHelper.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVCombinerHelper.cpp
+@@ -89,14 +89,17 @@ bool SPIRVCombinerHelper::matchSelectToFaceForward(MachineInstr &MI) const {
+ 
+   // Match the FCMP condition.
+   Register DotReg, CondZeroReg;
++  // CUDAVM: backport face-forward FCMP guard.
++  // LLVM main returns immediately when the select condition is not an FCMP;
++  // LLVM 22.1.4 otherwise reads the uninitialized predicate below.
+   CmpInst::Predicate Pred;
+   if (!mi_match(CondReg, MRI,
+-                m_GFCmp(m_Pred(Pred), m_Reg(DotReg), m_Reg(CondZeroReg))) ||
+-      !(Pred == CmpInst::FCMP_OLT || Pred == CmpInst::FCMP_ULT)) {
+-    if (!(Pred == CmpInst::FCMP_OGT || Pred == CmpInst::FCMP_UGT))
+-      return false;
++                m_GFCmp(m_Pred(Pred), m_Reg(DotReg), m_Reg(CondZeroReg))))
++    return false;
++  if (Pred == CmpInst::FCMP_OGT || Pred == CmpInst::FCMP_UGT)
+     std::swap(DotReg, CondZeroReg);
+-  }
++  else if (!(Pred == CmpInst::FCMP_OLT || Pred == CmpInst::FCMP_ULT))
++    return false;
+ 
+   // Check if FCMP is a comparison between a dot product and 0.
+   MachineInstr *DotInstr = MRI.getVRegDef(DotReg);
+diff --git a/llvm/lib/Target/SPIRV/SPIRVEmitIntrinsics.cpp b/llvm/lib/Target/SPIRV/SPIRVEmitIntrinsics.cpp
+index 40a0cff6984c728f47575713cc6aed182e15ceaa..ff17add8c20596bbd491002a27f3fddea91ce45b 100644
+--- a/llvm/lib/Target/SPIRV/SPIRVEmitIntrinsics.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVEmitIntrinsics.cpp
+@@ -1242,9 +1242,11 @@ void SPIRVEmitIntrinsics::deduceOperandElementType(
+     Ops.push_back(std::make_pair(Ref->getPointerOperand(),
+                                  StoreInst::getPointerOperandIndex()));
+   } else if (auto *Ref = dyn_cast<AtomicCmpXchgInst>(I)) {
+-    KnownElemTy = isPointerTy(I->getType())
++    // CUDAVM: the memory element is the compared scalar, not {value, success}.
++    Type *ValueTy = Ref->getCompareOperand()->getType();
++    KnownElemTy = isPointerTy(ValueTy)
+                       ? getAtomicElemTy(GR, I, Ref->getPointerOperand())
+-                      : I->getType();
++                      : ValueTy;
+     if (!KnownElemTy)
+       return;
+     Incomplete = isTodoType(Ref->getPointerOperand());
+diff --git a/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp b/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp
+index 100057f6d1a399f0075178f4c3e1f9831b4d393f..72a4badc917e3f91a8cf1f044c0882e3c048caf8 100644
+--- a/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp
+@@ -1754,12 +1754,12 @@ bool SPIRVInstructionSelector::selectAtomicRMW(Register ResVReg,
+   Result &= ScopeConstant.second;
+ 
+   Register Ptr = I.getOperand(1).getReg();
+-  // TODO: Changed as it's implemented in the translator. See test/atomicrmw.ll
+-  // auto ScSem =
+-  // getMemSemanticsForStorageClass(GR.getPointerStorageClass(Ptr));
++  auto ScSem =
++      getMemSemanticsForStorageClass(GR.getPointerStorageClass(Ptr));
+   AtomicOrdering AO = MemOp->getSuccessOrdering();
+   uint32_t MemSem = static_cast<uint32_t>(getMemSemantics(AO));
+-  auto MemSemConstant = buildI32Constant(MemSem /*| ScSem*/, I);
++  auto MemSemConstant =
++      buildI32Constant(STI.isShader() && !MemSem ? 0 : MemSem | ScSem, I);
+   Register MemSemReg = MemSemConstant.first;
+   Result &= MemSemConstant.second;
+ 
+@@ -1945,29 +1945,51 @@ bool SPIRVInstructionSelector::selectAtomicCmpXchg(Register ResVReg,
+     unsigned ScSem = static_cast<uint32_t>(
+         getMemSemanticsForStorageClass(GR.getPointerStorageClass(Ptr)));
+     AtomicOrdering AO = MemOp->getSuccessOrdering();
+-    unsigned MemSemEq = static_cast<uint32_t>(getMemSemantics(AO)) | ScSem;
++    unsigned MemSemEq = static_cast<uint32_t>(getMemSemantics(AO));
++    MemSemEq = STI.isShader() && !MemSemEq ? 0 : MemSemEq | ScSem;
+     auto MemSemEqConstant = buildI32Constant(MemSemEq, I);
+     MemSemEqReg = MemSemEqConstant.first;
+     Result &= MemSemEqConstant.second;
+     AtomicOrdering FO = MemOp->getFailureOrdering();
+-    unsigned MemSemNeq = static_cast<uint32_t>(getMemSemantics(FO)) | ScSem;
++    unsigned MemSemNeq = static_cast<uint32_t>(getMemSemantics(FO));
++    MemSemNeq = STI.isShader() && !MemSemNeq ? 0 : MemSemNeq | ScSem;
+     if (MemSemEq == MemSemNeq)
+       MemSemNeqReg = MemSemEqReg;
+     else {
+-      auto MemSemNeqConstant = buildI32Constant(MemSemEq, I);
++      auto MemSemNeqConstant = buildI32Constant(MemSemNeq, I);
+       MemSemNeqReg = MemSemNeqConstant.first;
+       Result &= MemSemNeqConstant.second;
+     }
+   } else {
+     ScopeReg = I.getOperand(5).getReg();
+-    MemSemEqReg = I.getOperand(6).getReg();
+-    MemSemNeqReg = I.getOperand(7).getReg();
++    // CUDAVM: the scalar intrinsic carries ordering bits only. Vulkan also
++    // requires the pointer's storage-class semantics for non-relaxed orders.
++    unsigned ScSem = static_cast<uint32_t>(
++        getMemSemanticsForStorageClass(GR.getPointerStorageClass(Ptr)));
++    unsigned Eq = getIConstVal(I.getOperand(6).getReg(), MRI);
++    unsigned Neq = getIConstVal(I.getOperand(7).getReg(), MRI);
++    // Vulkan storage-class bits require a non-relaxed memory order. A relaxed
++    // operation has no ordering semantics, including on compare failure.
++    Eq = STI.isShader() && !Eq ? 0 : Eq | ScSem;
++    Neq = STI.isShader() && !Neq ? 0 : Neq | ScSem;
++    auto EqConstant = buildI32Constant(Eq, I);
++    MemSemEqReg = EqConstant.first;
++    Result &= EqConstant.second;
++    auto NeqConstant = buildI32Constant(Neq, I);
++    MemSemNeqReg = NeqConstant.first;
++    Result &= NeqConstant.second;
+   }
+ 
+   Register Cmp = I.getOperand(3).getReg();
+   Register Val = I.getOperand(4).getReg();
++  // Ordinary LLVM cmpxchg is represented by the same intrinsic after IR type
++  // mutation, but its assigned SPIR-V result type remains {old, success}.
++  const bool IsScalarIntrinsic =
++      isa<GIntrinsic>(I) && ResType->getOpcode() != SPIRV::OpTypeStruct;
+   SPIRVType *SpvValTy = GR.getSPIRVTypeForVReg(Val);
+-  Register ACmpRes = createVirtualRegister(SpvValTy, &GR, MRI, *I.getMF());
++  Register ACmpRes = IsScalarIntrinsic
++                         ? ResVReg
++                         : createVirtualRegister(SpvValTy, &GR, MRI, *I.getMF());
+   const DebugLoc &DL = I.getDebugLoc();
+   Result &=
+       BuildMI(*I.getParent(), I, DL, TII.get(SPIRV::OpAtomicCompareExchange))
+@@ -1980,6 +2002,12 @@ bool SPIRVInstructionSelector::selectAtomicCmpXchg(Register ResVReg,
+           .addUse(Val)
+           .addUse(Cmp)
+           .constrainAllUses(TII, TRI, RBI);
++
++  // llvm.spv.cmpxchg is deliberately scalar: it exposes the old value and
++  // lets IR form the success comparison. Ordinary LLVM cmpxchg still has the
++  // aggregate { old, success } result handled below.
++  if (IsScalarIntrinsic)
++    return Result;
+   SPIRVType *BoolTy = GR.getOrCreateSPIRVBoolType(I, TII);
+   Register CmpSuccReg = createVirtualRegister(BoolTy, &GR, MRI, *I.getMF());
+   Result &= BuildMI(*I.getParent(), I, DL, TII.get(SPIRV::OpIEqual))
+diff --git a/llvm/lib/Target/SPIRV/SPIRVLegalizerInfo.cpp b/llvm/lib/Target/SPIRV/SPIRVLegalizerInfo.cpp
+index f6587ba068c0ed673e230e8e6fb23948e9597531..5a49527e53b58b7300d9dc39c22571f60f12d4a7 100644
+--- a/llvm/lib/Target/SPIRV/SPIRVLegalizerInfo.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVLegalizerInfo.cpp
+@@ -243,8 +243,12 @@ SPIRVLegalizerInfo::SPIRVLegalizerInfo(const SPIRVSubtarget &ST) {
+ 
+   // Illegal G_UNMERGE_VALUES instructions should be handled
+   // during the combine phase.
++  // CUDAVM: shader wide G_BUILD_VECTOR splitting. Backported from LLVM main.
+   getActionDefinitionsBuilder(G_BUILD_VECTOR)
+-      .legalIf(vectorElementCountIsLessThanOrEqualTo(0, MaxVectorSize));
++      .legalIf(vectorElementCountIsLessThanOrEqualTo(0, MaxVectorSize))
++      .fewerElementsIf(vectorElementCountIsGreaterThan(0, MaxVectorSize),
++                       LegalizeMutations::changeElementCountTo(
++                           0, ElementCount::getFixed(MaxVectorSize)));
+ 
+   // When entering the legalizer, there should be no G_BITCAST instructions.
+   // They should all be calls to the `spv_bitcast` intrinsic. The call to
+diff --git a/llvm/lib/Target/SPIRV/SPIRVMergeRegionExitTargets.cpp b/llvm/lib/Target/SPIRV/SPIRVMergeRegionExitTargets.cpp
+index aba9cf7962e68d9306b218ef3a0bd0fc3c985e32..1ff684c94ed3d86439ff4192d74fdf1fc70e2000 100644
+--- a/llvm/lib/Target/SPIRV/SPIRVMergeRegionExitTargets.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVMergeRegionExitTargets.cpp
+@@ -88,7 +88,34 @@ public:
+     }
+ 
+     // TODO: add support for switch cases.
+-    llvm_unreachable("Unhandled terminator type.");
++    // CUDAVM v24: a convergence-region exit may be a switch. Only external
++  // successors are redirected through the common exit, so the selected route
++  // value matters only on arms present in TargetToValue.
++  if (auto *SI = dyn_cast<SwitchInst>(T)) {
++    Value *Selected = TargetToValue.lookup(SI->getDefaultDest());
++    if (Selected == nullptr) {
++      for (auto &Case : SI->cases()) {
++        if (Value *CaseTarget = TargetToValue.lookup(Case.getCaseSuccessor())) {
++          Selected = CaseTarget;
++          break;
++        }
++      }
++    }
++    if (Selected == nullptr)
++      return nullptr;
++
++    for (auto &Case : SI->cases()) {
++      Value *CaseTarget = TargetToValue.lookup(Case.getCaseSuccessor());
++      if (CaseTarget == nullptr)
++        continue;
++      Value *Matches =
++          Builder.CreateICmpEQ(SI->getCondition(), Case.getCaseValue());
++      Selected = Builder.CreateSelect(Matches, CaseTarget, Selected);
++    }
++    return Selected;
++  }
++
++  llvm_unreachable("Unhandled terminator type.");
+   }
+ 
+   /// Replaces |BB|'s branch targets present in |ToReplace| with |NewTarget|.
+@@ -174,8 +201,11 @@ public:
+     std::vector<std::pair<BasicBlock *, Value *>> ExitToVariable;
+     for (auto Exit : SortedExits) {
+       llvm::Value *Value = createExitVariable(Exit, TargetToValue);
++    // CUDAVM v24: a return-only/internal-only exit has no route value to store.
++    if (Value == nullptr)
++      continue;
+       IRBuilder<> B2(Exit);
+-      B2.SetInsertPoint(Exit->getFirstInsertionPt());
++      B2.SetInsertPoint(Exit->getTerminator());
+       B2.CreateStore(Value, Variable);
+       ExitToVariable.emplace_back(std::make_pair(Exit, Value));
+     }
+@@ -235,6 +265,10 @@ public:
+ #endif
+ 
+   bool runOnFunction(Function &F) override {
++    // CUDAVM v24: guarded native region-exit merge with switch/dominance support.
++    if (F.hasFnAttribute("cudavm.spirv.dispatch.fallback"))
++      return false;
++
+     LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+     auto *TopLevelRegion =
+         getAnalysis<SPIRVConvergenceRegionAnalysisWrapperPass>()
+diff --git a/llvm/lib/Target/SPIRV/SPIRVModuleAnalysis.cpp b/llvm/lib/Target/SPIRV/SPIRVModuleAnalysis.cpp
+index babce22d4f583f50379ad16684c92845291f17dd..988fe39860f8bafb55fe895a9cf9ca3b40d27c9a 100644
+--- a/llvm/lib/Target/SPIRV/SPIRVModuleAnalysis.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVModuleAnalysis.cpp
+@@ -143,6 +143,12 @@ void SPIRVModuleAnalysis::setBaseInfo(const Module &M) {
+   MAI.InstrsToDelete.clear();
+   MAI.FuncMap.clear();
+   MAI.GlobalVarList.clear();
++  // CUDAVM: clear all process-global per-module ID state. Upstream clears the
++  // other analysis maps here but leaves these keyed by objects from the prior
++  // MachineModuleInfo, causing duplicate IDs on a second SPIR-V translation.
++  MAI.BBNumToRegMap.clear();
++  MAI.FPFastMathDefaultInfoMap.clear();
++  MAI.SrcExt.clear();
+   MAI.ExtInstSetMap.clear();
+   MAI.Reqs.clear();
+   MAI.Reqs.initAvailableCapabilities(*ST);
+diff --git a/llvm/lib/Target/SPIRV/SPIRVPrepareFunctions.cpp b/llvm/lib/Target/SPIRV/SPIRVPrepareFunctions.cpp
+index c3b23cd645bc4db3828d03995d5901e729828d9d..95a8bbfe5b4bf8f6402ee0d5353c028b40aff93d 100644
+--- a/llvm/lib/Target/SPIRV/SPIRVPrepareFunctions.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVPrepareFunctions.cpp
+@@ -89,7 +89,9 @@ static Function *getOrCreateFunction(Module *M, Type *RetTy,
+   Function *F = M->getFunction(Name);
+   if (F && F->getFunctionType() == FT)
+     return F;
+-  Function *NewF = Function::Create(FT, GlobalValue::ExternalLinkage, Name, M);
++  // Intrinsic expansion helpers are defined inside this module. Exporting
++  // them adds Linkage capability, which a Vulkan executable cannot declare.
++  Function *NewF = Function::Create(FT, GlobalValue::InternalLinkage, Name, M);
+   if (F)
+     NewF->setDSOLocal(F->isDSOLocal());
+   NewF->setCallingConv(CallingConv::SPIR_FUNC);
+@@ -405,6 +407,70 @@ static bool toSpvLifetimeIntrinsic(IntrinsicInst *II, Intrinsic::ID NewID) {
+ 
+ // Substitutes calls to LLVM intrinsics with either calls to SPIR-V intrinsics
+ // or calls to proper generated functions. Returns True if F was modified.
++static bool lowerShaderCountZeros(IntrinsicInst *II) {
++  Type *Ty = II->getType();
++  unsigned Width = Ty->getScalarSizeInBits();
++  if ((Width > 32 && Width != 64) || isa<ScalableVectorType>(Ty))
++    return false;
++
++  IRBuilder<> B(II);
++  B.SetCurrentDebugLocation(II->getDebugLoc());
++  Type *WordTy = Ty->getWithNewBitWidth(32);
++  bool Leading = II->getIntrinsicID() == Intrinsic::ctlz;
++  auto Scan = [&](Value *Word) -> Value * {
++    Value *Bit = B.CreateIntrinsic(Leading ? Intrinsic::spv_firstbituhigh
++                                           : Intrinsic::spv_firstbitlow,
++                                   {WordTy}, {Word});
++    return Leading
++               ? B.CreateSub(ConstantInt::get(WordTy, Width > 32 ? 31 : Width - 1),
++                              Bit)
++               : Bit;
++  };
++  Value *Input = II->getArgOperand(0);
++  Value *Low = B.CreateZExtOrTrunc(Input, WordTy);
++  Value *Count = Scan(Low);
++  if (Width > 32) {
++    Value *High = B.CreateTrunc(
++        B.CreateLShr(Input, ConstantInt::get(Ty, 32)), WordTy);
++    Value *HighCount = Scan(High);
++    Value *Primary = Leading ? High : Low;
++    Value *PrimaryCount = Leading ? HighCount : Count;
++    Value *SecondaryCount = Leading ? Count : HighCount;
++    Count = B.CreateSelect(
++        B.CreateICmpEQ(Primary, Constant::getNullValue(WordTy)),
++        B.CreateAdd(SecondaryCount, ConstantInt::get(WordTy, 32)), PrimaryCount);
++  }
++  Count = B.CreateZExtOrTrunc(Count, Ty);
++  // The native scans return -1 for zero, rather than LLVM's width result.
++  // Preserve both LLVM's defined width result and its zero-is-poison contract.
++  Constant *ZeroResult = cast<ConstantInt>(II->getArgOperand(1))->isOne()
++                             ? PoisonValue::get(Ty)
++                             : ConstantInt::get(Ty, Width);
++  Value *Result = B.CreateSelect(
++      B.CreateICmpEQ(Input, Constant::getNullValue(Ty)), ZeroResult, Count);
++  II->replaceAllUsesWith(Result);
++  II->eraseFromParent();
++  return true;
++}
++
++static void lowerKernelBitReverse(IntrinsicInst *II) {
++  IRBuilder<> B(II);
++  B.SetCurrentDebugLocation(II->getDebugLoc());
++  Type *Ty = II->getType();
++  unsigned Width = Ty->getScalarSizeInBits();
++  Value *Result = II->getArgOperand(0);
++  for (unsigned Shift = 1; Shift < Width; Shift *= 2) {
++    APInt Mask = APInt::getAllOnes(Width).udiv(
++        APInt(Width, 1).shl(Shift) + 1);
++    Value *Amount = ConstantInt::get(Ty, Shift);
++    Value *Bits = ConstantInt::get(Ty, Mask);
++    Result = B.CreateOr(B.CreateAnd(B.CreateLShr(Result, Amount), Bits),
++                         B.CreateShl(B.CreateAnd(Result, Bits), Amount));
++  }
++  II->replaceAllUsesWith(Result);
++  II->eraseFromParent();
++}
++
+ bool SPIRVPrepareFunctions::substituteIntrinsicCalls(Function *F) {
+   bool Changed = false;
+   const SPIRVSubtarget &STI = TM.getSubtarget<SPIRVSubtarget>(*F);
+@@ -419,6 +485,20 @@ bool SPIRVPrepareFunctions::substituteIntrinsicCalls(Function *F) {
+         continue;
+       auto *II = cast<IntrinsicInst>(Call);
+       switch (II->getIntrinsicID()) {
++      case Intrinsic::cttz:
++      case Intrinsic::ctlz:
++        if (STI.isShader())
++          Changed |= lowerShaderCountZeros(II);
++        break;
++      case Intrinsic::bitreverse:
++        // Kernel environments cannot use Shader's OpBitReverse without the
++        // optional bit-instructions extension. Keep this path extension-free.
++        if (!STI.isShader() &&
++            !STI.canUseExtension(SPIRV::Extension::SPV_KHR_bit_instructions)) {
++          lowerKernelBitReverse(II);
++          Changed = true;
++        }
++        break;
+       case Intrinsic::memset:
+       case Intrinsic::bswap:
+         Changed |= lowerIntrinsicToFunction(II);
+diff --git a/llvm/lib/Target/SPIRV/SPIRVStructurizer.cpp b/llvm/lib/Target/SPIRV/SPIRVStructurizer.cpp
+index ea634fb616f10b1a636be1a6294899b3e668b5df..8f919f48df5e5cad7cb3bfab399c70197eeefabc 100644
+--- a/llvm/lib/Target/SPIRV/SPIRVStructurizer.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVStructurizer.cpp
+@@ -23,11 +23,13 @@
+ #include "llvm/IR/Intrinsics.h"
+ #include "llvm/IR/IntrinsicsSPIRV.h"
+ #include "llvm/IR/LegacyPassManager.h"
++#include "llvm/IR/Verifier.h"
+ #include "llvm/InitializePasses.h"
+ #include "llvm/Transforms/Utils.h"
+ #include "llvm/Transforms/Utils/Cloning.h"
+ #include "llvm/Transforms/Utils/LoopSimplify.h"
+ #include "llvm/Transforms/Utils/LowerMemIntrinsics.h"
++#include <queue>
+ #include <stack>
+ #include <unordered_set>
+ 
+@@ -39,9 +41,17 @@ using Edge = std::pair<BasicBlock *, BasicBlock *>;
+ 
+ // Helper function to do a partial order visit from the block |Start|, calling
+ // |Op| on each visited node.
++static bool cudavmCanBuildNativePartialOrder(Function &F);
++static void cudavmSelectNativeOrderFallback(Function &F);
++
+ static void partialOrderVisit(BasicBlock &Start,
+                               std::function<bool(BasicBlock *)> Op) {
+-  PartialOrderingVisitor V(*Start.getParent());
++  Function &F = *Start.getParent();
++  if (!cudavmCanBuildNativePartialOrder(F)) {
++    cudavmSelectNativeOrderFallback(F);
++    return;
++  }
++  PartialOrderingVisitor V(F);
+   V.partialOrderVisit(Start, std::move(Op));
+ }
+ 
+@@ -278,6 +288,93 @@ static void replaceBranchTargets(BasicBlock *BB, BasicBlock *OldTarget,
+   assert(false && "Unhandled terminator type.");
+ }
+ 
++// CUDAVM v24: recoverable native partial-order boundary.
++// Keep this probe intentionally isomorphic to SPIRVUtils.cpp's
++// PartialOrderingVisitor::CanBeVisited/visit implementation.  It must run on
++// the exact CFG that the next structurizer step will inspect; probing earlier
++// in the target pipeline is unsound because the structurizer itself splits and
++// inserts blocks before later visitor constructions.
++static bool cudavmCanBuildNativePartialOrder(Function &F) {
++  DomTreeBuilder::BBDomTree DT;
++  DT.recalculate(F);
++  LoopInfo LI(DT);
++
++  std::queue<BasicBlock *> ToVisit;
++  SmallPtrSet<BasicBlock *, 0> Queued;
++  SmallPtrSet<BasicBlock *, 0> Ordered;
++
++  BasicBlock *Entry = &F.getEntryBlock();
++  ToVisit.push(Entry);
++  Queued.insert(Entry);
++
++  auto CanBeVisited = [&](BasicBlock *BB) {
++    for (BasicBlock *P : predecessors(BB)) {
++      // Back-edges do not constrain forward partial ordering.
++      if (DT.dominates(BB, P))
++        continue;
++
++      if (!Ordered.contains(P))
++        return false;
++
++      // A loop exit is not ready until the loop latch has been ordered.
++      Loop *L = LI.getLoopFor(P);
++      if (L == nullptr || L->contains(BB))
++        continue;
++
++      // FixIrreducible + LoopSimplify should have produced at most one
++      // back-edge. Treat anything else as native-order unsafe in release too.
++      if (L->getNumBackEdges() > 1)
++        return false;
++
++      BasicBlock *Latch = L->getLoopLatch();
++      if (Latch == nullptr)
++        continue;
++      if (!Ordered.contains(Latch))
++        return false;
++    }
++    return true;
++  };
++
++  size_t QueueIndex = 0;
++  while (!ToVisit.empty()) {
++    BasicBlock *BB = ToVisit.front();
++    ToVisit.pop();
++
++    if (!CanBeVisited(BB)) {
++      ToVisit.push(BB);
++      // Match LLVM's fatal progress test exactly: after one full rotation with
++      // no candidate, PartialOrderingVisitor would report_fatal_error.
++      if (QueueIndex >= ToVisit.size())
++        return false;
++      ++QueueIndex;
++      continue;
++    }
++
++    QueueIndex = 0;
++    Ordered.insert(BB);
++    for (BasicBlock *S : successors(BB)) {
++      if (Queued.contains(S))
++        continue;
++      ToVisit.push(S);
++      Queued.insert(S);
++    }
++  }
++
++  return true;
++}
++
++static bool cudavmNeedsNativeMergeSort(Function &F) {
++  for (BasicBlock &BB : F)
++    if (getMergeInstructions(BB).size() > 1)
++      return true;
++  return false;
++}
++
++static void cudavmSelectNativeOrderFallback(Function &F) {
++  F.addFnAttr("cudavm.spirv.dispatch.fallback");
++  F.addFnAttr("cudavm.spirv.strategy", "dispatcher-fallback-native-order");
++}
++
+ namespace {
+ // Given a reducible CFG, produces a structurized CFG in the SPIR-V sense,
+ // adding merge instructions when required.
+@@ -538,7 +635,34 @@ class SPIRVStructurizer : public FunctionPass {
+     }
+ 
+     // TODO: add support for switch cases.
+-    llvm_unreachable("Unhandled terminator type.");
++    // CUDAVM v24: preserve local structurization for switch exits instead of
++  // forcing an otherwise representable construct through whole-function
++  // dispatch solely because LLVM omitted this helper case.
++  if (auto *SI = dyn_cast<SwitchInst>(T)) {
++    Value *Selected = TargetToValue.lookup(SI->getDefaultDest());
++    if (Selected == nullptr) {
++      for (auto &Case : SI->cases()) {
++        if (Value *CaseTarget = TargetToValue.lookup(Case.getCaseSuccessor())) {
++          Selected = CaseTarget;
++          break;
++        }
++      }
++    }
++    if (Selected == nullptr)
++      return nullptr;
++
++    for (auto &Case : SI->cases()) {
++      Value *CaseTarget = TargetToValue.lookup(Case.getCaseSuccessor());
++      if (CaseTarget == nullptr)
++        continue;
++      Value *Matches =
++          Builder.CreateICmpEQ(SI->getCondition(), Case.getCaseValue());
++      Selected = Builder.CreateSelect(Matches, CaseTarget, Selected);
++    }
++    return Selected;
++  }
++
++  llvm_unreachable("Unhandled terminator type.");
+   }
+ 
+   // Creates a new basic block in F with a single OpUnreachable instruction.
+@@ -1114,6 +1238,39 @@ public:
+   SPIRVStructurizer() : FunctionPass(ID) {}
+ 
+   bool runOnFunction(Function &F) override {
++    if (F.isDeclaration() || F.hasFnAttribute("cudavm.spirv.dispatch.fallback"))
++      return false;
++
++    // CUDAVM: native mutation is transactional. A guarded early exit or an
++    // invalid result must not feed partially rewritten PHIs into RegToMem.
++    ValueToValueMapTy SaveMap;
++    Function *Checkpoint = CloneFunction(&F, SaveMap);
++    bool Modified = structurize(F);
++    bool Invalid = verifyFunction(F, &errs());
++    if (Invalid || F.hasFnAttribute("cudavm.spirv.dispatch.fallback")) {
++      std::string Reason = Invalid ? "dispatcher-fallback-native-invalid-ir"
++                                  : F.getFnAttribute("cudavm.spirv.strategy")
++                                        .getValueAsString().str();
++      F.deleteBody();
++      ValueToValueMapTy RestoreMap;
++      RestoreMap[Checkpoint] = &F;
++      for (Argument &Arg : Checkpoint->args())
++        RestoreMap[&Arg] = F.getArg(Arg.getArgNo());
++      SmallVector<ReturnInst *, 8> Returns;
++      CloneFunctionInto(&F, Checkpoint, RestoreMap,
++                        CloneFunctionChangeType::LocalChangesOnly, Returns);
++      F.setLinkage(Checkpoint->getLinkage());
++      F.setComdat(Checkpoint->getComdat());
++      F.addFnAttr("cudavm.spirv.dispatch.fallback");
++      F.addFnAttr("cudavm.spirv.strategy", Reason);
++      Modified = true;
++    }
++    Checkpoint->eraseFromParent();
++    return Modified;
++  }
++
++  bool structurize(Function &F) {
++
+     bool Modified = false;
+ 
+     // In LLVM, Switches are allowed to have several cases branching to the same
+@@ -1136,6 +1293,11 @@ public:
+     // STEP 3:
+     // Sort selection merge, the largest construct goes first.
+     // This simplifies the next step.
++    if (cudavmNeedsNativeMergeSort(F) &&
++        !cudavmCanBuildNativePartialOrder(F)) {
++      cudavmSelectNativeOrderFallback(F);
++      return true;
++    }
+     Modified |= sortSelectionMergeHeaders(F);
+ 
+     // STEP 4: As this stage, we can have a single basic block with multiple
+@@ -1155,7 +1317,16 @@ public:
+     // edges are called critical edges. What we need is to split those edges
+     // into several parts. Each part exiting the parent's construct by its merge
+     // block.
++    if (!cudavmCanBuildNativePartialOrder(F)) {
++      cudavmSelectNativeOrderFallback(F);
++      return true;
++    }
+     Modified |= splitCriticalEdges(F);
++    // Splitter's construct walkers build fresh PartialOrderingVisitor objects
++    // after local CFG rewrites.  The guarded helper above can select fallback
++    // from inside splitCriticalEdges; stop native structurization immediately.
++    if (F.hasFnAttribute("cudavm.spirv.dispatch.fallback"))
++      return true;
+ 
+     // STEP 7: The previous steps possibly created a lot of "proxy" blocks.
+     // Blocks with a single unconditional branch, used to create a valid
+@@ -1184,7 +1355,6 @@ public:
+     AU.addRequired<LoopInfoWrapperPass>();
+     AU.addRequired<SPIRVConvergenceRegionAnalysisWrapperPass>();
+ 
+-    AU.addPreserved<SPIRVConvergenceRegionAnalysisWrapperPass>();
+     FunctionPass::getAnalysisUsage(AU);
+   }
+ 
+diff --git a/llvm/lib/Target/SPIRV/SPIRVTargetMachine.cpp b/llvm/lib/Target/SPIRV/SPIRVTargetMachine.cpp
+index 10038753f4a75fc9374eff75c9de15d7f5aae43e..107e5badbfe5d6be44f4d6560b6080c4b5b8d40a 100644
+--- a/llvm/lib/Target/SPIRV/SPIRVTargetMachine.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVTargetMachine.cpp
+@@ -35,6 +35,42 @@
+ #include "llvm/Target/TargetOptions.h"
+ #include "llvm/Transforms/Scalar.h"
+ #include "llvm/Transforms/Utils.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
++#include "llvm/Transforms/Utils/Local.h"
++
++// CUDAVM: v33 growth-bounded proxy-merge hybrid SPIR-V structurization. Reducible CFGs
++// stay local; irreducible SCCs are repaired with FixIrreducible. Functions with
++// pathological irreducible-repair cost or high incoming-PHI pressure fall back
++// before LLVM's native structurizer can amplify them.
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/PostOrderIterator.h"
++#include "llvm/ADT/SCCIterator.h"
++#include "llvm/ADT/SmallPtrSet.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/Twine.h"
++#include "llvm/Analysis/CFG.h"
++#include "llvm/Analysis/LoopInfo.h"
++#include "llvm/Analysis/PostDominators.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/CFG.h"
++#include "llvm/IR/Dominators.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/IntrinsicsSPIRV.h"
++#include "llvm/IR/Verifier.h"
++#include "llvm/InitializePasses.h"
++#include "llvm/Pass.h"
++#include "llvm/PassRegistry.h"
++#include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/Transforms/Utils/Local.h"
++#include "llvm/Transforms/Utils/PromoteMemToReg.h"
++#include <algorithm>
++#include <cstdlib>
++#include <limits>
++#include <string>
++#include <vector>
+ #include <optional>
+ 
+ using namespace llvm;
+@@ -101,6 +137,2724 @@ void SPIRVTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
+ 
+ namespace {
+ // SPIR-V Code Generator Pass Configuration Options.
++// CUDAVM: v33 growth-bounded proxy-merge hybrid SPIR-V structurization.
++//
++// Vulkan shader logical addressing cannot spill a StorageBuffer pointer into a
++// Function variable without VariablePointersStorageBuffer. CUDAVM intentionally
++// does not require that capability: resource pointers are short-lived address
++// expressions, while the scalar word index is the actual state that may cross
++// dispatcher states. LoopSimplify can make an otherwise local resource pointer
++// span a basic-block boundary, so rematerialize those expressions immediately
++// before RegToMem.
++class CUDAVMResourcePointerRematerializationPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMResourcePointerRematerializationPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM SPIR-V resource-pointer rematerialization";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration())
++      return false;
++
++    SmallVector<IntrinsicInst *, 64> ResourcePointers;
++    for (BasicBlock &BB : F)
++      for (Instruction &I : BB)
++        if (auto *II = dyn_cast<IntrinsicInst>(&I);
++            II && II->getIntrinsicID() == Intrinsic::spv_resource_getpointer)
++          ResourcePointers.push_back(II);
++
++    bool Changed = false;
++    for (IntrinsicInst *Pointer : ResourcePointers) {
++      SmallVector<Use *, 16> Uses;
++      for (Use &U : Pointer->uses())
++        Uses.push_back(&U);
++
++      for (Use *U : Uses) {
++        auto *UserI = dyn_cast<Instruction>(U->getUser());
++        if (!UserI)
++          report_fatal_error(
++              Twine("CUDAVM SPIR-V resource pointer has a non-instruction user in function '") +
++              F.getName() + "'");
++
++        if (isa<PHINode>(UserI))
++          report_fatal_error(
++              Twine("CUDAVM SPIR-V resource pointer reached a PHI before RegToMem in function '") +
++              F.getName() +
++              "'; carry the scalar resource index across control flow instead");
++
++        if (UserI->getParent() == Pointer->getParent())
++          continue;
++
++        auto *PointerClone = cast<IntrinsicInst>(Pointer->clone());
++
++        // The handle is itself a target-extension value and therefore must not
++        // become cross-block RegToMem state. Recreate the pure binding lookup
++        // next to the cloned getpointer. Its operands are constants/globals.
++        Value *Handle = Pointer->getArgOperand(0);
++        if (auto *HandleI = dyn_cast<IntrinsicInst>(Handle);
++            HandleI &&
++            HandleI->getIntrinsicID() ==
++                Intrinsic::spv_resource_handlefrombinding &&
++            HandleI->getParent() != UserI->getParent()) {
++          auto *HandleClone = cast<IntrinsicInst>(HandleI->clone());
++          HandleClone->insertBefore(UserI->getIterator());
++          PointerClone->setArgOperand(0, HandleClone);
++        } else if (auto *HandleDef = dyn_cast<Instruction>(Handle);
++                   HandleDef && HandleDef->getParent() != UserI->getParent()) {
++          report_fatal_error(
++              Twine("CUDAVM SPIR-V resource handle cannot be rematerialized in function '") +
++              F.getName() + "'");
++        }
++
++        PointerClone->insertBefore(UserI->getIterator());
++        U->set(PointerClone);
++        Changed = true;
++      }
++    }
++
++    // Keep the contract wider than the specific intrinsic above. If another
++    // pointer-producing instruction begins to span blocks, fail here instead
++    // of allowing generic RegToMem to silently require VariablePointers. Entry
++    // allocas are storage declarations, not SSA pointer state, and are exempt.
++    for (BasicBlock &BB : F) {
++      for (Instruction &I : BB) {
++        if (!I.getType()->isPointerTy() || isa<AllocaInst>(I))
++          continue;
++        for (Use &U : I.uses()) {
++          auto *UserI = dyn_cast<Instruction>(U.getUser());
++          if (!UserI)
++            continue;
++          if (isa<PHINode>(UserI) || UserI->getParent() != I.getParent()) {
++            std::string Text;
++            raw_string_ostream OS(Text);
++            I.print(OS);
++            OS.flush();
++            report_fatal_error(
++                Twine("CUDAVM SPIR-V pointer SSA value still crosses a basic-block boundary before RegToMem in function '") +
++                F.getName() + ":\n  value: " + Text);
++          }
++        }
++      }
++    }
++
++    return Changed;
++  }
++};
++
++char CUDAVMResourcePointerRematerializationPass::ID = 0;
++
++static constexpr StringLiteral CUDAVMDispatchFallbackAttr =
++    "cudavm.spirv.dispatch.fallback";
++static constexpr StringLiteral CUDAVMDispatchAppliedAttr =
++    "cudavm.spirv.dispatch.applied";
++static constexpr StringLiteral CUDAVMStructurizationStrategyAttr =
++    "cudavm.spirv.strategy";
++
++struct CUDAVMIrreducibleSummary {
++  size_t SCCCount = 0;
++  size_t BlockCount = 0;
++  size_t EntryBlockCount = 0;
++  size_t ExternalEntryEdgeCount = 0;
++  size_t RepairCost = 0;
++};
++
++static CUDAVMIrreducibleSummary cudavmSummarizeIrreducibleCFG(Function &F) {
++  CUDAVMIrreducibleSummary Summary;
++  DomTreeBuilder::BBDomTree DT;
++  DT.recalculate(F);
++
++  for (auto I = scc_begin(&F); !I.isAtEnd(); ++I) {
++    const std::vector<BasicBlock *> &SCC = *I;
++    bool Cyclic = SCC.size() > 1;
++    if (!Cyclic && !SCC.empty()) {
++      for (BasicBlock *Succ : successors(SCC.front()))
++        Cyclic |= Succ == SCC.front();
++    }
++    if (!Cyclic)
++      continue;
++
++    SmallPtrSet<BasicBlock *, 16> Members;
++    for (BasicBlock *BB : SCC)
++      Members.insert(BB);
++
++    SmallPtrSet<BasicBlock *, 8> EntryBlocks;
++    size_t ExternalEntryEdges = 0;
++    for (BasicBlock *BB : SCC) {
++      if (!DT.isReachableFromEntry(BB))
++        continue;
++      for (BasicBlock *Pred : predecessors(BB)) {
++        if (Members.contains(Pred) || !DT.isReachableFromEntry(Pred))
++          continue;
++        EntryBlocks.insert(BB);
++        ++ExternalEntryEdges;
++      }
++    }
++
++    if (EntryBlocks.size() <= 1)
++      continue;
++
++    ++Summary.SCCCount;
++    Summary.BlockCount += SCC.size();
++    Summary.EntryBlockCount += EntryBlocks.size();
++    Summary.ExternalEntryEdgeCount += ExternalEntryEdges;
++
++    // FixIrreducible adds a local guard/header around the SCC and redirects
++    // its entry edges. This deliberately conservative estimate is used only as
++    // a growth budget; it is not an execution-cost model.
++    const size_t Multiplicity = std::max<size_t>(1, EntryBlocks.size() - 1);
++    if (SCC.size() > std::numeric_limits<size_t>::max() / Multiplicity)
++      Summary.RepairCost = std::numeric_limits<size_t>::max();
++    else {
++      const size_t SCCCost = SCC.size() * Multiplicity + ExternalEntryEdges;
++      if (Summary.RepairCost >
++          std::numeric_limits<size_t>::max() - SCCCost)
++        Summary.RepairCost = std::numeric_limits<size_t>::max();
++      else
++        Summary.RepairCost += SCCCost;
++    }
++  }
++  return Summary;
++}
++
++static size_t cudavmLocalRepairBudget() {
++  constexpr size_t DefaultBudget = 4096;
++  const char *Value = std::getenv("CUDAVM_SPIRV_LOCAL_REPAIR_BUDGET");
++  if (!Value || !*Value)
++    return DefaultBudget;
++  char *End = nullptr;
++  unsigned long long Parsed = std::strtoull(Value, &End, 10);
++  if (End == Value || *End != '\0')
++    return DefaultBudget;
++  return Parsed > std::numeric_limits<size_t>::max()
++             ? std::numeric_limits<size_t>::max()
++             : static_cast<size_t>(Parsed);
++}
++
++static bool cudavmForceDispatcherFor(const Function &F) {
++  if (F.hasFnAttribute("cudavm.spirv.force.dispatch"))
++    return true;
++  const char *Value = std::getenv("CUDAVM_SPIRV_FORCE_DISPATCH");
++  if (!Value)
++    return false;
++  StringRef Filter(Value);
++  return Filter.empty() || Filter == "1" || Filter == "all" ||
++         F.getName().contains(Filter);
++}
++
++static size_t cudavmNativePhiFanInBudget() {
++  constexpr size_t DefaultBudget = 32;
++  const char *Value = std::getenv("CUDAVM_SPIRV_NATIVE_PHI_FANIN_BUDGET");
++  if (!Value || !*Value)
++    return DefaultBudget;
++  char *End = nullptr;
++  unsigned long long Parsed = std::strtoull(Value, &End, 10);
++  if (End == Value || *End != '\0')
++    return DefaultBudget;
++  return Parsed > std::numeric_limits<size_t>::max()
++             ? std::numeric_limits<size_t>::max()
++             : static_cast<size_t>(Parsed);
++}
++
++static size_t cudavmMaxPhiFanIn(const Function &F) {
++  size_t MaxFanIn = 0;
++  for (const BasicBlock &BB : F)
++    for (const PHINode &Phi : BB.phis())
++      MaxFanIn = std::max(MaxFanIn, static_cast<size_t>(Phi.getNumIncomingValues()));
++  return MaxFanIn;
++}
++
++static size_t cudavmNativeBlockBudget() {
++  constexpr size_t DefaultBudget = 64;
++  const char *Value = std::getenv("CUDAVM_SPIRV_NATIVE_BLOCK_BUDGET");
++  if (!Value || !*Value)
++    return DefaultBudget;
++  char *End = nullptr;
++  unsigned long long Parsed = std::strtoull(Value, &End, 10);
++  if (End == Value || *End != '\0')
++    return DefaultBudget;
++  return Parsed > std::numeric_limits<size_t>::max()
++             ? std::numeric_limits<size_t>::max()
++             : static_cast<size_t>(Parsed);
++}
++
++static size_t cudavmNativeInstructionBudget() {
++  constexpr size_t DefaultBudget = 1400;
++  const char *Value = std::getenv("CUDAVM_SPIRV_NATIVE_INSTRUCTION_BUDGET");
++  if (!Value || !*Value)
++    return DefaultBudget;
++  char *End = nullptr;
++  unsigned long long Parsed = std::strtoull(Value, &End, 10);
++  if (End == Value || *End != '\0')
++    return DefaultBudget;
++  return Parsed > std::numeric_limits<size_t>::max()
++             ? std::numeric_limits<size_t>::max()
++             : static_cast<size_t>(Parsed);
++}
++
++static size_t cudavmInstructionCount(const Function &F) {
++  size_t Count = 0;
++  for (const BasicBlock &BB : F)
++    Count += BB.size();
++  return Count;
++}
++
++// Choose the structurization domain before RegToMem destroys the information
++// that predicts native growth. Normal/reasonably irreducible functions retain
++// their original CFG and use local SCC repair + LLVM's SPIR-V structurizer.
++// Excessive repair cost or incoming-PHI fan-in selects bounded memory-state
++// dispatch early, before the native structurizer can duplicate regions.
++class CUDAVMCFGStrategyPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMCFGStrategyPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM SPIR-V CFG structurization strategy";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration())
++      return false;
++
++    removeUnreachableBlocks(F);
++    CUDAVMIrreducibleSummary Summary = cudavmSummarizeIrreducibleCFG(F);
++    const size_t Budget = cudavmLocalRepairBudget();
++    const size_t PhiFanInBudget = cudavmNativePhiFanInBudget();
++    const size_t NativeBlockBudget = cudavmNativeBlockBudget();
++    const size_t NativeInstructionBudget = cudavmNativeInstructionBudget();
++    const size_t MaxPhiFanIn = cudavmMaxPhiFanIn(F);
++    const size_t BlockCount = F.size();
++    const size_t InstructionCount = cudavmInstructionCount(F);
++    const bool Forced = cudavmForceDispatcherFor(F);
++    const bool RepairPressure = Summary.RepairCost > Budget;
++    const bool PhiPressure = MaxPhiFanIn > PhiFanInBudget;
++    // On the observed libc++ corpus, native success stays below 64 source blocks
++    // and 1400 pre-RegToMem instructions, while the expensive late-fallback cases
++    // exceed at least one of those bounds. Route those functions directly to the
++    // bounded dispatcher before region merging/native structurization can duplicate
++    // their CFG. Both limits are environment-overridable for backend experiments.
++    const bool GrowthPressure = BlockCount > NativeBlockBudget
++        || InstructionCount > NativeInstructionBudget;
++    const bool Fallback = Forced || RepairPressure || PhiPressure || GrowthPressure;
++
++    F.removeFnAttr(CUDAVMDispatchFallbackAttr);
++    F.removeFnAttr(CUDAVMDispatchAppliedAttr);
++    F.removeFnAttr(CUDAVMStructurizationStrategyAttr);
++    if (Fallback) {
++      F.addFnAttr(CUDAVMDispatchFallbackAttr);
++      if (Forced)
++        F.addFnAttr(CUDAVMStructurizationStrategyAttr,
++                    "dispatcher-fallback-forced");
++      else if (PhiPressure)
++        F.addFnAttr(CUDAVMStructurizationStrategyAttr,
++                    "dispatcher-fallback-phi-pressure");
++      else if (GrowthPressure)
++        F.addFnAttr(CUDAVMStructurizationStrategyAttr,
++                    "dispatcher-fallback-growth-pressure");
++      else
++        F.addFnAttr(CUDAVMStructurizationStrategyAttr,
++                    "dispatcher-fallback-repair-pressure");
++    } else if (Summary.SCCCount != 0) {
++      F.addFnAttr(CUDAVMStructurizationStrategyAttr, "local-scc-repair");
++    } else {
++      F.addFnAttr(CUDAVMStructurizationStrategyAttr, "native-structured");
++    }
++
++    const char *TraceValue = std::getenv("CUDAVM_TRACE_SPIRV_CFG");
++    if (TraceValue) {
++      StringRef Filter(TraceValue);
++      if (Filter.empty() || Filter == "1" || Filter == "all" ||
++          F.getName().contains(Filter)) {
++        errs() << "cudavm: SPIR-V strategy function=" << F.getName()
++               << " strategy="
++               << F.getFnAttribute(CUDAVMStructurizationStrategyAttr).getValueAsString()
++               << " irreducible_sccs=" << Summary.SCCCount
++               << " irreducible_blocks=" << Summary.BlockCount
++               << " entry_blocks=" << Summary.EntryBlockCount
++               << " entry_edges=" << Summary.ExternalEntryEdgeCount
++               << " repair_cost=" << Summary.RepairCost
++               << " repair_budget=" << Budget
++               << " max_phi_fanin=" << MaxPhiFanIn
++               << " native_phi_fanin_budget=" << PhiFanInBudget
++               << " blocks=" << BlockCount
++               << " native_block_budget=" << NativeBlockBudget
++               << " instructions=" << InstructionCount
++               << " native_instruction_budget=" << NativeInstructionBudget << "\n";
++      }
++    }
++
++    return true;
++  }
++};
++
++char CUDAVMCFGStrategyPass::ID = 0;
++
++// FixIrreducible must make every non-fallback graph reducible before LLVM's
++// PartialOrderingVisitor is allowed to see it. This converts the old backend
++// fatal into an CUDAVM boundary diagnostic with the concrete function and cost.
++class CUDAVMReducibleCFGContractPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMReducibleCFGContractPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM native SPIR-V structurizer reducibility contract";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration() || F.hasFnAttribute(CUDAVMDispatchFallbackAttr))
++      return false;
++
++    DomTreeBuilder::BBDomTree DT;
++    DT.recalculate(F);
++    LoopInfo LI(DT);
++    ReversePostOrderTraversal<Function *> RPO(&F);
++    if (!containsIrreducibleCFG<BasicBlock *>(RPO, LI))
++      return false;
++
++    CUDAVMIrreducibleSummary Summary = cudavmSummarizeIrreducibleCFG(F);
++    report_fatal_error(
++        Twine("CUDAVM local irreducible-CFG repair did not produce a reducible graph for function '") +
++        F.getName() + "' (sccs=" + Twine(Summary.SCCCount) +
++        ", blocks=" + Twine(Summary.BlockCount) +
++        ", entry-blocks=" + Twine(Summary.EntryBlockCount) +
++        ", repair-cost=" + Twine(Summary.RepairCost) + ")");
++  }
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.setPreservesAll();
++  }
++};
++
++char CUDAVMReducibleCFGContractPass::ID = 0;
++
++// LLVM 22's native structurizer often gets the hard part right but omits a
++// selection marker, or chooses a merge block that is not dominated by the
++// selection header. Flattening the entire function for those local annotation
++// defects recreates the code-size/driver-compile problem CUDAVM is trying to
++// avoid. Repair only the marker when the CFG already has a canonical local
++// convergence point: the nearest common post-dominator of all terminator
++// successors. If that point is not a unique, strictly dominated merge block,
++// leave the function unchanged and let the following contract select the
++// bounded dispatcher fallback.
++class CUDAVMLocalSelectionRepairPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMLocalSelectionRepairPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM local SPIR-V selection repair";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration() || F.hasFnAttribute(CUDAVMDispatchFallbackAttr))
++      return false;
++
++    // A merge block may only be declared by one SPIR-V header. LLVM 22 often
++    // leaves an otherwise-good selection converging at the merge block of an
++    // enclosing construct, so merely annotating the nearest common
++    // post-dominator is illegal. In that case split only the incoming edges
++    // dominated by this selection header and use the new edge-proxy block as
++    // the selection's private merge.
++    SmallPtrSet<BasicBlock *, 32> FailedHeaders;
++    unsigned Inserted = 0;
++    unsigned Retargeted = 0;
++    unsigned Proxies = 0;
++    bool Changed = false;
++
++    auto MergeKindBeforeTerminator = [](BasicBlock &BB) -> Intrinsic::ID {
++      Instruction *Terminator = BB.getTerminator();
++      if (!Terminator)
++        return Intrinsic::not_intrinsic;
++      auto *II = dyn_cast_or_null<IntrinsicInst>(Terminator->getPrevNode());
++      return II ? II->getIntrinsicID() : Intrinsic::not_intrinsic;
++    };
++
++    // Repair one header at a time and rebuild dominance/post-dominance after
++    // every proxy split. This keeps the transform simple and prevents stale
++    // analysis from being used after SplitBlockPredecessors rewrites edges.
++    while (true) {
++      DominatorTree DT(F);
++      PostDominatorTree PDT(F);
++      bool MutatedCFG = false;
++
++      DenseMap<BasicBlock *, unsigned> MergeUseCount;
++      SmallPtrSet<BasicBlock *, 32> DeclaredMergeBlocks;
++      SmallPtrSet<BasicBlock *, 32> ContinueTargets;
++      for (BasicBlock &BB : F) {
++        for (Instruction &I : BB) {
++          auto *II = dyn_cast<IntrinsicInst>(&I);
++          if (!II)
++            continue;
++          if (II->getIntrinsicID() == Intrinsic::spv_selection_merge ||
++              II->getIntrinsicID() == Intrinsic::spv_loop_merge) {
++            if (auto *BA = dyn_cast<BlockAddress>(II->getArgOperand(0))) {
++              if (BA->getBasicBlock()->getParent() == &F) {
++                ++MergeUseCount[BA->getBasicBlock()];
++                DeclaredMergeBlocks.insert(BA->getBasicBlock());
++              }
++            }
++          }
++          if (II->getIntrinsicID() == Intrinsic::spv_loop_merge) {
++            if (auto *BA = dyn_cast<BlockAddress>(II->getArgOperand(1)))
++              if (BA->getBasicBlock()->getParent() == &F)
++                ContinueTargets.insert(BA->getBasicBlock());
++          }
++        }
++      }
++
++      auto CanReachFunctionReturn = [&](BasicBlock *Start) {
++        SmallVector<BasicBlock *, 32> Worklist = {Start};
++        SmallPtrSet<BasicBlock *, 32> Seen;
++        while (!Worklist.empty()) {
++          BasicBlock *Block = Worklist.pop_back_val();
++          if (!Seen.insert(Block).second)
++            continue;
++          if (isa<ReturnInst>(Block->getTerminator()))
++            return true;
++          for (BasicBlock *Succ : successors(Block))
++            Worklist.push_back(Succ);
++        }
++        return false;
++      };
++
++      auto NearestConvergence = [&](BasicBlock &Header) -> BasicBlock * {
++        // Exceptional exits are commonly shared by several nested C++
++        // selections, so their target is not dominated by any one header.
++        // Prefer that shared terminal target; LocalMerge will split this
++        // header's incoming exceptional edges into a private merge proxy.
++        SmallVector<BasicBlock *, 8> ExceptionalExitTargets;
++        SmallPtrSet<BasicBlock *, 8> SeenExceptionalExitTargets;
++        for (BasicBlock &Block : F) {
++          if (!DT.isReachableFromEntry(&Block) ||
++              !DT.dominates(&Header, &Block))
++            continue;
++          for (BasicBlock *Succ : successors(&Block)) {
++            if (!CanReachFunctionReturn(Succ) &&
++                !DT.dominates(&Header, Succ) &&
++                SeenExceptionalExitTargets.insert(Succ).second)
++              ExceptionalExitTargets.push_back(Succ);
++          }
++        }
++        if (!ExceptionalExitTargets.empty()) {
++          BasicBlock *Merge = ExceptionalExitTargets.front();
++          for (unsigned I = 1; I < ExceptionalExitTargets.size(); ++I) {
++            if (!PDT.getNode(Merge) ||
++                !PDT.getNode(ExceptionalExitTargets[I]))
++              return nullptr;
++            Merge = PDT.findNearestCommonDominator(
++                Merge, ExceptionalExitTargets[I]);
++            if (!Merge)
++              return nullptr;
++          }
++          return Merge;
++        }
++
++        SmallVector<BasicBlock *, 8> ReturningSuccessors;
++        SmallVector<BasicBlock *, 8> TerminatingSuccessors;
++        SmallPtrSet<BasicBlock *, 8> Seen;
++        for (BasicBlock *Succ : successors(&Header)) {
++          if (!Seen.insert(Succ).second)
++            continue;
++          (CanReachFunctionReturn(Succ) ? ReturningSuccessors
++                                        : TerminatingSuccessors)
++              .push_back(Succ);
++        }
++        // When an arm can only terminate exceptionally, use that arm as the
++        // merge construct and let normal-returning arms terminate the
++        // selection. Including both exit classes makes the post-dominator
++        // query resolve to its virtual root and needlessly forces the whole
++        // function through the dispatcher fallback.
++        SmallVectorImpl<BasicBlock *> &Successors =
++            TerminatingSuccessors.empty() ? ReturningSuccessors
++                                          : TerminatingSuccessors;
++        if (Successors.empty())
++          return nullptr;
++        if (Successors.size() == 1)
++          return Successors.front();
++
++        BasicBlock *Merge = Successors.front();
++        for (unsigned I = 1; I < Successors.size(); ++I) {
++          if (!PDT.getNode(Merge) || !PDT.getNode(Successors[I]))
++            return nullptr;
++          Merge = PDT.findNearestCommonDominator(Merge, Successors[I]);
++          if (!Merge)
++            return nullptr;
++        }
++        if (Merge == &Header || !DT.isReachableFromEntry(Merge))
++          return nullptr;
++        return Merge;
++      };
++
++      auto ProxyMerge = [&](BasicBlock &Header,
++                            BasicBlock *Convergence) -> BasicBlock * {
++        if (!Convergence || !Convergence->canSplitPredecessors())
++          return nullptr;
++
++        // Never split a continue edge or a backedge into a loop header. Those
++        // require loop-aware restructuring rather than a local selection
++        // annotation repair.
++        if (ContinueTargets.contains(Convergence) ||
++            MergeKindBeforeTerminator(*Convergence) ==
++                Intrinsic::spv_loop_merge)
++          return nullptr;
++
++        SmallVector<BasicBlock *, 16> Preds;
++        for (BasicBlock *Pred : predecessors(Convergence)) {
++          if (!DT.isReachableFromEntry(Pred) ||
++              !DT.dominates(&Header, Pred))
++            continue;
++          if (DT.dominates(Convergence, Pred))
++            return nullptr;
++          Preds.push_back(Pred);
++        }
++        if (Preds.empty())
++          return nullptr;
++
++        BasicBlock *Proxy = SplitBlockPredecessors(
++            Convergence, Preds, ".cudavm.selection.merge", &DT);
++        if (!Proxy)
++          return nullptr;
++        ++Proxies;
++        Changed = true;
++        MutatedCFG = true;
++
++        // The split is semantics-preserving even if this check fails; in that
++        // case leave the extra edge block in place and let the following
++        // structured-CFG contract select the bounded dispatcher fallback.
++        DominatorTree NewDT(F);
++        if (!NewDT.isReachableFromEntry(Proxy) ||
++            !NewDT.dominates(&Header, Proxy))
++          return nullptr;
++        return Proxy;
++      };
++
++      auto LocalMerge = [&](BasicBlock &Header) -> BasicBlock * {
++        BasicBlock *Convergence = NearestConvergence(Header);
++        if (!Convergence)
++          return nullptr;
++
++        // Direct annotation is valid only when the merge is private to this
++        // header and already lies in its dominance region.
++        if (DT.dominates(&Header, Convergence) &&
++            !DeclaredMergeBlocks.contains(Convergence) &&
++            !ContinueTargets.contains(Convergence))
++          return Convergence;
++
++        // Otherwise isolate the selection's incoming paths from the enclosing
++        // convergence block. The fresh proxy is a unique SPIR-V merge block.
++        return ProxyMerge(Header, Convergence);
++      };
++
++      auto InsertSelectionMerge = [&](BasicBlock &Header,
++                                      BasicBlock *Merge) {
++        Instruction *Terminator = Header.getTerminator();
++        IRBuilder<> B(Terminator);
++        auto *MergeAddress = BlockAddress::get(&F, Merge);
++        SmallVector<Value *, 2> Args = {MergeAddress, B.getInt32(0)};
++        B.CreateIntrinsic(Intrinsic::spv_selection_merge,
++                          {MergeAddress->getType()}, Args);
++      };
++
++      bool RepairedOne = false;
++
++      // Build nested selections from the inside out. If several constructs
++      // share an exceptional exit, this makes their private merge proxies a
++      // properly nested chain instead of allowing a later inner proxy to
++      // bypass an already-declared outer merge.
++      SmallVector<BasicBlock *, 64> HeadersByDepth;
++      for (BasicBlock &Header : F)
++        if (DT.isReachableFromEntry(&Header))
++          HeadersByDepth.push_back(&Header);
++      std::stable_sort(HeadersByDepth.begin(), HeadersByDepth.end(),
++                       [&](BasicBlock *Left, BasicBlock *Right) {
++                         return DT.getNode(Left)->getLevel() >
++                                DT.getNode(Right)->getLevel();
++                       });
++
++      // Retarget an invalid existing merge first. A valid merge is left alone
++      // even if it is not the nearest post-dominator; the native structurizer
++      // may intentionally choose a later merge to satisfy nesting.
++      for (BasicBlock *HeaderPointer : HeadersByDepth) {
++        BasicBlock &Header = *HeaderPointer;
++        if (FailedHeaders.contains(&Header))
++          continue;
++        Instruction *Terminator = Header.getTerminator();
++        auto *II = dyn_cast_or_null<IntrinsicInst>(
++            Terminator ? Terminator->getPrevNode() : nullptr);
++        if (!II || II->getIntrinsicID() != Intrinsic::spv_selection_merge)
++          continue;
++        auto *BA = dyn_cast<BlockAddress>(II->getArgOperand(0));
++        if (!BA || BA->getBasicBlock()->getParent() != &F)
++          continue;
++        BasicBlock *OldMerge = BA->getBasicBlock();
++        if (DT.isReachableFromEntry(OldMerge) && OldMerge != &Header &&
++            DT.dominates(&Header, OldMerge))
++          continue;
++
++        // Temporarily remove this header's declaration from uniqueness
++        // accounting so the same block does not reject its own replacement.
++        auto OldIt = MergeUseCount.find(OldMerge);
++        if (OldIt != MergeUseCount.end() && OldIt->second > 0) {
++          if (--OldIt->second == 0) {
++            MergeUseCount.erase(OldIt);
++            DeclaredMergeBlocks.erase(OldMerge);
++          }
++        }
++
++        BasicBlock *NewMerge = LocalMerge(Header);
++        if (!NewMerge) {
++          FailedHeaders.insert(&Header);
++          if (!MutatedCFG) {
++            ++MergeUseCount[OldMerge];
++            DeclaredMergeBlocks.insert(OldMerge);
++            continue;
++          }
++          RepairedOne = true;
++          break;
++        }
++        II->setArgOperand(0, BlockAddress::get(&F, NewMerge));
++        if (std::getenv("CUDAVM_TRACE_SPIRV_CFG")) {
++          errs() << "cudavm: SPIR-V retarget selection header=";
++          Header.printAsOperand(errs(), false);
++          errs() << " merge=";
++          NewMerge->printAsOperand(errs(), false);
++          errs() << "\n";
++        }
++        ++Retargeted;
++        Changed = true;
++        RepairedOne = true;
++        break;
++      }
++      if (RepairedOne)
++        continue;
++
++      // Fill missing selection declarations. Shader OpSwitch always requires
++      // one. Conditional branches need one unless they are loop headers or
++      // branch directly to an existing merge/continue target.
++      for (BasicBlock *HeaderPointer : HeadersByDepth) {
++        BasicBlock &Header = *HeaderPointer;
++        if (FailedHeaders.contains(&Header) ||
++            !DT.isReachableFromEntry(&Header))
++          continue;
++        Instruction *Terminator = Header.getTerminator();
++        Intrinsic::ID MergeKind = MergeKindBeforeTerminator(Header);
++
++        bool NeedsSelection = false;
++        if (isa<SwitchInst>(Terminator)) {
++          NeedsSelection = MergeKind == Intrinsic::not_intrinsic;
++        } else if (auto *Branch = dyn_cast<BranchInst>(Terminator)) {
++          NeedsSelection =
++              Branch->isConditional() &&
++              Branch->getSuccessor(0) != Branch->getSuccessor(1) &&
++              MergeKind == Intrinsic::not_intrinsic &&
++              !DeclaredMergeBlocks.contains(Branch->getSuccessor(0)) &&
++              !DeclaredMergeBlocks.contains(Branch->getSuccessor(1)) &&
++              !ContinueTargets.contains(Branch->getSuccessor(0)) &&
++              !ContinueTargets.contains(Branch->getSuccessor(1));
++        }
++
++        if (!NeedsSelection)
++          continue;
++
++        BasicBlock *Merge = LocalMerge(Header);
++        if (!Merge) {
++          if (std::getenv("CUDAVM_TRACE_SPIRV_CFG") &&
++              isa<SwitchInst>(Terminator)) {
++            errs() << "cudavm: SPIR-V local selection repair could not find "
++                      "switch merge:\n";
++            Header.print(errs());
++            for (BasicBlock *Succ : successors(&Header)) {
++              errs() << "cudavm:   successor ";
++              Succ->printAsOperand(errs(), false);
++              errs() << ":\n";
++              Succ->print(errs());
++            }
++          }
++          FailedHeaders.insert(&Header);
++          if (MutatedCFG) {
++            RepairedOne = true;
++            break;
++          }
++          continue;
++        }
++        InsertSelectionMerge(Header, Merge);
++        if (std::getenv("CUDAVM_TRACE_SPIRV_CFG")) {
++          errs() << "cudavm: SPIR-V insert selection header=";
++          Header.printAsOperand(errs(), false);
++          errs() << " merge=";
++          Merge->printAsOperand(errs(), false);
++          errs() << "\n";
++        }
++        ++Inserted;
++        Changed = true;
++        RepairedOne = true;
++        break;
++      }
++
++      if (!RepairedOne)
++        break;
++    }
++
++    if (Changed && std::getenv("CUDAVM_TRACE_SPIRV_CFG"))
++      errs() << "cudavm: SPIR-V local selection repair function=" << F.getName()
++             << " inserted=" << Inserted << " retargeted=" << Retargeted
++             << " proxies=" << Proxies << "\n";
++    return Changed;
++  }
++};
++
++char CUDAVMLocalSelectionRepairPass::ID = 0;
++
++// SPIR-V switch case constructs that fall through to another case must appear
++// consecutively in OpSwitch target order. LLVM SwitchInst case order has no
++// semantic effect: unique integer case values determine dispatch independently
++// of operand order. Reorder only the case operands after native structurization
++// so the structurizer's valid case-to-case edges satisfy SPIR-V's lexical case
++// ordering rule without flattening the function or changing its CFG.
++class CUDAVMSwitchCaseOrderRepairPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMSwitchCaseOrderRepairPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM local SPIR-V switch case-order repair";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration() || F.hasFnAttribute(CUDAVMDispatchFallbackAttr))
++      return false;
++
++    DominatorTree DT(F);
++    unsigned ReorderedSwitches = 0;
++    unsigned ReorderedCases = 0;
++    bool Changed = false;
++
++    auto MergeKindBeforeTerminator = [](BasicBlock &BB) -> Intrinsic::ID {
++      Instruction *Terminator = BB.getTerminator();
++      if (!Terminator)
++        return Intrinsic::not_intrinsic;
++      auto *II = dyn_cast_or_null<IntrinsicInst>(Terminator->getPrevNode());
++      return II ? II->getIntrinsicID() : Intrinsic::not_intrinsic;
++    };
++
++    for (BasicBlock &Header : F) {
++      auto *Switch = dyn_cast<SwitchInst>(Header.getTerminator());
++      if (!Switch || Switch->getNumCases() < 2 ||
++          MergeKindBeforeTerminator(Header) != Intrinsic::spv_selection_merge)
++        continue;
++
++      auto *MergeII = dyn_cast_or_null<IntrinsicInst>(
++          Switch->getPrevNode());
++      auto *MergeBA = MergeII
++                          ? dyn_cast<BlockAddress>(MergeII->getArgOperand(0))
++                          : nullptr;
++      if (!MergeBA || MergeBA->getBasicBlock()->getParent() != &F)
++        continue;
++      BasicBlock *SwitchMerge = MergeBA->getBasicBlock();
++
++      // Preserve the original order for unrelated case chains and preserve the
++      // original order of values that share one destination. Only the order of
++      // destination groups constrained by actual case fall-through is changed.
++      SmallVector<BasicBlock *, 16> ListedTargets;
++      SmallPtrSet<BasicBlock *, 16> ListedSet;
++      DenseMap<BasicBlock *, SmallVector<ConstantInt *, 4>> ValuesByTarget;
++      for (auto Case : Switch->cases()) {
++        BasicBlock *Target = Case.getCaseSuccessor();
++        if (ListedSet.insert(Target).second)
++          ListedTargets.push_back(Target);
++        ValuesByTarget[Target].push_back(Case.getCaseValue());
++      }
++
++      SmallVector<BasicBlock *, 16> Targets;
++      SmallPtrSet<BasicBlock *, 16> SeenTargets;
++      auto AddTarget = [&](BasicBlock *Target) {
++        if (SeenTargets.insert(Target).second)
++          Targets.push_back(Target);
++      };
++      AddTarget(Switch->getDefaultDest());
++      for (BasicBlock *Target : ListedTargets)
++        AddTarget(Target);
++
++      // If native structurization already left a case outside the switch
++      // header's dominance region, ordering cannot repair it. The following
++      // structured-CFG contract will select the bounded dispatcher fallback.
++      bool Unsupported = false;
++      for (BasicBlock *Target : Targets) {
++        if (Target == SwitchMerge)
++          continue;
++        if (!DT.isReachableFromEntry(Target) ||
++            !DT.dominates(&Header, Target)) {
++          Unsupported = true;
++          break;
++        }
++      }
++      if (Unsupported)
++        continue;
++
++      auto CaseOwner = [&](BasicBlock *Block) -> BasicBlock * {
++        if (!DT.isReachableFromEntry(Block) ||
++            !DT.dominates(&Header, Block) || Block == SwitchMerge ||
++            DT.dominates(SwitchMerge, Block))
++          return nullptr;
++
++        BasicBlock *Owner = nullptr;
++        for (BasicBlock *Target : Targets) {
++          if (Target == SwitchMerge || !DT.dominates(Target, Block))
++            continue;
++          if (!Owner || DT.dominates(Owner, Target))
++            Owner = Target;
++        }
++        return Owner;
++      };
++
++      DenseMap<BasicBlock *, BasicBlock *> NextCase;
++      DenseMap<BasicBlock *, BasicBlock *> PreviousCase;
++      for (BasicBlock &CaseBlock : F) {
++        BasicBlock *SourceOwner = CaseOwner(&CaseBlock);
++        if (!SourceOwner)
++          continue;
++        for (BasicBlock *Succ : successors(&CaseBlock)) {
++          BasicBlock *TargetOwner = CaseOwner(Succ);
++          if (!TargetOwner || TargetOwner == SourceOwner)
++            continue;
++
++          auto NextIt = NextCase.find(SourceOwner);
++          if (NextIt != NextCase.end() && NextIt->second != TargetOwner) {
++            Unsupported = true;
++            break;
++          }
++          auto PrevIt = PreviousCase.find(TargetOwner);
++          if (PrevIt != PreviousCase.end() &&
++              PrevIt->second != SourceOwner) {
++            Unsupported = true;
++            break;
++          }
++          NextCase[SourceOwner] = TargetOwner;
++          PreviousCase[TargetOwner] = SourceOwner;
++        }
++        if (Unsupported)
++          break;
++      }
++      if (Unsupported)
++        continue;
++
++      auto IsListed = [&](BasicBlock *Target) {
++        return ListedSet.contains(Target);
++      };
++
++      // Translate SPIR-V adjacency requirements into a set of disjoint chains
++      // over the listed LLVM switch destinations. The default destination does
++      // not occupy a literal/target pair in OpSwitch, so when a listed case
++      // falls through Default and Default falls through a listed case, the two
++      // listed destinations themselves must be adjacent.
++      DenseMap<BasicBlock *, BasicBlock *> RequiredNext;
++      DenseMap<BasicBlock *, BasicBlock *> RequiredPrev;
++      for (auto &Edge : NextCase) {
++        BasicBlock *Source = Edge.first;
++        BasicBlock *Target = Edge.second;
++        if (!IsListed(Source))
++          continue;
++
++        BasicBlock *Required = nullptr;
++        if (IsListed(Target)) {
++          Required = Target;
++        } else if (Target == Switch->getDefaultDest()) {
++          auto DefaultNext = NextCase.find(Target);
++          if (DefaultNext != NextCase.end() && IsListed(DefaultNext->second))
++            Required = DefaultNext->second;
++        }
++        if (!Required)
++          continue;
++
++        if (Required == Source) {
++          Unsupported = true;
++          break;
++        }
++        auto NextIt = RequiredNext.find(Source);
++        if (NextIt != RequiredNext.end() && NextIt->second != Required) {
++          Unsupported = true;
++          break;
++        }
++        auto PrevIt = RequiredPrev.find(Required);
++        if (PrevIt != RequiredPrev.end() && PrevIt->second != Source) {
++          Unsupported = true;
++          break;
++        }
++        RequiredNext[Source] = Required;
++        RequiredPrev[Required] = Source;
++      }
++      if (Unsupported)
++        continue;
++
++      SmallVector<BasicBlock *, 16> OrderedTargets;
++      SmallPtrSet<BasicBlock *, 16> Visited;
++      auto AppendChain = [&](BasicBlock *Head) {
++        BasicBlock *Current = Head;
++        while (Current) {
++          if (!Visited.insert(Current).second) {
++            Unsupported = true;
++            return;
++          }
++          OrderedTargets.push_back(Current);
++          auto NextIt = RequiredNext.find(Current);
++          Current = NextIt == RequiredNext.end() ? nullptr : NextIt->second;
++        }
++      };
++
++      // Walking heads in original order keeps independent chains stable.
++      for (BasicBlock *Target : ListedTargets) {
++        if (RequiredPrev.find(Target) != RequiredPrev.end())
++          continue;
++        AppendChain(Target);
++        if (Unsupported)
++          break;
++      }
++      if (Unsupported || Visited.size() != ListedTargets.size())
++        continue; // Cyclic/inconsistent fall-through cannot be linearized.
++
++      struct CaseRecord {
++        ConstantInt *Value;
++        BasicBlock *Target;
++      };
++      SmallVector<CaseRecord, 32> NewCases;
++      for (BasicBlock *Target : OrderedTargets)
++        for (ConstantInt *Value : ValuesByTarget[Target])
++          NewCases.push_back({Value, Target});
++      if (NewCases.size() != Switch->getNumCases())
++        continue;
++
++      bool Differs = false;
++      unsigned Index = 0;
++      for (auto Case : Switch->cases()) {
++        if (Case.getCaseValue() != NewCases[Index].Value ||
++            Case.getCaseSuccessor() != NewCases[Index].Target)
++          Differs = true;
++        ++Index;
++      }
++      if (!Differs)
++        continue;
++
++      Index = 0;
++      for (auto Case : Switch->cases()) {
++        Case.setValue(NewCases[Index].Value);
++        Case.setSuccessor(NewCases[Index].Target);
++        ++Index;
++      }
++
++      // Branch weights are indexed by switch operand position. They are not
++      // semantic and are stale after permutation, so discard them rather than
++      // attaching a weight to the wrong case.
++      Switch->setMetadata(LLVMContext::MD_prof, nullptr);
++      ++ReorderedSwitches;
++      ReorderedCases += NewCases.size();
++      Changed = true;
++    }
++
++    if (Changed && std::getenv("CUDAVM_TRACE_SPIRV_CFG"))
++      errs() << "cudavm: SPIR-V switch case order repair function="
++             << F.getName() << " switches=" << ReorderedSwitches
++             << " cases=" << ReorderedCases << "\n";
++    return Changed;
++  }
++};
++
++char CUDAVMSwitchCaseOrderRepairPass::ID = 0;
++
++
++// LLVM's native structurizer sometimes chooses a switch merge that is locally
++// well-formed but too early: one or more case constructs bypass it and only
++// reconverge at a later post-dominator. SPIR-V forbids those edges because a
++// case construct may leave only through another case, its corresponding merge,
++// or an enclosing loop merge/continue. Retarget such switches to the actual
++// convergence point. If that point is already owned by an enclosing construct,
++// isolate only the predecessors dominated by this switch into a private proxy
++// merge. This changes no branch semantics; the full CUDAVM structured-CFG
++// contract immediately following this pass remains the authority on validity.
++class CUDAVMSwitchExitMergeRepairPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMSwitchExitMergeRepairPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM local SPIR-V switch-exit merge repair";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration() || F.hasFnAttribute(CUDAVMDispatchFallbackAttr))
++      return false;
++
++    SmallPtrSet<BasicBlock *, 32> FailedHeaders;
++    unsigned Retargeted = 0;
++    unsigned Proxies = 0;
++    bool Changed = false;
++    // A proxy can become the next invalid exit of the same switch. Bound
++    // repair using the original graph size, rather than its growing size.
++    const size_t RepairBudget = std::min(cudavmLocalRepairBudget(),
++                                        std::max<size_t>(1, F.size()) * 2);
++    size_t Repairs = 0;
++
++    auto MergeKindBeforeTerminator = [](BasicBlock &BB) -> Intrinsic::ID {
++      Instruction *Terminator = BB.getTerminator();
++      if (!Terminator)
++        return Intrinsic::not_intrinsic;
++      auto *II = dyn_cast_or_null<IntrinsicInst>(Terminator->getPrevNode());
++      return II ? II->getIntrinsicID() : Intrinsic::not_intrinsic;
++    };
++
++    while (true) {
++      if (Repairs++ >= RepairBudget) {
++        F.addFnAttr(CUDAVMDispatchFallbackAttr);
++        F.addFnAttr(CUDAVMStructurizationStrategyAttr,
++                    "dispatcher-fallback-switch-repair-budget");
++        errs() << "cudavm: SPIR-V switch repair budget exhausted function="
++               << F.getName() << " repairs=" << Repairs - 1 << "\n";
++        Changed = true;
++        break;
++      }
++      DominatorTree DT(F);
++      PostDominatorTree PDT(F);
++
++      SmallPtrSet<BasicBlock *, 32> DeclaredMergeBlocks;
++      SmallPtrSet<BasicBlock *, 32> LoopMergeBlocks;
++      SmallPtrSet<BasicBlock *, 32> ContinueTargets;
++      for (BasicBlock &BB : F) {
++        for (Instruction &I : BB) {
++          auto *II = dyn_cast<IntrinsicInst>(&I);
++          if (!II)
++            continue;
++          const Intrinsic::ID IID = II->getIntrinsicID();
++          if (IID != Intrinsic::spv_selection_merge &&
++              IID != Intrinsic::spv_loop_merge)
++            continue;
++          if (auto *BA = dyn_cast<BlockAddress>(II->getArgOperand(0))) {
++            if (BA->getBasicBlock()->getParent() == &F) {
++              DeclaredMergeBlocks.insert(BA->getBasicBlock());
++              if (IID == Intrinsic::spv_loop_merge)
++                LoopMergeBlocks.insert(BA->getBasicBlock());
++            }
++          }
++          if (IID == Intrinsic::spv_loop_merge) {
++            if (auto *BA = dyn_cast<BlockAddress>(II->getArgOperand(1)))
++              if (BA->getBasicBlock()->getParent() == &F)
++                ContinueTargets.insert(BA->getBasicBlock());
++          }
++        }
++      }
++
++      bool RepairedOne = false;
++      for (BasicBlock &Header : F) {
++        if (FailedHeaders.contains(&Header) ||
++            !DT.isReachableFromEntry(&Header))
++          continue;
++
++        auto *Switch = dyn_cast<SwitchInst>(Header.getTerminator());
++        if (!Switch)
++          continue;
++        auto *MergeII = dyn_cast_or_null<IntrinsicInst>(
++            Switch->getPrevNode());
++        if (!MergeII ||
++            MergeII->getIntrinsicID() != Intrinsic::spv_selection_merge)
++          continue;
++        auto *MergeBA =
++            dyn_cast<BlockAddress>(MergeII->getArgOperand(0));
++        if (!MergeBA || MergeBA->getBasicBlock()->getParent() != &F)
++          continue;
++        BasicBlock *OldMerge = MergeBA->getBasicBlock();
++
++        SmallVector<BasicBlock *, 16> Targets;
++        SmallPtrSet<BasicBlock *, 16> SeenTargets;
++        auto AddTarget = [&](BasicBlock *Target) {
++          if (SeenTargets.insert(Target).second)
++            Targets.push_back(Target);
++        };
++        AddTarget(Switch->getDefaultDest());
++        for (auto &Case : Switch->cases())
++          AddTarget(Case.getCaseSuccessor());
++
++        auto CaseOwner = [&](BasicBlock *Block) -> BasicBlock * {
++          if (!DT.isReachableFromEntry(Block) ||
++              !DT.dominates(&Header, Block) || Block == OldMerge ||
++              DT.dominates(OldMerge, Block))
++            return nullptr;
++
++          BasicBlock *Owner = nullptr;
++          for (BasicBlock *Target : Targets) {
++            if (Target == OldMerge || !DT.dominates(Target, Block))
++              continue;
++            if (!Owner || DT.dominates(Owner, Target))
++              Owner = Target;
++          }
++          return Owner;
++        };
++
++        BasicBlock *InvalidExitTarget = nullptr;
++        for (BasicBlock &CaseBlock : F) {
++          BasicBlock *SourceOwner = CaseOwner(&CaseBlock);
++          if (!SourceOwner)
++            continue;
++          for (BasicBlock *Succ : successors(&CaseBlock)) {
++            BasicBlock *TargetOwner = CaseOwner(Succ);
++            if (TargetOwner == SourceOwner || TargetOwner)
++              continue;
++            if (Succ == OldMerge || LoopMergeBlocks.contains(Succ) ||
++                ContinueTargets.contains(Succ))
++              continue;
++            InvalidExitTarget = Succ;
++            break;
++          }
++          if (InvalidExitTarget)
++            break;
++        }
++        if (!InvalidExitTarget)
++          continue;
++
++        // Find the actual convergence of every switch successor. An invalid
++        // case exit means the current merge is generally before this point.
++        BasicBlock *Convergence = nullptr;
++        for (BasicBlock *Succ : successors(&Header)) {
++          if (!PDT.getNode(Succ)) {
++            Convergence = nullptr;
++            break;
++          }
++          Convergence = Convergence
++                            ? PDT.findNearestCommonDominator(Convergence, Succ)
++                            : Succ;
++          if (!Convergence)
++            break;
++        }
++        if (!Convergence || Convergence == &Header ||
++            Convergence == OldMerge ||
++            !DT.isReachableFromEntry(Convergence))
++          Convergence = InvalidExitTarget;
++        if (!Convergence || Convergence == &Header ||
++            Convergence == OldMerge ||
++            !DT.isReachableFromEntry(Convergence)) {
++          FailedHeaders.insert(&Header);
++          continue;
++        }
++
++        // Never split a continue edge or a backedge into a loop header. Those
++        // need loop-aware restructuring and remain on the bounded fallback.
++        if (ContinueTargets.contains(Convergence) ||
++            MergeKindBeforeTerminator(*Convergence) ==
++                Intrinsic::spv_loop_merge) {
++          FailedHeaders.insert(&Header);
++          continue;
++        }
++
++        BasicBlock *NewMerge = nullptr;
++        bool MutatedCFG = false;
++        if (DT.dominates(&Header, Convergence) &&
++            !DeclaredMergeBlocks.contains(Convergence)) {
++          NewMerge = Convergence;
++        } else if (Convergence->canSplitPredecessors()) {
++          SmallVector<BasicBlock *, 16> Preds;
++          bool HasBackedge = false;
++          for (BasicBlock *Pred : predecessors(Convergence)) {
++            if (!DT.isReachableFromEntry(Pred) ||
++                !DT.dominates(&Header, Pred))
++              continue;
++            if (DT.dominates(Convergence, Pred)) {
++              HasBackedge = true;
++              break;
++            }
++            Preds.push_back(Pred);
++          }
++          if (!HasBackedge && !Preds.empty()) {
++            BasicBlock *Proxy = SplitBlockPredecessors(
++                Convergence, Preds, ".cudavm.switch.exit.merge", &DT);
++            if (Proxy) {
++              ++Proxies;
++              Changed = true;
++              MutatedCFG = true;
++
++              DominatorTree NewDT(F);
++              bool ValidProxy =
++                  NewDT.isReachableFromEntry(Proxy) &&
++                  NewDT.dominates(&Header, Proxy);
++              if (ValidProxy)
++                NewMerge = Proxy;
++            }
++          }
++        }
++
++        if (!NewMerge) {
++          FailedHeaders.insert(&Header);
++          // A predecessor split above is semantics-preserving even if it did
++          // not become a legal private merge. Rebuild analyses and continue;
++          // the following contract can still choose whole-function fallback.
++          if (MutatedCFG) {
++            RepairedOne = true;
++            break;
++          }
++          continue;
++        }
++
++        MergeII->setArgOperand(0, BlockAddress::get(&F, NewMerge));
++        ++Retargeted;
++        Changed = true;
++        RepairedOne = true;
++        break;
++      }
++
++      if (!RepairedOne)
++        break;
++    }
++
++    if (Changed && std::getenv("CUDAVM_TRACE_SPIRV_CFG"))
++      errs() << "cudavm: SPIR-V switch exit merge repair function="
++             << F.getName() << " retargeted=" << Retargeted
++             << " proxies=" << Proxies << "\n";
++    return Changed;
++  }
++};
++
++char CUDAVMSwitchExitMergeRepairPass::ID = 0;
++
++
++
++// LLVM 22's native structurizer can itself create invalid SSA dominance while
++// splitting/proxying larger C++ CFGs. Do not let a local merge annotation make
++// such a function look structurally acceptable: invalid native IR must take the
++// late memory-state dispatcher, which re-demotes cross-block scalar SSA before
++// rewiring the CFG.
++class CUDAVMPostNativeIRFallbackPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMPostNativeIRFallbackPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM post-native SPIR-V IR validity boundary";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration() || F.hasFnAttribute(CUDAVMDispatchFallbackAttr))
++      return false;
++
++    raw_null_ostream NullOS;
++    if (!verifyFunction(F, &NullOS))
++      return false;
++
++    F.addFnAttr(CUDAVMDispatchFallbackAttr);
++    F.addFnAttr(CUDAVMStructurizationStrategyAttr,
++                "dispatcher-fallback-native-invalid-ir");
++    errs() << "cudavm: SPIR-V native-structure fallback function="
++           << F.getName()
++           << " reason=invalid-ir-after-native-structurizer\n";
++    return true;
++  }
++};
++
++char CUDAVMPostNativeIRFallbackPass::ID = 0;
++
++// Validate the structured-control entry rule that spirv-val enforces after
++// LLVM's native structurizer.  A selection construct is the region dominated
++// by its header, excluding the merge block and everything dominated by that
++// merge. Any branch from outside that construct must enter through the header.
++// LLVM 22 can produce a locally compact CFG that violates this rule on larger
++// C++ functions; detect it while we still have LLVM IR and route only that
++// function through CUDAVM's bounded fallback.
++class CUDAVMNativeStructuredCFGContractPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMNativeStructuredCFGContractPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM native SPIR-V structured-CFG contract";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration() || F.hasFnAttribute(CUDAVMDispatchFallbackAttr))
++      return false;
++
++    DomTreeBuilder::BBDomTree DT;
++    DT.recalculate(F);
++
++    auto MarkFallback = [&](StringRef Reason, BasicBlock *Header,
++                            BasicBlock *Source, BasicBlock *Target) -> bool {
++      F.addFnAttr(CUDAVMDispatchFallbackAttr);
++      F.addFnAttr(CUDAVMStructurizationStrategyAttr,
++                  "dispatcher-fallback-native-validate");
++      errs() << "cudavm: SPIR-V native-structure fallback function="
++             << F.getName() << " reason=" << Reason;
++      if (Header) {
++        errs() << " header=";
++        Header->printAsOperand(errs(), false);
++      }
++      if (Source) {
++        errs() << " source=";
++        Source->printAsOperand(errs(), false);
++      }
++      if (Target) {
++        errs() << " target=";
++        Target->printAsOperand(errs(), false);
++      }
++      errs() << "\n";
++      return true;
++    };
++
++    SmallPtrSet<BasicBlock *, 32> DeclaredMergeBlocks;
++    SmallPtrSet<BasicBlock *, 32> LoopMergeBlocks;
++    SmallPtrSet<BasicBlock *, 32> ContinueTargets;
++    DenseMap<BasicBlock *, BasicBlock *> MergeOwner;
++    for (BasicBlock &BB : F) {
++      for (Instruction &I : BB) {
++        auto *II = dyn_cast<IntrinsicInst>(&I);
++        if (!II)
++          continue;
++        const Intrinsic::ID IID = II->getIntrinsicID();
++        if (IID != Intrinsic::spv_selection_merge &&
++            IID != Intrinsic::spv_loop_merge)
++          continue;
++
++        Instruction *Terminator = BB.getTerminator();
++        if (IID == Intrinsic::spv_selection_merge) {
++          bool IsSelectionTerminator = isa<SwitchInst>(Terminator);
++          if (auto *Branch = dyn_cast_or_null<BranchInst>(Terminator))
++            IsSelectionTerminator |= Branch->isConditional();
++          if (II->getNextNode() != Terminator || !IsSelectionTerminator)
++            return MarkFallback("invalid-selection-merge-placement", &BB,
++                                &BB, nullptr);
++        } else {
++          if (II->getNextNode() != Terminator ||
++              !isa<BranchInst>(Terminator))
++            return MarkFallback("invalid-loop-merge-placement", &BB, &BB,
++                                nullptr);
++        }
++
++        auto *MergeBA = dyn_cast<BlockAddress>(II->getArgOperand(0));
++        if (!MergeBA || MergeBA->getBasicBlock()->getParent() != &F)
++          return MarkFallback("invalid-merge-address", &BB, &BB, nullptr);
++        BasicBlock *Merge = MergeBA->getBasicBlock();
++        auto OwnerIt = MergeOwner.find(Merge);
++        if (OwnerIt != MergeOwner.end() && OwnerIt->second != &BB)
++          return MarkFallback("merge-block-shared-by-headers", &BB,
++                              OwnerIt->second, Merge);
++        MergeOwner[Merge] = &BB;
++        DeclaredMergeBlocks.insert(Merge);
++
++        if (IID == Intrinsic::spv_loop_merge) {
++          LoopMergeBlocks.insert(Merge);
++          if (auto *BA = dyn_cast<BlockAddress>(II->getArgOperand(1)))
++            if (BA->getBasicBlock()->getParent() == &F)
++              ContinueTargets.insert(BA->getBasicBlock());
++        }
++      }
++    }
++
++    auto MergeKindBeforeTerminator = [](BasicBlock &BB) -> Intrinsic::ID {
++      Instruction *Terminator = BB.getTerminator();
++      if (!Terminator)
++        return Intrinsic::not_intrinsic;
++      auto *II = dyn_cast_or_null<IntrinsicInst>(Terminator->getPrevNode());
++      return II ? II->getIntrinsicID() : Intrinsic::not_intrinsic;
++    };
++
++    // Shader structured-control completeness. LLVM 22 can finish its native
++    // structurizer while omitting a required selection merge or while leaving
++    // a backedge aimed at a block that is not a loop header. Detect those
++    // exact SPIR-V-invalid shapes before emission and use CUDAVM's fallback.
++    for (BasicBlock &BB : F) {
++      if (!DT.isReachableFromEntry(&BB))
++        continue;
++      Instruction *Terminator = BB.getTerminator();
++      const Intrinsic::ID MergeKind = MergeKindBeforeTerminator(BB);
++
++      if (auto *Switch = dyn_cast<SwitchInst>(Terminator)) {
++        if (MergeKind != Intrinsic::spv_selection_merge) {
++          if (std::getenv("CUDAVM_TRACE_SPIRV_CFG")) {
++            errs() << "cudavm: SPIR-V switch missing selection merge:\n";
++            BB.print(errs());
++          }
++          return MarkFallback("switch-without-selection-merge", &BB, &BB,
++                              nullptr);
++        }
++
++        auto *MergeII = dyn_cast_or_null<IntrinsicInst>(
++            Terminator->getPrevNode());
++        auto *MergeBA = MergeII
++                            ? dyn_cast<BlockAddress>(MergeII->getArgOperand(0))
++                            : nullptr;
++        if (!MergeBA || MergeBA->getBasicBlock()->getParent() != &F)
++          return MarkFallback("invalid-switch-merge-address", &BB, &BB,
++                              nullptr);
++        BasicBlock *SwitchMerge = MergeBA->getBasicBlock();
++
++        // Shader switch constructs have additional rules beyond an ordinary
++        // LLVM switch: the switch header must dominate every case construct,
++        // repeated target labels must be consecutive, and fall-through case
++        // constructs must appear consecutively in the OpSwitch target list.
++        SmallVector<BasicBlock *, 16> Targets;
++        SmallPtrSet<BasicBlock *, 16> SeenTargets;
++        auto AddTarget = [&](BasicBlock *Target) {
++          if (SeenTargets.insert(Target).second)
++            Targets.push_back(Target);
++        };
++        AddTarget(Switch->getDefaultDest());
++
++        DenseMap<BasicBlock *, unsigned> FirstCaseIndex;
++        DenseMap<BasicBlock *, unsigned> LastCaseIndex;
++        unsigned CaseIndex = 0;
++        for (auto &Case : Switch->cases()) {
++          BasicBlock *Target = Case.getCaseSuccessor();
++          AddTarget(Target);
++          auto FirstIt = FirstCaseIndex.find(Target);
++          if (FirstIt == FirstCaseIndex.end()) {
++            FirstCaseIndex[Target] = CaseIndex;
++            LastCaseIndex[Target] = CaseIndex;
++          } else {
++            if (LastCaseIndex[Target] + 1 != CaseIndex)
++              return MarkFallback("switch-target-labels-not-consecutive",
++                                  &BB, &BB, Target);
++            LastCaseIndex[Target] = CaseIndex;
++          }
++          ++CaseIndex;
++        }
++
++        for (BasicBlock *Target : Targets) {
++          if (Target == SwitchMerge)
++            continue;
++          if (!DT.isReachableFromEntry(Target) ||
++              !DT.dominates(&BB, Target))
++            return MarkFallback("switch-header-does-not-dominate-case",
++                                &BB, &BB, Target);
++        }
++
++        auto CaseOwner = [&](BasicBlock *Block) -> BasicBlock * {
++          if (!DT.isReachableFromEntry(Block) ||
++              !DT.dominates(&BB, Block) || Block == SwitchMerge ||
++              DT.dominates(SwitchMerge, Block))
++            return nullptr;
++
++          BasicBlock *Owner = nullptr;
++          for (BasicBlock *Target : Targets) {
++            if (Target == SwitchMerge || !DT.dominates(Target, Block))
++              continue;
++            if (!Owner || DT.dominates(Owner, Target))
++              Owner = Target;
++          }
++          return Owner;
++        };
++
++        DenseMap<BasicBlock *, BasicBlock *> NextCase;
++        DenseMap<BasicBlock *, BasicBlock *> PreviousCase;
++        for (BasicBlock &CaseBlock : F) {
++          BasicBlock *SourceOwner = CaseOwner(&CaseBlock);
++          if (!SourceOwner)
++            continue;
++          for (BasicBlock *Succ : successors(&CaseBlock)) {
++            BasicBlock *TargetOwner = CaseOwner(Succ);
++            if (TargetOwner == SourceOwner)
++              continue;
++            if (!TargetOwner) {
++              // spirv-val permits a case construct to leave through its
++              // switch merge, or through an enclosing loop's merge/continue.
++              // Any other branch leaves the case construct through an
++              // unstructured edge.
++              if (Succ == SwitchMerge || LoopMergeBlocks.contains(Succ) ||
++                  ContinueTargets.contains(Succ))
++                continue;
++              return MarkFallback("switch-case-invalid-exit", &BB,
++                                  &CaseBlock, Succ);
++            }
++            auto NextIt = NextCase.find(SourceOwner);
++            if (NextIt != NextCase.end() && NextIt->second != TargetOwner)
++              return MarkFallback("switch-case-branches-to-multiple-cases",
++                                  &BB, SourceOwner, TargetOwner);
++            auto PrevIt = PreviousCase.find(TargetOwner);
++            if (PrevIt != PreviousCase.end() &&
++                PrevIt->second != SourceOwner)
++              return MarkFallback("switch-case-has-multiple-fallthroughs",
++                                  &BB, SourceOwner, TargetOwner);
++            NextCase[SourceOwner] = TargetOwner;
++            PreviousCase[TargetOwner] = SourceOwner;
++          }
++        }
++
++        auto CaseIsListed = [&](BasicBlock *Target) {
++          return FirstCaseIndex.find(Target) != FirstCaseIndex.end();
++        };
++        for (auto &Edge : NextCase) {
++          BasicBlock *Source = Edge.first;
++          BasicBlock *Target = Edge.second;
++          if (!CaseIsListed(Source))
++            continue;
++
++          BasicBlock *RequiredNext = nullptr;
++          if (CaseIsListed(Target)) {
++            RequiredNext = Target;
++          } else if (Target == Switch->getDefaultDest()) {
++            // If a case falls through to an unlisted Default which then falls
++            // through to another listed case, SPIR-V requires those two case
++            // labels to be adjacent in the OpSwitch operand list.
++            auto DefaultNext = NextCase.find(Target);
++            if (DefaultNext != NextCase.end() &&
++                CaseIsListed(DefaultNext->second))
++              RequiredNext = DefaultNext->second;
++          }
++
++          if (RequiredNext &&
++              LastCaseIndex[Source] + 1 != FirstCaseIndex[RequiredNext])
++            return MarkFallback("switch-case-target-order-invalid", &BB,
++                                Source, RequiredNext);
++        }
++      }
++
++      if (auto *Branch = dyn_cast<BranchInst>(Terminator)) {
++        if (Branch->isConditional() &&
++            Branch->getSuccessor(0) != Branch->getSuccessor(1) &&
++            MergeKind != Intrinsic::spv_selection_merge &&
++            MergeKind != Intrinsic::spv_loop_merge &&
++            !DeclaredMergeBlocks.contains(Branch->getSuccessor(0)) &&
++            !DeclaredMergeBlocks.contains(Branch->getSuccessor(1)) &&
++            !ContinueTargets.contains(Branch->getSuccessor(0)) &&
++            !ContinueTargets.contains(Branch->getSuccessor(1)))
++          return MarkFallback("conditional-without-selection-merge", &BB,
++                              &BB, nullptr);
++      }
++
++      for (BasicBlock *Succ : successors(&BB)) {
++        if (!DT.isReachableFromEntry(Succ) || !DT.dominates(Succ, &BB))
++          continue;
++        if (MergeKindBeforeTerminator(*Succ) != Intrinsic::spv_loop_merge)
++          return MarkFallback("backedge-target-is-not-loop-header", Succ,
++                              &BB, Succ);
++      }
++    }
++
++    // Validate selection dominance/entry constraints as well. A selection
++    // construct is the region dominated by its header, excluding the merge
++    // block and everything dominated by that merge. No edge may enter the
++    // construct body from outside except through the header.
++    for (BasicBlock &Header : F) {
++      if (!DT.isReachableFromEntry(&Header))
++        continue;
++
++      for (Instruction &I : Header) {
++        auto *II = dyn_cast<IntrinsicInst>(&I);
++        if (!II || II->getIntrinsicID() != Intrinsic::spv_selection_merge)
++          continue;
++
++        auto *BA = dyn_cast<BlockAddress>(II->getArgOperand(0));
++        if (!BA || BA->getBasicBlock()->getParent() != &F)
++          return MarkFallback("invalid-selection-merge-address", &Header,
++                              nullptr, nullptr);
++
++        BasicBlock *Merge = BA->getBasicBlock();
++        if (!DT.isReachableFromEntry(Merge))
++          continue;
++        if (!DT.dominates(&Header, Merge) || &Header == Merge)
++          return MarkFallback("selection-header-does-not-dominate-merge",
++                              &Header, nullptr, Merge);
++
++        auto InConstruct = [&](BasicBlock *BB) {
++          return BB != Merge && DT.isReachableFromEntry(BB) &&
++                 DT.dominates(&Header, BB) && !DT.dominates(Merge, BB);
++        };
++
++        for (BasicBlock &Target : F) {
++          if (&Target == &Header || !InConstruct(&Target))
++            continue;
++          for (BasicBlock *Source : predecessors(&Target)) {
++            if (!DT.isReachableFromEntry(Source) || InConstruct(Source))
++              continue;
++            return MarkFallback("branch-enters-selection-body", &Header,
++                                Source, &Target);
++          }
++        }
++
++        // Switch case exits have their own rules and were validated above.
++        // For an ordinary conditional selection, every branch that leaves
++        // the construct must leave through this selection's merge block.
++        auto *HeaderBranch = dyn_cast<BranchInst>(Header.getTerminator());
++        if (HeaderBranch && HeaderBranch->isConditional()) {
++          for (BasicBlock &Source : F) {
++            if (!InConstruct(&Source))
++              continue;
++            for (BasicBlock *Target : successors(&Source)) {
++              if (InConstruct(Target) || Target == Merge)
++                continue;
++              return MarkFallback("selection-invalid-exit", &Header,
++                                  &Source, Target);
++            }
++          }
++        }
++      }
++    }
++
++    return false;
++  }
++};
++
++char CUDAVMNativeStructuredCFGContractPass::ID = 0;
++
++// LLVM's native region/structurizer passes may create fresh cross-block SSA after
++// the first RegToMem, and LLVM 22's region-exit merger can even transiently
++// produce invalid dominance on CFGs synthesized by CUDAVM recursion lowering.
++// Mark such functions before native structurization so they take the bounded
++// fallback instead of feeding malformed SSA farther into the target pipeline.
++class CUDAVMPreNativeIRFallbackPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMPreNativeIRFallbackPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM pre-native SPIR-V IR validity boundary";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration() || F.hasFnAttribute(CUDAVMDispatchFallbackAttr))
++      return false;
++
++    raw_null_ostream NullOS;
++    if (!verifyFunction(F, &NullOS))
++      return false;
++
++    F.addFnAttr(CUDAVMDispatchFallbackAttr);
++    F.addFnAttr(CUDAVMStructurizationStrategyAttr,
++                "dispatcher-fallback-region-invalid");
++    errs() << "cudavm: SPIR-V native-structure fallback function="
++           << F.getName() << " reason=invalid-ir-after-region-exit-merge\n";
++    return true;
++  }
++};
++
++char CUDAVMPreNativeIRFallbackPass::ID = 0;
++
++static bool cudavmFallbackValueEscapes(const Instruction &Inst) {
++  if (!Inst.getType()->isSized())
++    return false;
++
++  const BasicBlock *BB = Inst.getParent();
++  for (const User *U : Inst.users()) {
++    const auto *UI = cast<Instruction>(U);
++    if (UI->getParent() != BB || isa<PHINode>(UI))
++      return true;
++  }
++  return false;
++}
++
++// The canonical dispatcher assumes the RegToMem invariant: no ordinary SSA
++// value is live across executable states. Native structurization can introduce
++// new cross-block scalar SSA after the first RegToMem, so a late fallback must
++// re-establish that invariant before it starts rewiring predecessors. Doing
++// this only on fallback-marked functions preserves compact SSA on the native
++// path. Pointer state is deliberately rejected: logical SPIR-V pointer values
++// may never be hidden in Function-storage spill slots.
++class CUDAVMLateDispatcherStateNormalizationPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMLateDispatcherStateNormalizationPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM late dispatcher RegToMem normalization";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration() || !F.hasFnAttribute(CUDAVMDispatchFallbackAttr) ||
++        F.hasFnAttribute(CUDAVMDispatchAppliedAttr))
++      return false;
++
++    BasicBlock &Entry = F.getEntryBlock();
++    auto AllocaPoint = Entry.begin();
++    while (AllocaPoint != Entry.end() && isa<AllocaInst>(*AllocaPoint))
++      ++AllocaPoint;
++    if (AllocaPoint == Entry.end())
++      report_fatal_error(
++          Twine("CUDAVM late dispatcher normalization found unterminated entry in function '") +
++          F.getName() + "'");
++
++    SmallVector<Instruction *, 64> Escaped;
++    for (BasicBlock &BB : F) {
++      for (Instruction &I : BB) {
++        if (isa<PHINode>(I))
++          continue;
++        if (isa<AllocaInst>(I) && &BB == &Entry)
++          continue;
++        if (!cudavmFallbackValueEscapes(I))
++          continue;
++        if (I.getType()->isPointerTy())
++          report_fatal_error(
++              Twine("CUDAVM late dispatcher normalization would spill pointer SSA in function '") +
++              F.getName() + "'");
++        Escaped.push_back(&I);
++      }
++    }
++
++    // Match RegToMem's reverse work-list order so demoting a producer cannot
++    // invalidate a later work-list element before it is processed.
++    for (auto It = Escaped.rbegin(), End = Escaped.rend(); It != End; ++It)
++      DemoteRegToStack(**It, false, AllocaPoint);
++
++    SmallVector<PHINode *, 32> Phis;
++    for (BasicBlock &BB : F)
++      for (PHINode &Phi : BB.phis()) {
++        if (Phi.getType()->isPointerTy())
++          report_fatal_error(
++              Twine("CUDAVM late dispatcher normalization observed pointer PHI in function '") +
++              F.getName() + "'");
++        Phis.push_back(&Phi);
++      }
++    for (PHINode *Phi : Phis)
++      DemotePHIToStack(Phi, AllocaPoint);
++
++    std::string VerifyDiagnostic;
++    raw_string_ostream VerifyOutput(VerifyDiagnostic);
++    if (verifyFunction(F, &VerifyOutput)) {
++      VerifyOutput.flush();
++      report_fatal_error(
++          Twine("CUDAVM late dispatcher normalization failed to restore valid SSA in function '") +
++          F.getName() + ":\n" + VerifyDiagnostic);
++    }
++
++    if (!Escaped.empty() || !Phis.empty())
++      errs() << "cudavm: SPIR-V late dispatcher normalization function="
++             << F.getName() << " escaped=" << Escaped.size()
++             << " phis=" << Phis.size() << "\n";
++    return !Escaped.empty() || !Phis.empty();
++  }
++};
++
++char CUDAVMLateDispatcherStateNormalizationPass::ID = 0;
++
++// RegToMem has already removed PHIs and ordinary values spanning basic blocks.
++// Keep its existing entry/allocation block as a permanent prologue, and map
++// each executable basic block to one scalar state. The only cyclic CFG is then
++// one natural loop containing one switch. Unlike LLVM's generic structurizer,
++// we know the exact loop/selection nesting while constructing it, so emit the
++// target merge intrinsics here instead of rediscovering the constructs later.
++class CUDAVMCanonicalDispatchCFGPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMCanonicalDispatchCFGPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM bounded SPIR-V dispatcher fallback";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration() || !F.hasFnAttribute(CUDAVMDispatchFallbackAttr) ||
++        F.hasFnAttribute(CUDAVMDispatchAppliedAttr))
++      return false;
++
++    // A late fallback may be selected after LLVM's native structurizer has
++    // already inserted merge intrinsics and split/proxy blocks. The CFG edits
++    // are semantics-preserving and can be flattened, but those merge markers
++    // describe the old construct tree and must not survive into the canonical
++    // dispatcher.
++    SmallVector<Instruction *, 32> OldMergeIntrinsics;
++    for (BasicBlock &BB : F)
++      for (Instruction &I : BB)
++        if (auto *II = dyn_cast<IntrinsicInst>(&I);
++            II && (II->getIntrinsicID() == Intrinsic::spv_loop_merge ||
++                   II->getIntrinsicID() == Intrinsic::spv_selection_merge))
++          OldMergeIntrinsics.push_back(II);
++    for (Instruction *I : OldMergeIntrinsics)
++      I->eraseFromParent();
++
++    removeUnreachableBlocks(F);
++
++    // A terminal single-block function contains no structured construct.
++    if (F.size() == 1) {
++      Instruction *T = F.getEntryBlock().getTerminator();
++      if (isa<ReturnInst>(T) || isa<UnreachableInst>(T))
++        return false;
++    }
++
++    BasicBlock *Entry = &F.getEntryBlock();
++
++    // The dispatcher deliberately destroys the original dominance relation
++    // between executable states. Storage declarations whose pointer is used by
++    // later states must therefore live in the permanent prologue. This is the
++    // same target-side normalization used by GPU backends such as NVPTX:
++    // constant-size allocas can be hoisted to function entry without needing a
++    // runtime stack-state representation. Dynamic/inalloca storage is a
++    // different semantic feature and must be lowered explicitly rather than
++    // hidden by this CFG transform.
++    SmallVector<AllocaInst *, 32> Allocas;
++    for (BasicBlock &BB : F)
++      for (Instruction &I : BB)
++        if (auto *AI = dyn_cast<AllocaInst>(&I))
++          Allocas.push_back(AI);
++
++    Instruction *AllocaAnchor = &*Entry->getFirstInsertionPt();
++    for (AllocaInst *AI : Allocas) {
++      if (!isa<ConstantInt>(AI->getArraySize()) || AI->isUsedWithInAlloca() ||
++          AI->isSwiftError())
++        report_fatal_error(
++            Twine("CUDAVM canonical SPIR-V dispatcher requires explicit lowering for dynamic/special alloca in function '") +
++            F.getName() + "'");
++      if (AI != AllocaAnchor)
++        AI->moveBefore(AllocaAnchor->getIterator());
++    }
++
++    auto FirstBody = Entry->begin();
++    while (FirstBody != Entry->end() && isa<AllocaInst>(*FirstBody))
++      ++FirstBody;
++    if (FirstBody == Entry->end())
++      report_fatal_error(
++          Twine("CUDAVM SPIR-V dispatcher found unterminated entry in function '") +
++          F.getName() + "'");
++
++    // Splitting here preserves all RegToMem and source allocas in the real
++    // entry, so their original function-wide dominance remains true.
++    BasicBlock *InitialBody = Entry->splitBasicBlock(
++        FirstBody, "cudavm.spirv.dispatch.initial");
++
++    // Capture only original executable blocks before creating dispatcher
++    // infrastructure. Each appears exactly once in the final CFG.
++    SmallVector<BasicBlock *, 64> Blocks;
++    DenseMap<BasicBlock *, unsigned> StateFor;
++    Blocks.reserve(F.size() - 1);
++    for (BasicBlock &BB : F) {
++      if (&BB == Entry)
++        continue;
++      for (Instruction &I : BB) {
++        if (isa<PHINode>(I))
++          report_fatal_error(
++              Twine("CUDAVM SPIR-V dispatcher observed PHI after RegToMem in function '") +
++              F.getName() + "'");
++      }
++      if (Blocks.size() >= std::numeric_limits<unsigned>::max())
++        report_fatal_error("CUDAVM SPIR-V dispatcher state space overflow");
++      const unsigned State = static_cast<unsigned>(Blocks.size());
++      Blocks.push_back(&BB);
++      StateFor[&BB] = State;
++    }
++
++    auto StateForTarget = [&](BasicBlock *Target) -> unsigned {
++      // The executable suffix of the old entry moved to InitialBody. Any
++      // original back-edge to Entry must resume there, never in the prologue.
++      if (Target == Entry)
++        Target = InitialBody;
++      auto It = StateFor.find(Target);
++      if (It == StateFor.end())
++        report_fatal_error(
++            Twine("CUDAVM SPIR-V dispatcher target is outside the state space in function '") +
++            F.getName() + "'");
++      return It->second;
++    };
++
++    LLVMContext &Ctx = F.getContext();
++
++    // Header blocks must precede the original body. Exit/merge blocks are
++    // appended after all state blocks, yielding the natural structured order.
++    BasicBlock *LoopHeader =
++        BasicBlock::Create(Ctx, "cudavm.spirv.dispatch.loop", &F, InitialBody);
++    BasicBlock *SwitchHeader =
++        BasicBlock::Create(Ctx, "cudavm.spirv.dispatch.switch", &F, InitialBody);
++    constexpr unsigned MaxDispatchCases = 64;
++    const unsigned ChunkCount = static_cast<unsigned>(
++        (Blocks.size() + MaxDispatchCases - 1) / MaxDispatchCases);
++    const bool TieredDispatch = ChunkCount > 1;
++    SmallVector<BasicBlock *, 4> ChunkHeaders;
++    SmallVector<BasicBlock *, 4> ChunkInvalids;
++    SmallVector<BasicBlock *, 4> ChunkMerges;
++    if (TieredDispatch) {
++      ChunkHeaders.reserve(ChunkCount);
++      ChunkInvalids.reserve(ChunkCount);
++      ChunkMerges.reserve(ChunkCount);
++      for (unsigned Chunk = 0; Chunk < ChunkCount; ++Chunk) {
++        ChunkHeaders.push_back(BasicBlock::Create(
++            Ctx, "cudavm.spirv.dispatch.chunk", &F, InitialBody));
++        ChunkInvalids.push_back(BasicBlock::Create(
++            Ctx, "cudavm.spirv.dispatch.chunk.invalid", &F));
++        ChunkMerges.push_back(BasicBlock::Create(
++            Ctx, "cudavm.spirv.dispatch.chunk.merge", &F));
++      }
++    }
++    BasicBlock *Invalid =
++        BasicBlock::Create(Ctx, "cudavm.spirv.dispatch.invalid", &F);
++    BasicBlock *SwitchMerge =
++        BasicBlock::Create(Ctx, "cudavm.spirv.dispatch.merge", &F);
++    BasicBlock *Continue =
++        BasicBlock::Create(Ctx, "cudavm.spirv.dispatch.continue", &F);
++    BasicBlock *LoopMerge =
++        BasicBlock::Create(Ctx, "cudavm.spirv.dispatch.loop.merge", &F);
++
++    Instruction *OldEntryTerminator = Entry->getTerminator();
++    IRBuilder<> EntryBuilder(OldEntryTerminator);
++    AllocaInst *StateSlot = EntryBuilder.CreateAlloca(
++        EntryBuilder.getInt32Ty(), nullptr, "cudavm.spirv.dispatch.state");
++    EntryBuilder.CreateStore(
++        EntryBuilder.getInt32(StateForTarget(InitialBody)), StateSlot);
++    EntryBuilder.CreateBr(LoopHeader);
++    OldEntryTerminator->eraseFromParent();
++
++    // Mirror SPIRVStructurizer's representation for an infinite LLVM loop:
++    // structurally connect an unreachable merge with a constant-false edge,
++    // then place spv.loop.merge immediately before the conditional branch.
++    IRBuilder<> LoopBuilder(LoopHeader);
++    auto *LoopMergeAddress = BlockAddress::get(&F, LoopMerge);
++    auto *ContinueAddress = BlockAddress::get(&F, Continue);
++    // OpLoopMerge is: Merge Block, Continue Target, Loop Control, followed
++    // by optional Loop Control parameters. LLVM's selector copies the explicit
++    // spv_loop_merge operands verbatim, so LoopControl::None must be present.
++    SmallVector<Value *, 3> LoopMergeArgs = {
++        LoopMergeAddress, ContinueAddress, LoopBuilder.getInt32(0)};
++    LoopBuilder.CreateIntrinsic(Intrinsic::spv_loop_merge, {LoopMergeArgs});
++    LoopBuilder.CreateCondBr(LoopBuilder.getFalse(), LoopMerge, SwitchHeader);
++
++    IRBuilder<> SwitchBuilder(SwitchHeader);
++    Value *State = SwitchBuilder.CreateLoad(
++        SwitchBuilder.getInt32Ty(), StateSlot, "cudavm.spirv.dispatch.current");
++    auto *SwitchMergeAddress = BlockAddress::get(&F, SwitchMerge);
++    if (TieredDispatch) {
++      Value *DispatchKey = SwitchBuilder.CreateUDiv(
++          State, SwitchBuilder.getInt32(MaxDispatchCases),
++          "cudavm.spirv.dispatch.chunk.id");
++      SmallVector<Value *, 2> SelectionMergeArgs = {
++          SwitchMergeAddress, SwitchBuilder.getInt32(0)};
++      SwitchBuilder.CreateIntrinsic(
++          Intrinsic::spv_selection_merge,
++          {SwitchMergeAddress->getType()}, SelectionMergeArgs);
++      SwitchInst *Dispatch = SwitchBuilder.CreateSwitch(
++          DispatchKey, Invalid, ChunkCount);
++      for (unsigned Chunk = 0; Chunk < ChunkCount; ++Chunk) {
++        Dispatch->addCase(SwitchBuilder.getInt32(Chunk), ChunkHeaders[Chunk]);
++
++        IRBuilder<> ChunkBuilder(ChunkHeaders[Chunk]);
++        auto *ChunkMergeAddress = BlockAddress::get(&F, ChunkMerges[Chunk]);
++        SmallVector<Value *, 2> ChunkSelectionMergeArgs = {
++            ChunkMergeAddress, ChunkBuilder.getInt32(0)};
++        ChunkBuilder.CreateIntrinsic(
++            Intrinsic::spv_selection_merge,
++            {ChunkMergeAddress->getType()}, ChunkSelectionMergeArgs);
++        const unsigned Begin = Chunk * MaxDispatchCases;
++        const unsigned End = std::min<unsigned>(
++            static_cast<unsigned>(Blocks.size()), Begin + MaxDispatchCases);
++        SwitchInst *ChunkDispatch = ChunkBuilder.CreateSwitch(
++            State, ChunkInvalids[Chunk], End - Begin);
++        for (unsigned Index = Begin; Index < End; ++Index)
++          ChunkDispatch->addCase(ChunkBuilder.getInt32(Index), Blocks[Index]);
++
++        IRBuilder<> InvalidBuilder(ChunkInvalids[Chunk]);
++        if (F.getReturnType()->isVoidTy())
++          InvalidBuilder.CreateRetVoid();
++        else
++          InvalidBuilder.CreateRet(Constant::getNullValue(F.getReturnType()));
++        IRBuilder<>(ChunkMerges[Chunk]).CreateBr(SwitchMerge);
++      }
++    } else {
++      SmallVector<Value *, 2> SelectionMergeArgs = {
++          SwitchMergeAddress, SwitchBuilder.getInt32(0)};
++      SwitchBuilder.CreateIntrinsic(
++          Intrinsic::spv_selection_merge,
++          {SwitchMergeAddress->getType()}, SelectionMergeArgs);
++      SwitchInst *Dispatch = SwitchBuilder.CreateSwitch(
++          State, Invalid, static_cast<unsigned>(Blocks.size()));
++      for (BasicBlock *BB : Blocks)
++        Dispatch->addCase(
++            SwitchBuilder.getInt32(StateForTarget(BB)), BB);
++    }
++
++    IRBuilder<> InvalidBuilder(Invalid);
++    if (F.getReturnType()->isVoidTy())
++      InvalidBuilder.CreateRetVoid();
++    else
++      InvalidBuilder.CreateRet(Constant::getNullValue(F.getReturnType()));
++    IRBuilder<>(SwitchMerge).CreateBr(Continue);
++    IRBuilder<>(Continue).CreateBr(LoopHeader);
++    IRBuilder<> LoopMergeBuilder(LoopMerge);
++    if (F.getReturnType()->isVoidTy())
++      LoopMergeBuilder.CreateRetVoid();
++    else
++      LoopMergeBuilder.CreateRet(Constant::getNullValue(F.getReturnType()));
++
++    for (BasicBlock *BB : Blocks) {
++      Instruction *Terminator = BB->getTerminator();
++      if (isa<ReturnInst>(Terminator) || isa<UnreachableInst>(Terminator))
++        continue;
++
++      IRBuilder<> B(Terminator);
++      Value *NextState = nullptr;
++      if (auto *Branch = dyn_cast<BranchInst>(Terminator)) {
++        if (Branch->isUnconditional()) {
++          NextState =
++              B.getInt32(StateForTarget(Branch->getSuccessor(0)));
++        } else {
++          Value *TrueState =
++              B.getInt32(StateForTarget(Branch->getSuccessor(0)));
++          Value *FalseState =
++              B.getInt32(StateForTarget(Branch->getSuccessor(1)));
++          NextState = B.CreateSelect(
++              Branch->getCondition(), TrueState, FalseState,
++              "cudavm.spirv.dispatch.next");
++        }
++      } else if (auto *Switch = dyn_cast<SwitchInst>(Terminator)) {
++        NextState = B.getInt32(StateForTarget(Switch->getDefaultDest()));
++        for (auto &Case : Switch->cases()) {
++          Value *Matches =
++              B.CreateICmpEQ(Switch->getCondition(), Case.getCaseValue());
++          NextState = B.CreateSelect(
++              Matches,
++              B.getInt32(StateForTarget(Case.getCaseSuccessor())),
++              NextState, "cudavm.spirv.dispatch.case");
++        }
++      } else {
++        report_fatal_error(
++            Twine("Unsupported terminator in CUDAVM SPIR-V dispatcher for function '") +
++            F.getName() + "': " + Terminator->getOpcodeName());
++      }
++
++      B.CreateStore(NextState, StateSlot);
++      BasicBlock *DispatchMerge = TieredDispatch
++          ? ChunkMerges[StateForTarget(BB) / MaxDispatchCases]
++          : SwitchMerge;
++      B.CreateBr(DispatchMerge);
++      Terminator->eraseFromParent();
++    }
++
++    std::string VerifyDiagnostic;
++    raw_string_ostream VerifyOutput(VerifyDiagnostic);
++    if (verifyFunction(F, &VerifyOutput)) {
++      VerifyOutput.flush();
++      report_fatal_error(
++          Twine("CUDAVM canonical SPIR-V dispatcher produced invalid IR in function '") +
++          F.getName() + ":\n" + VerifyDiagnostic);
++    }
++
++    DomTreeBuilder::BBDomTree DT;
++    DT.recalculate(F);
++    LoopInfo LI(DT);
++    ReversePostOrderTraversal<Function *> RPO(&F);
++    if (containsIrreducibleCFG<BasicBlock *>(RPO, LI))
++      report_fatal_error(
++          Twine("CUDAVM canonical SPIR-V dispatcher produced irreducible CFG in function '") +
++          F.getName() + "'");
++
++    F.addFnAttr(CUDAVMDispatchAppliedAttr);
++    return true;
++  }
++};
++
++char CUDAVMCanonicalDispatchCFGPass::ID = 0;
++
++static std::string cudavmInstructionText(const Instruction &I) {
++  std::string Text;
++  raw_string_ostream OS(Text);
++  I.print(OS);
++  OS.flush();
++  return Text;
++}
++
++// The SPIR-V selector consumes merge intrinsic operands as the exact operands
++// of OpLoopMerge/OpSelectionMerge. Validate that contract while the operands
++// are still LLVM values, so malformed target IR cannot become an opaque
++// GlobalISel/spirv-val failure.
++class CUDAVMMergeContractPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMMergeContractPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM SPIR-V merge-intrinsic contract validation";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration())
++      return false;
++
++    // The second RegToMem can insert selector reloads between an annotation
++    // and a generated dispatcher switch. An annotation has no runtime effect;
++    // schedule it after those reloads without relaxing the CFG checks below.
++    if (F.hasFnAttribute(CUDAVMDispatchAppliedAttr)) {
++      SmallVector<IntrinsicInst *, 16> Merges;
++      for (BasicBlock &BB : F)
++        for (Instruction &I : BB)
++          if (auto *II = dyn_cast<IntrinsicInst>(&I))
++            if (II->getIntrinsicID() == Intrinsic::spv_selection_merge ||
++                II->getIntrinsicID() == Intrinsic::spv_loop_merge)
++              Merges.push_back(II);
++      for (IntrinsicInst *II : Merges)
++        II->moveBefore(II->getParent()->getTerminator()->getIterator());
++    }
++
++    SmallPtrSet<BasicBlock *, 32> DeclaredMergeBlocks;
++    SmallPtrSet<BasicBlock *, 32> ContinueTargets;
++
++    for (BasicBlock &BB : F) {
++      for (Instruction &I : BB) {
++        auto *II = dyn_cast<IntrinsicInst>(&I);
++        if (!II)
++          continue;
++
++        const Intrinsic::ID IID = II->getIntrinsicID();
++        if (IID != Intrinsic::spv_loop_merge &&
++            IID != Intrinsic::spv_selection_merge)
++          continue;
++
++        auto Fail = [&](StringRef Reason) -> void {
++          report_fatal_error(
++              Twine("CUDAVM SPIR-V merge contract violation in function '") +
++              F.getName() + "': " + Reason + "\n  intrinsic: " +
++              cudavmInstructionText(*II));
++        };
++
++        if (IID == Intrinsic::spv_loop_merge) {
++          if (II->arg_size() != 3)
++            Fail("spv_loop_merge must have merge, continue, and loop-control operands");
++          auto *MergeBA = dyn_cast<BlockAddress>(II->getArgOperand(0));
++          auto *ContinueBA = dyn_cast<BlockAddress>(II->getArgOperand(1));
++          if (!MergeBA || MergeBA->getBasicBlock()->getParent() != &F)
++            Fail("spv_loop_merge merge operand is not a local blockaddress");
++          if (!ContinueBA || ContinueBA->getBasicBlock()->getParent() != &F)
++            Fail("spv_loop_merge continue operand is not a local blockaddress");
++          DeclaredMergeBlocks.insert(MergeBA->getBasicBlock());
++          ContinueTargets.insert(ContinueBA->getBasicBlock());
++          auto *LoopControl = dyn_cast<ConstantInt>(II->getArgOperand(2));
++          if (!LoopControl || !LoopControl->getType()->isIntegerTy(32) ||
++              !LoopControl->isZero())
++            Fail("spv_loop_merge loop-control operand must be i32 LoopControl::None (0)");
++          if (II->getNextNode() != BB.getTerminator() ||
++              !isa<BranchInst>(BB.getTerminator()))
++            Fail("spv_loop_merge must immediately precede its loop-header branch");
++          continue;
++        }
++
++        if (II->arg_size() != 2)
++          Fail("spv_selection_merge must have merge and selection-control operands");
++        auto *MergeBA = dyn_cast<BlockAddress>(II->getArgOperand(0));
++        if (!MergeBA || MergeBA->getBasicBlock()->getParent() != &F)
++          Fail("spv_selection_merge merge operand is not a local blockaddress");
++        DeclaredMergeBlocks.insert(MergeBA->getBasicBlock());
++        auto *SelectionControl = dyn_cast<ConstantInt>(II->getArgOperand(1));
++        if (!SelectionControl || !SelectionControl->getType()->isIntegerTy(32))
++          Fail("spv_selection_merge selection-control operand must be i32");
++        Instruction *Terminator = BB.getTerminator();
++        if (II->getNextNode() != Terminator)
++          Fail("spv_selection_merge must immediately precede its selection terminator");
++        if (auto *Branch = dyn_cast<BranchInst>(Terminator)) {
++          if (!Branch->isConditional())
++            Fail("spv_selection_merge must precede a conditional branch or switch");
++        } else if (!isa<SwitchInst>(Terminator)) {
++          Fail("spv_selection_merge must precede a conditional branch or switch");
++        }
++      }
++    }
++
++    DominatorTree DT(F);
++    auto MergeKindBeforeTerminator = [](BasicBlock &BB) -> Intrinsic::ID {
++      Instruction *Terminator = BB.getTerminator();
++      if (!Terminator)
++        return Intrinsic::not_intrinsic;
++      auto *II = dyn_cast_or_null<IntrinsicInst>(Terminator->getPrevNode());
++      return II ? II->getIntrinsicID() : Intrinsic::not_intrinsic;
++    };
++    auto FailBlock = [&](StringRef Reason, BasicBlock &BB) -> void {
++      std::string TerminatorText = cudavmInstructionText(*BB.getTerminator());
++      report_fatal_error(
++          Twine("CUDAVM SPIR-V structured-control contract violation in function '") +
++          F.getName() + "' at block '" + BB.getName() + "': " + Reason +
++          "\n  terminator: " + TerminatorText);
++    };
++
++    for (BasicBlock &BB : F) {
++      if (!DT.isReachableFromEntry(&BB))
++        continue;
++      Instruction *Terminator = BB.getTerminator();
++      const Intrinsic::ID MergeKind = MergeKindBeforeTerminator(BB);
++
++      if (isa<SwitchInst>(Terminator) &&
++          MergeKind != Intrinsic::spv_selection_merge)
++        FailBlock("switch is missing spv_selection_merge", BB);
++
++      if (auto *Branch = dyn_cast<BranchInst>(Terminator)) {
++        if (Branch->isConditional() &&
++            Branch->getSuccessor(0) != Branch->getSuccessor(1) &&
++            MergeKind != Intrinsic::spv_selection_merge &&
++            MergeKind != Intrinsic::spv_loop_merge &&
++            !DeclaredMergeBlocks.contains(Branch->getSuccessor(0)) &&
++            !DeclaredMergeBlocks.contains(Branch->getSuccessor(1)) &&
++            !ContinueTargets.contains(Branch->getSuccessor(0)) &&
++            !ContinueTargets.contains(Branch->getSuccessor(1)))
++          FailBlock("conditional branch is missing spv_selection_merge", BB);
++      }
++
++      for (BasicBlock *Succ : successors(&BB)) {
++        if (!DT.isReachableFromEntry(Succ) || !DT.dominates(Succ, &BB))
++          continue;
++        if (MergeKindBeforeTerminator(*Succ) != Intrinsic::spv_loop_merge)
++          FailBlock("backedge targets a block without spv_loop_merge", BB);
++      }
++    }
++
++    return false;
++  }
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.setPreservesAll();
++  }
++};
++
++char CUDAVMMergeContractPass::ID = 0;
++
++// RegToMem may spill scalar/vector state, but never an SSA pointer. Logical
++// Vulkan shaders cannot store a StorageBuffer pointer in Function storage
++// without VariablePointersStorageBuffer, and CUDAVM deliberately does not enable
++// that capability. Diagnose this at the pass boundary rather than in spirv-val.
++class CUDAVMRegToMemPointerContractPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMRegToMemPointerContractPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM RegToMem pointer-spill contract";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration())
++      return false;
++
++    for (BasicBlock &BB : F) {
++      for (Instruction &I : BB) {
++        auto *AI = dyn_cast<AllocaInst>(&I);
++        if (!AI || !AI->getAllocatedType()->isPointerTy())
++          continue;
++
++        // RegToMem names its synthetic stack slots with a reg2mem stem. Do not
++        // reject source-language pointer objects here; CUDAVM's earlier pointer
++        // lowering owns those semantics.
++        if (!AI->getName().contains("reg2mem"))
++          continue;
++
++        std::string Text;
++        raw_string_ostream OS(Text);
++        AI->print(OS);
++        OS.flush();
++        report_fatal_error(
++            Twine("CUDAVM RegToMem attempted to spill a pointer in function '") +
++            F.getName() + ":\n  alloca: " + Text);
++      }
++    }
++    return false;
++  }
++};
++
++char CUDAVMRegToMemPointerContractPass::ID = 0;
++
++// RegToMem is temporary on the native/local path, where compact scalar SSA is
++// restored after structurization. Canonical-dispatch fallback is intentionally
++// different: its spill/state slots remain in Function memory because promoting
++// them produces global PHIs with one incoming value per dispatcher state.
++// Pointer objects are always left in memory. The pre-RegToMem pointer contract
++// guarantees that no resource pointer value enters synthetic scalar state.
++class CUDAVMScalarStatePromotionPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMScalarStatePromotionPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM structured CFG non-pointer state promotion";
++  }
++
++  bool runOnFunction(Function &F) override {
++    // Native-local CFGs benefit from mem2reg after structurization. A canonical
++    // dispatcher does not: promoting its spill/state slots creates one PHI arm
++    // per state and recreates the O(blocks * live-state) serialization blowup.
++    // Keep fallback functions in compact memory-state form deliberately.
++    if (F.isDeclaration() || F.hasFnAttribute(CUDAVMDispatchAppliedAttr))
++      return false;
++
++    SmallVector<AllocaInst *, 64> Allocas;
++    for (Instruction &I : F.getEntryBlock()) {
++      auto *AI = dyn_cast<AllocaInst>(&I);
++      if (!AI)
++        continue;
++
++      // Pointer objects remain in Function memory: promoting them can create
++      // pointer PHIs that LLVM 22's logical-pointer legalizer cannot rewrite.
++      if (AI->getAllocatedType()->isPointerTy())
++        continue;
++
++      const bool SyntheticRegToMem = AI->getName().contains("reg2mem");
++      const bool DispatcherState =
++          AI->getName() == "cudavm.spirv.dispatch.state";
++      if (!isAllocaPromotable(AI)) {
++        if (SyntheticRegToMem || DispatcherState)
++          report_fatal_error(
++              Twine("CUDAVM synthetic structured-control state is not promotable in function '") +
++              F.getName() + "':\n  alloca: " + cudavmInstructionText(*AI));
++        continue;
++      }
++      Allocas.push_back(AI);
++    }
++
++    if (Allocas.empty())
++      return false;
++
++    DominatorTree DT(F);
++    PromoteMemToReg(Allocas, DT);
++
++    // RegToMem/dispatcher scalar state must disappear completely. Source
++    // pointer allocas are intentionally excluded and were checked earlier.
++    for (Instruction &I : F.getEntryBlock()) {
++      auto *AI = dyn_cast<AllocaInst>(&I);
++      if (!AI || AI->getAllocatedType()->isPointerTy())
++        continue;
++      if (AI->getName().contains("reg2mem") ||
++          AI->getName() == "cudavm.spirv.dispatch.state")
++        report_fatal_error(
++            Twine("CUDAVM structured-control promotion left synthetic state in function '") +
++            F.getName() + ":\n  alloca: " + cudavmInstructionText(*AI));
++    }
++    return true;
++  }
++};
++
++char CUDAVMScalarStatePromotionPass::ID = 0;
++
++// Scalar/vector PHIs are expected after state promotion and are precisely the
++// compact SSA representation we want. Pointer PHIs are still forbidden: LLVM
++// 22's logical SPIR-V pointer-cast legalization cannot rewrite spv_ptrcast on
++// PHI incoming edges. Keep that pointer-only invariant explicit.
++class CUDAVMStateMachineSSAContractPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMStateMachineSSAContractPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM structured CFG pointer-SSA contract";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration())
++      return false;
++
++    for (BasicBlock &BB : F) {
++      for (Instruction &I : BB) {
++        auto *Phi = dyn_cast<PHINode>(&I);
++        if (!Phi || !Phi->getType()->isPointerTy())
++          continue;
++        report_fatal_error(
++            Twine("CUDAVM structured SPIR-V pointer-SSA contract violation in function '") +
++            F.getName() +
++            "': pointer PHI reached logical-pointer legalization\n  phi: " +
++            cudavmInstructionText(*Phi));
++      }
++    }
++    return false;
++  }
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.setPreservesAll();
++  }
++};
++
++char CUDAVMStateMachineSSAContractPass::ID = 0;
++
++static bool cudavmPointerCastUserSupportedByNativeLegalizer(const User *U) {
++  if (isa<LoadInst>(U) || isa<StoreInst>(U))
++    return true;
++
++  auto *II = dyn_cast<IntrinsicInst>(U);
++  if (!II)
++    return false;
++
++  switch (II->getIntrinsicID()) {
++  case Intrinsic::spv_assign_ptr_type:
++  case Intrinsic::spv_gep:
++  case Intrinsic::spv_store:
++    return true;
++  default:
++    return false;
++  }
++}
++
++// LLVM's logical-pointer legalizer is intentionally exhaustive: every
++// spv_ptrcast must be consumed by one of the user forms it knows how to
++// rewrite. LLVM 22 otherwise reaches llvm_unreachable for an unsupported user.
++// Check the same precondition immediately before the native pass and report the
++// concrete producer/user pair instead of crashing inside the legalizer.
++class CUDAVMPtrcastContractPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMPtrcastContractPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM SPIR-V logical pointer-cast contract validation";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration())
++      return false;
++
++    for (BasicBlock &BB : F) {
++      for (Instruction &I : BB) {
++        auto *PtrCast = dyn_cast<IntrinsicInst>(&I);
++        if (!PtrCast || PtrCast->getIntrinsicID() != Intrinsic::spv_ptrcast)
++          continue;
++
++        for (Use &U : PtrCast->uses()) {
++          User *Consumer = U.getUser();
++          if (cudavmPointerCastUserSupportedByNativeLegalizer(Consumer))
++            continue;
++
++          std::string UserText;
++          if (auto *UserI = dyn_cast<Instruction>(Consumer))
++            UserText = cudavmInstructionText(*UserI);
++          else {
++            raw_string_ostream OS(UserText);
++            Consumer->print(OS);
++            OS.flush();
++          }
++
++          report_fatal_error(
++              Twine("CUDAVM SPIR-V pointer-cast contract violation in function '") +
++              F.getName() +
++              "': native SPIRVLegalizePointerCast does not support this spv_ptrcast user" +
++              "\n  ptrcast: " + cudavmInstructionText(*PtrCast) +
++              "\n  user operand: " + Twine(U.getOperandNo()) +
++              "\n  user: " + UserText);
++        }
++      }
++    }
++    return false;
++  }
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.setPreservesAll();
++  }
++};
++
++char CUDAVMPtrcastContractPass::ID = 0;
++
++// SPIRVEmitIntrinsics owns ordinary LLVM bitcasts. LLVM 22's logical-pointer
++// legalization can itself synthesize a vector reinterpretation afterwards;
++// canonicalize only those *remaining* raw vector bitcasts here, immediately
++// before the generic ISel preparation/IRTranslator boundary.
++class CUDAVMPostPointerVectorBitcastPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMPostPointerVectorBitcastPass() : FunctionPass(ID) {}
++  StringRef getPassName() const override {
++    return "CUDAVM post-pointer SPIR-V vector bitcast canonicalization";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration())
++      return false;
++
++    SmallVector<BitCastInst *, 16> Casts;
++    for (BasicBlock &BB : F) {
++      for (Instruction &I : BB) {
++        auto *Cast = dyn_cast<BitCastInst>(&I);
++        if (!Cast)
++          continue;
++        Type *SrcTy = Cast->getOperand(0)->getType();
++        Type *DstTy = Cast->getType();
++        if (!SrcTy->isVectorTy() && !DstTy->isVectorTy())
++          continue;
++        Casts.push_back(Cast);
++      }
++    }
++
++    for (BitCastInst *Cast : Casts) {
++      IRBuilder<> B(Cast);
++      Value *Replacement = B.CreateIntrinsic(
++          Intrinsic::spv_bitcast,
++          {Cast->getType(), Cast->getOperand(0)->getType()},
++          {Cast->getOperand(0)});
++      Replacement->takeName(Cast);
++      Cast->replaceAllUsesWith(Replacement);
++      Cast->eraseFromParent();
++    }
++
++    if (!Casts.empty()) {
++      std::string VerifyDiagnostic;
++      raw_string_ostream VerifyOutput(VerifyDiagnostic);
++      if (verifyFunction(F, &VerifyOutput)) {
++        VerifyOutput.flush();
++        report_fatal_error(
++            Twine("CUDAVM post-pointer vector-bitcast legalization produced invalid IR in function '") +
++            F.getName() + ":\n" + VerifyDiagnostic);
++      }
++    }
++    return !Casts.empty();
++  }
++};
++
++char CUDAVMPostPointerVectorBitcastPass::ID = 0;
++
++// Read-only boundary diagnostics retained from v9. They are silent for a valid,
++// fully reachable reducible graph unless CUDAVM_TRACE_SPIRV_CFG selects it.
++class CUDAVMCFGDiagnosticsPass final : public FunctionPass {
++public:
++  static char ID;
++
++  CUDAVMCFGDiagnosticsPass() : FunctionPass(ID), Stage("unspecified") {}
++  explicit CUDAVMCFGDiagnosticsPass(StringRef Stage)
++      : FunctionPass(ID), Stage(Stage.str()) {}
++  StringRef getPassName() const override {
++    return "CUDAVM SPIR-V CFG diagnostics";
++  }
++
++  bool runOnFunction(Function &F) override {
++    if (F.isDeclaration())
++      return false;
++
++    std::string VerifyDiagnostic;
++    raw_string_ostream VerifyOutput(VerifyDiagnostic);
++    const bool Invalid = verifyFunction(F, &VerifyOutput);
++
++    bool Irreducible = false;
++    size_t ReachableCount = 0;
++    DomTreeBuilder::BBDomTree DT;
++    if (!Invalid) {
++      DT.recalculate(F);
++      LoopInfo LI(DT);
++      ReversePostOrderTraversal<Function *> RPO(&F);
++      for (BasicBlock *BB : RPO) {
++        (void)BB;
++        ++ReachableCount;
++      }
++      Irreducible = containsIrreducibleCFG<BasicBlock *>(RPO, LI);
++    }
++    const bool HasUnreachable = !Invalid && ReachableCount != F.size();
++
++    const char *FilterValue = std::getenv("CUDAVM_TRACE_SPIRV_CFG");
++    bool Trace = false;
++    if (FilterValue != nullptr) {
++      StringRef Filter(FilterValue);
++      Trace = Filter.empty() || Filter == "1" || Filter == "all" ||
++              F.getName().contains(Filter);
++    }
++
++    size_t EdgeCount = 0;
++    size_t InstructionCount = 0;
++    size_t PhiCount = 0;
++    size_t PhiIncomingCount = 0;
++    size_t MaxPhiFanIn = 0;
++    size_t AllocaCount = 0;
++    size_t LoadCount = 0;
++    size_t StoreCount = 0;
++    size_t MergeIntrinsicCount = 0;
++    for (BasicBlock &BB : F) {
++      EdgeCount += succ_size(&BB);
++      for (Instruction &I : BB) {
++        ++InstructionCount;
++        if (auto *Phi = dyn_cast<PHINode>(&I)) {
++          ++PhiCount;
++          PhiIncomingCount += Phi->getNumIncomingValues();
++          MaxPhiFanIn = std::max<size_t>(MaxPhiFanIn,
++                                        Phi->getNumIncomingValues());
++        }
++        AllocaCount += isa<AllocaInst>(I);
++        LoadCount += isa<LoadInst>(I);
++        StoreCount += isa<StoreInst>(I);
++        if (auto *II = dyn_cast<IntrinsicInst>(&I))
++          MergeIntrinsicCount +=
++              II->getIntrinsicID() == Intrinsic::spv_loop_merge ||
++              II->getIntrinsicID() == Intrinsic::spv_selection_merge;
++      }
++    }
++
++    const bool PathologicalPhi =
++        MaxPhiFanIn > 32 || PhiIncomingCount > 4096;
++    if (!Trace && !Invalid && !HasUnreachable && !Irreducible &&
++        !PathologicalPhi)
++      return false;
++
++    StringRef Strategy = "unset";
++    Attribute StrategyAttr = F.getFnAttribute(CUDAVMStructurizationStrategyAttr);
++    if (StrategyAttr.isValid())
++      Strategy = StrategyAttr.getValueAsString();
++
++    errs() << "cudavm: SPIR-V CFG stage=" << Stage
++           << " function=" << F.getName() << " blocks=" << F.size()
++           << " edges=" << EdgeCount << " valid=" << !Invalid
++           << " reachable=" << ReachableCount
++           << " unreachable=" << (!Invalid ? F.size() - ReachableCount : 0)
++           << " reducible=" << (!Invalid && !Irreducible)
++           << " strategy=" << Strategy
++           << " instructions=" << InstructionCount
++           << " phis=" << PhiCount
++           << " phi_incoming=" << PhiIncomingCount
++           << " max_phi_fanin=" << MaxPhiFanIn
++           << " allocas=" << AllocaCount
++           << " loads=" << LoadCount
++           << " stores=" << StoreCount
++           << " merges=" << MergeIntrinsicCount
++           << " pathological_phi=" << PathologicalPhi << "\n";
++
++    if (Invalid) {
++      VerifyOutput.flush();
++      errs() << "cudavm: SPIR-V verifier failure stage=" << Stage
++             << " function=" << F.getName() << "\n" << VerifyDiagnostic;
++    }
++
++    if (Irreducible) {
++      for (auto I = scc_begin(&F); !I.isAtEnd(); ++I) {
++        const std::vector<BasicBlock *> &SCC = *I;
++        bool Cyclic = SCC.size() > 1;
++        if (!Cyclic && !SCC.empty()) {
++          for (BasicBlock *Succ : successors(SCC.front()))
++            Cyclic |= Succ == SCC.front();
++        }
++        if (!Cyclic)
++          continue;
++
++        SmallPtrSet<BasicBlock *, 16> Members;
++        for (BasicBlock *BB : SCC)
++          Members.insert(BB);
++
++        SmallPtrSet<BasicBlock *, 8> EntryBlocks;
++        for (BasicBlock *BB : SCC) {
++          if (!DT.isReachableFromEntry(BB))
++            continue;
++          for (BasicBlock *Pred : predecessors(BB)) {
++            if (!Members.contains(Pred) && DT.isReachableFromEntry(Pred))
++              EntryBlocks.insert(BB);
++          }
++        }
++        if (EntryBlocks.size() <= 1)
++          continue;
++
++        errs() << "cudavm: SPIR-V irreducible SCC stage=" << Stage
++               << " function=" << F.getName() << " members=" << SCC.size()
++               << " entries=" << EntryBlocks.size() << "\n";
++        for (BasicBlock *SCCEntry : EntryBlocks) {
++          errs() << "cudavm:   SCC entry=";
++          SCCEntry->printAsOperand(errs(), false);
++          if (SCCEntry->hasName())
++            errs() << " name=" << SCCEntry->getName();
++          errs() << "\n";
++        }
++      }
++    }
++
++    const char *IRFilterValue = std::getenv("CUDAVM_TRACE_SPIRV_IR");
++    bool TraceIR = false;
++    if (IRFilterValue != nullptr) {
++      StringRef Filter(IRFilterValue);
++      TraceIR = Filter.empty() || Filter == "1" || Filter == "all" ||
++                F.getName().contains(Filter);
++    }
++    if (TraceIR) {
++      errs() << "cudavm: SPIR-V IR begin stage=" << Stage
++             << " function=" << F.getName() << "\n";
++      F.print(errs());
++      errs() << "cudavm: SPIR-V IR end stage=" << Stage
++             << " function=" << F.getName() << "\n";
++    }
++    return false;
++  }
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.setPreservesAll();
++  }
++
++private:
++  std::string Stage;
++};
++
++char CUDAVMCFGDiagnosticsPass::ID = 0;
++
+ class SPIRVPassConfig : public TargetPassConfig {
+ public:
+   SPIRVPassConfig(SPIRVTargetMachine &TM, PassManagerBase &PM)
+@@ -193,23 +2947,70 @@ void SPIRVPassConfig::addISelPrepare() {
+     //  - loops have a single entry edge (pre-header to loop header).
+     //  - all loop exits are dominated by the loop pre-header.
+     //  - loops have a single back-edge.
++    addPass(new CUDAVMCFGDiagnosticsPass("target-input"));
+     addPass(createLoopSimplifyPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-loop-simplify"));
++    addPass(new CUDAVMResourcePointerRematerializationPass());
++    addPass(new CUDAVMCFGStrategyPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-cfg-strategy"));
+ 
+     // 2. Removes registers whose lifetime spans across basic blocks. Also
+     // removes phi nodes. This will greatly simplify the next steps.
+     addPass(createRegToMemWrapperPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-reg-to-mem"));
++    addPass(new CUDAVMRegToMemPointerContractPass());
++    addPass(new CUDAVMCanonicalDispatchCFGPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-dispatch-fallback"));
++    // FixIrreducible is a legacy FunctionPass. CUDAVM embeds LLVM libraries
++    // directly instead of running the opt/llc umbrella initializers, so make
++    // every analysis dependency visible to the legacy pass registry first.
++    PassRegistry &CUDAVMPassRegistry = *PassRegistry::getPassRegistry();
++    initializeDominatorTreeWrapperPassPass(CUDAVMPassRegistry);
++    initializeLoopInfoWrapperPassPass(CUDAVMPassRegistry);
++    initializeCycleInfoWrapperPassPass(CUDAVMPassRegistry);
++    initializeFixIrreduciblePass(CUDAVMPassRegistry);
++    addPass(createFixIrreduciblePass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-local-irreducible-repair"));
++    // Local SCC repair can synthesize guard PHIs after the first RegToMem.
++    // The native structurizer rewrites/deletes blocks assuming memory state.
++    addPass(createRegToMemWrapperPass());
++    addPass(new CUDAVMRegToMemPointerContractPass());
++    addPass(new CUDAVMReducibleCFGContractPass());
+ 
+     // 3. Merge the convergence region exit nodes into one. After this step,
+     // regions are single-entry, single-exit. This will help determine the
+     // correct merge block.
+     addPass(createSPIRVMergeRegionExitTargetsPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-region-exit-merge"));
++    addPass(new CUDAVMPreNativeIRFallbackPass());
+ 
+     // 4. Structurize.
+     addPass(createSPIRVStructurizerPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-native-structurizer"));
++    addPass(new CUDAVMPostNativeIRFallbackPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-post-native-ir-boundary"));
++    addPass(new CUDAVMLocalSelectionRepairPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-local-selection-repair"));
++    addPass(new CUDAVMSwitchCaseOrderRepairPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-switch-case-order-repair"));
++    addPass(new CUDAVMSwitchExitMergeRepairPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-switch-exit-merge-repair"));
++    // The patched structurizer can abort before an unsafe PartialOrderingVisitor
++    // construction by setting the fallback attribute. If it completes, validate
++    // the SPIR-V selection-entry rule while the CFG is still LLVM IR. In either
++    // case only the failing function is flattened.
++    addPass(new CUDAVMNativeStructuredCFGContractPass());
++    addPass(new CUDAVMLateDispatcherStateNormalizationPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-late-dispatch-normalization"));
++    addPass(new CUDAVMCanonicalDispatchCFGPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-native-validate-fallback"));
+ 
+     // 5. Reduce the amount of variables required by pushing some operations
+     // back to virtual registers.
+-    addPass(createPromoteMemoryToRegisterPass());
++    addPass(new CUDAVMScalarStatePromotionPass());
++    addPass(new CUDAVMCFGDiagnosticsPass("after-structured-state-promotion"));
++    addPass(new CUDAVMStateMachineSSAContractPass());
++    addPass(new CUDAVMMergeContractPass());
+   }
+   SPIRVTargetMachine &TM = getTM<SPIRVTargetMachine>();
+   addPass(createSPIRVStripConvergenceIntrinsicsPass());
+@@ -218,8 +3019,14 @@ void SPIRVPassConfig::addISelPrepare() {
+   addPass(createSPIRVCBufferAccessLegacyPass());
+   addPass(createSPIRVPushConstantAccessLegacyPass(&TM));
+   addPass(createSPIRVEmitIntrinsicsPass(&TM));
+-  if (TM.getSubtargetImpl()->isLogicalSPIRV())
++  if (TM.getSubtargetImpl()->isLogicalSPIRV()) {
++    // SPIRVEmitIntrinsics has now materialized every logical pointer cast.
++    // Diagnose unsupported native-legalizer users before LLVM's unreachable.
++    addPass(new CUDAVMStateMachineSSAContractPass());
++    addPass(new CUDAVMPtrcastContractPass());
+     addPass(createSPIRVLegalizePointerCastPass(&TM));
++    addPass(new CUDAVMPostPointerVectorBitcastPass());
++  }
+   TargetPassConfig::addISelPrepare();
+ }
+ 

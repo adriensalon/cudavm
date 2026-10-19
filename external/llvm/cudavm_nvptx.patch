@@ -1,0 +1,24 @@
+diff --git a/clang/lib/Headers/__clang_cuda_runtime_wrapper.h b/clang/lib/Headers/__clang_cuda_runtime_wrapper.h
+index 295f4191f9927017b63db07da8ca1e4e280fdce2..67ee5ef81622d0ff8b786931a5541c306c65b87d 100644
+--- a/clang/lib/Headers/__clang_cuda_runtime_wrapper.h
++++ b/clang/lib/Headers/__clang_cuda_runtime_wrapper.h
+@@ -29,6 +29,9 @@
+ #if defined(__CUDA__) && defined(__clang__)
+ 
+ // Include some forward declares that must come before cmath.
++#if defined(_MSC_VER)
++static inline __attribute__((device, always_inline)) long double fma(long double x, long double y, long double z) { return __builtin_fmal(x, y, z); }
++#endif
+ #include <__clang_cuda_math_forward_declares.h>
+ 
+ // Define __CUDACC__ early as libstdc++ standard headers with GNU extensions
+@@ -502,7 +505,9 @@ __device__ inline __cuda_builtin_gridDim_t::operator uint3() const {
+ #pragma push_macro("uint3")
+ #define dim3 __cuda_builtin_blockDim_t
+ #define uint3 __cuda_builtin_threadIdx_t
++#if __has_include("curand_mtgp32_kernel.h")
+ #include "curand_mtgp32_kernel.h"
++#endif
+ #pragma pop_macro("dim3")
+ #pragma pop_macro("uint3")
+ #pragma pop_macro("__USE_FAST_MATH__")
