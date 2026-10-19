@@ -120,6 +120,19 @@ struct cuda_array_buffer : cuda_buffer {
         }
     }
 };
+struct cuda_image_object : image_object {
+    std::shared_ptr<cuda_context> context;
+    bool surface;
+    cuda_image_object(std::shared_ptr<cuda_context> owner, bool is_surface) : context(std::move(owner)), surface(is_surface) {}
+    ~cuda_image_object() {
+        if (handle && context->api->push(context->value) == CUDA_SUCCESS) {
+            auto& driver = context->api->driver;
+            if (surface) driver.get<decltype(&cuSurfObjectDestroy)>("cuSurfObjectDestroy")(handle);
+            else driver.get<decltype(&cuTexObjectDestroy)>("cuTexObjectDestroy")(handle);
+            CUcontext previous{}; context->api->pop(&previous);
+        }
+    }
+};
 CUDA_MEMCPY3D cuda_array_row(buffer* to, size_t destination, void* host_to,
                            buffer* from, size_t source, const void* host_from, size_t bytes) {
     CUDA_MEMCPY3D p{};
@@ -708,6 +721,26 @@ struct cuda_session : session {
         auto result = std::make_shared<cuda_array_buffer>(context, d);
         cuda_context_guard guard(*context);
         check(context->api->driver.get<decltype(&cuArray3DCreate)>("cuArray3DCreate_v2")(&result->value, &d), "cuArray3DCreate_v2");
+        return result;
+    }
+    std::shared_ptr<image_object> create_texture(buffer& storage, const CUDA_TEXTURE_DESC& texture, const CUDA_RESOURCE_VIEW_DESC* view) override {
+        auto result = std::make_shared<cuda_image_object>(context, false);
+        CUDA_RESOURCE_DESC resource{}; resource.resType = CU_RESOURCE_TYPE_ARRAY;
+        resource.res.array.hArray = static_cast<cuda_array_buffer&>(storage).value;
+        cuda_context_guard guard(*context);
+        CUtexObject handle{};
+        check(context->api->driver.get<decltype(&cuTexObjectCreate)>("cuTexObjectCreate")(&handle, &resource, &texture, view), "cuTexObjectCreate");
+        result->handle = handle;
+        return result;
+    }
+    std::shared_ptr<image_object> create_surface(buffer& storage) override {
+        auto result = std::make_shared<cuda_image_object>(context, true);
+        CUDA_RESOURCE_DESC resource{}; resource.resType = CU_RESOURCE_TYPE_ARRAY;
+        resource.res.array.hArray = static_cast<cuda_array_buffer&>(storage).value;
+        cuda_context_guard guard(*context);
+        CUsurfObject handle{};
+        check(context->api->driver.get<decltype(&cuSurfObjectCreate)>("cuSurfObjectCreate")(&handle, &resource), "cuSurfObjectCreate");
+        result->handle = handle;
         return result;
     }
     std::vector<std::shared_ptr<buffer>> allocate_mipmapped_array(const CUDA_ARRAY3D_DESCRIPTOR& d, unsigned levels) override {

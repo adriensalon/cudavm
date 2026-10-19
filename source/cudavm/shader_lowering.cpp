@@ -7,6 +7,7 @@
 #include <set>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Analysis/CFG.h>
@@ -764,7 +765,101 @@ struct lowering {
         if(operation==10 || operation==11) return b.CreateInsertValue(b.CreateInsertValue(llvm::UndefValue::get(type(call.getType())),b.CreateTrunc(out,b.getInt32Ty()),0),b.CreateICmpNE(b.CreateLShr(out,b.getInt64(32)),b.getInt64(0)),1);
         return call.getType()->isIntegerTy(1)?b.CreateICmpNE(out,b.getInt32(0)):out;
     }
+    // Checked forms emitted by Clang's pinned texture/surface headers. Only
+    // the shader clone interprets the object's GPU descriptor; NVPTX keeps PTX.
+    bool image_operation(const llvm::CallInst& instruction, llvm::Value*& output) {
+        if (!instruction.isInlineAsm()) return false;
+        auto* assembly = llvm::cast<llvm::InlineAsm>(instruction.getCalledOperand());
+        if (assembly->isAlignStack() || assembly->getDialect() != llvm::InlineAsm::AD_ATT) return false;
+        std::string text; for (unsigned char c : assembly->getAsmString()) if (!std::isspace(c)) text += char(c);
+        bool texture = text == "tex.2d.v4.f32.f32{$0,$1,$2,$3},[$4,{$5,$6}];";
+        bool reading = false, writing = false, clamp = false, trap = false;
+        for (auto mode : {"zero", "clamp", "trap"}) {
+            if (text == std::string("suld.b.2d.b32.") + mode + "{$0},[$1,{$2,$3}];") reading = true;
+            if (text == std::string("sust.b.2d.b32.") + mode + "[$0,{$1,$2}],{$3};") writing = true;
+            if ((reading || writing) && text.find(std::string(".") + mode) != std::string::npos) {
+                clamp = std::string_view(mode) == "clamp"; trap = std::string_view(mode) == "trap"; break;
+            }
+        }
+        if (!texture && !reading && !writing) return false;
+        if (dxil) {
+            entry->addFnAttr("cudavm.image.operations");
+            read->addFnAttr(llvm::Attribute::AlwaysInline);
+            resolve->addFnAttr(llvm::Attribute::AlwaysInline);
+        }
+        if (instruction.arg_size() != (writing ? 4u : 3u) || !instruction.getArgOperand(0)->getType()->isIntegerTy(64))
+            fail(instruction, "invalid image instruction operands");
+        if (texture) {
+            auto* structure = llvm::dyn_cast<llvm::StructType>(instruction.getType());
+            if (!structure || structure->getNumElements() != 4 ||
+                !llvm::all_of(structure->elements(), [](auto* type) { return type->isFloatTy(); }) ||
+                !instruction.getArgOperand(1)->getType()->isFloatTy() || !instruction.getArgOperand(2)->getType()->isFloatTy() ||
+                assembly->getConstraintString() != "=f,=f,=f,=f,l,f,f") fail(instruction, "invalid texture instruction signature");
+        } else if (!instruction.getArgOperand(1)->getType()->isIntegerTy(32) || !instruction.getArgOperand(2)->getType()->isIntegerTy(32) ||
+            (writing ? (!instruction.getType()->isVoidTy() || !instruction.getArgOperand(3)->getType()->isIntegerTy(32) || assembly->getConstraintString() != "l,r,r,r")
+                     : (!instruction.getType()->isIntegerTy(32) || assembly->getConstraintString() != "=r,l,r,r")))
+            fail(instruction, "invalid surface instruction signature");
+        auto* object = value(instruction.getArgOperand(0));
+        auto* base = load(object, b.getInt64Ty());
+        auto* width = load(b.CreateAdd(object, b.getInt64(8)), b.getInt32Ty());
+        auto* height = load(b.CreateAdd(object, b.getInt64(12)), b.getInt32Ty());
+        llvm::Value *x = value(instruction.getArgOperand(1)), *y = value(instruction.getArgOperand(2));
+        llvm::Value* valid = b.getTrue();
+        if (texture) {
+            auto coordinate = [&](llvm::Value* bits, llvm::Value* extent) {
+                // Exact floor of a nonnegative binary32 coordinate, followed
+                // by integer clamping. Masked shifts avoid poison in inactive
+                // selects, and no rounded float extent or FP-to-int overflow
+                // can move a boundary sample to the wrong texel.
+                auto* exponent = b.CreateAnd(b.CreateLShr(bits, b.getInt32(23)), b.getInt32(255));
+                auto* mantissa = b.CreateOr(b.CreateAnd(bits, b.getInt32(0x7fffff)), b.getInt32(0x800000));
+                auto* left = b.CreateShl(mantissa, b.CreateAnd(b.CreateSub(exponent, b.getInt32(150)), b.getInt32(31)));
+                auto* right = b.CreateLShr(mantissa, b.CreateAnd(b.CreateSub(b.getInt32(150), exponent), b.getInt32(31)));
+                auto* integer = b.CreateSelect(b.CreateICmpUGE(exponent, b.getInt32(150)), left, right);
+                integer = b.CreateSelect(b.CreateICmpULT(exponent, b.getInt32(127)), b.getInt32(0), integer);
+                integer = b.CreateSelect(b.CreateICmpUGE(exponent, b.getInt32(158)), b.getInt32(UINT32_MAX), integer);
+                integer = b.CreateSelect(b.CreateICmpSLT(bits, b.getInt32(0)), b.getInt32(0), integer);
+                auto* maximum = b.CreateSub(extent, b.getInt32(1));
+                return b.CreateBinaryIntrinsic(llvm::Intrinsic::umin, integer, maximum);
+            };
+            x = coordinate(x, width); y = coordinate(y, height);
+            x = b.CreateMul(x, b.getInt32(4));
+        } else {
+            auto* row_bytes = b.CreateMul(width, b.getInt32(4));
+            valid = b.CreateAnd(b.CreateICmpULT(x, row_bytes), b.CreateICmpULT(y, height));
+            if (clamp) {
+                auto clamp_index = [&](llvm::Value* index, llvm::Value* maximum) {
+                    return b.CreateSelect(b.CreateICmpSLT(index, b.getInt32(0)), b.getInt32(0),
+                        b.CreateSelect(b.CreateICmpUGT(index, maximum), maximum, index));
+                };
+                x = clamp_index(x, b.CreateSub(row_bytes, b.getInt32(4)));
+                y = clamp_index(y, b.CreateSub(height, b.getInt32(1))); valid = b.getTrue();
+            }
+            if (trap) {
+                // Arena word 2 is a launch fault flag, independent of the
+                // atomic representation locks. Completion reports the fault.
+                auto scope = dxil ? llvm::SyncScope::System : b.getContext().getOrInsertSyncScopeID("device");
+                b.CreateAtomicRMW(llvm::AtomicRMWInst::Or, word_pointer(0, b.getInt32(2)), b.CreateZExt(b.CreateNot(valid), b.getInt32Ty()),
+                    llvm::Align(4), llvm::AtomicOrdering::Monotonic, scope);
+            }
+        }
+        auto* offset = b.CreateAdd(b.CreateMul(b.CreateMul(b.CreateZExt(y, b.getInt64Ty()), b.CreateZExt(width, b.getInt64Ty())), b.getInt64(4)), b.CreateZExt(x, b.getInt64Ty()));
+        // The invalid private tag routes zero-mode accesses to the memory
+        // helper's no-op/zero path, without touching a real allocation.
+        auto* address = b.CreateSelect(valid, b.CreateAdd(base, offset), b.getInt64(0xffffffff00000000ull));
+        if (writing) { store(address, value(instruction.getArgOperand(3))); output = nullptr; }
+        else {
+            output = load(address, b.getInt32Ty());
+            if (texture) {
+                llvm::Value* tuple = llvm::UndefValue::get(type(instruction.getType()));
+                for (unsigned i = 0; i < 4; ++i) tuple = b.CreateInsertValue(tuple, i == 0 ? output : b.getInt32(i == 3 ? 0x3f800000 : 0), i);
+                output = tuple;
+            }
+        }
+        return true;
+    }
     llvm::Value* call(const llvm::CallInst& instruction) {
+        llvm::Value* image = nullptr; if (image_operation(instruction, image)) return image;
         auto* function = instruction.getCalledFunction();
         if (!function) fail(instruction, "indirect calls or CUDA inline assembly require fallback");
         if(instruction.getType()->isHalfTy() || llvm::any_of(instruction.args(),[](const auto& argument){return argument->getType()->isHalfTy();}))
@@ -1203,6 +1298,15 @@ std::unique_ptr<llvm::Module> lower_native_shader(const llvm::Module& input, con
         if(llvm::Linker(*module).linkInModule(std::move(lowered))) throw std::runtime_error("native math helper linking failed: "+symbol);
     }
     trace("verify");
+    if (environment == shader_environment::dxil && module->getFunction("main")->hasFnAttribute("cudavm.image.operations")) {
+        llvm::LoopAnalysisManager loops; llvm::FunctionAnalysisManager functions;
+        llvm::CGSCCAnalysisManager calls; llvm::ModuleAnalysisManager modules; llvm::PassBuilder builder;
+        builder.registerLoopAnalyses(loops); builder.registerFunctionAnalyses(functions);
+        builder.registerCGSCCAnalyses(calls); builder.registerModuleAnalyses(modules);
+        builder.crossRegisterProxies(loops, functions, calls, modules);
+        llvm::AlwaysInlinerPass().run(*module, modules);
+        module->getFunction("main")->removeFnAttr("cudavm.image.operations");
+    }
     if(auto* directory=std::getenv("CUDAVM_DUMP_NATIVE_DIR")) {
         std::string text;llvm::raw_string_ostream output(text);module->print(output,nullptr);
         write_file(std::string(directory)+"/"+std::to_string(std::hash<std::string>{}(symbol))+"-"+std::to_string(unsigned(environment))+".ll",text);

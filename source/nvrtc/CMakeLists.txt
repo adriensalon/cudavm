@@ -35,8 +35,23 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/include/cudart/vector_types.h"
     "${PROJECT_SOURCE_DIR}/include/nvcc/crt/host_defines.h"
     "${CUDAVM_CLANG_RESOURCE_DIR}/include/__clang_cuda_builtin_vars.h")
-file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/nvrtc_headers.hpp" CONTENT
-    "// Embedded, unmodified NVIDIA and LLVM headers; license notices retained.\nnamespace cudavm {\ninline constexpr char nvrtc_vector_types[] = R\"cudavm(@nvrtc_vector_types@)cudavm\";\ninline constexpr char nvrtc_host_defines[] = R\"cudavm(@nvrtc_host_defines@)cudavm\";\ninline constexpr char nvrtc_builtin_variables[] = R\"cudavm(@nvrtc_builtin_variables@)cudavm\";\n}\n" @ONLY)
+set(nvrtc_headers_source "// Embedded, unmodified NVIDIA and LLVM headers; license notices retained.\n#include \"embedded_headers.hpp\"\nnamespace cudavm {\ninline constexpr char nvrtc_vector_types[] = R\"cudavm(${nvrtc_vector_types})cudavm\";\ninline constexpr char nvrtc_host_defines[] = R\"cudavm(${nvrtc_host_defines})cudavm\";\ninline constexpr char nvrtc_builtin_variables[] = R\"cudavm(${nvrtc_builtin_variables})cudavm\";\n")
+set(nvrtc_image_entries)
+foreach(header device_types.h driver_types.h builtin_types.h texture_types.h surface_types.h
+        texture_indirect_functions.h surface_indirect_functions.h cuda_runtime_api.h __clang_cuda_texture_intrinsics.h)
+    if(header STREQUAL "__clang_cuda_texture_intrinsics.h")
+        set(header_path "${CUDAVM_CLANG_RESOURCE_DIR}/include/${header}")
+    else()
+        set(header_path "${PROJECT_SOURCE_DIR}/include/cudart/${header}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${header_path}")
+    file(READ "${header_path}" header_contents)
+    string(MAKE_C_IDENTIFIER "${header}" header_id)
+    string(APPEND nvrtc_headers_source "inline constexpr char nvrtc_image_${header_id}[] = R\"cudavm(${header_contents})cudavm\";\n")
+    string(APPEND nvrtc_image_entries "{\"${header}\", nvrtc_image_${header_id}, sizeof(nvrtc_image_${header_id})-1},\n")
+endforeach()
+string(APPEND nvrtc_headers_source "inline constexpr embedded_file nvrtc_image_headers[] = {\n${nvrtc_image_entries}};\n}\n")
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/nvrtc_headers.hpp" CONTENT "${nvrtc_headers_source}" @ONLY)
 # The complete Clang builtin-header set is an in-memory resource, not an SDK
 # directory. User and pinned NVIDIA headers keep their ordinary include paths.
 file(GLOB_RECURSE builtin_headers CONFIGURE_DEPENDS RELATIVE "${CUDAVM_CLANG_RESOURCE_DIR}/include"
@@ -62,6 +77,7 @@ file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/embedded_headers.cpp" CONTENT
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/embedded_headers.cpp"
         PROPERTIES COMPILE_OPTIONS -Wno-overlength-strings)
+    set_source_files_properties(nvrtc_frontend.cpp PROPERTIES COMPILE_OPTIONS -Wno-overlength-strings)
 endif()
 install(FILES "${CUDAVM_LLVM_LICENSE}"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME LLVM-LICENSE.txt)

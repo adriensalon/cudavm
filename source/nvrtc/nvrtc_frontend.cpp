@@ -38,6 +38,7 @@ constexpr auto preamble = R"cudavm(
 #define __CUDACC_VER_MAJOR__ 13
 #define __CUDACC_VER_MINOR__ 4
 #define __CUDACC_VER_BUILD__ 1
+#define CUDA_VERSION 13040
 #define __FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__ 1
 #if __has_include(<nv/target>)
 #include <nv/target>
@@ -45,6 +46,10 @@ constexpr auto preamble = R"cudavm(
 #include <vector_types.h>
 #include <__clang_cuda_builtin_vars.h>
 typedef __SIZE_TYPE__ size_t;
+#include <cuda_runtime_api.h>
+#include <__clang_cuda_texture_intrinsics.h>
+#include <texture_indirect_functions.h>
+#include <surface_indirect_functions.h>
 __device__ inline float2 make_float2(float x,float y) { return float2{x,y}; }
 // NVRTC supplies this utility to the CUDA numeric headers without a host C++
 // standard library. The lvalue overload also coexists with a caller's utility.
@@ -273,6 +278,7 @@ nvrtc_output compile_nvrtc_source(const std::string& source, const std::string& 
     add(root + "/builtins/vector_types.h", nvrtc_vector_types);
     add(root + "/builtins/crt/host_defines.h", nvrtc_host_defines);
     add(root + "/builtins/__clang_cuda_builtin_vars.h", nvrtc_builtin_variables);
+    for (const auto& header : nvrtc_image_headers) add(root + "/builtins/" + header.path, {header.contents, header.size});
     std::string rtc_preamble = preamble;
     for(auto operation:device_simd_operations) {
         std::string name=operation.name,arguments="unsigned int x";

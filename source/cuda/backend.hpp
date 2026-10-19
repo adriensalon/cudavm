@@ -291,7 +291,11 @@ struct launch_shape {
     unsigned grid[3], block[3], shared_bytes;
     launch_options options{};
 };
-struct allocation_binding { uint64_t address; buffer* native; };
+struct allocation_binding { uint64_t address; buffer* native; bool surface_descriptor = false; };
+struct image_object {
+    uint64_t handle = 0;
+    virtual ~image_object() = default;
+};
 struct kernel_parameter { size_t offset, size; };
 struct compute_pipeline {
     unsigned direct_buffers = 0;
@@ -419,6 +423,12 @@ struct session {
     // Buffer storage implements allocation and byte transfers on shader
     // adapters. It does not imply native image sampling support.
     virtual std::shared_ptr<buffer> allocate_array(const CUDA_ARRAY3D_DESCRIPTOR& d) { return allocate(array_storage_bytes(d)); }
+    virtual std::shared_ptr<image_object> create_texture(buffer&, const CUDA_TEXTURE_DESC&, const CUDA_RESOURCE_VIEW_DESC*) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "native texture objects are unavailable");
+    }
+    virtual std::shared_ptr<image_object> create_surface(buffer&) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "native surface objects are unavailable");
+    }
     virtual std::vector<std::shared_ptr<buffer>> allocate_mipmapped_array(const CUDA_ARRAY3D_DESCRIPTOR& d, unsigned levels) {
         std::vector<std::shared_ptr<buffer>> result;
         for (unsigned i = 0; i < levels; ++i) result.push_back(allocate_array(array_level_descriptor(d, i)));

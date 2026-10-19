@@ -297,6 +297,7 @@ CUdeviceptr symbol_region(symbol_storage storage, size_t bytes, size_t offset) {
 }
 #include "nvidia_registration_state.inl"
 #include "arrays.inl"
+#include "image_objects.inl"
 #include "memory.inl"
 #include "launch_state.inl"
 #include "device_state.inl"
@@ -311,6 +312,7 @@ using namespace cudavm;
 #include "interop.inl"
 #include "memory_exports.inl"
 #include "array_exports.inl"
+#include "image_object_exports.inl"
 #include "host_memory_exports.inl"
 #include "stream_exports.inl"
 #include "async_memory_exports.inl"

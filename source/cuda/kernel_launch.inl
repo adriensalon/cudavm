@@ -7,6 +7,7 @@ struct captured_launch {
     std::vector<std::shared_ptr<buffer>> resources;
     std::vector<allocation_binding> bindings;
     std::vector<std::shared_ptr<host_entry>> hosts;
+    std::vector<std::shared_ptr<image_object_entry>> images;
     void execute() {
         std::lock_guard lock(owner->execution);
         size_t bytes = arguments.size();
@@ -87,6 +88,15 @@ std::shared_ptr<captured_launch> prepare_launch(CUfunction handle, const launch_
         command->resources.push_back(allocation.native);
         command->bindings.push_back({address, allocation.native.get()});
         if (host) command->hosts.push_back(std::move(host));
+    }
+    for (auto* objects : {&global().textures, &global().surfaces}) for (auto& [handle, image] : *objects) {
+        if (image->owner != owner || image->retiring || image->array->retiring) continue;
+        command->images.push_back(image);
+        if (!image->descriptor) continue;
+        command->bindings.push_back({handle, image->descriptor.get(), objects == &global().surfaces});
+        auto address = image->array->image_address;
+        if (std::none_of(command->bindings.begin(), command->bindings.end(), [&](auto binding) { return binding.address == address; }))
+            command->bindings.push_back({address, image->array->native.get()});
     }
     context_configuration(owner, [&] { command->function->validate_launch(shape, command->arguments, command->bindings); });
     command->parameters = std::move(layout);

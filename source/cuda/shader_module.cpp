@@ -207,6 +207,7 @@ struct shader_kernel : kernel {
             }
         }
         auto pipeline=prepare(shape);
+        bool check_image_fault = std::any_of(bindings.begin(), bindings.end(), [](auto binding) { return binding.surface_descriptor; });
         if(!arena || arena->size<arena_size) arena=owner.allocate(arena_size);
         if(!args || args->size<packet.size()) args=owner.allocate(packet.size());
         // Native shaders use the arena ABI. Submit its gathers, dispatch and
@@ -221,7 +222,12 @@ struct shader_kernel : kernel {
             auto tasks=std::make_shared<device_group>();
             // Retain host packet storage (OpenCL borrows it), pipelines and
             // every transfer fence until writeback completes, including errors.
-            auto completion=std::make_shared<device_continuation>(tasks,[pipeline,payload,zero] {});
+            auto completion=std::make_shared<device_continuation>(tasks,[this,pipeline,payload,zero,check_image_fault] {
+                if (check_image_fault) {
+                    uint32_t fault = 0; owner.read(*arena, 8, std::as_writable_bytes(std::span(&fault, 1)));
+                    require(!fault, CUDA_ERROR_ILLEGAL_ADDRESS, "surface access is outside the array bounds");
+                }
+            });
             tasks->tasks.push_back(owner.enqueue_write(*arena,0,*zero,queue));
             for(size_t i=0;i<mappings.size();++i) {auto m=mappings[i];tasks->tasks.push_back(owner.enqueue_copy(*arena,m.offset,*m.binding.native,0,m.binding.native->size,queue));}
             tasks->tasks.push_back(owner.enqueue_write(*args,0,*payload,queue));
@@ -235,9 +241,13 @@ struct shader_kernel : kernel {
         owner.write(*args,0,packet);
         // Context transport ordering prevents another command from changing
         // the shared heap before its complete writeback has been published.
-        auto continuation = std::make_shared<device_continuation>(device_work{}, [this, mappings = std::move(mappings), pipeline] {
+        auto continuation = std::make_shared<device_continuation>(device_work{}, [this, mappings = std::move(mappings), pipeline,check_image_fault] {
             (void)pipeline; // Keep evicted pipeline variants alive through GPU completion.
             for(auto m:mappings) owner.copy(*m.binding.native,0,*arena,m.offset,m.binding.native->size);
+            if (check_image_fault) {
+                uint32_t fault = 0; owner.read(*arena, 8, std::as_writable_bytes(std::span(&fault, 1)));
+                require(!fault, CUDA_ERROR_ILLEGAL_ADDRESS, "surface access is outside the array bounds");
+            }
         });
         continuation->task = owner.enqueue_dispatch_bound(*pipeline,shape,*arena,*args,{},queue);
         return continuation;

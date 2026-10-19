@@ -108,6 +108,17 @@ struct array_entry {
     CUDA_ARRAY3D_DESCRIPTOR descriptor{};
     CUmipmappedArray parent = nullptr;
     bool retiring = false;
+    CUdeviceptr image_address = 0;
+};
+struct image_object_entry {
+    std::shared_ptr<context> owner;
+    std::shared_ptr<array_entry> array;
+    std::shared_ptr<image_object> native;
+    std::shared_ptr<buffer> descriptor;
+    CUDA_RESOURCE_DESC resource{};
+    CUDA_TEXTURE_DESC texture{};
+    std::optional<CUDA_RESOURCE_VIEW_DESC> view;
+    bool retiring = false;
 };
 struct mipmapped_array_entry { std::shared_ptr<context> owner; std::vector<CUarray> levels; bool retiring = false; };
 struct semaphore_entry { std::shared_ptr<context> owner; std::shared_ptr<external_semaphore> native; CUexternalSemaphoreHandleType type; };
@@ -164,6 +175,7 @@ struct state {
     std::map<CUdeviceptr, allocation> allocations;
     std::unordered_map<CUarray, std::shared_ptr<array_entry>> arrays;
     std::unordered_map<CUmipmappedArray, mipmapped_array_entry> mipmapped_arrays;
+    std::unordered_map<uint64_t, std::shared_ptr<image_object_entry>> textures, surfaces;
     std::uintptr_t next_array = 0xd000000, next_mipmapped_array = 0xe000000;
     // Extracted registry nodes keep earlier allocation generations until their
     // frees retire. A failed dependency can restore a node without allocation.
@@ -207,7 +219,7 @@ struct state {
     uint64_t next_graph_id = 1;
     std::uintptr_t next_user_object = 0x9000000;
     // Buffers must be destroyed before native sessions and the backend loader.
-    ~state() { graph_execs.clear(); graph_nodes.clear(); graphs.clear(); graph_live.clear(); graph_cache.clear(); user_objects.clear(); functions.clear(); modules.clear(); arrays.clear(); mipmapped_arrays.clear(); allocations.clear(); hosts.clear(); graphics.clear(); memories.clear(); semaphores.clear(); primaries.clear(); contexts.clear(); }
+    ~state() { graph_execs.clear(); graph_nodes.clear(); graphs.clear(); graph_live.clear(); graph_cache.clear(); user_objects.clear(); functions.clear(); modules.clear(); textures.clear(); surfaces.clear(); arrays.clear(); mipmapped_arrays.clear(); allocations.clear(); hosts.clear(); graphics.clear(); memories.clear(); semaphores.clear(); primaries.clear(); contexts.clear(); }
 };
 void synchronize_context(const std::shared_ptr<context>&);
 void capture_unsafe(const std::shared_ptr<context>&);
@@ -410,6 +422,8 @@ void destroy(const std::shared_ptr<context>& owner, bool pop_current = true) {
     std::erase_if(global().graph_execs, [&](auto& item) { return item.second.owner.lock() == owner; });
     std::erase_if(global().functions, [&](auto& item) { return item.second.owner == owner; });
     std::erase_if(global().modules, [&](auto& item) { return item.second.owner == owner; });
+    std::erase_if(global().textures, [&](auto& item) { return item.second->owner == owner; });
+    std::erase_if(global().surfaces, [&](auto& item) { return item.second->owner == owner; });
     std::erase_if(global().arrays, [&](auto& item) { return item.second->owner == owner; });
     std::erase_if(global().mipmapped_arrays, [&](auto& item) { return item.second.owner == owner; });
     std::erase_if(global().graph_live, [&](auto& item) { return item.second->owner.lock() == owner; });
@@ -479,17 +493,19 @@ function_entry& function_resources(CUfunction handle) {
 }
 void launch(CUfunction function, const launch_shape& shape, CUstream stream, void** parameters, void** extra,
             const std::shared_ptr<context>& owner);
+CUdeviceptr reserve_device_address(size_t bytes) {
+    constexpr CUdeviceptr alignment = 256;
+    require(bytes <= std::numeric_limits<CUdeviceptr>::max() - global().next_address - alignment,
+            CUDA_ERROR_OUT_OF_MEMORY, "device address space exhausted");
+    auto address = global().next_address;
+    global().next_address += (static_cast<CUdeviceptr>(bytes) + alignment - 1) & ~(alignment - 1);
+    return address;
+}
 CUdeviceptr add_shared_allocation(const std::shared_ptr<context>& owner, std::shared_ptr<buffer> storage,
                            CUgraphicsResource graphics = nullptr, CUexternalMemory external = nullptr, CUmodule module = nullptr) {
     auto bytes = storage->size;
     CUdeviceptr address = storage->native_address();
-    if (!address) {
-        constexpr CUdeviceptr alignment = 256;
-        require(bytes <= std::numeric_limits<CUdeviceptr>::max() - global().next_address - alignment,
-                CUDA_ERROR_OUT_OF_MEMORY, "device address space exhausted");
-        address = global().next_address;
-        global().next_address += (static_cast<CUdeviceptr>(bytes) + alignment - 1) & ~(alignment - 1);
-    }
+    if (!address) address = reserve_device_address(bytes);
     require(!global().allocations.contains(address), CUDA_ERROR_UNKNOWN, "native device address collision");
     std::erase_if(global().device_buffers, [](auto& entry) { return entry.native.expired(); });
     global().device_buffers.push_back({owner->device, storage});
@@ -692,6 +708,7 @@ std::function<void()> graph_prepare_semaphores(const graph_node&);
 bool capture_graph_launch(const std::shared_ptr<context>&, CUstream, const graph_exec&);
 #include "streams.inl"
 #include "arrays.inl"
+#include "image_objects.inl"
 #include "memory.inl"
 #include "async_memory.inl"
 #include "launch_state.inl"
@@ -738,6 +755,7 @@ using namespace cudavm;
 #include "device_exports.inl"
 #include "memory_exports.inl"
 #include "array_exports.inl"
+#include "image_object_exports.inl"
 #include "host_memory_exports.inl"
 #include "stream_exports.inl"
 #include "memory_operation_exports.inl"
@@ -878,7 +896,7 @@ extern "C" CUDAVM_API int cudavmShutdown() {
         value.streams.clear(); value.events.clear(); value.reset_events.clear();
         value.graph_execs.clear(); value.graph_nodes.clear(); value.graphs.clear();
         value.functions.clear(); value.modules.clear(); value.library_kernels.clear(); value.libraries.clear();
-        value.graph_live.clear(); value.arrays.clear(); value.mipmapped_arrays.clear(); value.allocations.clear(); value.pool_retiring.clear(); value.hosts.clear(); value.graphics.clear(); value.memories.clear(); value.semaphores.clear();
+        value.graph_live.clear(); value.textures.clear(); value.surfaces.clear(); value.arrays.clear(); value.mipmapped_arrays.clear(); value.allocations.clear(); value.pool_retiring.clear(); value.hosts.clear(); value.graphics.clear(); value.memories.clear(); value.semaphores.clear();
         value.primaries.clear(); value.primary_records.clear(); value.primary_flags.clear(); value.contexts.clear();
         value.graph_cache.clear(); value.graph_pools.clear();
         value.memory_pools.clear(); value.default_pools.clear(); value.current_pools.clear();
