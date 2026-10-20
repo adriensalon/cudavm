@@ -251,7 +251,9 @@ CUlibrary library_load(const void* image, const char* path, CUjit_option* option
             require(reinterpret_cast<uintptr_t>(values[i]) <= 4, CUDA_ERROR_INVALID_VALUE, "invalid optimization level");
             entry->options.push_back(options[i]); entry->values.push_back(values[i]);
         }
-        require(has_module_descriptor(entry->image), CUDA_ERROR_NOT_SUPPORTED, "shader libraries require a cudavm native module descriptor");
+        if (!has_module_descriptor(entry->image) && entry->image.find(".version") != std::string::npos)
+            entry->image = compile_shader_ptx(entry->image, global().kind);
+        require(has_module_descriptor(entry->image), CUDA_ERROR_NOT_SUPPORTED, "shader library format is unsupported");
         try { entry->descriptors = decode_module_descriptor(entry->image).entries; }
         catch (const std::exception& e) { throw failure(CUDA_ERROR_INVALID_IMAGE, e.what()); }
     }

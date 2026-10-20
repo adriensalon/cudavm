@@ -4,6 +4,7 @@
 #include "command_queue.hpp"
 #include "command_domain.hpp"
 #include "../cudavm/module_descriptor.hpp"
+#include "shader_ptx.hpp"
 #include "ptx_parameters.hpp"
 #include "nvidia_image.hpp"
 #include <array>

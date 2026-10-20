@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include "shader_ptx.hpp"
 #include "../cudavm/module_descriptor.hpp"
 #include "../cudavm/shader_packet.hpp"
 #include "../cudavm/spirv_artifact.hpp"
@@ -315,8 +316,10 @@ std::shared_ptr<executable> session::load_image(const void* image,unsigned count
         require(reinterpret_cast<uintptr_t>(values[i])<=4,CUDA_ERROR_INVALID_VALUE,"invalid JIT optimization hint");
     }
     auto text=std::string_view(static_cast<const char*>(image));
-    if (!cudavm::has_module_descriptor(text) && text.find(".version") != text.npos)
-        throw failure(CUDA_ERROR_NOT_SUPPORTED, "native module descriptor unavailable; recompile source with cudavm AOT or NVRTC");
+    std::string compiled;
+    if (!cudavm::has_module_descriptor(text) && text.find(".version") != text.npos) {
+        compiled = compile_shader_ptx(text, kind()); text = compiled;
+    }
     try {
         auto result = std::make_shared<shader_executable>(*this,cudavm::decode_module_descriptor(text));
         for (auto& entry : cudavm::decode_spirv_artifacts(text)) {
