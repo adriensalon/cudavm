@@ -11,6 +11,7 @@
 #include "../cudavm/device_math_source.hpp"
 #include "nvrtc_headers.hpp"
 #include <filesystem>
+#include <mutex>
 #include <clang/AST/Attr.h>
 #include <clang/AST/Mangle.h>
 #include <clang/AST/RecursiveASTVisitor.h>
@@ -267,6 +268,10 @@ struct nvrtc_action : clang::EmitLLVMOnlyAction {
 nvrtc_output compile_nvrtc_source(const std::string& source, const std::string& name,
     const std::vector<std::pair<std::string, std::string>>& headers,
     const std::vector<std::string>& expressions, const nvrtc_options& settings, std::string& log) {
+    // The current in-process LLVM pipeline has shared target state. Keep
+    // concurrent public programs isolated while their compiler requests run.
+    static std::mutex compilation_mutex;
+    std::lock_guard compilation_lock(compilation_mutex);
     // Each request has its own virtual files, diagnostics, frontend and IR context.
     // Neither source nor virtual headers are materialized on disk.
     auto root = (std::filesystem::current_path() / "__cudavm_nvrtc_virtual__").generic_string();

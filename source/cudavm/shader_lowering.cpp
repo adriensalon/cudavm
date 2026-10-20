@@ -765,6 +765,7 @@ struct lowering {
         if(operation==10 || operation==11) return b.CreateInsertValue(b.CreateInsertValue(llvm::UndefValue::get(type(call.getType())),b.CreateTrunc(out,b.getInt32Ty()),0),b.CreateICmpNE(b.CreateLShr(out,b.getInt64(32)),b.getInt64(0)),1);
         return call.getType()->isIntegerTy(1)?b.CreateICmpNE(out,b.getInt32(0)):out;
     }
+    #include "shader_texture_filter.inl"
     // Checked forms emitted by Clang's pinned texture/surface headers. Only
     // the shader clone interprets the object's GPU descriptor; NVPTX keeps PTX.
     bool image_operation(const llvm::CallInst& instruction, llvm::Value*& output) {
@@ -782,8 +783,8 @@ struct lowering {
             }
         }
         if (!texture && !reading && !writing) return false;
+        entry->addFnAttr("cudavm.image.operations");
         if (dxil) {
-            entry->addFnAttr("cudavm.image.operations");
             read->addFnAttr(llvm::Attribute::AlwaysInline);
             resolve->addFnAttr(llvm::Attribute::AlwaysInline);
         }
@@ -796,8 +797,9 @@ struct lowering {
                 !instruction.getArgOperand(1)->getType()->isFloatTy() || !instruction.getArgOperand(2)->getType()->isFloatTy() ||
                 assembly->getConstraintString() != "=f,=f,=f,=f,l,f,f") fail(instruction, "invalid texture instruction signature");
         } else if (!instruction.getArgOperand(1)->getType()->isIntegerTy(32) || !instruction.getArgOperand(2)->getType()->isIntegerTy(32) ||
-            (writing ? (!instruction.getType()->isVoidTy() || !instruction.getArgOperand(3)->getType()->isIntegerTy(32) || assembly->getConstraintString() != "l,r,r,r")
-                     : (!instruction.getType()->isIntegerTy(32) || assembly->getConstraintString() != "=r,l,r,r")))
+            (writing ? (!instruction.getType()->isVoidTy() ||
+                        !(instruction.getArgOperand(3)->getType()->isIntegerTy(32) || instruction.getArgOperand(3)->getType()->isFloatTy()) || assembly->getConstraintString() != "l,r,r,r")
+                     : (!(instruction.getType()->isIntegerTy(32) || instruction.getType()->isFloatTy()) || assembly->getConstraintString() != "=r,l,r,r")))
             fail(instruction, "invalid surface instruction signature");
         auto* object = value(instruction.getArgOperand(0));
         auto* base = load(object, b.getInt64Ty());
@@ -806,7 +808,8 @@ struct lowering {
         llvm::Value *x = value(instruction.getArgOperand(1)), *y = value(instruction.getArgOperand(2));
         llvm::Value* valid = b.getTrue();
         if (texture) {
-            auto coordinate = [&](llvm::Value* bits, llvm::Value* extent) {
+            auto* normalized = b.CreateICmpNE(b.CreateAnd(load(b.CreateAdd(object, b.getInt64(20)), b.getInt32Ty()), b.getInt32(1)), b.getInt32(0));
+            auto coordinate = [&](llvm::Value* bits, llvm::Value* extent, unsigned axis) {
                 // Exact floor of a nonnegative binary32 coordinate, followed
                 // by integer clamping. Masked shifts avoid poison in inactive
                 // selects, and no rounded float extent or FP-to-int overflow
@@ -820,9 +823,50 @@ struct lowering {
                 integer = b.CreateSelect(b.CreateICmpUGE(exponent, b.getInt32(158)), b.getInt32(UINT32_MAX), integer);
                 integer = b.CreateSelect(b.CreateICmpSLT(bits, b.getInt32(0)), b.getInt32(0), integer);
                 auto* maximum = b.CreateSub(extent, b.getInt32(1));
-                return b.CreateBinaryIntrinsic(llvm::Intrinsic::umin, integer, maximum);
+                auto* clamped = b.CreateBinaryIntrinsic(llvm::Intrinsic::umin, integer, maximum);
+
+                // Reduce normalized coordinates before scaling so even the
+                // largest finite binary32 values cannot overflow. Integer
+                // significand products preserve texel boundaries and tiny
+                // negative coordinates without shader FP contraction/FTZ.
+                // Native texture coordinates flush subnormals to signed zero.
+                auto* shift = b.CreateSub(b.getInt32(150), exponent);
+                auto* fraction_mask = b.CreateSub(b.CreateShl(b.getInt32(1), b.CreateAnd(shift, b.getInt32(31))), b.getInt32(1));
+                auto* fraction = b.CreateSelect(b.CreateICmpULT(exponent, b.getInt32(127)), mantissa, b.CreateAnd(mantissa, fraction_mask));
+                fraction = b.CreateSelect(b.CreateOr(b.CreateICmpEQ(exponent, b.getInt32(0)), b.CreateICmpUGE(exponent, b.getInt32(150))), b.getInt32(0), fraction);
+                auto* product = b.CreateMul(b.CreateZExt(fraction, b.getInt64Ty()), b.CreateZExt(extent, b.getInt64Ty()));
+                auto* safe_shift = b.CreateZExt(b.CreateAnd(shift, b.getInt32(63)), b.getInt64Ty());
+                auto* whole = b.CreateSelect(b.CreateICmpULT(shift, b.getInt32(64)), b.CreateLShr(product, safe_shift), b.getInt64(0));
+                auto* remainder = b.CreateICmpNE(product, b.CreateShl(whole, safe_shift));
+                auto* fractional_index = b.CreateTrunc(whole, b.getInt32Ty());
+                auto* ceiling = b.CreateAdd(fractional_index, b.CreateZExt(remainder, b.getInt32Ty()));
+                auto* reflected_index = b.CreateSub(extent, ceiling);
+                auto* odd = b.CreateAnd(b.CreateICmpUGE(exponent, b.getInt32(127)), b.CreateICmpULE(exponent, b.getInt32(150)));
+                odd = b.CreateAnd(odd, b.CreateICmpNE(b.CreateAnd(b.CreateLShr(mantissa, b.CreateAnd(shift, b.getInt32(31))), b.getInt32(1)), b.getInt32(0)));
+                auto* negative = b.CreateAnd(b.CreateICmpSLT(bits, b.getInt32(0)), b.CreateICmpNE(exponent, b.getInt32(0)));
+                auto* mode = load(b.CreateAdd(object, b.getInt64(24 + axis * 4)), b.getInt32Ty());
+                auto* wrap = b.CreateICmpEQ(mode, b.getInt32(0));
+                auto* mirror = b.CreateICmpEQ(mode, b.getInt32(2));
+                auto* wrapped = b.CreateSelect(b.CreateAnd(negative, b.CreateICmpNE(fraction, b.getInt32(0))), reflected_index, fractional_index);
+                // Mirror the integer texel index after floor, rather than
+                // reflecting a floating coordinate. This preserves CUDA's
+                // orientation at exact negative/reversed texel boundaries.
+                auto* period = b.CreateMul(extent, b.getInt32(2));
+                auto* positive_index = b.CreateAdd(b.CreateSelect(odd, extent, b.getInt32(0)), fractional_index);
+                auto* negative_distance = b.CreateAdd(b.CreateSelect(odd, extent, b.getInt32(0)), ceiling);
+                auto* negative_index = b.CreateSelect(b.CreateICmpEQ(negative_distance, b.getInt32(0)), b.getInt32(0), b.CreateSub(period, negative_distance));
+                auto* mirror_index = b.CreateSelect(negative, negative_index, positive_index);
+                auto* mirrored = b.CreateSelect(b.CreateICmpULT(mirror_index, extent), mirror_index, b.CreateSub(b.CreateSub(period, b.getInt32(1)), mirror_index));
+                auto* repeated = b.CreateSelect(mirror, mirrored, wrapped);
+                auto* normalized_clamp = b.CreateSelect(b.CreateICmpUGE(exponent, b.getInt32(127)), maximum, fractional_index);
+                normalized_clamp = b.CreateSelect(negative, b.getInt32(0), normalized_clamp);
+                auto* normalized_index = b.CreateSelect(b.CreateOr(wrap, mirror), repeated, normalized_clamp);
+                auto* in_range = b.CreateAnd(b.CreateNot(negative), b.CreateSelect(normalized,
+                    b.CreateICmpULT(exponent, b.getInt32(127)), b.CreateAnd(b.CreateICmpULT(exponent, b.getInt32(158)), b.CreateICmpULT(integer, extent))));
+                valid = b.CreateAnd(valid, b.CreateOr(b.CreateICmpNE(mode, b.getInt32(3)), in_range));
+                return b.CreateSelect(normalized, normalized_index, clamped);
             };
-            x = coordinate(x, width); y = coordinate(y, height);
+            x = coordinate(x, width, 0); y = coordinate(y, height, 1);
             x = b.CreateMul(x, b.getInt32(4));
         } else {
             auto* row_bytes = b.CreateMul(width, b.getInt32(4));
@@ -851,9 +895,14 @@ struct lowering {
         else {
             output = load(address, b.getInt32Ty());
             if (texture) {
+                output = b.CreateSelect(valid, output, load(b.CreateAdd(object, b.getInt64(32)), b.getInt32Ty()));
                 llvm::Value* tuple = llvm::UndefValue::get(type(instruction.getType()));
-                for (unsigned i = 0; i < 4; ++i) tuple = b.CreateInsertValue(tuple, i == 0 ? output : b.getInt32(i == 3 ? 0x3f800000 : 0), i);
-                output = tuple;
+                for (unsigned i = 0; i < 4; ++i) {
+                    auto* component = i == 0 ? output : b.CreateSelect(valid, b.getInt32(i == 3 ? 0x3f800000 : 0),
+                        load(b.CreateAdd(object, b.getInt64(32 + 4 * i)), b.getInt32Ty()));
+                    tuple = b.CreateInsertValue(tuple, component, i);
+                }
+                output = filter_texture(object, value(instruction.getArgOperand(1)), value(instruction.getArgOperand(2)), tuple, instruction);
             }
         }
         return true;
@@ -1298,14 +1347,14 @@ std::unique_ptr<llvm::Module> lower_native_shader(const llvm::Module& input, con
         if(llvm::Linker(*module).linkInModule(std::move(lowered))) throw std::runtime_error("native math helper linking failed: "+symbol);
     }
     trace("verify");
-    if (environment == shader_environment::dxil && module->getFunction("main")->hasFnAttribute("cudavm.image.operations")) {
+    if (llvm::any_of(*module, [](const auto& function) { return function.hasFnAttribute("cudavm.image.operations"); })) {
         llvm::LoopAnalysisManager loops; llvm::FunctionAnalysisManager functions;
         llvm::CGSCCAnalysisManager calls; llvm::ModuleAnalysisManager modules; llvm::PassBuilder builder;
         builder.registerLoopAnalyses(loops); builder.registerFunctionAnalyses(functions);
         builder.registerCGSCCAnalyses(calls); builder.registerModuleAnalyses(modules);
         builder.crossRegisterProxies(loops, functions, calls, modules);
         llvm::AlwaysInlinerPass().run(*module, modules);
-        module->getFunction("main")->removeFnAttr("cudavm.image.operations");
+        for (auto& function : *module) function.removeFnAttr("cudavm.image.operations");
     }
     if(auto* directory=std::getenv("CUDAVM_DUMP_NATIVE_DIR")) {
         std::string text;llvm::raw_string_ostream output(text);module->print(output,nullptr);

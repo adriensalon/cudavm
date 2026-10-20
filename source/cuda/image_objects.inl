@@ -40,16 +40,26 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
         if (surface) require(d.Format == CU_AD_FORMAT_SIGNED_INT32 || d.Format == CU_AD_FORMAT_UNSIGNED_INT32 || d.Format == CU_AD_FORMAT_FLOAT,
                 CUDA_ERROR_NOT_SUPPORTED, "shader surfaces require 32-bit elements");
         else {
-            require(d.Format == CU_AD_FORMAT_FLOAT && texture->filterMode == CU_TR_FILTER_MODE_POINT &&
-                !(texture->flags & ~CU_TRSF_READ_AS_INTEGER), CUDA_ERROR_NOT_SUPPORTED, "shader textures require unnormalized point-sampled float elements");
-            // Wrap and mirror become clamp when coordinates are unnormalized.
-            require(texture->addressMode[0] != CU_TR_ADDRESS_MODE_BORDER && texture->addressMode[1] != CU_TR_ADDRESS_MODE_BORDER,
-                    CUDA_ERROR_NOT_SUPPORTED, "shader texture border addressing is unavailable");
+            require(d.Format == CU_AD_FORMAT_FLOAT &&
+                !(texture->flags & ~(CU_TRSF_READ_AS_INTEGER | CU_TRSF_NORMALIZED_COORDINATES)),
+                CUDA_ERROR_NOT_SUPPORTED, "shader textures require float elements");
             require(!view, CUDA_ERROR_NOT_SUPPORTED, "shader texture resource views are unavailable");
         }
         entry->native = std::make_shared<image_object>();
-        entry->native->handle = reserve_device_address(32);
-        std::array<uint32_t, 8> descriptor{uint32_t(array->image_address), uint32_t(array->image_address >> 32), uint32_t(d.Width), uint32_t(d.Height), surface ? 2u : 1u};
+        std::array<uint32_t, 12> descriptor{uint32_t(array->image_address), uint32_t(array->image_address >> 32), uint32_t(d.Width), uint32_t(d.Height), surface ? 2u : 1u};
+        if (texture) {
+            descriptor[5] = unsigned(bool(texture->flags & CU_TRSF_NORMALIZED_COORDINATES)) |
+                (texture->filterMode == CU_TR_FILTER_MODE_LINEAR ? 2u : 0u);
+            for (unsigned i = 0; i < 2; ++i) {
+                auto mode = texture->addressMode[i];
+                // CUDA treats unnormalized wrap and mirror as clamp. Retain
+                // the caller's original descriptor for public queries.
+                if (!(descriptor[5] & 1u) && (mode == CU_TR_ADDRESS_MODE_WRAP || mode == CU_TR_ADDRESS_MODE_MIRROR)) mode = CU_TR_ADDRESS_MODE_CLAMP;
+                descriptor[6 + i] = uint32_t(mode);
+            }
+            std::memcpy(descriptor.data() + 8, texture->borderColor, sizeof(texture->borderColor));
+        }
+        entry->native->handle = reserve_device_address(sizeof(descriptor));
         entry->descriptor = context_configuration(owner, [&] {
             auto storage = owner->native->allocate(sizeof(descriptor));
             owner->native->write(*storage, 0, std::as_bytes(std::span(descriptor))); return storage;
