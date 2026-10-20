@@ -6,11 +6,11 @@ std::string compile_shader_ptx(std::string_view input, cudavmBackend backend) {
     // Retry discovery after an unavailable service; a failed first load must
     // not prevent a later application from deploying the optional compiler.
 #if defined(_WIN32)
-    static dynamic_library compiler({"cudavm_ptx_jit.dll"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
+    static dynamic_library compiler({"cudavm_ptxjit.dll"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
 #elif defined(__APPLE__)
-    static dynamic_library compiler({"cudavm_ptx_jit.dylib"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
+    static dynamic_library compiler({"cudavm_ptxjit.dylib"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
 #else
-    static dynamic_library compiler({"cudavm_ptx_jit.so"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
+    static dynamic_library compiler({"cudavm_ptxjit.so"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
 #endif
     auto compile = compiler.get<ptx_jit_compile>("cudavmCompilePtxV1");
     std::array<char, 8192> diagnostic{};

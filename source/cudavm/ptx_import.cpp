@@ -1,6 +1,7 @@
 #include "ptx_import.hpp"
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <map>
 #include <set>
 #include <vector>
@@ -12,6 +13,7 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
+#include <llvm/Transforms/Scalar/SROA.h>
 
 namespace cudavm {
 namespace {
@@ -41,7 +43,7 @@ std::vector<ptx_token> ptx_tokens(std::string_view input) {
             }
             if (at == input.size() || input[at] != '"') ptx_fail(token, "unsupported or unterminated string literal", true);
             token.text += input[at]; advance();
-        } else if (std::string_view("{}()[]<>,;:@!+-|").find(input[at]) != std::string_view::npos) {
+        } else if (std::string_view("{}()[]<>,;:@!+-|=").find(input[at]) != std::string_view::npos) {
             token.text += input[at]; advance();
         } else {
             while (at < input.size()) {
@@ -95,81 +97,215 @@ struct ptx_instruction {
     std::vector<std::vector<ptx_token>> operands;
 };
 struct ptx_register { ptx_type type; llvm::AllocaInst* slot; };
-struct ptx_parameter { ptx_token name; ptx_type type; };
+struct ptx_parameter {
+    ptx_token name;
+    ptx_type type;
+    uint64_t count = 1;
+    unsigned alignment = 1;
+    bool array = false;
+    uint64_t bytes() const { return count * (type.bits / 8); }
+    llvm::Type* storage(llvm::LLVMContext& context) const {
+        return array ? llvm::ArrayType::get(type.storage(context), count) : static_cast<llvm::Type*>(type.storage(context));
+    }
+};
+struct ptx_body {
+    ptx_token name;
+    llvm::Function* function;
+    std::vector<ptx_parameter> parameters, results;
+    std::map<std::string, ptx_register> registers;
+    std::map<std::string, std::pair<ptx_parameter, llvm::Value*>> slots;
+    std::vector<ptx_instruction> instructions;
+};
+struct ptx_global {
+    ptx_parameter declaration;
+    llvm::GlobalVariable* variable;
+    std::vector<std::vector<ptx_token>> initializer;
+};
 
 class ptx_parser {
     std::vector<ptx_token> tokens;
     size_t cursor = 0;
     llvm::LLVMContext& context;
     std::unique_ptr<llvm::Module> module;
+    std::vector<ptx_body> bodies;
+    std::map<std::string, std::pair<std::vector<ptx_parameter>, std::vector<ptx_parameter>>> signatures;
+    std::vector<ptx_global> globals;
+    std::map<std::string, ptx_token> symbols;
+    unsigned symbol_counter = 0;
     const ptx_token& peek() const { return tokens.at(cursor); }
     ptx_token take() { auto token = peek(); if (cursor + 1 < tokens.size()) ++cursor; return token; }
     bool accept(const char* text) { if (peek().text != text) return false; take(); return true; }
     ptx_token expect(const char* text) { auto token = take(); if (token.text != text) ptx_fail(token, std::string("expected '") + text + "'"); return token; }
     ptx_token identifier() { auto token = take(); if (!ptx_identifier(token.text)) ptx_fail(token, "expected identifier"); return token; }
 
-    void kernel() {
+
+    unsigned alignment() {
+        auto token = take(); auto value = ptx_unsigned(token);
+        if (!value || value > 256 || (value & (value - 1))) ptx_fail(token, "invalid storage alignment");
+        return unsigned(value);
+    }
+    ptx_parameter declaration(bool unsized = false) {
+        unsigned align = accept(".align") ? alignment() : 0;
+        auto type = ptx_scalar(take(), true);
+        if (peek().text == ".ptr") ptx_fail(peek(), "pointer parameter annotations are unsupported", true);
         auto name = identifier();
-        if (module->getNamedValue(name.text)) ptx_fail(name, "duplicate kernel");
-        if (module->size() >= 4096) ptx_fail(name, "kernel resource limit exceeded", true);
-        expect("("); std::vector<ptx_parameter> parameters; std::set<std::string> parameter_names;
-        uint64_t parameter_bytes = 0;
+        ptx_parameter result{name, type, 1, align ? align : type.bits / 8, false};
+        if (accept("[")) {
+            result.array = true;
+            result.count = peek().text == "]" ? 0 : ptx_unsigned(take());
+            expect("]");
+            if ((!result.count && !unsized) || result.count > (1u << 24)) ptx_fail(name, "invalid or excessive storage extent");
+            if (peek().text == "[") ptx_fail(peek(), "multidimensional declarations are unsupported", true);
+        }
+        if (result.alignment < type.bits / 8) ptx_fail(name, "storage alignment is smaller than element size");
+        return result;
+    }
+    std::vector<ptx_parameter> parameter_list() {
+        expect("("); std::vector<ptx_parameter> result; std::set<std::string> names;
+        uint64_t extent = 0;
         if (!accept(")")) for (;;) {
-            expect(".param"); unsigned alignment = 0;
-            if (accept(".align")) {
-                auto token = take(); auto value = ptx_unsigned(token);
-                if (!value || value > 256 || (value & (value - 1))) ptx_fail(token, "invalid parameter alignment");
-                alignment = unsigned(value);
-            }
-            auto type_token = take(); auto type = ptx_scalar(type_token, true);
-            if (alignment && alignment != type.bits / 8) ptx_fail(type_token, "non-natural scalar parameter alignment is unsupported", true);
-            if (peek().text == ".ptr") ptx_fail(peek(), "pointer parameter annotations are unsupported", true);
-            auto parameter = identifier();
-            if (peek().text == "[") ptx_fail(peek(), "aggregate kernel parameters are unsupported", true);
-            if (!parameter_names.insert(parameter.text).second) ptx_fail(parameter, "duplicate parameter");
-            parameters.push_back({parameter, type});
-            parameter_bytes = (parameter_bytes + type.bits / 8 - 1) & ~uint64_t(type.bits / 8 - 1);
-            parameter_bytes += type.bits / 8;
-            if (parameter_bytes > 65536) ptx_fail(parameter, "kernel parameters exceed 64 KiB", true);
+            expect(".param"); auto parameter = declaration();
+            if (!names.insert(parameter.name.text).second) ptx_fail(parameter.name, "duplicate parameter");
+            extent = llvm::alignTo(extent, parameter.alignment) + parameter.bytes();
+            if (extent > 65536) ptx_fail(parameter.name, "function parameters exceed 64 KiB", true);
+            result.push_back(parameter);
             if (accept(")")) break;
             expect(",");
         }
-        // Execution constraints must be implemented, never discarded as hints.
-        if (peek().text != "{") ptx_fail(peek(), "unsupported kernel directive or declaration", true);
-        expect("{");
-        std::vector<llvm::Type*> signature;
-        for (const auto& parameter : parameters) signature.push_back(parameter.type.storage(context));
-        auto* function = llvm::Function::Create(llvm::FunctionType::get(llvm::Type::getVoidTy(context), signature, false),
-            llvm::GlobalValue::ExternalLinkage, name.text, *module);
-        function->addFnAttr("cudavm.kernel");
-        llvm::SmallVector<llvm::Metadata*> layout;
-        uint64_t offset = 0;
+        return result;
+    }
+    void storage(bool external, const std::string& space, ptx_body* body = nullptr,
+            std::map<std::string, std::string>* scope = nullptr) {
+        auto data = declaration(external && space == ".shared");
+        auto original = data.name.text;
+        if (scope) {
+            if (scope->contains(original)) ptx_fail(data.name, "duplicate storage declaration");
+            data.name.text = body->name.text + "$storage$" + std::to_string(symbol_counter++);
+            (*scope)[original] = data.name.text;
+        }
+        unsigned address_space = space == ".shared" ? 3 : space == ".const" ? 4 : 1;
+        if (external && space == ".shared" && data.count) ptx_fail(data.name, "extern shared storage must be unsized", true);
+        if (!external && !data.count) ptx_fail(data.name, "defined storage must have an extent");
+        auto* old = module->getNamedValue(data.name.text);
+        symbols[data.name.text] = data.name;
+        auto* variable = llvm::dyn_cast_or_null<llvm::GlobalVariable>(old);
+        if (old && (!variable || variable->getAddressSpace() != address_space || variable->getValueType() != data.storage(context)))
+            ptx_fail(data.name, "conflicting storage declaration");
+        if (variable && !external && variable->hasInitializer()) ptx_fail(data.name, "duplicate storage definition");
+        // CUDA constant storage is read-only to kernels, but host symbol copies
+        // may update it between launches. LLVM must not fold its initial value.
+        if (!variable) variable = new llvm::GlobalVariable(*module, data.storage(context), false,
+            scope ? llvm::GlobalValue::InternalLinkage : llvm::GlobalValue::ExternalLinkage, nullptr, data.name.text,
+            nullptr, llvm::GlobalVariable::NotThreadLocal, address_space);
+        if (variable->getAlign() && variable->getAlign()->value() != data.alignment) ptx_fail(data.name, "conflicting storage alignment");
+        variable->setAlignment(llvm::Align(data.alignment));
+        std::vector<std::vector<ptx_token>> initializer;
+        if (accept("=")) {
+            if (external || address_space == 3) ptx_fail(data.name, "external/shared storage cannot have an initializer");
+            bool list = accept("{");
+            if (!list || peek().text != "}") for (;;) {
+                initializer.emplace_back();
+                while (peek().text != "," && peek().text != ";" && peek().text != "}") {
+                    if (peek().text == "<eof>") ptx_fail(peek(), "unterminated initializer");
+                    initializer.back().push_back(take());
+                }
+                if (!list || !accept(",")) break;
+                if (peek().text == "}") break;
+            }
+            if (list) expect("}");
+            if (initializer.size() > data.count) ptx_fail(data.name, "too many initializer elements");
+        }
+        expect(";");
+        if (!external || address_space == 3) {
+            variable->setInitializer(address_space == 3 ? llvm::UndefValue::get(data.storage(context)) : llvm::Constant::getNullValue(data.storage(context)));
+            globals.push_back({data, variable, std::move(initializer)});
+        }
+    }
+    void callable(bool kernel, bool external) {
+        std::vector<ptx_parameter> results;
+        if (!kernel && peek().text == "(") results = parameter_list();
+        if (results.size() > 1) ptx_fail(results[1].name, "PTX ABI permits a single return parameter");
+        auto name = identifier(); auto parameters = parameter_list();
+        if (module->size() >= 4096) ptx_fail(name, "function resource limit exceeded", true);
+        std::vector<llvm::Type*> inputs, outputs;
+        for (const auto& parameter : parameters) inputs.push_back(kernel && (parameter.array || parameter.alignment != parameter.type.bits / 8)
+            ? llvm::PointerType::get(context, 0) : parameter.storage(context));
+        for (const auto& parameter : results) outputs.push_back(parameter.storage(context));
+        auto* output = outputs.empty() ? llvm::Type::getVoidTy(context) : outputs[0];
+        auto* type = llvm::FunctionType::get(output, inputs, false);
+        auto* function = module->getFunction(name.text);
+        if (module->getNamedValue(name.text) && (!function || function->getFunctionType() != type)) ptx_fail(name, "conflicting function declaration");
+        if (function && function->hasFnAttribute("cudavm.kernel") != kernel) ptx_fail(name, "conflicting function kind");
+        symbols[name.text] = name;
+        auto same = [](const auto& a, const auto& b) {
+            if (a.size() != b.size()) return false;
+            for (unsigned i = 0; i < a.size(); ++i)
+                if (a[i].bytes() != b[i].bytes() || a[i].alignment != b[i].alignment || a[i].array != b[i].array) return false;
+            return true;
+        };
+        if (auto found = signatures.find(name.text); found != signatures.end())
+            if (!same(found->second.first, parameters) || !same(found->second.second, results)) ptx_fail(name, "conflicting function parameter layout");
+        if (!function) function = llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage, name.text, *module);
+        if (kernel) function->addFnAttr("cudavm.kernel");
+        signatures[name.text] = {parameters, results};
         for (unsigned i = 0; i < parameters.size(); ++i) {
-            auto size = parameters[i].type.bits / 8;
-            offset = (offset + size - 1) & ~uint64_t(size - 1);
-            llvm::SmallVector<llvm::Metadata*> fields;
-            for (uint64_t value : {uint64_t(size), uint64_t(size), offset})
-                fields.push_back(llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), value)));
-            layout.push_back(llvm::MDNode::get(context, fields)); offset += size;
+            if (kernel && inputs[i]->isPointerTy()) {
+                function->addParamAttr(i, llvm::Attribute::getWithByValType(context, parameters[i].storage(context)));
+                function->addParamAttr(i, llvm::Attribute::getWithAlignment(context, llvm::Align(parameters[i].alignment)));
+            }
             function->getArg(i)->setName(parameters[i].name.text);
         }
-        function->setMetadata("cudavm.kernel.layout", llvm::MDNode::get(context, layout));
-        auto* entry = llvm::BasicBlock::Create(context, "entry", function);
-        llvm::IRBuilder<> allocations(entry);
-        std::map<std::string, ptx_register> registers;
-        std::vector<ptx_instruction> instructions;
-        while (!accept("}")) {
-            if (peek().text == "<eof>") ptx_fail(peek(), "unterminated kernel body");
+        if (accept(";")) {
+            if (kernel) ptx_fail(name, "kernel declarations require a definition", true);
+            return;
+        }
+        if (external) ptx_fail(name, "extern function cannot have a body");
+        if (!function->isDeclaration()) ptx_fail(name, "duplicate function definition");
+        if (peek().text != "{") ptx_fail(peek(), "unsupported kernel directive or declaration", true);
+        expect("{");
+        ptx_body body{name, function, parameters, results, {}, {}, {}};
+        auto* entry = llvm::BasicBlock::Create(context, "entry", function); llvm::IRBuilder<> allocations(entry);
+        std::vector<std::map<std::string, std::string>> scopes(1);
+        auto add_slot = [&](const ptx_parameter& parameter, llvm::Value* input = nullptr, bool byval = false) {
+            if (body.slots.contains(parameter.name.text)) ptx_fail(parameter.name, "duplicate parameter");
+            llvm::Value* slot = input;
+            if (!byval) {
+                auto* storage = allocations.CreateAlloca(parameter.storage(context)); storage->setAlignment(llvm::Align(parameter.alignment)); slot = storage;
+                if (input) allocations.CreateAlignedStore(input, slot, llvm::Align(parameter.alignment));
+            }
+            body.slots.emplace(parameter.name.text, std::make_pair(parameter, slot));
+            scopes.back()[parameter.name.text] = parameter.name.text;
+        };
+        for (unsigned i = 0; i < parameters.size(); ++i) add_slot(parameters[i], function->getArg(i), kernel && inputs[i]->isPointerTy());
+        for (const auto& parameter : results) add_slot(parameter);
+        auto resolve = [&](ptx_token token) {
+            for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope)
+                if (auto found = scope->find(token.text); found != scope->end()) { token.text = found->second; break; }
+            return token;
+        };
+        while (true) {
+            if (accept("}")) { if (scopes.size() == 1) break; scopes.pop_back(); continue; }
+            if (accept("{")) { scopes.emplace_back(); continue; }
+            if (peek().text == "<eof>") ptx_fail(peek(), "unterminated function body");
             if (accept(".pragma")) {
-                auto hint = take();
-                if (hint.text != "\"nounroll\"") ptx_fail(hint, "unsupported pragma", true);
+                auto hint = take(); if (hint.text != "\"nounroll\"") ptx_fail(hint, "unsupported pragma", true);
                 expect(";"); continue;
             }
+            if (accept(".param")) {
+                auto parameter = declaration(); auto original = parameter.name.text;
+                if (scopes.back().contains(original)) ptx_fail(parameter.name, "duplicate local parameter");
+                parameter.name.text = name.text + "$param$" + std::to_string(symbol_counter++);
+                add_slot(parameter); scopes.back().erase(parameter.name.text); scopes.back()[original] = parameter.name.text;
+                expect(";"); continue;
+            }
+            bool external_storage = accept(".extern");
+            if (peek().text == ".shared") { take(); storage(external_storage, ".shared", &body, &scopes.back()); continue; }
+            if (external_storage) ptx_fail(peek(), "unsupported external body declaration", true);
             if (accept(".reg")) {
-                auto type_token = take(); auto type = ptx_scalar(type_token);
+                auto type = ptx_scalar(take());
                 for (;;) {
                     auto reg = take();
-                    if (!reg.text.starts_with('%') || !ptx_identifier(reg.text.substr(1))) ptx_fail(reg, "invalid register name");
+                    if (!(reg.text.starts_with('%') ? ptx_identifier(reg.text.substr(1)) : ptx_identifier(reg.text))) ptx_fail(reg, "invalid register name");
                     unsigned count = 0;
                     if (accept("<")) {
                         auto token = take(); auto value = ptx_unsigned(token);
@@ -178,9 +314,11 @@ class ptx_parser {
                     }
                     for (unsigned i = 0; i < std::max(1u, count); ++i) {
                         auto symbol = reg.text + (count ? std::to_string(i) : "");
-                        if (registers.contains(symbol)) ptx_fail(reg, "duplicate register");
-                        if (registers.size() >= 65536) ptx_fail(reg, "register resource limit exceeded", true);
-                        registers.emplace(symbol, ptx_register{type, allocations.CreateAlloca(type.storage(context), nullptr, symbol.substr(1))});
+                        if (scopes.back().contains(symbol)) ptx_fail(reg, "duplicate register");
+                        if (body.registers.size() >= 65536) ptx_fail(reg, "register resource limit exceeded", true);
+                        auto unique = symbol + "$" + std::to_string(symbol_counter++);
+                        scopes.back()[symbol] = unique;
+                        body.registers.emplace(unique, ptx_register{type, allocations.CreateAlloca(type.storage(context))});
                     }
                     if (accept(";")) break;
                     expect(",");
@@ -188,7 +326,7 @@ class ptx_parser {
                 continue;
             }
             ptx_instruction instruction{};
-            if (accept("@")) { instruction.negate = accept("!"); instruction.predicate = take().text; }
+            if (accept("@")) { instruction.negate = accept("!"); instruction.predicate = resolve(take()).text; }
             instruction.opcode = take();
             if (accept(":")) {
                 if (!instruction.predicate.empty() || !ptx_identifier(instruction.opcode.text)) ptx_fail(instruction.opcode, "invalid label");
@@ -196,23 +334,73 @@ class ptx_parser {
             } else {
                 if (instruction.opcode.text.starts_with('.')) ptx_fail(instruction.opcode, "unsupported body directive", true);
                 if (!accept(";")) {
-                    instruction.operands.emplace_back();
+                    instruction.operands.emplace_back(); unsigned nesting = 0;
                     while (!accept(";")) {
-                        if (peek().text == "}" || peek().text == "<eof>") ptx_fail(peek(), "expected instruction terminator");
-                        if (accept(",")) instruction.operands.emplace_back();
-                        else instruction.operands.back().push_back(take());
+                        if ((peek().text == "}" && !nesting) || peek().text == "<eof>") ptx_fail(peek(), "expected instruction terminator");
+                        auto token = take();
+                        if (token.text == "(" || token.text == "[" || token.text == "{") ++nesting;
+                        if (token.text == ")" || token.text == "]" || token.text == "}") { if (!nesting) ptx_fail(token, "unbalanced operand"); --nesting; }
+                        if (token.text == "," && !nesting) instruction.operands.emplace_back();
+                        else instruction.operands.back().push_back(resolve(token));
                     }
+                    if (nesting) ptx_fail(instruction.opcode, "unbalanced operand");
                     for (const auto& operand : instruction.operands) if (operand.empty()) ptx_fail(instruction.opcode, "empty operand");
                 }
             }
-            instructions.push_back(std::move(instruction));
-            if (instructions.size() > 65536) ptx_fail(peek(), "instruction resource limit exceeded", true);
+            body.instructions.push_back(std::move(instruction));
+            if (body.instructions.size() > 65536) ptx_fail(peek(), "instruction resource limit exceeded", true);
         }
-        lower(*function, entry, registers, parameters, instructions);
+        if (kernel) {
+            llvm::SmallVector<llvm::Metadata*> layout; uint64_t offset = 0;
+            for (const auto& parameter : parameters) {
+                offset = llvm::alignTo(offset, parameter.alignment); llvm::SmallVector<llvm::Metadata*> fields;
+                for (uint64_t value : {parameter.bytes(), uint64_t(parameter.alignment), offset})
+                    fields.push_back(llvm::ConstantAsMetadata::get(allocations.getInt64(value)));
+                layout.push_back(llvm::MDNode::get(context, fields)); offset += parameter.bytes();
+            }
+            function->setMetadata("cudavm.kernel.layout", llvm::MDNode::get(context, layout));
+        }
+        bodies.push_back(std::move(body));
     }
-
-    void lower(llvm::Function& function, llvm::BasicBlock* entry, const std::map<std::string, ptx_register>& registers,
-            const std::vector<ptx_parameter>& parameters, const std::vector<ptx_instruction>& instructions) {
+    void lower(ptx_body& body) {
+        auto& function = *body.function; auto* entry = &function.getEntryBlock();
+        const auto& registers = body.registers;
+        std::vector<ptx_instruction> instructions;
+        // CUDA compilers use vector parameter operations for aggregate fields.
+        // Expand them into scalar accesses before SSA construction; each lane
+        // retains the original predicate and its byte offset.
+        for (const auto& instruction : body.instructions) {
+            auto text = instruction.opcode.text; size_t at = text.find(".v2."); unsigned lanes = 2;
+            if (at == text.npos) { at = text.find(".v4."); lanes = 4; }
+            if (at == text.npos || (!text.starts_with("ld.") && !text.starts_with("st."))) { instructions.push_back(instruction); continue; }
+            bool load = text.starts_with("ld.");
+            if (instruction.operands.size() != 2) ptx_fail(instruction.opcode, "wrong operand count");
+            auto type = ptx_scalar({text.substr(text.rfind('.') + 1), instruction.opcode.line, instruction.opcode.column}, true);
+            const auto& fields = instruction.operands[load ? 0 : 1]; const auto& address = instruction.operands[load ? 1 : 0];
+            if (fields.size() != lanes * 2 + 1 || fields.front().text != "{" || fields.back().text != "}") ptx_fail(instruction.opcode, "invalid vector register list");
+            if ((address.size() != 3 && address.size() != 5) || address.front().text != "[" || address.back().text != "]") ptx_fail(instruction.opcode, "unsupported address expression", true);
+            int64_t displacement = 0;
+            if (address.size() == 5) {
+                if (address[2].text != "+" && address[2].text != "-") ptx_fail(address[2], "invalid address displacement");
+                auto amount = ptx_unsigned(address[3]); if (amount > INT32_MAX - 32) ptx_fail(address[3], "address displacement exceeds supported range", true);
+                displacement = int64_t(amount) * (address[2].text == "-" ? -1 : 1);
+            }
+            if (text.starts_with("ld.param.") || text.starts_with("st.param.")) {
+                auto found = body.slots.find(address[1].text); auto align = lanes * type.bits / 8;
+                if (found == body.slots.end() || found->second.first.alignment < align || displacement % align) ptx_fail(address[1], "vector parameter access is misaligned");
+            }
+            for (unsigned lane = 0; lane < lanes; ++lane) {
+                if (lane && fields[lane * 2].text != ",") ptx_fail(instruction.opcode, "invalid vector register separator");
+                auto scalar = instruction; scalar.opcode.text.erase(at, 3);
+                scalar.operands[load ? 0 : 1] = {fields[lane * 2 + 1]};
+                auto offset = displacement + lane * (type.bits / 8);
+                auto token = instruction.opcode;
+                auto sign = token; sign.text = offset < 0 ? "-" : "+";
+                auto amount = token; amount.text = std::to_string(offset < 0 ? -offset : offset);
+                scalar.operands[load ? 1 : 0] = {address.front(), address[1], sign, amount, address.back()};
+                instructions.push_back(std::move(scalar));
+            }
+        }
         llvm::IRBuilder<> builder(entry);
         auto reg = [&](const ptx_token& token) -> const ptx_register& {
             auto found = registers.find(token.text);
@@ -225,7 +413,7 @@ class ptx_parser {
             if (negative && tokens[0].text != "-") ptx_fail(tokens[0], "expected negative immediate");
             const auto& token = tokens.back();
             llvm::Value* value = nullptr;
-            if (token.text.starts_with('%')) {
+            if (token.text.starts_with('%') || registers.contains(token.text)) {
                 if (negative) ptx_fail(token, "register negation requires an instruction", true);
                 auto found = registers.find(token.text);
                 if (found != registers.end()) {
@@ -249,6 +437,9 @@ class ptx_parser {
                     if (!value) ptx_fail(token, token.text.find('.') == std::string::npos ? "undeclared register" : "unsupported special register",
                         token.text.find('.') != std::string::npos);
                 }
+            } else if (auto* global = module->getGlobalVariable(token.text, true)) {
+                if (negative || (type.bits != 32 && type.bits != 64) || type.kind == 'f') ptx_fail(token, "invalid symbol address operand");
+                value = builder.CreatePtrToInt(global, type.storage(context));
             } else if (token.text.starts_with("0f") && token.text.size() == 10) {
                 if (type.bits != 32 || negative) ptx_fail(token, "invalid binary32 literal");
                 uint64_t bits = 0;
@@ -316,7 +507,71 @@ class ptx_parser {
                 next = llvm::BasicBlock::Create(context, "fallthrough", &function);
                 builder.CreateCondBr(predicate, execute, next); builder.SetInsertPoint(execute);
             }
-            if (opcode.text == "ret" || opcode.text == "exit") { arity(0); builder.CreateRetVoid(); }
+            if (opcode.text == "ret" || opcode.text == "exit") {
+                arity(0);
+                if (opcode.text == "exit" && !function.hasFnAttribute("cudavm.kernel")) ptx_fail(opcode, "exit in device functions is unsupported", true);
+                llvm::Value* result = nullptr;
+                for (unsigned i = 0; i < body.results.size(); ++i) {
+                    const auto& parameter = body.results[i];
+                    auto* value = builder.CreateAlignedLoad(parameter.storage(context), body.slots.at(parameter.name.text).second, llvm::Align(parameter.alignment));
+                    result = value;
+                }
+                if (result) builder.CreateRet(result); else builder.CreateRetVoid();
+            } else if (opcode.text == "bar.sync") {
+                if (instruction.operands.empty() || instruction.operands.size() > 2) ptx_fail(opcode, "wrong operand count");
+                std::vector<llvm::Value*> args;
+                for (unsigned i = 0; i < instruction.operands.size(); ++i) {
+                    auto* value = operand(i, {32, 'u'});
+                    if (auto* constant = llvm::dyn_cast<llvm::ConstantInt>(value)) {
+                        auto number = constant->getZExtValue();
+                        if ((!i && number >= 16) || (i && (!number || number % 32))) ptx_fail(opcode, "invalid CTA barrier operand");
+                    }
+                    args.push_back(value);
+                }
+                auto callee = module->getOrInsertFunction(args.size() == 1 ? "llvm.nvvm.barrier.cta.sync.aligned.all" : "llvm.nvvm.barrier.cta.sync.aligned.count",
+                    llvm::FunctionType::get(builder.getVoidTy(), std::vector<llvm::Type*>(args.size(), builder.getInt32Ty()), false));
+                llvm::cast<llvm::Function>(callee.getCallee())->addFnAttr(llvm::Attribute::Convergent);
+                builder.CreateCall(callee, args)->setConvergent();
+            } else if (opcode.text == "call" || opcode.text == "call.uni") {
+                auto list = [&](const std::vector<ptx_token>& tokens) {
+                    std::vector<ptx_token> names;
+                    if (tokens.size() < 2 || tokens.front().text != "(" || tokens.back().text != ")") ptx_fail(opcode, "expected call parameter list");
+                    for (size_t i = 1; i + 1 < tokens.size(); ++i) {
+                        if (i % 2 == 0) { if (tokens[i].text != ",") ptx_fail(tokens[i], "expected call parameter separator"); }
+                        else names.push_back(tokens[i]);
+                    }
+                    if (tokens.size() > 2 && tokens[tokens.size() - 2].text == ",") ptx_fail(opcode, "empty call parameter");
+                    return names;
+                };
+                unsigned target_index = !instruction.operands.empty() && instruction.operands[0].front().text == "(" ? 1 : 0;
+                if (instruction.operands.size() != target_index + 2) ptx_fail(opcode, "unsupported indirect call or call prototype", true);
+                const auto& target = instruction.operands[target_index];
+                if (target.size() != 1 || !ptx_identifier(target[0].text)) ptx_fail(opcode, "indirect calls are unsupported", true);
+                auto* callee = module->getFunction(target[0].text);
+                if (!callee || callee->isDeclaration()) ptx_fail(target[0], "unresolved device function");
+                if (callee->hasFnAttribute("cudavm.kernel")) ptx_fail(target[0], "cannot call a kernel");
+                const auto& signature = signatures.at(target[0].text);
+                auto inputs = list(instruction.operands[target_index + 1]);
+                auto outputs = target_index ? list(instruction.operands[0]) : std::vector<ptx_token>{};
+                if (inputs.size() != signature.first.size() || outputs.size() != signature.second.size()) ptx_fail(opcode, "call parameter count mismatch");
+                auto slot = [&](const ptx_token& token, const ptx_parameter& expected, bool output) -> llvm::Value* {
+                    auto found = body.slots.find(token.text);
+                    if (found == body.slots.end()) ptx_fail(token, "call requires declared .param storage");
+                    const auto& actual = found->second.first;
+                    if (actual.bytes() != expected.bytes() || actual.alignment < expected.alignment) ptx_fail(token, "call parameter layout mismatch");
+                    if (output && std::any_of(body.parameters.begin(), body.parameters.end(), [&](const auto& p) { return p.name.text == token.text; }))
+                        ptx_fail(token, "cannot overwrite input parameter");
+                    if (!output && std::any_of(body.results.begin(), body.results.end(), [&](const auto& p) { return p.name.text == token.text; }))
+                        ptx_fail(token, "cannot read function return parameter");
+                    return found->second.second;
+                };
+                std::vector<llvm::Value*> arguments;
+                for (unsigned i = 0; i < inputs.size(); ++i) arguments.push_back(builder.CreateAlignedLoad(signature.first[i].storage(context), slot(inputs[i], signature.first[i], false), llvm::Align(signature.first[i].alignment)));
+                auto* call = builder.CreateCall(callee, arguments); call->setConvergent();
+                for (unsigned i = 0; i < outputs.size(); ++i) {
+                    builder.CreateAlignedStore(call, slot(outputs[i], signature.second[i], true), llvm::Align(signature.second[i].alignment));
+                }
+            }
             else if (parts.size() >= 2) {
                 const auto& op = parts[0];
                 auto type = ptx_scalar({parts.back(), opcode.line, opcode.column}, op == "ld" || op == "st");
@@ -327,7 +582,10 @@ class ptx_parser {
                     bool load = op == "ld", parameter = parts.size() == 3 && parts[1] == "param";
                     bool global = (parts.size() == 3 && parts[1] == "global") ||
                         (load && parts.size() == 4 && parts[1] == "global" && parts[2] == "nc");
-                    if ((!parameter && !global) || (!load && parameter)) ptx_fail(opcode, "unsupported memory instruction", true);
+                    bool shared = parts.size() == 3 && parts[1] == "shared";
+                    bool constant = parts.size() == 3 && parts[1] == "const";
+                    bool generic = parts.size() == 2;
+                    if ((!parameter && !global && !shared && !constant && !generic) || (!load && constant)) ptx_fail(opcode, "unsupported memory instruction", true);
                     const auto& address = instruction.operands[load ? 1 : 0];
                     if (address.size() < 3 || address.front().text != "[" || address.back().text != "]" ||
                         (address.size() != 3 && address.size() != 5)) ptx_fail(opcode, "unsupported address expression", true);
@@ -338,28 +596,41 @@ class ptx_parser {
                         if (amount > INT32_MAX) ptx_fail(address[3], "address displacement exceeds supported range", true);
                         displacement = int64_t(amount) * (address[2].text == "-" ? -1 : 1);
                     }
+                    llvm::Value* pointer = nullptr;
                     if (parameter) {
-                        auto found = std::find_if(parameters.begin(), parameters.end(), [&](const auto& p) { return p.name.text == address[1].text; });
-                        if (found == parameters.end()) ptx_fail(address[1], "unknown kernel parameter");
-                        if (displacement < 0 || uint64_t(displacement) + type.bits / 8 > found->type.bits / 8 || displacement % (type.bits / 8))
+                        auto found = body.slots.find(address[1].text);
+                        if (found == body.slots.end()) ptx_fail(address[1], "unknown function parameter");
+                        if (displacement < 0 || uint64_t(displacement) + type.bits / 8 > found->second.first.bytes() || displacement % (type.bits / 8) || found->second.first.alignment < type.bits / 8)
                             ptx_fail(address[1], "parameter load is out of bounds or misaligned");
-                        value = function.getArg(unsigned(found - parameters.begin()));
-                        if (displacement) value = builder.CreateLShr(value, uint64_t(displacement) * 8);
-                        value = builder.CreateTruncOrBitCast(value, type.storage(context));
+                        if (!load && std::any_of(body.parameters.begin(), body.parameters.end(), [&](const auto& p) { return p.name.text == address[1].text; }))
+                            ptx_fail(address[1], "cannot overwrite input parameter");
+                        if (load && std::any_of(body.results.begin(), body.results.end(), [&](const auto& p) { return p.name.text == address[1].text; }))
+                            ptx_fail(address[1], "cannot read function return parameter");
+                        pointer = builder.CreateGEP(builder.getInt8Ty(), found->second.second, builder.getInt64(uint64_t(displacement)));
                     } else {
-                        auto* pointer_bits = scalar({address[1]}, {64, 'u'});
-                        if (displacement) pointer_bits = builder.CreateAdd(pointer_bits, builder.getInt64(uint64_t(displacement)));
-                        auto* pointer = builder.CreateIntToPtr(pointer_bits, llvm::PointerType::get(context, 1));
-                        if (load) value = builder.CreateAlignedLoad(type.storage(context), pointer, llvm::Align(type.bits / 8));
-                        else {
-                            auto* data = scalar(instruction.operands[1], type, true);
-                            if (type.kind == 'f') data = builder.CreateBitCast(data, builder.getInt32Ty());
-                            builder.CreateAlignedStore(data, pointer, llvm::Align(type.bits / 8));
-                        }
+                        unsigned width = 64;
+                        if (shared && registers.contains(address[1].text)) width = registers.at(address[1].text).type.bits;
+                        if (width != 32 && width != 64) ptx_fail(address[1], "invalid address register width");
+                        auto* pointer_bits = scalar({address[1]}, {width, 'u'});
+                        if (displacement) pointer_bits = builder.CreateAdd(pointer_bits, llvm::ConstantInt::get(pointer_bits->getType(), uint64_t(displacement)));
+                        pointer = builder.CreateIntToPtr(pointer_bits, llvm::PointerType::get(context, shared ? 3 : constant ? 4 : global ? 1 : 0));
+                    }
+                    if (load) value = builder.CreateAlignedLoad(type.storage(context), pointer, llvm::Align(type.bits / 8));
+                    else {
+                        auto* data = scalar(instruction.operands[1], type, true);
+                        if (type.kind == 'f') data = builder.CreateBitCast(data, builder.getInt32Ty());
+                        builder.CreateAlignedStore(data, pointer, llvm::Align(type.bits / 8));
                     }
                     if (load) write(instruction.operands[0], value, type, true);
-                } else if (op == "cvta" && parts == std::vector<std::string>{"cvta", "to", "global", "u64"}) {
-                    arity(2); write(instruction.operands[0], operand(1, type), type);
+                } else if (op == "cvta" && (type.bits == 32 || type.bits == 64) && type.kind == 'u' &&
+                        (parts.size() == 3 || (parts.size() == 4 && parts[1] == "to"))) {
+                    arity(2); bool to = parts.size() == 4; auto space = parts[to ? 2 : 1];
+                    if (space != "global" && space != "shared" && space != "const") ptx_fail(opcode, "unsupported address space conversion", true);
+                    auto* specific = llvm::PointerType::get(context, space == "shared" ? 3 : space == "const" ? 4 : 1);
+                    auto* generic = llvm::PointerType::get(context, 0);
+                    auto* pointer = builder.CreateIntToPtr(operand(1, type), to ? generic : specific);
+                    value = builder.CreatePtrToInt(builder.CreateAddrSpaceCast(pointer, to ? specific : generic), type.storage(context));
+                    write(instruction.operands[0], value, type);
                 } else if (op == "cvt" && parts.size() == 3 && type.kind != 'f' && type.kind != 'b' && type.bits >= 16) {
                     arity(2); auto destination = ptx_scalar({parts[1], opcode.line, opcode.column});
                     if (destination.kind != 's' && destination.kind != 'u') ptx_fail(opcode, "unsupported conversion", true);
@@ -429,6 +700,7 @@ class ptx_parser {
         }
         if (!builder.GetInsertBlock()->getTerminator()) ptx_fail(tokens[cursor - 1], "kernel control flow falls through its closing brace");
         llvm::FunctionAnalysisManager analyses; llvm::PassBuilder passes; passes.registerFunctionAnalyses(analyses);
+        llvm::SROAPass(llvm::SROAOptions::ModifyCFG).run(function, analyses);
         llvm::PromotePass().run(function, analyses);
     }
 public:
@@ -454,11 +726,66 @@ public:
         module->setDataLayout("e-p:64:64-p1:64:64-p3:32:32-p4:64:64-p5:32:32-p6:32:32-i64:64-i128:128-v16:16-v32:32-n16:32:64");
         module->getOrInsertNamedMetadata("cudavm.ir.stage")->addOperand(llvm::MDNode::get(context, llvm::MDString::get(context, "cudavm.portable")));
         while (peek().text != "<eof>") {
-            accept(".visible");
-            if (!accept(".entry")) ptx_fail(peek(), "unsupported module declaration or directive", true);
-            kernel();
+            accept(".visible"); bool external = accept(".extern");
+            if (accept(".entry")) callable(true, external);
+            else if (accept(".func")) callable(false, external);
+            else if (peek().text == ".global" || peek().text == ".const" || peek().text == ".shared") {
+                auto space = take(); storage(external, space.text);
+            } else ptx_fail(peek(), "unsupported module declaration or directive", true);
         }
-        if (module->empty()) ptx_fail(peek(), "PTX module contains no kernels");
+        bool has_kernel = false;
+        for (const auto& body : bodies) has_kernel |= body.function->hasFnAttribute("cudavm.kernel");
+        if (!has_kernel) ptx_fail(peek(), "PTX module contains no kernels");
+        for (auto& global : globals) if (!global.initializer.empty()) {
+            const auto& data = global.declaration;
+            std::vector<llvm::Constant*> elements(data.count, llvm::ConstantInt::get(data.type.storage(context), 0));
+            for (unsigned i = 0; i < global.initializer.size(); ++i) {
+                auto tokens = global.initializer[i];
+                if (tokens.empty()) ptx_fail(data.name, "empty initializer element");
+                if (tokens[0].text == "generic" && tokens.size() >= 4 && tokens[1].text == "(" && tokens[3].text == ")") {
+                    tokens.erase(tokens.begin(), tokens.begin() + 2); tokens.erase(tokens.begin() + 1);
+                }
+                auto* target = module->getGlobalVariable(tokens[0].text, true);
+                if (target) {
+                    if (data.type.bits != 64 || data.type.kind == 'f' || (target->getAddressSpace() != 1 && target->getAddressSpace() != 4)) ptx_fail(tokens[0], "symbol initializer requires a 64-bit global address", true);
+                    llvm::Constant* address = target;
+                    if (tokens.size() == 3 && (tokens[1].text == "+" || tokens[1].text == "-")) {
+                        auto offset = ptx_unsigned(tokens[2]);
+                        if (tokens[1].text == "-" || offset > module->getDataLayout().getTypeAllocSize(target->getValueType()).getFixedValue()) ptx_fail(tokens[0], "initializer relocation is out of bounds");
+                        address = llvm::ConstantExpr::getGetElementPtr(llvm::Type::getInt8Ty(context), target, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), offset));
+                    } else if (tokens.size() != 1) ptx_fail(tokens[0], "unsupported initializer expression", true);
+                    elements[i] = llvm::ConstantExpr::getPtrToInt(address, data.type.storage(context));
+                } else {
+                    bool negative = tokens.size() == 2 && tokens[0].text == "-";
+                    if (tokens.size() != (negative ? 2u : 1u)) ptx_fail(tokens[0], "unsupported initializer expression", true);
+                    const auto& literal = tokens.back(); uint64_t bits;
+                    if (literal.text.starts_with("0f") && literal.text.size() == 10 && data.type.bits == 32 && !negative) {
+                        if (llvm::StringRef(literal.text).drop_front(2).getAsInteger(16, bits)) ptx_fail(literal, "invalid binary32 literal");
+                    } else {
+                        if (data.type.kind == 'f') ptx_fail(literal, "floating initializers require PTX 0f binary32 encoding", true);
+                        bits = ptx_unsigned(literal); if (negative) bits = uint64_t(0) - bits;
+                    }
+                    elements[i] = llvm::ConstantInt::get(data.type.storage(context), bits);
+                }
+            }
+            global.variable->setInitializer(data.array ? llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(data.storage(context)), elements) : elements[0]);
+        }
+        for (auto& body : bodies) lower(body);
+        // Inlining is the shader call mechanism. Reject cycles before entering
+        // LLVM so recursive input never becomes a target failure or an abort.
+        std::map<llvm::Function*, unsigned> colors;
+        std::function<void(llvm::Function*)> visit = [&](llvm::Function* function) {
+            if (colors[function] == 2) return;
+            if (colors[function] == 1) ptx_fail(symbols.at(function->getName().str()), "recursive device calls are unsupported", true);
+            colors[function] = 1;
+            for (auto& block : *function) for (auto& instruction : block)
+                if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction))
+                    if (auto* callee = call->getCalledFunction(); callee && !callee->isDeclaration()) visit(callee);
+            colors[function] = 2;
+        };
+        for (auto& body : bodies) visit(body.function);
+        for (auto& global : module->globals())
+            if (global.isDeclaration() && global.getAddressSpace() != 3 && !global.use_empty()) ptx_fail(symbols.at(global.getName().str()), "unresolved device storage");
         std::string diagnostic; llvm::raw_string_ostream stream(diagnostic);
         if (llvm::verifyModule(*module, &stream)) throw ptx_import_error(false, "invalid imported PTX IR: " + diagnostic);
         return std::move(module);

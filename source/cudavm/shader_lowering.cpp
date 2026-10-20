@@ -393,7 +393,24 @@ struct lowering {
         if (auto* expression = llvm::dyn_cast<llvm::ConstantExpr>(input)) {
             if (auto* pointer = llvm::dyn_cast<llvm::GEPOperator>(expression)) return gep(*pointer);
             if (expression->getOpcode() == llvm::Instruction::AddrSpaceCast || expression->getOpcode() == llvm::Instruction::BitCast) return value(expression->getOperand(0));
-            if (expression->getOpcode() == llvm::Instruction::PtrToInt) return b.CreateZExtOrTrunc(value(expression->getOperand(0)), expression->getType());
+            if (expression->getOpcode() == llvm::Instruction::PtrToInt) {
+                auto* address = value(expression->getOperand(0));
+                if (expression->getOperand(0)->getType()->getPointerAddressSpace() == 3)
+                    address = b.CreateAnd(address, b.getInt64(0x3fffffffull));
+                return b.CreateZExtOrTrunc(address, expression->getType());
+            }
+            if (expression->getOpcode() == llvm::Instruction::IntToPtr) {
+                auto* address = b.CreateZExtOrTrunc(value(expression->getOperand(0)), b.getInt64Ty());
+                if (expression->getType()->getPointerAddressSpace() == 3)
+                    address = b.CreateOr(address, b.getInt64(0xffffffff40000000ull));
+                return address;
+            }
+            if (expression->getOpcode() == llvm::Instruction::Add || expression->getOpcode() == llvm::Instruction::Sub) {
+                auto* left = b.CreateZExtOrTrunc(value(expression->getOperand(0)), type(expression->getType()));
+                auto* right = b.CreateZExtOrTrunc(value(expression->getOperand(1)), type(expression->getType()));
+                auto* result = expression->getOpcode() == llvm::Instruction::Add ? b.CreateAdd(left, right) : b.CreateSub(left, right);
+                return canonical(result, expression->getType());
+            }
             fail(*input, "unsupported constant expression");
         }
         if (llvm::isa<llvm::ConstantPointerNull>(input)) return b.getInt64(0);
@@ -1090,7 +1107,15 @@ struct lowering {
         if (auto* returned=llvm::dyn_cast<llvm::ReturnInst>(&input)) { if(returned->getReturnValue()) b.CreateRet(value(returned->getReturnValue()));else b.CreateRetVoid(); return; }
         if (auto* pointer = llvm::dyn_cast<llvm::GetElementPtrInst>(&input)) { values[&input] = gep(*llvm::cast<llvm::GEPOperator>(pointer)); return; }
         if (auto* cast = llvm::dyn_cast<llvm::CastInst>(&input); cast && (input.getType()->isPointerTy() || cast->getOperand(0)->getType()->isPointerTy())) {
-            values[&input] = b.CreateZExtOrTrunc(value(cast->getOperand(0)), type(input.getType())); return;
+            auto* address = value(cast->getOperand(0));
+            // PTX shared-space integers are byte offsets. Generic pointers keep
+            // the transport tag; explicit shared ptr/int conversions strip or
+            // restore it, including the common 32-bit shared-address form.
+            if (cast->getOpcode() == llvm::Instruction::PtrToInt && cast->getOperand(0)->getType()->getPointerAddressSpace() == 3)
+                address = b.CreateAnd(address, b.getInt64(0x3fffffffull));
+            if (cast->getOpcode() == llvm::Instruction::IntToPtr && input.getType()->getPointerAddressSpace() == 3)
+                address = b.CreateOr(b.CreateZExtOrTrunc(address, b.getInt64Ty()), b.getInt64(0xffffffff40000000ull));
+            values[&input] = b.CreateZExtOrTrunc(address, type(input.getType())); return;
         }
         if (auto* select = llvm::dyn_cast<llvm::SelectInst>(&input)) { values[&input] = b.CreateSelect(value(select->getCondition()), value(select->getTrueValue()), value(select->getFalseValue())); return; }
         if(auto* cast=llvm::dyn_cast<llvm::BitCastInst>(&input)) {
@@ -1217,7 +1242,10 @@ struct lowering {
             if(bytes>32768 || shared_bytes>32768-bytes) fail(global,"static shared memory exceeds native profile");
             shared_offsets[&global]=shared_bytes;shared_bytes+=uint32_t(bytes);
         }
-        shared_bytes=uint32_t(llvm::alignTo(shared_bytes,16));
+        uint64_t dynamic_alignment=16;
+        for(const auto& [global,offset]:shared_offsets) if(!dl.getTypeAllocSize(global->getValueType()).getFixedValue())
+            dynamic_alignment=std::max(dynamic_alignment,global->getAlign().value_or(dl.getABITypeAlign(global->getValueType())).value());
+        shared_bytes=uint32_t(llvm::alignTo(shared_bytes,dynamic_alignment));
         for(auto& [global,offset]:shared_offsets) if(!dl.getTypeAllocSize(global->getValueType()).getFixedValue()) offset=shared_bytes;
         auto scratch=(collective_storage?native_collective_shared_bytes:0u)+(named_barriers?native_named_barrier_shared_bytes:0u);
         if(shared_bytes+scratch>32768) fail(kernel,"native shared storage and collective scratch exceed 32 KiB");

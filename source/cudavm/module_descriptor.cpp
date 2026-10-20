@@ -2,6 +2,7 @@
 #include "shader_lowering.hpp"
 #include "shader_collectives.hpp"
 #include "module_descriptor.hpp"
+#include <algorithm>
 #include <map>
 #include <set>
 #include <llvm/IR/Constants.h>
@@ -120,13 +121,16 @@ std::string emit_native_module(const llvm::Module& input) {
         std::set<const llvm::Constant*> visited;
         std::set<const llvm::GlobalVariable*> used;
         for (auto& i : llvm::instructions(f)) for (const auto& operand : i.operands()) collect_shared(operand.get(), visited, used);
-        uint64_t shared = 0;
+        uint64_t shared = 0, dynamic_alignment = 16;
         for (const auto& g : m->globals()) if (used.contains(&g)) {
-            shared = llvm::alignTo(shared, g.getAlign().value_or(dl.getABITypeAlign(g.getValueType())).value());
-            shared += dl.getTypeAllocSize(g.getValueType()).getFixedValue();
+            auto alignment = g.getAlign().value_or(dl.getABITypeAlign(g.getValueType())).value();
+            auto bytes = dl.getTypeAllocSize(g.getValueType()).getFixedValue();
+            if (!bytes) { dynamic_alignment = std::max(dynamic_alignment, alignment); continue; }
+            shared = llvm::alignTo(shared, alignment);
+            shared += bytes;
         }
         if (shared > 32768) throw std::runtime_error("native static shared memory exceeds 32 KiB");
-        shared=llvm::alignTo(shared,16);
+        shared=llvm::alignTo(shared,dynamic_alignment);
         bool collectives=native_atomic_polling(f),named_barriers=false;
         for(const auto& bb:f) for(const auto& input:bb) if(auto* call=llvm::dyn_cast<llvm::CallInst>(&input);call && call->getCalledFunction()) {
             auto* function=call->getCalledFunction(); auto name=function->hasFnAttribute("cudavm.cuda.origin")?function->getFnAttribute("cudavm.cuda.origin").getValueAsString():function->getName();
