@@ -25,6 +25,9 @@ llvm::Value* filter_texture_component(llvm::Value* object, llvm::Value* x, llvm:
         auto* base = load(descriptor, b.getInt64Ty());
         auto* width = load(b.CreateAdd(descriptor, b.getInt64(8)), b.getInt32Ty());
         auto* height = load(b.CreateAdd(descriptor, b.getInt64(12)), b.getInt32Ty());
+        auto* channels = load(b.CreateAdd(descriptor, b.getInt64(48)), b.getInt32Ty());
+        auto* texel_bytes = load(b.CreateAdd(descriptor, b.getInt64(52)), b.getInt32Ty());
+        auto* present = b.CreateICmpUGT(channels, b.getInt32(component));
         auto* mode_x = load(b.CreateAdd(descriptor, b.getInt64(24)), b.getInt32Ty());
         auto* mode_y = load(b.CreateAdd(descriptor, b.getInt64(28)), b.getInt32Ty());
         // Quantize texel coordinates to 1/256 before subtracting the half-texel
@@ -83,8 +86,9 @@ llvm::Value* filter_texture_component(llvm::Value* object, llvm::Value* x, llvm:
             auto xx = address(b.CreateAdd(horizontal[0], b.getInt64(column)), width, mode_x);
             auto yy = address(b.CreateAdd(vertical[0], b.getInt64(row)), height, mode_y);
             unsigned tap = 2 * row + column; valid[tap] = b.CreateAnd(xx[1], yy[1]);
-            auto* offset = b.CreateMul(b.CreateAdd(b.CreateMul(yy[0], b.CreateZExt(width, b.getInt64Ty())), xx[0]), b.getInt64(4));
-            samples[tap] = component == 0 ? load(b.CreateSelect(valid[tap], b.CreateAdd(base, offset), b.getInt64(0xffffffff00000000ull)), b.getInt32Ty()) : b.getInt32(component == 3 ? 0x3f800000 : 0);
+            auto* offset = b.CreateAdd(b.CreateMul(b.CreateAdd(b.CreateMul(yy[0], b.CreateZExt(width, b.getInt64Ty())), xx[0]), b.CreateZExt(texel_bytes, b.getInt64Ty())), b.getInt64(4 * component));
+            auto* sample = load(b.CreateSelect(b.CreateAnd(valid[tap], present), b.CreateAdd(base, offset), b.getInt64(0xffffffff00000000ull)), b.getInt32Ty());
+            samples[tap] = b.CreateSelect(present, sample, b.getInt32(component == 3 ? 0x3f800000 : 0));
         }
         auto flush = [&](llvm::Value* real) {
             auto* bits = b.CreateBitCast(real, b.getInt32Ty());

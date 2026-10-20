@@ -34,11 +34,11 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
             : owner->native->create_texture(*array->native, *texture, view); });
     } else {
         auto& d = array->descriptor;
-        require(d.Height && !d.Depth && !(d.Flags & (CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_CUBEMAP)) && d.NumChannels == 1,
-                CUDA_ERROR_NOT_SUPPORTED, "shader image objects require a single-channel 2D array");
+        require(d.Height && !d.Depth && !(d.Flags & (CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_CUBEMAP)),
+                CUDA_ERROR_NOT_SUPPORTED, "shader image objects require a 2D array");
         require(d.Width <= UINT32_MAX && d.Height <= UINT32_MAX && array->native->size < (1u << 30), CUDA_ERROR_NOT_SUPPORTED, "image exceeds shader address transport");
-        if (surface) require(d.Format == CU_AD_FORMAT_SIGNED_INT32 || d.Format == CU_AD_FORMAT_UNSIGNED_INT32 || d.Format == CU_AD_FORMAT_FLOAT,
-                CUDA_ERROR_NOT_SUPPORTED, "shader surfaces require 32-bit elements");
+        if (surface) require(d.NumChannels == 1 && (d.Format == CU_AD_FORMAT_SIGNED_INT32 || d.Format == CU_AD_FORMAT_UNSIGNED_INT32 || d.Format == CU_AD_FORMAT_FLOAT),
+                CUDA_ERROR_NOT_SUPPORTED, "shader surfaces require single-channel 32-bit elements");
         else {
             require(d.Format == CU_AD_FORMAT_FLOAT &&
                 !(texture->flags & ~(CU_TRSF_READ_AS_INTEGER | CU_TRSF_NORMALIZED_COORDINATES)),
@@ -46,7 +46,8 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
             require(!view, CUDA_ERROR_NOT_SUPPORTED, "shader texture resource views are unavailable");
         }
         entry->native = std::make_shared<image_object>();
-        std::array<uint32_t, 12> descriptor{uint32_t(array->image_address), uint32_t(array->image_address >> 32), uint32_t(d.Width), uint32_t(d.Height), surface ? 2u : 1u};
+        std::array<uint32_t, 14> descriptor{uint32_t(array->image_address), uint32_t(array->image_address >> 32), uint32_t(d.Width), uint32_t(d.Height), surface ? 2u : 1u};
+        descriptor[12] = d.NumChannels; descriptor[13] = 4 * d.NumChannels;
         if (texture) {
             descriptor[5] = unsigned(bool(texture->flags & CU_TRSF_NORMALIZED_COORDINATES)) |
                 (texture->filterMode == CU_TR_FILTER_MODE_LINEAR ? 2u : 0u);

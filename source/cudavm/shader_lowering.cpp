@@ -805,6 +805,7 @@ struct lowering {
         auto* base = load(object, b.getInt64Ty());
         auto* width = load(b.CreateAdd(object, b.getInt64(8)), b.getInt32Ty());
         auto* height = load(b.CreateAdd(object, b.getInt64(12)), b.getInt32Ty());
+        auto* texel_bytes = texture ? load(b.CreateAdd(object, b.getInt64(52)), b.getInt32Ty()) : b.getInt32(4);
         llvm::Value *x = value(instruction.getArgOperand(1)), *y = value(instruction.getArgOperand(2));
         llvm::Value* valid = b.getTrue();
         if (texture) {
@@ -867,7 +868,7 @@ struct lowering {
                 return b.CreateSelect(normalized, normalized_index, clamped);
             };
             x = coordinate(x, width, 0); y = coordinate(y, height, 1);
-            x = b.CreateMul(x, b.getInt32(4));
+            x = b.CreateMul(x, texel_bytes);
         } else {
             auto* row_bytes = b.CreateMul(width, b.getInt32(4));
             valid = b.CreateAnd(b.CreateICmpULT(x, row_bytes), b.CreateICmpULT(y, height));
@@ -887,23 +888,24 @@ struct lowering {
                     llvm::Align(4), llvm::AtomicOrdering::Monotonic, scope);
             }
         }
-        auto* offset = b.CreateAdd(b.CreateMul(b.CreateMul(b.CreateZExt(y, b.getInt64Ty()), b.CreateZExt(width, b.getInt64Ty())), b.getInt64(4)), b.CreateZExt(x, b.getInt64Ty()));
+        auto* offset = b.CreateAdd(b.CreateMul(b.CreateMul(b.CreateZExt(y, b.getInt64Ty()), b.CreateZExt(width, b.getInt64Ty())), b.CreateZExt(texel_bytes, b.getInt64Ty())), b.CreateZExt(x, b.getInt64Ty()));
         // The invalid private tag routes zero-mode accesses to the memory
         // helper's no-op/zero path, without touching a real allocation.
         auto* address = b.CreateSelect(valid, b.CreateAdd(base, offset), b.getInt64(0xffffffff00000000ull));
         if (writing) { store(address, value(instruction.getArgOperand(3))); output = nullptr; }
         else {
-            output = load(address, b.getInt32Ty());
             if (texture) {
-                output = b.CreateSelect(valid, output, load(b.CreateAdd(object, b.getInt64(32)), b.getInt32Ty()));
+                auto* channels = load(b.CreateAdd(object, b.getInt64(48)), b.getInt32Ty());
                 llvm::Value* tuple = llvm::UndefValue::get(type(instruction.getType()));
                 for (unsigned i = 0; i < 4; ++i) {
-                    auto* component = i == 0 ? output : b.CreateSelect(valid, b.getInt32(i == 3 ? 0x3f800000 : 0),
-                        load(b.CreateAdd(object, b.getInt64(32 + 4 * i)), b.getInt32Ty()));
+                    auto* present = b.CreateICmpUGT(channels, b.getInt32(i));
+                    auto* component_address = b.CreateSelect(b.CreateAnd(valid, present), b.CreateAdd(address, b.getInt64(4 * i)), b.getInt64(0xffffffff00000000ull));
+                    auto* sampled = b.CreateSelect(present, load(component_address, b.getInt32Ty()), b.getInt32(i == 3 ? 0x3f800000 : 0));
+                    auto* component = b.CreateSelect(valid, sampled, load(b.CreateAdd(object, b.getInt64(32 + 4 * i)), b.getInt32Ty()));
                     tuple = b.CreateInsertValue(tuple, component, i);
                 }
                 output = filter_texture(object, value(instruction.getArgOperand(1)), value(instruction.getArgOperand(2)), tuple, instruction);
-            }
+            } else output = load(address, b.getInt32Ty());
         }
         return true;
     }
