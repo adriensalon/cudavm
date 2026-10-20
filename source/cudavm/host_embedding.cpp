@@ -78,13 +78,17 @@ std::string embed_cuda(const llvm::Module& module, const std::string& code) {
                 throw std::runtime_error("host symbol registration escaped the closed device graph");
         }
     }
-    stream << "namespace {\nconst unsigned char image[] = {\n";
+    // String storage avoids one C++ initializer AST node per artifact byte.
+    // Keep literals short and escape every non-ASCII byte independently of
+    // the host source encoding. Their implicit terminator preserves the ABI.
+    stream << "namespace {\nconst unsigned char image[] =\n\"";
     unsigned column = 0;
     for (unsigned char byte : code) {
-        stream << static_cast<unsigned>(byte) << ',';
-        if (++column == 32) { stream << '\n'; column = 0; }
+        if (byte >= 32 && byte <= 126 && byte != '"' && byte != '\\' && byte != '?') stream << char(byte);
+        else stream << '\\' << char('0' + (byte >> 6)) << char('0' + ((byte >> 3) & 7)) << char('0' + (byte & 7));
+        if (++column == 1024) { stream << "\"\n\""; column = 0; }
     }
-    stream << "0};\n";
+    stream << "\";\n";
     size_t index = 0;
     for (const auto& value : kernels) {
         const auto& parameters = *value.getAsObject()->getArray("parameters");

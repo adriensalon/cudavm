@@ -7,6 +7,8 @@
 #include "ptx_parameters.hpp"
 #include "nvidia_image.hpp"
 #include <array>
+#include <bit>
+#include <cmath>
 #include <fstream>
 #include <iterator>
 #include <iomanip>

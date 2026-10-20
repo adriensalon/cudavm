@@ -773,7 +773,10 @@ struct lowering {
         auto* assembly = llvm::cast<llvm::InlineAsm>(instruction.getCalledOperand());
         if (assembly->isAlignStack() || assembly->getDialect() != llvm::InlineAsm::AD_ATT) return false;
         std::string text; for (unsigned char c : assembly->getAsmString()) if (!std::isspace(c)) text += char(c);
-        bool texture = text == "tex.2d.v4.f32.f32{$0,$1,$2,$3},[$4,{$5,$6}];";
+        bool float_texture = text == "tex.2d.v4.f32.f32{$0,$1,$2,$3},[$4,{$5,$6}];";
+        bool integer_texture = text == "tex.2d.v4.s32.f32{$0,$1,$2,$3},[$4,{$5,$6}];" ||
+            text == "tex.2d.v4.u32.f32{$0,$1,$2,$3},[$4,{$5,$6}];";
+        bool texture = float_texture || integer_texture;
         bool reading = false, writing = false, clamp = false, trap = false;
         for (auto mode : {"zero", "clamp", "trap"}) {
             if (text == std::string("suld.b.2d.b32.") + mode + "{$0},[$1,{$2,$3}];") reading = true;
@@ -793,23 +796,25 @@ struct lowering {
         if (texture) {
             auto* structure = llvm::dyn_cast<llvm::StructType>(instruction.getType());
             if (!structure || structure->getNumElements() != 4 ||
-                !llvm::all_of(structure->elements(), [](auto* type) { return type->isFloatTy(); }) ||
+                !llvm::all_of(structure->elements(), [&](auto* type) { return float_texture ? type->isFloatTy() : type->isIntegerTy(32); }) ||
                 !instruction.getArgOperand(1)->getType()->isFloatTy() || !instruction.getArgOperand(2)->getType()->isFloatTy() ||
-                assembly->getConstraintString() != "=f,=f,=f,=f,l,f,f") fail(instruction, "invalid texture instruction signature");
+                assembly->getConstraintString() != (float_texture ? "=f,=f,=f,=f,l,f,f" : "=r,=r,=r,=r,l,f,f")) fail(instruction, "invalid texture instruction signature");
         } else if (!instruction.getArgOperand(1)->getType()->isIntegerTy(32) || !instruction.getArgOperand(2)->getType()->isIntegerTy(32) ||
             (writing ? (!instruction.getType()->isVoidTy() ||
                         !(instruction.getArgOperand(3)->getType()->isIntegerTy(32) || instruction.getArgOperand(3)->getType()->isFloatTy()) || assembly->getConstraintString() != "l,r,r,r")
                      : (!(instruction.getType()->isIntegerTy(32) || instruction.getType()->isFloatTy()) || assembly->getConstraintString() != "=r,l,r,r")))
             fail(instruction, "invalid surface instruction signature");
         auto* object = value(instruction.getArgOperand(0));
-        auto* base = load(object, b.getInt64Ty());
-        auto* width = load(b.CreateAdd(object, b.getInt64(8)), b.getInt32Ty());
-        auto* height = load(b.CreateAdd(object, b.getInt64(12)), b.getInt32Ty());
-        auto* texel_bytes = texture ? load(b.CreateAdd(object, b.getInt64(52)), b.getInt32Ty()) : b.getInt32(4);
+        if (texture) object = b.CreateZExt(call_helper(resolve, {object}), b.getInt64Ty());
+        auto descriptor_word = [&](unsigned offset) { return texture ? image_word(object, offset) : load(b.CreateAdd(object, b.getInt64(offset)), b.getInt32Ty()); };
+        auto* base = texture ? b.CreateZExt(call_helper(resolve, {pair(descriptor_word(0), descriptor_word(4))}), b.getInt64Ty()) : load(object, b.getInt64Ty());
+        auto* width = descriptor_word(8);
+        auto* height = descriptor_word(12);
+        auto* texel_bytes = texture ? descriptor_word(52) : b.getInt32(4);
         llvm::Value *x = value(instruction.getArgOperand(1)), *y = value(instruction.getArgOperand(2));
         llvm::Value* valid = b.getTrue();
         if (texture) {
-            auto* normalized = b.CreateICmpNE(b.CreateAnd(load(b.CreateAdd(object, b.getInt64(20)), b.getInt32Ty()), b.getInt32(1)), b.getInt32(0));
+            auto* normalized = b.CreateICmpNE(b.CreateAnd(descriptor_word(20), b.getInt32(1)), b.getInt32(0));
             auto coordinate = [&](llvm::Value* bits, llvm::Value* extent, unsigned axis) {
                 // Exact floor of a nonnegative binary32 coordinate, followed
                 // by integer clamping. Masked shifts avoid poison in inactive
@@ -845,7 +850,7 @@ struct lowering {
                 auto* odd = b.CreateAnd(b.CreateICmpUGE(exponent, b.getInt32(127)), b.CreateICmpULE(exponent, b.getInt32(150)));
                 odd = b.CreateAnd(odd, b.CreateICmpNE(b.CreateAnd(b.CreateLShr(mantissa, b.CreateAnd(shift, b.getInt32(31))), b.getInt32(1)), b.getInt32(0)));
                 auto* negative = b.CreateAnd(b.CreateICmpSLT(bits, b.getInt32(0)), b.CreateICmpNE(exponent, b.getInt32(0)));
-                auto* mode = load(b.CreateAdd(object, b.getInt64(24 + axis * 4)), b.getInt32Ty());
+                auto* mode = descriptor_word(24 + axis * 4);
                 auto* wrap = b.CreateICmpEQ(mode, b.getInt32(0));
                 auto* mirror = b.CreateICmpEQ(mode, b.getInt32(2));
                 auto* wrapped = b.CreateSelect(b.CreateAnd(negative, b.CreateICmpNE(fraction, b.getInt32(0))), reflected_index, fractional_index);
@@ -895,16 +900,12 @@ struct lowering {
         if (writing) { store(address, value(instruction.getArgOperand(3))); output = nullptr; }
         else {
             if (texture) {
-                auto* channels = load(b.CreateAdd(object, b.getInt64(48)), b.getInt32Ty());
                 llvm::Value* tuple = llvm::UndefValue::get(type(instruction.getType()));
                 for (unsigned i = 0; i < 4; ++i) {
-                    auto* present = b.CreateICmpUGT(channels, b.getInt32(i));
-                    auto* component_address = b.CreateSelect(b.CreateAnd(valid, present), b.CreateAdd(address, b.getInt64(4 * i)), b.getInt64(0xffffffff00000000ull));
-                    auto* sampled = b.CreateSelect(present, load(component_address, b.getInt32Ty()), b.getInt32(i == 3 ? 0x3f800000 : 0));
-                    auto* component = b.CreateSelect(valid, sampled, load(b.CreateAdd(object, b.getInt64(32 + 4 * i)), b.getInt32Ty()));
-                    tuple = b.CreateInsertValue(tuple, component, i);
+                    auto* sampled = texture_component(object, address, i, float_texture);
+                    tuple = b.CreateInsertValue(tuple, sampled, i);
                 }
-                output = filter_texture(object, value(instruction.getArgOperand(1)), value(instruction.getArgOperand(2)), tuple, instruction);
+                output = float_texture ? filter_texture(object, value(instruction.getArgOperand(1)), value(instruction.getArgOperand(2)), tuple, instruction) : tuple;
             } else output = load(address, b.getInt32Ty());
         }
         return true;
@@ -1301,6 +1302,35 @@ struct lowering {
     }
 };
 }
+void scalarize_native_aggregate_phis(llvm::Module& module) {
+    std::vector<llvm::PHINode*> pending;
+    for (auto& function : module) for (auto& block : function) for (auto& phi : block.phis())
+        if (phi.getType()->isAggregateType()) pending.push_back(&phi);
+    for (size_t index = 0; index < pending.size(); ++index) {
+        auto* phi = pending[index]; auto* type = phi->getType();
+        unsigned count = llvm::isa<llvm::StructType>(type) ? type->getStructNumElements() : unsigned(type->getArrayNumElements());
+        llvm::IRBuilder<> builder(&*phi->getParent()->getFirstInsertionPt());
+        llvm::Value* aggregate = llvm::PoisonValue::get(type);
+        std::vector<llvm::PHINode*> fields;
+        for (unsigned component = 0; component < count; ++component) {
+            auto* element = type->isStructTy() ? llvm::cast<llvm::StructType>(type)->getElementType(component) : llvm::cast<llvm::ArrayType>(type)->getElementType();
+            auto* field = llvm::PHINode::Create(element, phi->getNumIncomingValues(), phi->getName()+".field", phi->getIterator());
+            fields.push_back(field); aggregate = builder.CreateInsertValue(aggregate, field, component);
+            if (field->getType()->isAggregateType()) pending.push_back(field);
+        }
+        phi->replaceAllUsesWith(aggregate);
+        std::map<llvm::BasicBlock*, std::vector<llvm::Value*>> edge_values;
+        for (unsigned incoming = 0; incoming < phi->getNumIncomingValues(); ++incoming) {
+            auto* predecessor = phi->getIncomingBlock(incoming);
+            builder.SetInsertPoint(predecessor->getTerminator());
+            auto [edge, inserted] = edge_values.try_emplace(predecessor);
+            if (inserted) for (unsigned component = 0; component < count; ++component)
+                edge->second.push_back(builder.CreateExtractValue(phi->getIncomingValue(incoming), component));
+            for (unsigned component = 0; component < count; ++component) fields[component]->addIncoming(edge->second[component], predecessor);
+        }
+        phi->eraseFromParent();
+    }
+}
 std::unique_ptr<llvm::Module> prepare_native_shader_module(const llvm::Module& input) {
     auto module = llvm::CloneModule(input);
     resolve_device_function_aliases(*module, true); resolve_device_data_aliases(*module, true); normalize_device_relocations(*module);
@@ -1358,6 +1388,9 @@ std::unique_ptr<llvm::Module> lower_native_shader(const llvm::Module& input, con
         llvm::AlwaysInlinerPass().run(*module, modules);
         for (auto& function : *module) function.removeFnAttr("cudavm.image.operations");
     }
+    // SPIR-V's aggregate instruction rewriting does not preserve aggregate
+    // PHIs. Keep each field's edge value explicit before entering codegen.
+    scalarize_native_aggregate_phis(*module);
     if(auto* directory=std::getenv("CUDAVM_DUMP_NATIVE_DIR")) {
         std::string text;llvm::raw_string_ostream output(text);module->print(output,nullptr);
         write_file(std::string(directory)+"/"+std::to_string(std::hash<std::string>{}(symbol))+"-"+std::to_string(unsigned(environment))+".ll",text);

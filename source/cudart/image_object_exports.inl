@@ -1,6 +1,11 @@
 RUNTIME_API(cudaCreateTextureObject, (cudaTextureObject_t* output, const cudaResourceDesc* resource, const cudaTextureDesc* texture, const cudaResourceViewDesc* view),
     require(output && resource && texture, CUDA_ERROR_INVALID_VALUE, "null texture descriptor or output"); runtime_current();
     auto r = runtime_image_resource(*resource); auto t = runtime_texture_descriptor(*texture);
+    if (texture->readMode == cudaReadModeElementType && texture->filterMode == cudaFilterModeLinear) {
+        CUDA_ARRAY3D_DESCRIPTOR array{}; check(cuArray3DGetDescriptor(&array, r.res.array.hArray));
+        symbol_require(array.Format == CU_AD_FORMAT_FLOAT || array.Format == CU_AD_FORMAT_HALF,
+            cudaErrorInvalidFilterSetting, "linear filtering requires floating-point reads");
+    }
     CUDA_RESOURCE_VIEW_DESC v{}; if (view) v = runtime_image_view(*view);
     check(cuTexObjectCreate(output, &r, &t, view ? &v : nullptr)))
 RUNTIME_API(cudaDestroyTextureObject, (cudaTextureObject_t handle), runtime_current(); check(runtime_driver_wait([&] { return cuTexObjectDestroy(handle); })))
