@@ -1,6 +1,7 @@
 #pragma once
 #include <bit>
 #include <cstdint>
+#include <cmath>
 #include <string>
 #include "device_numeric_source.hpp"
 #include "device_half_source.hpp"
@@ -12,6 +13,8 @@ namespace cudavm {
 #define CV_BITS(x) std::bit_cast<uint32_t>(x)
 #define CV_FLOAT(x) std::bit_cast<float>(uint32_t(x))
 #define CV_MATH_PRECISE
+#define CV_MATH_FMA(x,y,z) std::fma(x,y,z)
+#define CV_MATH_CLZ(x) std::countl_zero(uint32_t(x))
 #define CV_MATH_CONTRACT
 #define CV_MATH(...) using uint = uint32_t; __VA_ARGS__ inline constexpr char math_source[] = #__VA_ARGS__;
 CV_MATH(
@@ -36,8 +39,8 @@ CV_MATH_FN float cvFloatDivide(float a,float b) {
     if(ax==0u) return CV_FLOAT(sign);
     int ex=int(ax>>23u)-127,ey=int(ay>>23u)-127;
     uint m=(ax&0x007fffffu)|0x00800000u,n=(ay&0x007fffffu)|0x00800000u;
-    if((ax>>23u)==0u) {m=ax;ex=-126;while(m<0x00800000u){m<<=1u;--ex;}}
-    if((ay>>23u)==0u) {n=ay;ey=-126;while(n<0x00800000u){n<<=1u;--ey;}}
+    if((ax>>23u)==0u) {uint shift=CV_MATH_CLZ(ax)-8u;m=ax<<shift;ex=-126-int(shift);}
+    if((ay>>23u)==0u) {uint shift=CV_MATH_CLZ(ay)-8u;n=ay<<shift;ey=-126-int(shift);}
     int exponent=ex-ey;
     if(m<n) {m<<=1u;--exponent;}
     if(exponent>127) return CV_FLOAT(sign|0x7f800000u);
@@ -107,8 +110,7 @@ CV_MATH_FN float cvMathSqrt(float x) {
     int exponent=int(m>>23u)-127;
     m=(m&0x007fffffu)|0x00800000u;
     if((bits&0x7f800000u)==0u) {
-        exponent=-126;m=bits;
-        while(m<0x00800000u) {m<<=1u;--exponent;}
+        uint shift=CV_MATH_CLZ(bits)-8u;exponent=-126-int(shift);m=bits<<shift;
     }
     // Restoring integer square root of the exact 48-bit scaled significand.
     uint shift=23u+(uint(exponent)&1u),lo=m<<shift,hi=m>>(32u-shift);
@@ -135,11 +137,37 @@ CV_MATH_FN uint cvMathTwoOverPi(uint i) {
 }
 CV_MATH_FN float cvMathScaled(uint m,int scale) {
     if(m==0u) return 0.0f;
-    while(m<0x00800000u) {m<<=1u;--scale;}
+    uint normalize_shift=CV_MATH_CLZ(m)-8u;m<<=normalize_shift;scale-=int(normalize_shift);
     int exponent=scale+150;
     if(exponent>0) return CV_FLOAT((uint(exponent)<<23u)|(m&0x007fffffu));
     uint shift=uint(1-exponent);
     return shift<24u?CV_FLOAT(m>>shift):0.0f;
+}
+// Exact truncation for finite |x| < 65536. Bounded range reductions use
+// this instead of introducing a general FP32-to-64-bit conversion helper.
+CV_MATH_FN int math_small_integer(float x) {
+    uint bits=CV_BITS(x),exponent=(bits>>23)&255u;
+    if(exponent<127u)return 0;
+    uint magnitude=((bits&0x7fffffu)|0x800000u)>>(150u-exponent);
+    return bits&0x80000000u?-int(magnitude):int(magnitude);
+}
+CV_MATH_FN float math_trig_reduced(float r,uint quadrant,uint sign) {
+    CV_MATH_CONTRACT
+    CV_MATH_PRECISE float z=r*r,result;
+    if((quadrant&1u)==0u) {
+        CV_MATH_PRECISE float p=2.7557319223985893e-6f+z*(-2.505210838544172e-8f);
+        p=-0.0001984126984126984f+z*p;
+        p=0.008333333333333333f+z*p;
+        p=-0.16666666666666667f+z*p;
+        result=r+r*z*p;
+    } else {
+        CV_MATH_PRECISE float p=-2.755731922398589e-7f+z*2.08767569878681e-9f;
+        p=2.48015873015873e-5f+z*p;
+        p=-0.001388888888888889f+z*p;
+        p=0.041666666666666664f+z*p;
+        result=(1.0f-z*0.5f)+(z*z)*p;
+    }
+    return CV_FLOAT(CV_BITS(result)^(((quadrant&2u)<<30u)^sign));
 }
 CV_MATH_FN float cvMathTrig(float x,uint cosine) {
     CV_MATH_CONTRACT
@@ -150,8 +178,8 @@ CV_MATH_FN float cvMathTrig(float x,uint cosine) {
     uint quadrant=0u;
     if(a<32.0f) {
         // Each high/middle product is exact in this bounded fast path.
-        quadrant=uint(a*0.63661977236758134308f+0.5f);
-        CV_MATH_PRECISE float n=float(quadrant);
+        quadrant=uint(math_small_integer(a*0.63661977236758134308f+0.5f));
+        CV_MATH_PRECISE float n=cvMathScaled(quadrant,0);
         r=((a-n*1.5703125f)-n*0.0004837512969970703125f)-n*7.54978941586159635335e-8f;
     } else {
         // Payne-Hanek reduction for every finite binary32 exponent. All integer
@@ -196,30 +224,101 @@ CV_MATH_FN float cvMathTrig(float x,uint cosine) {
         r=first+rest;
         if(above_half!=0u) r=-r;
     }
-    quadrant=(quadrant+cosine)&3u;
-    CV_MATH_PRECISE float z=r*r,result;
-    if((quadrant&1u)==0u) {
-        CV_MATH_PRECISE float p=2.7557319223985893e-6f+z*(-2.505210838544172e-8f);
-        p=-0.0001984126984126984f+z*p;
-        p=0.008333333333333333f+z*p;
-        p=-0.16666666666666667f+z*p;
-        result=r+r*z*p;
-    } else {
-        CV_MATH_PRECISE float p=-2.755731922398589e-7f+z*2.08767569878681e-9f;
-        p=2.48015873015873e-5f+z*p;
-        p=-0.001388888888888889f+z*p;
-        p=0.041666666666666664f+z*p;
-        result=(1.0f-z*0.5f)+(z*z)*p;
-    }
-    uint sign=((quadrant&2u)<<30u)^(cosine==0u?(bits&0x80000000u):0u);
-    return CV_FLOAT(CV_BITS(result)^sign);
+    return math_trig_reduced(r,(quadrant+cosine)&3u,cosine==0u?(bits&0x80000000u):0u);
+}
+// Widened binary16 inputs need only a bounded Cody-Waite reduction. The
+// leading n*201/128 product is exact throughout this domain. Splitting n into
+// multiples of eight makes both middle products exact as well.
+CV_MATH_FN float math_half_trig(float x,uint cosine) {
+    CV_MATH_CONTRACT
+    uint bits=CV_BITS(x),absolute=bits&0x7fffffffu;
+    if(absolute>=0x7f800000u)return CV_FLOAT(bits|0x00400000u);
+    if(absolute<0x39800000u)return cosine?1.0f:x;
+    float a=CV_FLOAT(absolute);
+    uint n=uint(math_small_integer(a*0.63661977236758134308f+0.5f));
+    float nf=cvMathScaled(n,0),high=cvMathScaled(n&~7u,0),low=cvMathScaled(n&7u,0);
+    float r=((a-nf*1.5703125f)-high*0.0004837512969970703125f)-low*0.0004837512969970703125f;
+    r=r-nf*7.54978941586159635335e-8f;
+    return math_trig_reduced(r,(n+cosine)&3u,cosine?0u:bits&0x80000000u);
 }
 CV_MATH_FN float cvMathSin(float x) {return cvMathTrig(x,0u);}
 CV_MATH_FN float cvMathCos(float x) {return cvMathTrig(x,1u);}
+// Centered exp2 polynomial followed by explicit exponent assembly. Round
+// subnormal results in integer space, independently of the target's FTZ mode.
+CV_MATH_FN float math_exponential(float x,uint base) {
+    CV_MATH_CONTRACT
+    uint bits=CV_BITS(x),ax=bits&0x7fffffffu;
+    if(ax>0x7f800000u)return CV_FLOAT(bits|0x00400000u);
+    float scaled=base==1u?x*1.4426950408889634f:base==2u?x*3.3219280948873623f:x;
+    if(scaled>=129.0f)return CV_FLOAT(0x7f800000u);
+    if(scaled<=-151.0f)return 0.0f;
+    float nf=cvMathFloor(scaled+0.5f);int n=math_small_integer(nf);float z;
+    if(base==0u)z=(x-nf)*0.6931471805599453f;
+    else if(base==1u)z=(x-nf*0.693145751953125f)-nf*1.428606765330187e-6f;
+    else z=(CV_MATH_FMA(x,2.3025851249694824f,-nf*0.693145751953125f)+x*(-3.197543652078138e-8f))-nf*1.428606765330187e-6f;
+    float p=1.0f+z*(1.0f+z*(0.5f+z*(0.16666666666666667f+z*(0.041666666666666664f+z*(0.008333333333333333f+z*(0.001388888888888889f+z*(0.0001984126984126984f+z*0.0000248015873015873f)))))));
+    uint pb=CV_BITS(p),m=(pb&0x7fffffu)|0x800000u;
+    int exponent=int(pb>>23)+n;
+    if(exponent>=255)return CV_FLOAT(0x7f800000u);
+    if(exponent>0)return CV_FLOAT((uint(exponent)<<23)|(m&0x7fffffu));
+    uint shift=uint(1-exponent);
+    if(shift>24u)return 0.0f;
+    uint q=m>>shift,rem=m&((1u<<shift)-1u),mid=1u<<(shift-1u);
+    return CV_FLOAT(q+uint(rem>mid || (rem==mid && (q&1u))));
+}
+CV_MATH_FN float math_log2_mode(float x,uint native_division) {
+    CV_MATH_CONTRACT
+    uint bits=CV_BITS(x),ax=bits&0x7fffffffu;
+    if(ax>0x7f800000u)return CV_FLOAT(bits|0x00400000u);
+    if(!ax)return CV_FLOAT(0xff800000u);
+    if(bits&0x80000000u)return CV_FLOAT(0x7fc00000u);
+    if(ax==0x7f800000u)return x;
+    int e=int(ax>>23)-127;uint m=ax&0x7fffffu;
+    if(ax<0x800000u) {uint shift=CV_MATH_CLZ(m)-8u;e=-126-int(shift);m=(m<<shift)&0x7fffffu;}
+    float a=CV_FLOAT(m|0x3f800000u);
+    if(a>1.4142135623730951f){a=a*0.5f;++e;}
+    float z=native_division?(a-1.0f)/(a+1.0f):cvFloatDivide(a-1.0f,a+1.0f),t=z*z;
+    float p=1.0f+t*(0.3333333333333333f+t*(0.2f+t*(0.14285714285714285f+t*(0.1111111111111111f+t*(0.09090909090909091f+t*0.07692307692307692f)))));
+    float ef=cvMathScaled(uint(e<0?-e:e),0);if(e<0)ef=-ef;
+    return ef+(z*p)*2.8853900817779268f;
+}
+CV_MATH_FN float math_log2(float x) {return math_log2_mode(x,0u);}
+CV_MATH_FN float math_exp2(float x) {return math_exponential(x,0u);}
+CV_MATH_FN float math_exp(float x) {return math_exponential(x,1u);}
+CV_MATH_FN float math_exp10(float x) {return math_exponential(x,2u);}
+CV_MATH_FN float math_log(float x) {return math_log2(x)*0.6931471805599453f;}
+CV_MATH_FN float math_log10(float x) {return math_log2(x)*0.3010299956639812f;}
+CV_MATH_FN float math_tanh_mode(float x,uint native_division) {
+    CV_MATH_CONTRACT
+    uint bits=CV_BITS(x),ax=bits&0x7fffffffu;
+    if(ax>0x7f800000u)return CV_FLOAT(bits|0x00400000u);
+    if(ax<0x39800000u)return x;
+    float a=CV_FLOAT(ax),v;
+    if(a>=10.0f)v=1.0f;
+    else if(a<0.5f) {
+        float t=a*a;
+        v=a*(1.0f+t*(-0.3333333333333333f+t*(0.13333333333333333f+t*(-0.05396825396825397f+t*(0.021869488536155203f+t*(-0.008863235529902197f+t*0.003592128036572481f))))));
+    } else {float e=math_exp2(a*2.8853900817779268f);v=native_division?(e-1.0f)/(e+1.0f):cvFloatDivide(e-1.0f,e+1.0f);}
+    return CV_FLOAT(CV_BITS(v)|(bits&0x80000000u));
+}
+CV_MATH_FN float math_tanh(float x) {return math_tanh_mode(x,0u);}
+CV_MATH_FN float math_reciprocal_mode(float x,uint native_division) {
+    if(!native_division)return cvFloatDivide(1.0f,x);
+    uint bits=CV_BITS(x),ax=bits&0x7fffffffu,sign=bits&0x80000000u;
+    if(!ax)return CV_FLOAT(sign|0x7f800000u);
+    if(ax==0x7f800000u)return CV_FLOAT(sign);
+    if(ax>0x7f800000u)return CV_FLOAT(bits|0x00400000u);
+    return 1.0f/x;
+}
+CV_MATH_FN float math_reciprocal(float x) {return math_reciprocal_mode(x,0u);}
+CV_MATH_FN float math_rsqrt(float x) {return cvFloatDivide(1.0f,cvMathSqrt(x));}
+CV_MATH_FN float math_flush(float x) {uint b=CV_BITS(x);return CV_FLOAT((b&0x7fffffffu)<0x800000u?b&0x80000000u:b);}
 )
 #undef CV_MATH
 #undef CV_MATH_FN
 #undef CV_MATH_PRECISE
+#undef CV_MATH_FMA
+#undef CV_MATH_CLZ
 #undef CV_MATH_CONTRACT
 #undef CV_BITS
 #undef CV_FLOAT
@@ -227,6 +326,8 @@ CV_MATH_FN float cvMathCos(float x) {return cvMathTrig(x,1u);}
 inline std::string device_math_header() {
     return native_numeric_header()+device_half_header()+std::string("#pragma clang system_header\n"
         "#define CV_MATH_FN __device__ inline\n#define CV_MATH_PRECISE\n"
+        "#define CV_MATH_CLZ(x) __builtin_clz(x)\n"
+        "#define CV_MATH_FMA(x,y,z) __builtin_elementwise_fma(x,y,z)\n"
         "#define CV_MATH_CONTRACT _Pragma(\"clang fp contract(off)\")\n"
         "#define CV_BITS(x) __builtin_bit_cast(unsigned, (x))\n"
         "#define CV_FLOAT(x) __builtin_bit_cast(float, unsigned(x))\n"
@@ -242,13 +343,55 @@ inline std::string device_math_header() {
         "extern \"C\" __device__ inline float __nv_roundf(float x) {return cudavm::cvMathRound(x);}\n"
         "extern \"C\" __device__ inline float __nv_rintf(float x) {return cudavm::cvMathRint(x);}\n"
         "extern \"C\" __device__ inline float __nv_nearbyintf(float x) {return cudavm::cvMathRint(x);}\n"
+        "extern \"C\" __device__ inline float __nv_exp2f(float x) {return cudavm::math_exp2(x);}\n"
+        "extern \"C\" __device__ inline float __nv_expf(float x) {return cudavm::math_exp(x);}\n"
+        "extern \"C\" __device__ inline float __nv_exp10f(float x) {return cudavm::math_exp10(x);}\n"
+        "extern \"C\" __device__ inline float __nv_log2f(float x) {return cudavm::math_log2(x);}\n"
+        "extern \"C\" __device__ inline float __nv_logf(float x) {return cudavm::math_log(x);}\n"
+        "extern \"C\" __device__ inline float __nv_log10f(float x) {return cudavm::math_log10(x);}\n"
+        "extern \"C\" __device__ inline float __nv_tanhf(float x) {return cudavm::math_tanh(x);}\n"
+        "extern \"C\" __device__ inline float __nv_fmaf_rn(float x,float y,float z) {return __builtin_elementwise_fma(x,y,z);}\n"
+        "extern \"C\" __device__ inline float __nv_fsub_rn(float x,float y) {return x-y;}\n"
         // Retain exact scalar helpers in portable IR. Shader lowering can
         // select them on its private clone while NVPTX retains CUDA operations.
         "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_sqrt(float x) {return cudavm::cvMathSqrt(x);}\n"
         "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_max(float x,float y) {return cudavm::cvMathMax(x,y);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_min(float x,float y) {return cudavm::cvMathMin(x,y);}\n"
         "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_divide(float x,float y) {return cudavm::cvFloatDivide(x,y);}\n"
         "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_integral(float x,unsigned mode) {return cudavm::cvMathIntegral(x,mode);}\n"
         "extern \"C\" __device__ __attribute__((used)) inline unsigned __cudavm_native_compare(unsigned x,unsigned y,unsigned predicate) {return cudavm::cvFloatCompare(x,y,predicate);}\n"
-        "#undef CV_MATH_FN\n#undef CV_MATH_PRECISE\n#undef CV_MATH_CONTRACT\n#undef CV_BITS\n#undef CV_FLOAT\n";
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_sin(float x) {return cudavm::cvMathSin(x);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_cos(float x) {return cudavm::cvMathCos(x);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_exp2(float x) {return cudavm::math_exp2(x);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_exp(float x) {return cudavm::math_exp(x);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_exp10(float x) {return cudavm::math_exp10(x); }\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_log2(float x) {return cudavm::math_log2(x);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_log(float x) {return cudavm::math_log(x);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_log10(float x) {return cudavm::math_log10(x);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_tanh(float x) {return cudavm::math_tanh(x);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_rcp(float x) {return cudavm::math_reciprocal(x);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_rsqrt(float x) {return cudavm::math_rsqrt(x);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_flush(float x) {return cudavm::math_flush(x);}\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_half_sin(float x) {return cudavm::math_half_trig(x,0); }\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_half_cos(float x) {return cudavm::math_half_trig(x,1); }\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_half_log2(float x) {return cudavm::math_log2_mode(x,1); }\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_half_log(float x) {return cudavm::math_log2_mode(x,1)*0.6931471805599453f; }\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_half_log10(float x) {return cudavm::math_log2_mode(x,1)*0.3010299956639812f; }\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_half_tanh(float x) {return cudavm::math_tanh_mode(x,1); }\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_half_rcp(float x) {return cudavm::math_reciprocal_mode(x,1); }\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_half_sqrt(float x) {unsigned b=__builtin_bit_cast(unsigned,x),a=b&0x7fffffffu; if(!a || b==0x7f800000u)return x; if(a>0x7f800000u)return __builtin_bit_cast(float,b|0x00400000u); if(b&0x80000000u)return __builtin_bit_cast(float,0x7fc00000u); return __builtin_elementwise_sqrt(x); }\n"
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_half_rsqrt(float x) {return cudavm::math_reciprocal_mode(__cudavm_native_half_sqrt(x),1); }\n"
+        // In this exponent interval every nonzero product, cancellation residue
+        // and result is normal. Other inputs need integer FMA on shader targets
+        // that can flush subnormals. DXIL selects integer FMA directly.
+        "extern \"C\" __device__ __attribute__((used)) inline float __cudavm_native_fma(float a,float b,float c) {\n"
+        " unsigned x=__builtin_bit_cast(unsigned,a),y=__builtin_bit_cast(unsigned,b),z=__builtin_bit_cast(unsigned,c);\n"
+        " unsigned ax=x&0x7fffffffu,ay=y&0x7fffffffu,az=z&0x7fffffffu;\n"
+        " bool sx=!ax || (ax>=(90u<<23) && ax<(161u<<23));\n"
+        " bool sy=!ay || (ay>=(90u<<23) && ay<(161u<<23));\n"
+        " bool sz=!az || (az>=(90u<<23) && az<(161u<<23));\n"
+        " if(sx && sy && sz)return __builtin_elementwise_fma(a,b,c);\n"
+        " return __builtin_bit_cast(float,__cudavm_native_word_f32_fma(x,y,z));}\n"
+        "#undef CV_MATH_CLZ\n#undef CV_MATH_FMA\n#undef CV_MATH_FN\n#undef CV_MATH_PRECISE\n#undef CV_MATH_CONTRACT\n#undef CV_BITS\n#undef CV_FLOAT\n";
 }
 }

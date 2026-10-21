@@ -8,6 +8,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/InlineAsm.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Support/CodeGen.h>
@@ -25,6 +26,13 @@ std::string emit_cuda(const llvm::Module& portable, const std::string& architect
 }
 std::string emit_cuda_ir(const llvm::Module& input, const std::string& architecture, std::string* target_data_layout) {
     auto module = llvm::CloneModule(input);
+    lower_half_math_intrinsics(*module);
+    for(const auto& function:*module)for(const auto& block:function)for(const auto& instruction:block)
+        if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->getType()->isHalfTy() && call->getCalledFunction() && call->getCalledFunction()->isIntrinsic()) {
+            auto id=call->getCalledFunction()->getIntrinsicID();
+            if(id!=llvm::Intrinsic::fma && id!=llvm::Intrinsic::fabs && id!=llvm::Intrinsic::copysign)
+                throw std::runtime_error("unsupported native half intrinsic: "+call->getCalledFunction()->getName().str());
+        }
     // PTX cannot alias entry points or weak functions. Export those names as
     // real bodies while retaining native .alias for ordinary strong helpers.
     resolve_device_function_aliases(*module, true, true);
@@ -53,13 +61,17 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
     if (!target) throw std::runtime_error(error);
     llvm::TargetOptions settings;
     // Inline instructions from CUDA headers also impose a PTX dialect floor.
-    // Packed half comparisons with integer results were introduced in PTX 6.5,
-    // after the default 6.3 dialect for SM 75. Preserve lower defaults elsewhere.
-    std::string features;
+    // Packed half comparisons need PTX 6.5; the pinned tanh assembly needs
+    // PTX 7.0 even on SM 75. Never lower a newer architecture's default floor.
+    unsigned dialect=0;
     for(const auto& function:*module)for(const auto& block:function)for(const auto& instruction:block)
-        if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->isInlineAsm())
-            if(architecture.starts_with("sm_") && std::stoi(architecture.substr(3))<80
-                && llvm::cast<llvm::InlineAsm>(call->getCalledOperand())->getAsmString().find(".u32.f16x2")!=std::string::npos)features="+ptx65";
+        if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->isInlineAsm()) {
+            auto text=llvm::cast<llvm::InlineAsm>(call->getCalledOperand())->getAsmString();
+            if(text.contains(".u32.f16x2"))dialect=std::max(dialect,65u);
+            if(text.contains("tanh.approx."))dialect=std::max(dialect,70u);
+        }
+    std::string features;
+    if(dialect && architecture.starts_with("sm_") && std::stoi(architecture.substr(3))<80)features="+ptx"+std::to_string(dialect);
     std::unique_ptr<llvm::TargetMachine> machine(target->createTargetMachine(module->getTargetTriple(), architecture, features, settings, std::nullopt));
     if (!machine) throw std::runtime_error("NVPTX target machine creation failed");
     module->setDataLayout(machine->createDataLayout());

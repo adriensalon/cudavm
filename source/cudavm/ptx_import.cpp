@@ -9,11 +9,15 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/InlineAsm.h>
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Scalar/SROA.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 
 namespace cudavm {
 namespace {
@@ -78,14 +82,15 @@ struct ptx_type {
         return (kind == 'f') == (other.kind == 'f');
     }
     llvm::IntegerType* storage(llvm::LLVMContext& context) const { return llvm::IntegerType::get(context, bits); }
-    llvm::Type* value(llvm::LLVMContext& context) const { return kind == 'f' ? llvm::Type::getFloatTy(context) : storage(context); }
+    llvm::Type* value(llvm::LLVMContext& context) const { return kind == 'f' ? (bits==16?llvm::Type::getHalfTy(context):llvm::Type::getFloatTy(context)) : storage(context); }
 };
 ptx_type ptx_scalar(const ptx_token& token, bool memory = false) {
     auto name = token.text; if (name.starts_with('.')) name.erase(0, 1);
+    if (name == "f16x2" && !memory) return {32, 'h'};
     if (name == "pred" && !memory) return {1, 'p'};
     for (auto prefix : {'b', 'u', 's', 'f'}) for (unsigned bits : {8u, 16u, 32u, 64u})
         if (name == prefix + std::to_string(bits)) {
-            if ((prefix == 'f' && bits != 32) || (!memory && bits == 8)) break;
+            if ((prefix == 'f' && bits != 32 && bits != 16) || (!memory && bits == 8)) break;
             return {bits, prefix};
         }
     ptx_fail(token, "unsupported scalar type", true);
@@ -225,7 +230,9 @@ class ptx_parser {
         std::vector<ptx_parameter> results;
         if (!kernel && peek().text == "(") results = parameter_list();
         if (results.size() > 1) ptx_fail(results[1].name, "PTX ABI permits a single return parameter");
-        auto name = identifier(); auto parameters = parameter_list();
+        auto name = identifier();
+        if(name.text.starts_with("__cudavm_native_") || name.text.starts_with("_ZN6cudavm"))ptx_fail(name,"reserved compiler symbol",true);
+        auto parameters = parameter_list();
         if (module->size() >= 4096) ptx_fail(name, "function resource limit exceeded", true);
         std::vector<llvm::Type*> inputs, outputs;
         for (const auto& parameter : parameters) inputs.push_back(kernel && (parameter.array || parameter.alignment != parameter.type.bits / 8)
@@ -362,6 +369,146 @@ class ptx_parser {
         }
         bodies.push_back(std::move(body));
     }
+
+    template<class Read,class Write> bool numeric_instruction(const std::vector<std::string>& parts,
+            const ptx_instruction& instruction,llvm::IRBuilder<>& b,Read read,Write write) {
+        const auto& op=parts[0];const auto& operands=instruction.operands;
+        auto type=ptx_scalar({parts.back(),instruction.opcode.line,instruction.opcode.column},op=="ld" || op=="st");
+        auto arity=[&](unsigned n){if(operands.size()!=n)ptx_fail(instruction.opcode,"wrong operand count");};
+        auto helper=[&](const std::string& name,std::vector<llvm::Value*> args,llvm::Type* result)->llvm::Value* {
+            std::vector<llvm::Type*> types;for(auto* arg:args)types.push_back(arg->getType());
+            return b.CreateCall(module->getOrInsertFunction("__cudavm_native_"+name,llvm::FunctionType::get(result,types,false)),args);
+        };
+        auto word=[&](llvm::Value* v)->llvm::Value* {return v->getType()->isFloatingPointTy()?b.CreateBitCast(v,llvm::Type::getIntNTy(context,v->getType()->getPrimitiveSizeInBits())):v;};
+        auto real=[&](llvm::Value* v)->llvm::Value* {return b.CreateBitCast(helper("word_f16_to_f32",{b.CreateZExtOrTrunc(word(v),b.getInt32Ty())},b.getInt32Ty()),b.getFloatTy());};
+        auto done=[&](llvm::Value* v,ptx_type t){write(operands[0],v,t,false);return true;};
+        if(op=="mov" && parts.size()==2 && (operands.size()==2) && (operands[0].size()>1 || operands[1].size()>1)) {
+            // mov.b32 packs/unpacks two independent 16-bit lanes.
+            if(type.bits!=32 || type.kind!='b')return false;
+            auto fields=[&](const auto& v){return v.size()==5 && v[0].text=="{" && v[2].text=="," && v[4].text=="}";};
+            if(fields(operands[1]))return done(b.CreateOr(b.CreateZExt(read({operands[1][1]},{16,'b'}),b.getInt32Ty()),b.CreateShl(b.CreateZExt(read({operands[1][3]},{16,'b'}),b.getInt32Ty()),16)),type);
+            if(fields(operands[0])) {
+                auto* v=read(operands[1],type);
+                write({operands[0][1]},b.CreateTrunc(v,b.getInt16Ty()),{16,'b'},false);
+                write({operands[0][3]},b.CreateTrunc(b.CreateLShr(v,16),b.getInt16Ty()),{16,'b'},false);return true;
+            }
+            return false;
+        }
+        if(op=="cvt" && parts.size()>=3) {
+            auto destination=ptx_scalar({parts[parts.size()-2],instruction.opcode.line,instruction.opcode.column});
+            if(destination.kind=='f' && destination.bits==16 && type.kind=='f' && type.bits==16 && parts.size()==4) {
+                const std::map<std::string,unsigned> modes{{"rzi",0},{"rmi",1},{"rpi",2},{"rni",4}};
+                if(!modes.contains(parts[1]))return false;
+                arity(2);auto* x=helper("integral",{real(read(operands[1],type)),b.getInt32(modes.at(parts[1]))},b.getFloatTy());
+                auto* v=helper("word_f32_to_f16",{word(x),b.getInt32(0)},b.getInt32Ty());
+                return done(b.CreateBitCast(b.CreateTrunc(v,b.getInt16Ty()),b.getHalfTy()),destination);
+            }
+            if(destination.kind=='f' && destination.bits==32 && type.kind=='f' && type.bits==16 && parts.size()==3) {
+                arity(2);return done(real(read(operands[1],type)),destination);
+            }
+            const std::vector<std::string> modes{"rn","rz","rm","rp"};
+            auto found=parts.size()==4?std::find(modes.begin(),modes.end(),parts[1]):modes.end();
+            if(destination.kind=='f' && destination.bits==16 && type.kind=='f' && type.bits==32 && found!=modes.end()) {
+                arity(2);auto* v=helper("word_f32_to_f16",{word(read(operands[1],type)),b.getInt32(unsigned(found-modes.begin()))},b.getInt32Ty());
+                return done(b.CreateBitCast(b.CreateTrunc(v,b.getInt16Ty()),b.getHalfTy()),destination);
+            }
+        }
+        if((type.kind=='f' || type.kind=='h') && (op=="neg" || op=="abs") && parts.size()==2) {
+            arity(2);auto* v=word(read(operands[1],type));auto sign=type.kind=='h'?0x80008000u:type.bits==16?0x8000u:0x80000000u;
+            auto* mask=llvm::ConstantInt::get(v->getType(),sign);
+            v=op=="neg"?b.CreateXor(v,mask):b.CreateAnd(v,b.CreateNot(mask));
+            return done(type.kind=='f'?b.CreateBitCast(v,type.value(context)):v,type);
+        }
+        if((op=="min" || op=="max") && (type.kind=='f' || type.kind=='h') &&
+            (parts.size()==2 || (parts.size()==3 && parts[1]=="NaN" && (type.bits==16 || type.kind=='h')))) {
+            arity(3);auto* a=read(operands[1],type);auto* c=read(operands[2],type);
+            auto compute=[&](llvm::Value* a,llvm::Value* c)->llvm::Value* {
+                bool half=type.bits==16 || type.kind=='h';
+                if(!half)return helper(op,{a,c},b.getFloatTy());
+                return helper("word_f16_minmax",{b.CreateZExtOrTrunc(word(a),b.getInt32Ty()),b.CreateZExtOrTrunc(word(c),b.getInt32Ty()),b.getInt32(op=="max"),b.getInt32(parts.size()==3)},b.getInt32Ty());
+            };
+            if(type.kind=='h') {
+                auto lane=[&](unsigned shift){return compute(b.CreateTrunc(b.CreateLShr(a,shift),b.getInt16Ty()),b.CreateTrunc(b.CreateLShr(c,shift),b.getInt16Ty()));};
+                return done(b.CreateOr(lane(0),b.CreateShl(lane(16),16)),type);
+            }
+            auto* v=compute(a,c);return done(type.bits==16?b.CreateBitCast(b.CreateTrunc(v,b.getInt16Ty()),b.getHalfTy()):v,type);
+        }
+        if(op=="setp" && parts.size()==3 && type.kind=='f') {
+            const std::map<std::string,llvm::CmpInst::Predicate> predicates{
+                {"eq",llvm::CmpInst::FCMP_OEQ},{"ne",llvm::CmpInst::FCMP_ONE},{"lt",llvm::CmpInst::FCMP_OLT},{"le",llvm::CmpInst::FCMP_OLE},{"gt",llvm::CmpInst::FCMP_OGT},{"ge",llvm::CmpInst::FCMP_OGE},
+                {"equ",llvm::CmpInst::FCMP_UEQ},{"neu",llvm::CmpInst::FCMP_UNE},{"ltu",llvm::CmpInst::FCMP_ULT},{"leu",llvm::CmpInst::FCMP_ULE},{"gtu",llvm::CmpInst::FCMP_UGT},{"geu",llvm::CmpInst::FCMP_UGE},{"nan",llvm::CmpInst::FCMP_UNO},{"num",llvm::CmpInst::FCMP_ORD}};
+            if(!predicates.contains(parts[1]))return false;
+            arity(3);return done(b.CreateFCmp(predicates.at(parts[1]),read(operands[1],type),read(operands[2],type)),{1,'p'});
+        }
+        if(op=="set" && parts.size()==4 && (type.kind=='f' || type.kind=='h')) {
+            arity(3);auto destination=ptx_scalar({parts[2],instruction.opcode.line,instruction.opcode.column});
+            if((type.kind=='f' && (type.bits!=16 || destination.kind!='f' || destination.bits!=16)) ||
+                (type.kind=='h' && destination.kind!='h' && (destination.kind!='u' || destination.bits!=32)))return false;
+            const std::map<std::string,llvm::CmpInst::Predicate> comparisons{{"eq",llvm::CmpInst::FCMP_OEQ},{"ne",llvm::CmpInst::FCMP_ONE},{"nan",llvm::CmpInst::FCMP_UNO}};
+            if(!comparisons.contains(parts[1]))return false;
+            auto* a=read(operands[1],type);auto* c=read(operands[2],type);
+            auto lane=[&](unsigned shift)->llvm::Value* {
+                auto half=[&](llvm::Value* x){return b.CreateBitCast(b.CreateTrunc(b.CreateLShr(x,shift),b.getInt16Ty()),b.getHalfTy());};
+                auto* predicate=b.CreateFCmp(comparisons.at(parts[1]),type.kind=='h'?half(a):a,type.kind=='h'?half(c):c);
+                return b.CreateSelect(predicate,b.getInt32(destination.kind=='u'?65535:0x3c00),b.getInt32(0));
+            };
+            auto* v=lane(0);
+            if(type.kind=='h')v=b.CreateOr(v,b.CreateShl(lane(16),16));
+            else v=b.CreateBitCast(b.CreateTrunc(v,b.getInt16Ty()),b.getHalfTy());
+            return done(v,destination);
+        }
+        if((op=="fma" || op=="add" || op=="sub" || op=="mul") && (type.kind=='f' || type.kind=='h') &&
+                (parts.size()==2 || (parts.size()==3 && parts[1]=="rn") ||
+                    ((type.bits==16 || type.kind=='h') && ((parts.size()==3 && parts[1]=="sat") || (parts.size()==4 && parts[1]=="rn" && parts[2]=="sat"))) ||
+                    (op=="fma" && (type.bits==16 || type.kind=='h') && parts.size()==4 && parts[1]=="rn" && parts[2]=="relu"))) {
+            bool fused=op=="fma";arity(fused?4:3);
+            auto* a=read(operands[1],type);auto* c=read(operands[2],type);
+            auto compute=[&](llvm::Value* a,llvm::Value* c,llvm::Value* d)->llvm::Value* {
+                llvm::Value* v=fused?b.CreateIntrinsic(a->getType(),llvm::Intrinsic::fma,{a,c,d}):op=="add"?b.CreateFAdd(a,c):op=="sub"?b.CreateFSub(a,c):b.CreateFMul(a,c);
+                bool saturate=std::find(parts.begin(),parts.end(),"sat")!=parts.end();
+                bool relu=std::find(parts.begin(),parts.end(),"relu")!=parts.end();
+                if(saturate || relu) {
+                        auto* bits=word(v);auto* magnitude=b.CreateAnd(bits,b.getInt16(0x7fff));
+                        auto* nan=b.CreateICmpUGT(magnitude,b.getInt16(0x7c00));
+                        auto* negative=b.CreateICmpNE(b.CreateAnd(bits,b.getInt16(0x8000)),b.getInt16(0));
+                        if(saturate)bits=b.CreateSelect(b.CreateOr(nan,negative),b.getInt16(0),b.CreateSelect(b.CreateICmpUGT(bits,b.getInt16(0x3c00)),b.getInt16(0x3c00),bits));
+                        else bits=b.CreateSelect(nan,b.getInt16(0x7fff),b.CreateSelect(negative,b.getInt16(0),bits));
+                        v=b.CreateBitCast(bits,b.getHalfTy());
+                }
+                return v;
+            };
+            auto* d=fused?read(operands[3],type):nullptr;
+            if(type.kind=='h') {
+                auto lane=[&](unsigned shift){auto half=[&](llvm::Value* x){return b.CreateBitCast(b.CreateTrunc(b.CreateLShr(x,shift),b.getInt16Ty()),b.getHalfTy());};return b.CreateZExt(word(compute(half(a),half(c),d?half(d):nullptr)),b.getInt32Ty());};
+                return done(b.CreateOr(lane(0),b.CreateShl(lane(16),16)),type);
+            }
+            return done(compute(a,c,d),type);
+        }
+        if(op=="div" && type.kind=='f' && type.bits==32 && parts==std::vector<std::string>{"div","rn","f32"}) {
+            arity(3);return done(b.CreateFDiv(read(operands[1],type),read(operands[2],type)),type);
+        }
+        if((op=="rcp" || op=="sqrt" || op=="rsqrt" || op=="ex2" || op=="lg2" || op=="sin" || op=="cos" || op=="tanh") &&
+                ((type.kind=='f' && type.bits==32 && (parts==std::vector<std::string>{op,"approx","ftz","f32"} || parts==std::vector<std::string>{op,"approx","f32"})) ||
+                 (op=="tanh" && (type.bits==16 || type.kind=='h') && parts.size()==3 && parts[1]=="approx"))) {
+            arity(2);auto* a=read(operands[1],type);
+            auto name=op=="ex2"?"exp2":op=="lg2"?"log2":op;
+            auto compute=[&](llvm::Value* x)->llvm::Value* {
+                bool half=type.bits==16 || type.kind=='h',flush=parts.size()==4;
+                if(half)x=real(x);
+                if(flush)x=helper("flush",{x},b.getFloatTy());
+                x=helper(name,{x},b.getFloatTy());
+                if(flush)x=helper("flush",{x},b.getFloatTy());
+                if(half)x=b.CreateTrunc(helper("word_f32_to_f16",{word(x),b.getInt32(0)},b.getInt32Ty()),b.getInt16Ty());
+                return x;
+            };
+            if(type.kind=='h') {
+                auto lane=[&](unsigned shift){return b.CreateZExt(compute(b.CreateTrunc(b.CreateLShr(a,shift),b.getInt16Ty())),b.getInt32Ty());};
+                return done(b.CreateOr(lane(0),b.CreateShl(lane(16),16)),type);
+            }
+            auto* v=compute(a);return done(type.bits==16?b.CreateBitCast(v,b.getHalfTy()):v,type);
+        }
+        return false;
+    }
     void lower(ptx_body& body) {
         auto& function = *body.function; auto* entry = &function.getEntryBlock();
         const auto& registers = body.registers;
@@ -456,7 +603,7 @@ class ptx_parser {
             if (destination.size() != 1) ptx_fail(destination.front(), "expected register destination");
             const auto& output = reg(destination[0]);
             if (!result_type.accepts_register(output.type)) ptx_fail(destination[0], "destination register type mismatch");
-            if (value->getType()->isFloatTy()) value = builder.CreateBitCast(value, builder.getInt32Ty());
+            if (value->getType()->isFloatingPointTy()) value = builder.CreateBitCast(value, llvm::Type::getIntNTy(context,value->getType()->getPrimitiveSizeInBits()));
             auto bits = value->getType()->getIntegerBitWidth();
             if ((output.type.bits != bits && (!relaxed || output.type.bits < bits)) ||
                     (output.type.bits == 1) != (bits == 1)) ptx_fail(destination[0], "destination register width mismatch");
@@ -577,7 +724,8 @@ class ptx_parser {
                 auto type = ptx_scalar({parts.back(), opcode.line, opcode.column}, op == "ld" || op == "st");
                 if (type.kind == 'p') ptx_fail(opcode, "unsupported predicate instruction", true);
                 llvm::Value* value = nullptr;
-                if (op == "ld" || op == "st") {
+                if (numeric_instruction(parts,instruction,builder,scalar,write)) {}
+                else if (op == "ld" || op == "st") {
                     arity(2);
                     bool load = op == "ld", parameter = parts.size() == 3 && parts[1] == "param";
                     bool global = (parts.size() == 3 && parts[1] == "global") ||
@@ -618,7 +766,7 @@ class ptx_parser {
                     if (load) value = builder.CreateAlignedLoad(type.storage(context), pointer, llvm::Align(type.bits / 8));
                     else {
                         auto* data = scalar(instruction.operands[1], type, true);
-                        if (type.kind == 'f') data = builder.CreateBitCast(data, builder.getInt32Ty());
+                        if (type.kind == 'f') data = builder.CreateBitCast(data, type.storage(context));
                         builder.CreateAlignedStore(data, pointer, llvm::Align(type.bits / 8));
                     }
                     if (load) write(instruction.operands[0], value, type, true);
@@ -795,4 +943,55 @@ public:
 std::unique_ptr<llvm::Module> import_ptx(llvm::LLVMContext& context, std::string_view input) {
     return ptx_parser(context, input).parse();
 }
+llvm::Value* import_numeric_inline_ptx(llvm::CallInst& call) {
+    auto* assembly=llvm::cast<llvm::InlineAsm>(call.getCalledOperand());
+    auto constraints=assembly->ParseConstraints();
+    if(constraints.empty() || constraints[0].Type!=llvm::InlineAsm::isOutput || constraints[0].isIndirect || !call.getType()->isSingleValueType())
+        throw std::runtime_error("numeric PTX requires one scalar register result");
+    if(constraints.size()!=call.arg_size()+1)throw std::runtime_error("unsupported numeric PTX constraints");
+    auto width=[](llvm::Type* t){return unsigned(t->getPrimitiveSizeInBits());};
+    std::vector<llvm::Type*> types{call.getType()};
+    for(unsigned i=0;i<call.arg_size();++i) {
+        if(constraints[i+1].Type!=llvm::InlineAsm::isInput || constraints[i+1].isIndirect)throw std::runtime_error("unsupported numeric PTX input constraint");
+        types.push_back(call.getArgOperand(i)->getType());
+    }
+    auto spelling=[&](unsigned i){auto bits=width(types[i]);if(bits!=16 && bits!=32 && bits!=64)throw std::runtime_error("unsupported numeric PTX register width");return ".b"+std::to_string(bits);};
+    auto& module=*call.getModule();unsigned ordinal=0;std::string name;
+    do {name="__cudavm_inline_numeric_"+std::to_string(ordinal++);}while(module.getNamedValue(name));
+    std::string source=".version 8.4\n.target sm_75\n.address_size 64\n.func (.param "+spelling(0)+" result) "+name+"(";
+    for(unsigned i=1;i<types.size();++i)source+=(i>1?", ":"")+std::string(".param ")+spelling(i)+" arg"+std::to_string(i);
+    source+=") {\n";
+    for(unsigned i=0;i<types.size();++i)source+=".reg "+spelling(i)+" %cv"+std::to_string(i)+";\n";
+    for(unsigned i=1;i<types.size();++i)source+="ld.param"+spelling(i)+" %cv"+std::to_string(i)+", [arg"+std::to_string(i)+"];\n";
+    if(constraints[0].hasMatchingInput())source+="mov"+spelling(0)+" %cv0, %cv"+std::to_string(constraints[0].MatchingInput)+";\n";
+    auto text=assembly->getAsmString();
+    for(size_t i=0;i<text.size();) {
+        if(text[i]=='$' && i+1<text.size() && text[i+1]=='$'){source+='$';i+=2;}
+        else if(text[i]=='$' && i+1<text.size() && std::isdigit(static_cast<unsigned char>(text[i+1]))) {
+            size_t end=i+1;while(end<text.size() && std::isdigit(static_cast<unsigned char>(text[end])))++end;
+            auto index=std::stoul(text.substr(i+1,end-i-1).str());if(index>=types.size())throw std::runtime_error("invalid numeric PTX operand reference");
+            source+="%cv"+std::to_string(index);i=end;
+        } else if(text.substr(i,5)==".reg."){source+=".reg .";i+=5;}
+        else source+=text[i++];
+    }
+    source+="\nst.param"+spelling(0)+" [result], %cv0; ret; }\n.entry __cudavm_inline_unused() {ret;}\n";
+    auto imported=import_ptx(module.getContext(),source);
+    auto* original=imported->getFunction(name);
+    auto* function=llvm::Function::Create(original->getFunctionType(),llvm::GlobalValue::InternalLinkage,name,module);
+    llvm::ValueToValueMapTy values;
+    for(auto& f:*imported)if(f.isDeclaration()) {
+        auto* existing=module.getFunction(f.getName());
+        if(f.isIntrinsic())existing=llvm::cast<llvm::Function>(module.getOrInsertFunction(f.getName(),f.getFunctionType()).getCallee());
+        else if(!existing || existing->isDeclaration() || existing->getFunctionType()!=f.getFunctionType())throw std::runtime_error("missing numeric PTX helper: "+f.getName().str());
+        values[&f]=existing;
+    }
+    for(unsigned i=0;i<function->arg_size();++i)values[original->getArg(i)]=function->getArg(i);
+    llvm::SmallVector<llvm::ReturnInst*> returns;
+    llvm::CloneFunctionInto(function,original,values,llvm::CloneFunctionChangeType::DifferentModule,returns);
+    function->addFnAttr(llvm::Attribute::AlwaysInline);
+    llvm::IRBuilder<> b(&call);std::vector<llvm::Value*> args;
+    for(unsigned i=0;i<call.arg_size();++i)args.push_back(b.CreateBitCast(call.getArgOperand(i),llvm::Type::getIntNTy(module.getContext(),width(types[i+1]))));
+    return b.CreateBitCast(b.CreateCall(function,args),call.getType());
+}
+
 }

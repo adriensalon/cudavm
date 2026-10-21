@@ -888,7 +888,42 @@ void lower_device_conversions(llvm::Module& module) {
     }
     check_ir(module);
 }
+void lower_half_math_intrinsics(llvm::Module& module) {
+    std::vector<llvm::CallInst*> calls;
+    for(auto& function:module)for(auto& block:function)for(auto& instruction:block)
+        if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->getCalledFunction() && call->getCalledFunction()->isIntrinsic() && call->getType()->isHalfTy())calls.push_back(call);
+    for(auto* call:calls) {
+        const char* operation=nullptr;
+        switch(call->getCalledFunction()->getIntrinsicID()) {
+        case llvm::Intrinsic::sqrt:operation="half_sqrt";break;
+        case llvm::Intrinsic::sin:operation="half_sin";break;
+        case llvm::Intrinsic::cos:operation="half_cos";break;
+        case llvm::Intrinsic::exp:operation="exp";break;
+        case llvm::Intrinsic::exp2:operation="exp2";break;
+        case llvm::Intrinsic::log:operation="half_log";break;
+        case llvm::Intrinsic::log2:operation="half_log2";break;
+        case llvm::Intrinsic::log10:operation="half_log10";break;
+        default:break;
+        }
+        if(!operation)continue;
+        auto require=[&](const std::string& name) {
+            auto* function=module.getFunction("__cudavm_native_"+name);
+            if(!function || function->isDeclaration())throw std::runtime_error("missing half math helper: "+name);
+            return function;
+        };
+        llvm::IRBuilder<> b(call);
+        auto* bits=b.CreateZExt(b.CreateBitCast(call->getArgOperand(0),b.getInt16Ty()),b.getInt32Ty());
+        auto* x=b.CreateBitCast(b.CreateCall(require("word_f16_to_f32"),{bits}),b.getFloatTy());
+        auto* value=b.CreateCall(require(operation),{x});
+        auto* result=b.CreateCall(require("word_f32_to_f16"),{b.CreateBitCast(value,b.getInt32Ty()),b.getInt32(0)});
+        call->replaceAllUsesWith(b.CreateBitCast(b.CreateTrunc(result,b.getInt16Ty()),b.getHalfTy()));call->eraseFromParent();
+    }
+}
 void lower_device_math(llvm::Module& module) {
+    // Both source frontends enter here. PTX import does not, so ABI-specific
+    // pinned-header mappings cannot replace arbitrary imported definitions.
+    for(auto& function:module)if(!function.isDeclaration())function.addFnAttr("cudavm.cuda.source");
+    lower_half_math_intrinsics(module);
     for(auto operation:device_math_operations) {
         auto* function=module.getFunction(std::string("__nv_")+operation.name);
         if(!function) continue;

@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-namespace llvm { class LLVMContext; class Module; }
+namespace llvm { class LLVMContext; class Module; class CallInst; class Value; }
 namespace cudavm {
 struct ptx_import_error : std::runtime_error {
     bool unsupported;
@@ -13,4 +13,6 @@ struct ptx_import_error : std::runtime_error {
 // Imports an explicitly bounded PTX instruction profile. No input descriptors,
 // source compiler or host registration metadata are required.
 std::unique_ptr<llvm::Module> import_ptx(llvm::LLVMContext&, std::string_view);
+// Checked, scalar-result numeric assembly from the pinned CUDA headers.
+llvm::Value* import_numeric_inline_ptx(llvm::CallInst&);
 }

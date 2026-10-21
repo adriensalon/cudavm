@@ -1,6 +1,7 @@
 #include "ptx_import.hpp"
 #include "ptx_jit.hpp"
 #include "compiler.hpp"
+#include "device_numeric_ir.hpp"
 #include "spirv_emitter.hpp"
 #include "dxil_emitter.hpp"
 #include "spirv_artifact.hpp"
@@ -36,6 +37,7 @@ extern "C" CUDAVM_PTX_JIT_EXPORT cudavm::ptx_jit_status cudavmCompilePtxV1(
         }
         static std::mutex mutex; std::lock_guard lock(mutex);
         llvm::LLVMContext context; auto module = import_ptx(context, {input, length});
+        link_device_numeric_ir(*module);
         std::string image(input, length); image += '\n'; image += emit_native_module(*module);
         std::vector<shader_artifact> artifacts;
         for (const auto& function : *module) if (function.hasFnAttribute("cudavm.kernel")) {

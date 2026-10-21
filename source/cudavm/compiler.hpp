@@ -31,6 +31,7 @@ std::unique_ptr<llvm::Module> link_device(llvm::LLVMContext&, const compiler_opt
 void prepare_portable(llvm::Module&);
 void lower_device_conversions(llvm::Module&);
 void lower_device_math(llvm::Module&);
+void lower_half_math_intrinsics(llvm::Module&);
 void lower_device_integers(llvm::Module&);
 void lower_device_synchronization(llvm::Module&);
 // Final optional references and canonical target-plus-offset initializers.

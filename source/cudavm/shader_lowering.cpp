@@ -1,6 +1,7 @@
 #include "shader_lowering.hpp"
 #include "shader_collectives.hpp"
 #include "device_conversions.hpp"
+#include "ptx_import.hpp"
 
 #include <map>
 #include <tuple>
@@ -68,11 +69,13 @@ void scalar_math(llvm::Module& module) {
         if(auto* binary=llvm::dyn_cast<llvm::BinaryOperator>(instruction);binary && binary->getType()->isHalfTy()) {
             auto* left=half_bits(binary->getOperand(0));auto* right=half_bits(binary->getOperand(1));
             if(binary->getOpcode()==llvm::Instruction::FSub)right=builder.CreateXor(right,builder.getInt32(0x8000));
-            if(binary->getOpcode()==llvm::Instruction::FAdd || binary->getOpcode()==llvm::Instruction::FSub || binary->getOpcode()==llvm::Instruction::FMul)
-                replacement=half_value(builder.CreateCall(numeric(binary->getOpcode()==llvm::Instruction::FMul?"f16_mul":"f16_add"),{left,right}));
+            if(binary->getOpcode()==llvm::Instruction::FAdd || binary->getOpcode()==llvm::Instruction::FSub || binary->getOpcode()==llvm::Instruction::FMul || binary->getOpcode()==llvm::Instruction::FDiv)
+                replacement=half_value(builder.CreateCall(numeric(binary->getOpcode()==llvm::Instruction::FDiv?"f16_div":binary->getOpcode()==llvm::Instruction::FMul?"f16_mul":"f16_add"),{left,right}));
         }
-        if(auto* compare=llvm::dyn_cast<llvm::FCmpInst>(instruction);compare && compare->getOperand(0)->getType()->isHalfTy())
-            replacement=builder.CreateFCmp(compare->getPredicate(),half_float(compare->getOperand(0)),half_float(compare->getOperand(1)));
+        if(auto* operation=llvm::dyn_cast<llvm::FCmpInst>(instruction);operation && operation->getOperand(0)->getType()->isHalfTy()) {
+            if(!compare || compare->isDeclaration())throw std::runtime_error("missing half comparison helper");
+            replacement=builder.CreateICmpNE(builder.CreateCall(compare,{bits(half_float(operation->getOperand(0))),bits(half_float(operation->getOperand(1))),builder.getInt32(operation->getPredicate())}),builder.getInt32(0));
+        }
         if(instruction->getOpcode()==llvm::Instruction::FNeg && instruction->getType()->isDoubleTy()) replacement=builder.CreateBitCast(builder.CreateXor(bits(instruction->getOperand(0)),builder.getInt64(0x8000000000000000ull)),builder.getDoubleTy());
         if(auto* binary=llvm::dyn_cast<llvm::BinaryOperator>(instruction);binary && binary->getType()->isDoubleTy()) {
             const char* operation=binary->getOpcode()==llvm::Instruction::FAdd?"add":binary->getOpcode()==llvm::Instruction::FSub?"sub":binary->getOpcode()==llvm::Instruction::FMul?"mul":binary->getOpcode()==llvm::Instruction::FDiv?"div":nullptr;
@@ -112,13 +115,25 @@ void scalar_math(llvm::Module& module) {
             if((cast->getOpcode()==llvm::Instruction::FPToSI || cast->getOpcode()==llvm::Instruction::FPToUI) && (source->getType()->isFloatTy() || source->getType()->isDoubleTy()))
                 if(auto* helper=numeric(source->getType()->isDoubleTy()?"f64_to_i64":"f32_to_i64")) replacement=builder.CreateTruncOrBitCast(builder.CreateCall(helper,{bits(source),builder.getInt32(1)}),cast->getType());
         }
-        if (divide && !divide->isDeclaration() && instruction->getOpcode() == llvm::Instruction::FDiv && instruction->getType()->isFloatTy())
+        // Only these mode helpers contain a guarded native division. Half
+        // callers select normal-range operands; strict FP32 callers select
+        // cvFloatDivide. Constant inlining removes the unused route.
+        auto parent=instruction->getFunction()->getName();
+        bool bounded_division=parent.starts_with("_ZN6cudavm14math_log2_modeEfj") || parent.starts_with("_ZN6cudavm14math_tanh_modeEfj") || parent.starts_with("_ZN6cudavm20math_reciprocal_modeEfj");
+        if (divide && !divide->isDeclaration() && !bounded_division && instruction->getOpcode() == llvm::Instruction::FDiv && instruction->getType()->isFloatTy())
             replacement = builder.CreateCall(divide,{instruction->getOperand(0),instruction->getOperand(1)});
         if (compare && !compare->isDeclaration()) if (auto* operation = llvm::dyn_cast<llvm::FCmpInst>(instruction); operation && operation->getOperand(0)->getType()->isFloatTy())
             replacement = builder.CreateICmpNE(builder.CreateCall(compare,{builder.CreateBitCast(operation->getOperand(0),builder.getInt32Ty()),builder.CreateBitCast(operation->getOperand(1),builder.getInt32Ty()),builder.getInt32(operation->getPredicate())}),builder.getInt32(0));
         if (auto* call = llvm::dyn_cast<llvm::CallInst>(instruction); call && call->getCalledFunction()) {
             auto* function = call->getCalledFunction();
             auto name = function->hasFnAttribute("cudavm.cuda.origin") ? function->getFnAttribute("cudavm.cuda.origin").getValueAsString() : function->getName();
+            if((name=="__cudavm_native_sin" || name=="__cudavm_native_cos") && call->arg_size()==1)
+                if(auto* cast=llvm::dyn_cast<llvm::BitCastInst>(call->getArgOperand(0)))
+                    if(auto* conversion=llvm::dyn_cast<llvm::CallInst>(cast->getOperand(0));conversion && conversion->getCalledFunction() && conversion->getCalledFunction()->getName()=="__cudavm_native_word_f16_to_f32") {
+                        auto* helper=module.getFunction(name=="__cudavm_native_sin"?"__cudavm_native_half_sin":"__cudavm_native_half_cos");
+                        if(!helper || helper->isDeclaration())throw std::runtime_error("missing bounded half trig helper");
+                        replacement=builder.CreateCall(helper,{call->getArgOperand(0)});
+                    }
             if(function->isIntrinsic() && function->getIntrinsicID()==llvm::Intrinsic::fma && call->getType()->isHalfTy())
                 replacement=half_value(builder.CreateCall(numeric("f16_fma"),{half_bits(call->getArgOperand(0)),half_bits(call->getArgOperand(1)),half_bits(call->getArgOperand(2))}));
             if(integral && function->isIntrinsic() && call->getType()->isFloatTy()) {
@@ -151,7 +166,7 @@ void scalar_math(llvm::Module& module) {
 void optimize(llvm::Module& module) {
     for (auto& f : module) if (!f.isDeclaration()) {
         f.removeFnAttr(llvm::Attribute::OptimizeNone); f.removeFnAttr(llvm::Attribute::NoInline);
-        if(f.hasFnAttribute("cudavm.math") || f.getName().starts_with("_ZN13cudavm") || f.getName().starts_with("__cudavm_native_word_")) {
+        if(f.hasFnAttribute("cudavm.math") || f.getName().starts_with("_ZN13cudavm") || f.getName().starts_with("__cudavm_native_")) {
             f.removeFnAttr(llvm::Attribute::AlwaysInline); f.addFnAttr(llvm::Attribute::NoInline);
         } else if (!f.hasFnAttribute("cudavm.kernel") && !f.hasFnAttribute("hlsl.shader") && f.getCallingConv() != llvm::CallingConv::PTX_Kernel && f.getCallingConv() != llvm::CallingConv::SPIR_KERNEL)
             f.addFnAttr(llvm::Attribute::AlwaysInline);
@@ -942,7 +957,7 @@ struct lowering {
             return nullptr;
         }
         if(name=="llvm.nvvm.membar.sys") fail(instruction,"shader system fence requires host/device coherent memory");
-        if(!function->isDeclaration() && (function->hasFnAttribute("cudavm.math") || function->getName().starts_with("_ZN13cudavm") || function->getName().starts_with("__cudavm_native_word_"))) {
+        if(!function->isDeclaration() && (function->hasFnAttribute("cudavm.math") || function->getName().starts_with("_ZN13cudavm") || function->getName().starts_with("__cudavm_native_"))) {
             std::vector<llvm::Type*> signature; std::vector<llvm::Value*> args;
             for(const auto& argument:instruction.args()) {
                 if(argument->getType()->isPointerTy() || !argument->getType()->isSingleValueType()) fail(instruction,"native math helper requires scalar arguments");
@@ -980,7 +995,8 @@ struct lowering {
         if (function->isIntrinsic()) {
             if(instruction.getType()->isDoubleTy()) fail(instruction,"native double intrinsic requires an exact portable numeric helper");
             if (name.starts_with("llvm.nvvm.")) fail(instruction, "CUDA operation requires explicit native shader lowering");
-            if (function->getIntrinsicID() == llvm::Intrinsic::lifetime_start || function->getIntrinsicID() == llvm::Intrinsic::lifetime_end || function->getIntrinsicID() == llvm::Intrinsic::assume) return nullptr;
+            if (function->getIntrinsicID() == llvm::Intrinsic::lifetime_start || function->getIntrinsicID() == llvm::Intrinsic::lifetime_end ||
+                function->getIntrinsicID() == llvm::Intrinsic::assume || function->getIntrinsicID() == llvm::Intrinsic::experimental_noalias_scope_decl) return nullptr;
             switch (function->getIntrinsicID()) {
             case llvm::Intrinsic::fabs: case llvm::Intrinsic::copysign: {
                 auto* magnitude=b.CreateBitCast(value(instruction.getArgOperand(0)),b.getInt32Ty());
@@ -1022,6 +1038,9 @@ struct lowering {
                     args.push_back(argument->getType()->isFloatTy()?b.CreateBitCast(operand,b.getFloatTy()):operand);
                 }
                 auto id = function->getIntrinsicID();
+                if(id==llvm::Intrinsic::fma && instruction.getType()->isFloatTy() && (dxil || kernel.getName()!="__cudavm_native_fma"))
+                    return numeric_call(dxil?"__cudavm_native_word_f32_fma":"__cudavm_native_fma",b.getInt32Ty(),
+                        {value(instruction.getArgOperand(0)),value(instruction.getArgOperand(1)),value(instruction.getArgOperand(2))});
                 if (dxil && (id==llvm::Intrinsic::ctlz || id==llvm::Intrinsic::cttz)) {
                     auto bits=instruction.getType()->getIntegerBitWidth();
                     bool leading=id==llvm::Intrinsic::ctlz;
@@ -1363,6 +1382,7 @@ std::unique_ptr<llvm::Module> prepare_native_shader_module(const llvm::Module& i
     auto module = llvm::CloneModule(input);
     resolve_device_function_aliases(*module, true); resolve_device_data_aliases(*module, true); normalize_device_relocations(*module);
     lower_shader_half(*module);
+    lower_half_math_intrinsics(*module);
     scalar_math(*module);
     optimize(*module);
     return module;
