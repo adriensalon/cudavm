@@ -54,14 +54,19 @@ void register_nvidia_managed(void** handle, void** host, const char* name, size_
     require(host && name && *name && bytes, CUDA_ERROR_INVALID_VALUE, "invalid NVIDIA managed variable registration");
     auto identity = nvidia_registration_identity(handle); auto& image = global().programs.at(identity);
     if (auto found = std::find_if(image.managed.begin(), image.managed.end(), [&](auto& item) { return item.host == host; }); found != image.managed.end()) {
-        require(found->symbol == name && found->bytes == bytes, CUDA_ERROR_INVALID_IMAGE, "conflicting managed variable registration"); return;
+        if (found->symbol != name || found->bytes != bytes) { image.managed_conflict = true; throw failure(CUDA_ERROR_INVALID_IMAGE, "conflicting managed variable registration"); }
+        return;
     }
     auto previous = global().symbols.find(host);
     if (previous != global().symbols.end() && previous->second.identity != identity) {
-        // Compiler constructors cannot consume a return status from this hook.
-        // Keep the incomplete image unavailable to subsequent init and launches.
-        image.managed_conflict = true;
-        throw failure(CUDA_ERROR_NOT_SUPPORTED, "managed host slots shared by different images are unavailable");
+        const auto& other = global().programs.at(previous->second.identity).managed;
+        auto shared = std::find_if(other.begin(), other.end(), [&](auto& item) { return item.host == host; });
+        if (shared == other.end() || shared->symbol != name || shared->bytes != bytes) {
+            // Constructor hooks cannot return errors; poison incomplete images
+            // so a rejected binding cannot silently fall back to ordinary load.
+            image.managed_conflict = true;
+            throw failure(CUDA_ERROR_INVALID_IMAGE, "conflicting coalesced managed variable registration");
+        }
     }
     require(!image.managed_image && !global().libraries.contains(identity), CUDA_ERROR_NOT_PERMITTED, "managed variables must be registered before image use");
     image.managed.push_back({host, name, bytes});
@@ -69,7 +74,7 @@ void register_nvidia_managed(void** handle, void** host, const char* name, size_
 }
 void initialize_nvidia_managed(void** handle) {
     auto identity = nvidia_registration_identity(handle); auto records = global().programs.at(identity).managed;
-    require(!global().programs.at(identity).managed_conflict, CUDA_ERROR_NOT_SUPPORTED, "managed host slots shared by different images are unavailable");
+    require(!global().programs.at(identity).managed_conflict, CUDA_ERROR_NOT_SUPPORTED, "managed registration contains conflicting host slots");
     auto retained = runtime_managed_image(global().programs.at(identity));
     check(cuInit(0)); auto library = runtime_library(identity);
     std::vector<CUdeviceptr> addresses; addresses.reserve(records.size());
@@ -91,7 +96,7 @@ cudaKernel_t compiler_kernel(const void* token) {
     auto found = global().bindings.find(token);
     symbol_require(token && found != global().bindings.end(), cudaErrorInvalidDeviceFunction, "compiler kernel entry is not registered");
     require(!global().programs.at(found->second.identity).retiring, CUDA_ERROR_NOT_PERMITTED, "compiler kernel program is unloading");
-    require(!global().programs.at(found->second.identity).managed_conflict, CUDA_ERROR_NOT_SUPPORTED, "managed host slots shared by different images are unavailable");
+    require(!global().programs.at(found->second.identity).managed_conflict, CUDA_ERROR_NOT_SUPPORTED, "managed registration contains conflicting host slots");
     if (auto entry = global().compiler_entries.find(token); entry != global().compiler_entries.end()) return entry->second;
     auto handle = reinterpret_cast<cudaKernel_t>(global().next_compiler_kernel); global().next_compiler_kernel += 0x100;
     global().compiler_kernels.emplace(handle, token);
@@ -111,6 +116,18 @@ void unregister_nvidia_image(void** handle) {
     auto identity = nvidia_registration_identity(handle); auto& image = global().programs.at(identity); image.retiring = true;
     try {
         if (image.managed_image) {
+            // A compiler slot may outlive the image which first supplied its
+            // storage. Bind surviving registrations before retiring that keeper,
+            // including images whose host initialization has not run yet.
+            std::vector<void**> survivors;
+            for (auto& [other_handle, registration] : global().nvidia_registrations) {
+                auto& other = global().programs.at(registration.identity);
+                if (registration.identity == identity || other.retiring || other.managed_conflict) continue;
+                if (std::any_of(other.managed.begin(), other.managed.end(), [&](auto& value) {
+                    return std::any_of(image.managed.begin(), image.managed.end(), [&](auto& item) { return item.host == value.host; });
+                })) survivors.push_back(other_handle);
+            }
+            for (auto survivor : survivors) initialize_nvidia_managed(survivor);
             // A new Driver epoch can restore this image before Runtime has
             // rebound it. Retire its keeper, rather than just our cached handle.
             auto retained = image.managed_image;
@@ -121,7 +138,12 @@ void unregister_nvidia_image(void** handle) {
             if (code != CUDA_ERROR_INVALID_HANDLE && !(code == CUDA_ERROR_NOT_INITIALIZED && epoch != cudavmDriverEpoch())) check(code);
         }
     } catch (...) { image.retiring = false; throw; }
-    for (auto& item : image.managed) *item.host = nullptr;
+    for (auto& item : image.managed) {
+        bool shared = false;
+        for (auto& [other_identity, other] : global().programs) if (other_identity != identity && !other.managed_conflict)
+            shared |= std::any_of(other.managed.begin(), other.managed.end(), [&](auto& value) { return value.host == item.host; });
+        if (!shared) *item.host = nullptr;
+    }
     std::erase_if(global().function_entries, [&](const auto& item) { return item.second.identity == identity; });
     auto remove_definitions = [&](auto& owners, auto& table) {
         for (auto it = owners.begin(); it != owners.end();) {

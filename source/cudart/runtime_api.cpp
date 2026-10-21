@@ -203,8 +203,9 @@ void bind_symbol(const void* token, const cudavmProgram* program, const char* sy
 std::shared_ptr<void> runtime_managed_image(program_image& program) {
     if (program.managed.empty()) return {};
     if (!program.managed_image) {
-        std::vector<const char*> names; for (auto& entry : program.managed) names.push_back(entry.symbol.c_str());
-        void* image = nullptr; check(cudavmDriverCreateManagedRegistration(&image, program.bytes.data(), program.bytes.size(), names.data(), names.size()));
+        std::vector<const char*> names; std::vector<const void*> slots; std::vector<size_t> sizes;
+        for (auto& entry : program.managed) { names.push_back(entry.symbol.c_str()); slots.push_back(entry.host); sizes.push_back(entry.bytes); }
+        void* image = nullptr; check(cudavmDriverCreateManagedRegistration(&image, program.bytes.data(), program.bytes.size(), names.data(), slots.data(), sizes.data(), names.size()));
         program.managed_image = std::shared_ptr<void>(image, [](void* pointer) { cudavmDriverReleaseManagedRegistration(pointer); });
     }
     return program.managed_image;
@@ -212,7 +213,7 @@ std::shared_ptr<void> runtime_managed_image(program_image& program) {
 CUlibrary runtime_library(const std::string& identity) {
     auto program = global().programs.find(identity);
     require(program != global().programs.end() && !program->second.retiring, CUDA_ERROR_NOT_PERMITTED, "registered program is unloading");
-    require(!program->second.managed_conflict, CUDA_ERROR_NOT_SUPPORTED, "managed host slots shared by different images are unavailable");
+    require(!program->second.managed_conflict, CUDA_ERROR_NOT_SUPPORTED, "managed registration contains conflicting host slots");
     if (auto it = global().libraries.find(identity); it != global().libraries.end()) return it->second;
     // Unregistration may erase the program while the Driver call releases our
     // mutex. Own the bytes until loading finishes, then reject stale publication.

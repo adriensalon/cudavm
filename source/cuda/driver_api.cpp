@@ -133,6 +133,7 @@ struct module_entry {
     std::unordered_map<std::string, CUfunction> functions;
     std::unordered_map<std::string, global_symbol> globals;
     CUlibrary library = nullptr;
+    bool retiring = false;
 };
 struct function_entry {
     CUmodule module;
@@ -462,6 +463,7 @@ void release_primary(int device) {
 module_entry& module_lookup(CUmodule handle, const std::shared_ptr<context>& owner) {
     auto it = global().modules.find(handle);
     require(it != global().modules.end(), CUDA_ERROR_INVALID_HANDLE, "invalid or unloaded module");
+    require(!it->second.retiring, CUDA_ERROR_NOT_PERMITTED, "registered module is resetting");
     require(it->second.owner == owner, CUDA_ERROR_INVALID_CONTEXT, "module belongs to a different context");
     return it->second;
 }
@@ -485,6 +487,7 @@ function_entry& function_lookup(CUfunction handle, const std::shared_ptr<context
     auto it = global().functions.find(handle);
     require(it != global().functions.end(), CUDA_ERROR_INVALID_HANDLE, "invalid or unloaded function");
     require(it->second.owner == owner, CUDA_ERROR_INVALID_CONTEXT, "function belongs to a different context");
+    module_lookup(it->second.module, owner);
     return it->second;
 }
 function_entry& function_resources(CUfunction handle) {
@@ -492,6 +495,7 @@ function_entry& function_resources(CUfunction handle) {
     auto it = global().functions.find(handle);
     require(it != global().functions.end(), CUDA_ERROR_INVALID_HANDLE, "invalid or unloaded function");
     require(!it->second.owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "function context is being destroyed");
+    module_lookup(it->second.module, it->second.owner);
     return it->second;
 }
 void launch(CUfunction function, const launch_shape& shape, CUstream stream, void** parameters, void** extra,
@@ -525,6 +529,10 @@ global_symbol find_global(CUmodule handle, const char* name, const std::shared_p
     require(name && *name,CUDA_ERROR_INVALID_VALUE,"null or empty global name");
     auto& module=module_lookup(handle,owner);
     if(auto it=module.globals.find(name);it!=module.globals.end())return it->second;
+    if (module.library) {
+        auto library = library_lookup(module.library);
+        if (auto found = library->managed.find(name); found != library->managed.end()) { module.globals.emplace(name, found->second); return found->second; }
+    }
     auto native = module.native;
     if (auto it = native->data_views.find(name); it != native->data_views.end()) {
         auto view = it->second;
@@ -783,13 +791,15 @@ using namespace cudavm;
 extern "C" CUDAVM_CUDA_API CUresult cudavmDriverLoadRegisteredLibrary(CUlibrary* output, const void* image, size_t bytes) {
     return driver_call([&] { driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null registered library output"); *output = registered_library_load(image, bytes); });
 }
-extern "C" CUDAVM_CUDA_API CUresult cudavmDriverCreateManagedRegistration(void** output, const void* image, size_t bytes, const char* const* names, size_t count) {
+extern "C" CUDAVM_CUDA_API CUresult cudavmDriverCreateManagedRegistration(void** output, const void* image, size_t bytes, const char* const* names, const void* const* slots, const size_t* sizes, size_t count) {
     return driver_call([&] {
-        require(output && image && bytes && static_cast<const char*>(image)[bytes - 1] == 0 && names && count,
+        require(output && image && bytes && static_cast<const char*>(image)[bytes - 1] == 0 && names && slots && sizes && count,
             CUDA_ERROR_INVALID_VALUE, "invalid managed registration image");
         auto value = std::make_shared<registered_managed_image>(); value->image.assign(static_cast<const char*>(image), bytes - 1);
-        for (size_t i = 0; i < count; ++i) { require(names[i] && *names[i], CUDA_ERROR_INVALID_VALUE, "missing managed symbol name"); value->names.emplace_back(names[i]); }
-        std::sort(value->names.begin(), value->names.end()); value->names.erase(std::unique(value->names.begin(), value->names.end()), value->names.end());
+        for (size_t i = 0; i < count; ++i) {
+            require(names[i] && *names[i] && slots[i] && sizes[i], CUDA_ERROR_INVALID_VALUE, "missing managed symbol name, host slot or size");
+            value->names.emplace_back(names[i]); value->slots.push_back(slots[i]); value->sizes.push_back(sizes[i]);
+        }
         auto handle = std::make_unique<std::shared_ptr<registered_managed_image>>(value);
         std::erase_if(global().registered_images, [](const auto& item) { return item.expired(); });
         global().registered_images.push_back(value); *output = handle.release();
@@ -826,7 +836,6 @@ extern "C" CUDAVM_CUDA_API CUresult cudavmDriverReleaseRegisteredModules(CUconte
         for (size_t i = 0; i < count; ++i) {
             auto entry = library_lookup(libraries[i]); require(entry->registered, CUDA_ERROR_NOT_PERMITTED, "library is not owned by Runtime registration");
             if (auto found = entry->modules.find(owner->id); found != entry->modules.end() && global().modules.contains(found->second)) {
-                require(!entry->registration, CUDA_ERROR_NOT_SUPPORTED, "managed registration modules cannot be reset individually in an explicit context");
                 modules.push_back(found->second);
             }
         }

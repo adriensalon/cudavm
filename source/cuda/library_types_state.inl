@@ -3,6 +3,8 @@
 struct registered_managed_image {
     std::string image;
     std::vector<std::string> names;
+    std::vector<const void*> slots;
+    std::vector<size_t> sizes;
     std::shared_ptr<context> owner;
     std::shared_ptr<device_library> native;
     std::map<std::string, std::shared_ptr<buffer>> storage;
@@ -25,6 +27,7 @@ struct library_entry {
     std::unordered_set<std::string> unavailable_parameters;
     bool registered = false;
     bool retiring = false;
+    std::unordered_set<uint64_t> resetting;
 };
 struct library_kernel_entry {
     CUlibrary library;

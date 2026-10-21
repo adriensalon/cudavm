@@ -24,9 +24,12 @@ std::vector<std::string> library_names(CUlibrary handle) {
 }
 CUmodule library_bind(CUlibrary handle, const std::shared_ptr<context>& owner) {
     auto entry = library_lookup(handle);
+    require(!entry->resetting.contains(owner->id), CUDA_ERROR_NOT_PERMITTED, "registered modules are resetting");
     std::erase_if(entry->modules, [](auto& item) { return !global().modules.contains(item.second); });
     if (auto it = entry->modules.find(owner->id); it != entry->modules.end()) return it->second;
-    auto native = native_call(owner, [&] { return entry->native ? entry->native->bind(*owner->native) :
+    auto native = native_call(owner, [&] { return entry->registration && owner != entry->registration->owner
+        ? entry->native->bind_registered(*owner->native, std::as_bytes(std::span(entry->registration->image.data(), entry->registration->image.size())), entry->registration->storage)
+        : entry->native ? entry->native->bind(*owner->native) :
         owner->native->load_image(entry->image.c_str(), unsigned(entry->options.size()), entry->options.data(), entry->values.data()); }, true);
     library_lookup(handle);
     auto module = add_module(owner, std::move(native)); global().modules.at(module).library = handle;
@@ -39,7 +42,7 @@ void bind_context_libraries(const std::shared_ptr<context>& owner) {
 }
 void configure_library_function(CUfunction handle) {
     auto& function = global().functions.at(handle); auto library = global().modules.at(function.module).library;
-    if (!library || library_lookup(library)->native) return;
+    if (!library || (library_lookup(library)->native && !library_lookup(library)->registration)) return;
     auto entry = library_kernel_lookup(library_find(library, function.name.c_str())); auto device = function.owner->device;
     if (auto it = entry->attributes.find(device); it != entry->attributes.end())
         for (auto& [attribute, value] : it->second) function.native->set_attribute(attribute, value);
@@ -103,6 +106,21 @@ void library_configure(CUkernel kernel, CUfunction_attribute attribute, int valu
         library_lookup(item->library);
         if (cache) entry->native->set_cache_config(item->name.c_str(), static_cast<CUfunc_cache>(value), device);
         else entry->native->set_attribute(item->name.c_str(), attribute, value, device);
+        if (!entry->registration) return;
+        if (cache) item->caches[device] = static_cast<CUfunc_cache>(value); else item->attributes[device][attribute] = value;
+        std::vector<CUfunction> functions;
+        for (auto& [id, fn] : global().functions)
+            if (fn.name == item->name && fn.owner->device == device && global().modules.at(fn.module).library == item->library) functions.push_back(id);
+        for (auto handle : functions) {
+            auto found = global().functions.find(handle); if (found == global().functions.end()) continue; auto target = found->second.owner;
+            native_call(target, [&] {
+                library_lookup(item->library);
+                auto found = global().functions.find(handle); if (found == global().functions.end()) return;
+                auto& fn = found->second;
+                if (cache ? fn.cache_override : fn.overrides.contains(attribute)) return;
+                if (cache) fn.native->set_cache_config(static_cast<CUfunc_cache>(value)); else fn.native->set_attribute(attribute, value);
+            }, true);
+        }
         return;
     }
     auto owner = library_query_context(item->library, device);
@@ -135,12 +153,21 @@ void library_unload(CUlibrary handle) {
     auto entry = library_lookup(handle);
     std::vector<std::shared_ptr<context>> owners;
     for (auto& [id, module] : entry->modules) if (auto it = global().modules.find(module); it != global().modules.end()) owners.push_back(it->second.owner);
+    for (auto& [address, allocation] : global().allocations) if (allocation.library == handle) owners.push_back(allocation.owner);
     for (auto& owner : owners) capture_unsafe(owner);
     entry->retiring = true;
     try { for (auto& owner : owners) synchronize_context(owner); }
     catch (...) { entry->retiring = false; throw; }
     std::unordered_set<CUmodule> modules; for (auto& [id, module] : entry->modules) modules.insert(module);
     std::erase_if(global().functions, [&](auto& it) { return modules.contains(it.second.module); });
+    for (auto& [address, allocation] : global().allocations) if (allocation.library == handle) {
+        // A coalesced symbol remains registered until its final image retires.
+        for (auto& [other_handle, other] : global().libraries) if (other_handle != handle && !other->retiring) {
+            if (std::any_of(other->managed.begin(), other->managed.end(), [&](auto& item) { return item.second.address == address; })) {
+                allocation.library = other_handle; break;
+            }
+        }
+    }
     std::erase_if(global().allocations, [&](auto& it) { return it.second.library == handle || modules.contains(it.second.module); });
     std::erase_if(global().modules, [&](auto& it) { return modules.contains(it.first); });
     if (entry->native && !entry->registration) entry->native->unload();
@@ -166,7 +193,9 @@ CUlibrary registered_managed_facade(const std::shared_ptr<registered_managed_ima
     auto handle = add_library(entry, false);
     try {
         for (auto& [name, native] : image->storage) {
-            auto address = add_shared_allocation(image->owner, native); global().allocations.at(address).library = handle;
+            auto address = native->native_address();
+            if (!global().allocations.contains(address)) { address = add_shared_allocation(image->owner, native); global().allocations.at(address).library = handle; }
+            else require(global().allocations.at(address).native == native, CUDA_ERROR_UNKNOWN, "managed symbol address collision");
             entry->managed.emplace(name, global_symbol{address, native->size});
         }
     } catch (...) { std::erase_if(global().allocations, [&](auto& item) { return item.second.library == handle; }); global().libraries.erase(handle); throw; }
@@ -182,7 +211,27 @@ CUlibrary registered_managed_load(const std::shared_ptr<registered_managed_image
             // Retain managed storage before launches, even when a kernel is
             // used before the first compiler-generated host initialization.
             auto owner = library_query_context(handle, 0); library_bind(handle, owner);
-            for (auto& name : image->names) (void)library_managed(handle, name.c_str());
+            for (size_t i = 0; i < image->names.size(); ++i) {
+                const auto& name = image->names[i]; std::shared_ptr<buffer> shared;
+                for (auto& weak : global().registered_images) if (auto other = weak.lock(); other && other != image && other->ready && !other->retired) {
+                    for (size_t j = 0; j < other->slots.size(); ++j) if (other->slots[j] == image->slots[i]) {
+                        require(other->names[j] == name, CUDA_ERROR_INVALID_IMAGE, "managed host slot names disagree");
+                        shared = other->storage.at(name); break;
+                    }
+                    if (shared) break;
+                }
+                auto own = library_managed(handle, name.c_str());
+                require(own.bytes == image->sizes[i] && (!shared || shared->size == own.bytes), CUDA_ERROR_INVALID_IMAGE, "managed variable size disagrees with image");
+                if (shared && own.address != shared->native_address()) {
+                    auto allocation = global().allocations.find(own.address);
+                    require(allocation != global().allocations.end() && allocation->second.library == handle,
+                        CUDA_ERROR_INVALID_IMAGE, "managed aliases refer to distinct initialized allocations");
+                    global().allocations.erase(own.address);
+                    image->storage.erase(name); library_lookup(handle)->managed.erase(name);
+                    image->storage.emplace(name, shared);
+                    library_lookup(handle)->managed.emplace(name, global_symbol{shared->native_address(), shared->size});
+                }
+            }
             image->ready = true;
         } catch (...) { library_unload(handle); throw; }
     }
@@ -222,13 +271,22 @@ void registered_module_release(CUmodule module, const std::shared_ptr<context>& 
     auto& binding = module_lookup(module, owner);
     auto entry = library_lookup(binding.library);
     require(entry->registered, CUDA_ERROR_NOT_PERMITTED, "module is not owned by Runtime registration");
-    auto native = binding.native; synchronize_context(owner);
-    require(module_lookup(module, owner).native == native, CUDA_ERROR_INVALID_HANDLE, "registered module changed while waiting");
-    native->unload();
+    auto native = binding.native; entry->resetting.insert(owner->id); binding.retiring = true;
+    try {
+        synchronize_context(owner);
+        auto found = global().modules.find(module);
+        require(found != global().modules.end() && found->second.native == native, CUDA_ERROR_INVALID_HANDLE, "registered module changed while waiting");
+        native->unload();
+    } catch (...) {
+        entry->resetting.erase(owner->id);
+        if (auto found = global().modules.find(module); found != global().modules.end()) found->second.retiring = false;
+        throw;
+    }
     std::erase_if(global().functions, [&](auto& item) { return item.second.module == module; });
     std::erase_if(global().allocations, [&](auto& item) { return item.second.module == module; });
     global().modules.erase(module);
     std::erase_if(entry->modules, [&](auto& item) { return item.second == module; });
+    entry->resetting.erase(owner->id);
 }
 CUlibrary library_load(const void* image, const char* path, CUjit_option* options, void** values, unsigned count,
                        CUlibraryOption* library_options, void** library_values, unsigned library_count) {

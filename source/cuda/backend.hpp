@@ -572,6 +572,9 @@ struct session {
 struct device_library {
     virtual ~device_library() = default;
     virtual std::shared_ptr<executable> bind(session&) = 0;
+    virtual std::shared_ptr<executable> bind_registered(session&, std::span<const std::byte>, const std::map<std::string, std::shared_ptr<buffer>>&) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "independent managed registration bindings are unavailable");
+    }
     virtual void find(const char*) = 0;
     virtual std::vector<std::string> kernel_names() = 0;
     virtual std::vector<kernel_parameter> parameters(const char*) = 0;

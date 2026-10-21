@@ -1,6 +1,7 @@
 #include "dynamic_library.hpp"
 #include "ptx_parameters.hpp"
 #include "nvidia_image.hpp"
+#include "nvidia_managed_image.hpp"
 #include <cctype>
 #include <fstream>
 #include <iterator>
@@ -968,6 +969,30 @@ struct cuda_device_library : device_library, std::enable_shared_from_this<cuda_d
         auto& target = static_cast<cuda_session&>(owner); auto result = std::make_shared<cuda_module>(target.context);
         cuda_context_guard guard(*target.context); check(api->driver.get<decltype(&cuLibraryGetModule)>("cuLibraryGetModule")(&result->value, value), "cuLibraryGetModule");
         result->library = shared_from_this(); result->layouts = layouts; result->layout_metadata = layout_metadata; result->names = names; result->data_views = views; return result;
+    }
+    std::shared_ptr<executable> bind_registered(session& owner, std::span<const std::byte> image, const std::map<std::string, std::shared_ptr<buffer>>& storage) override {
+        auto& target = static_cast<cuda_session&>(owner); cuda_context_guard guard(*target.context);
+        CUdevice device = 0; int major = 0, minor = 0;
+        check(api->driver.get<decltype(&cuCtxGetDevice)>("cuCtxGetDevice")(&device), "cuCtxGetDevice");
+        check(api->attribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device), "cuDeviceGetAttribute");
+        check(api->attribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device), "cuDeviceGetAttribute");
+        auto selected = nvidia_select_binding_image(image, unsigned(major * 10 + minor));
+        if (selected.ptx) {
+            CUlinkState link = nullptr;
+            check(api->driver.get<decltype(&cuLinkCreate)>("cuLinkCreate_v2")(0, nullptr, nullptr, &link), "cuLinkCreate");
+            try {
+                selected.bytes.push_back(std::byte{});
+                check(api->driver.get<decltype(&cuLinkAddData)>("cuLinkAddData_v2")(link, CU_JIT_INPUT_PTX, selected.bytes.data(), selected.bytes.size(), "managed registration", 0, nullptr, nullptr), "cuLinkAddData");
+                void* binary = nullptr; size_t bytes = 0;
+                check(api->driver.get<decltype(&cuLinkComplete)>("cuLinkComplete")(link, &binary, &bytes), "cuLinkComplete");
+                selected.bytes.assign(static_cast<std::byte*>(binary), static_cast<std::byte*>(binary) + bytes);
+            } catch (...) { api->driver.get<decltype(&cuLinkDestroy)>("cuLinkDestroy")(link); throw; }
+            check(api->driver.get<decltype(&cuLinkDestroy)>("cuLinkDestroy")(link), "cuLinkDestroy");
+        }
+        std::map<std::string, std::pair<CUdeviceptr, size_t>> bindings;
+        for (auto& [name, native] : storage) bindings.emplace(name, std::pair(native->native_address(), native->size));
+        auto binary = nvidia_bind_managed_symbols(selected.bytes, bindings);
+        return target.load_image(binary.data(), 0, nullptr, nullptr);
     }
     void unload() override { check(api->driver.get<decltype(&cuLibraryUnload)>("cuLibraryUnload")(value), "cuLibraryUnload"); value = nullptr; }
 };
