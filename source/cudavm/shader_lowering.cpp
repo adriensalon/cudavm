@@ -798,6 +798,7 @@ struct lowering {
         return call.getType()->isIntegerTy(1)?b.CreateICmpNE(out,b.getInt32(0)):out;
     }
     #include "shader_texture_filter.inl"
+    #include "shader_surface.inl"
     // Checked forms emitted by Clang's pinned texture/surface headers. Only
     // the shader clone interprets the object's GPU descriptor; NVPTX keeps PTX.
     bool image_operation(const llvm::CallInst& instruction, llvm::Value*& output) {
@@ -805,47 +806,42 @@ struct lowering {
         auto* assembly = llvm::cast<llvm::InlineAsm>(instruction.getCalledOperand());
         if (assembly->isAlignStack() || assembly->getDialect() != llvm::InlineAsm::AD_ATT) return false;
         std::string text; for (unsigned char c : assembly->getAsmString()) if (!std::isspace(c)) text += char(c);
-        bool float_texture = text == "tex.2d.v4.f32.f32{$0,$1,$2,$3},[$4,{$5,$6}];";
+        if (surface_operation(instruction, *assembly, text, output)) return true;
+        bool fetch = text == "tex.1d.v4.f32.s32{$0,$1,$2,$3},[$4,{$5}];" ||
+            text == "tex.1d.v4.s32.s32{$0,$1,$2,$3},[$4,{$5}];" || text == "tex.1d.v4.u32.s32{$0,$1,$2,$3},[$4,{$5}];";
+        bool float_texture = text == "tex.2d.v4.f32.f32{$0,$1,$2,$3},[$4,{$5,$6}];" || (fetch && text.find(".f32.") != std::string::npos);
         bool integer_texture = text == "tex.2d.v4.s32.f32{$0,$1,$2,$3},[$4,{$5,$6}];" ||
             text == "tex.2d.v4.u32.f32{$0,$1,$2,$3},[$4,{$5,$6}];";
-        bool texture = float_texture || integer_texture;
-        bool reading = false, writing = false, clamp = false, trap = false;
-        for (auto mode : {"zero", "clamp", "trap"}) {
-            if (text == std::string("suld.b.2d.b32.") + mode + "{$0},[$1,{$2,$3}];") reading = true;
-            if (text == std::string("sust.b.2d.b32.") + mode + "[$0,{$1,$2}],{$3};") writing = true;
-            if ((reading || writing) && text.find(std::string(".") + mode) != std::string::npos) {
-                clamp = std::string_view(mode) == "clamp"; trap = std::string_view(mode) == "trap"; break;
-            }
-        }
-        if (!texture && !reading && !writing) return false;
+        bool texture = float_texture || integer_texture || fetch;
+        if (!texture) return false;
         entry->addFnAttr("cudavm.image.operations");
         if (dxil) {
             read->addFnAttr(llvm::Attribute::AlwaysInline);
             resolve->addFnAttr(llvm::Attribute::AlwaysInline);
         }
-        if (instruction.arg_size() != (writing ? 4u : 3u) || !instruction.getArgOperand(0)->getType()->isIntegerTy(64))
+        if (instruction.arg_size() != (fetch ? 2u : 3u) || !instruction.getArgOperand(0)->getType()->isIntegerTy(64))
             fail(instruction, "invalid image instruction operands");
-        if (texture) {
-            auto* structure = llvm::dyn_cast<llvm::StructType>(instruction.getType());
-            if (!structure || structure->getNumElements() != 4 ||
-                !llvm::all_of(structure->elements(), [&](auto* type) { return float_texture ? type->isFloatTy() : type->isIntegerTy(32); }) ||
-                !instruction.getArgOperand(1)->getType()->isFloatTy() || !instruction.getArgOperand(2)->getType()->isFloatTy() ||
-                assembly->getConstraintString() != (float_texture ? "=f,=f,=f,=f,l,f,f" : "=r,=r,=r,=r,l,f,f")) fail(instruction, "invalid texture instruction signature");
-        } else if (!instruction.getArgOperand(1)->getType()->isIntegerTy(32) || !instruction.getArgOperand(2)->getType()->isIntegerTy(32) ||
-            (writing ? (!instruction.getType()->isVoidTy() ||
-                        !(instruction.getArgOperand(3)->getType()->isIntegerTy(32) || instruction.getArgOperand(3)->getType()->isFloatTy()) || assembly->getConstraintString() != "l,r,r,r")
-                     : (!(instruction.getType()->isIntegerTy(32) || instruction.getType()->isFloatTy()) || assembly->getConstraintString() != "=r,l,r,r")))
-            fail(instruction, "invalid surface instruction signature");
+        auto* structure = llvm::dyn_cast<llvm::StructType>(instruction.getType());
+        std::string constraints = float_texture ? "=f,=f,=f,=f,l," : "=r,=r,=r,=r,l,";
+        constraints += fetch ? "r" : "f,f";
+        if (!structure || structure->getNumElements() != 4 ||
+            !llvm::all_of(structure->elements(), [&](auto* type) { return float_texture ? type->isFloatTy() : type->isIntegerTy(32); }) ||
+            !(fetch ? instruction.getArgOperand(1)->getType()->isIntegerTy(32) :
+                instruction.getArgOperand(1)->getType()->isFloatTy() && instruction.getArgOperand(2)->getType()->isFloatTy()) ||
+            assembly->getConstraintString() != constraints) fail(instruction, "invalid texture instruction signature");
         auto* object = value(instruction.getArgOperand(0));
-        if (texture) object = b.CreateZExt(call_helper(resolve, {object}), b.getInt64Ty());
-        auto descriptor_word = [&](unsigned offset) { return texture ? image_word(object, offset) : load(b.CreateAdd(object, b.getInt64(offset)), b.getInt32Ty()); };
-        auto* base = texture ? b.CreateZExt(call_helper(resolve, {pair(descriptor_word(0), descriptor_word(4))}), b.getInt64Ty()) : load(object, b.getInt64Ty());
+        object = b.CreateZExt(call_helper(resolve, {object}), b.getInt64Ty());
+        auto descriptor_word = [&](unsigned offset) { return image_word(object, offset); };
+        auto* base = b.CreateZExt(call_helper(resolve, {pair(descriptor_word(0), descriptor_word(4))}), b.getInt64Ty());
         auto* width = descriptor_word(8);
         auto* height = descriptor_word(12);
-        auto* texel_bytes = texture ? descriptor_word(52) : b.getInt32(4);
-        llvm::Value *x = value(instruction.getArgOperand(1)), *y = value(instruction.getArgOperand(2));
+        auto* texel_bytes = descriptor_word(52);
+        auto* pitch = descriptor_word(64);
+        llvm::Value *x = value(instruction.getArgOperand(1)), *y = fetch ? b.getInt32(0) : value(instruction.getArgOperand(2));
         llvm::Value* valid = b.getTrue();
-        if (texture) {
+        if (fetch) {
+            valid = b.CreateICmpULT(x, width); x = b.CreateMul(x, texel_bytes);
+        } else {
             auto* normalized = b.CreateICmpNE(b.CreateAnd(descriptor_word(20), b.getInt32(1)), b.getInt32(0));
             auto coordinate = [&](llvm::Value* bits, llvm::Value* extent, unsigned axis) {
                 // Exact floor of a nonnegative binary32 coordinate, followed
@@ -906,40 +902,14 @@ struct lowering {
             };
             x = coordinate(x, width, 0); y = coordinate(y, height, 1);
             x = b.CreateMul(x, texel_bytes);
-        } else {
-            auto* row_bytes = b.CreateMul(width, b.getInt32(4));
-            valid = b.CreateAnd(b.CreateICmpULT(x, row_bytes), b.CreateICmpULT(y, height));
-            if (clamp) {
-                auto clamp_index = [&](llvm::Value* index, llvm::Value* maximum) {
-                    return b.CreateSelect(b.CreateICmpSLT(index, b.getInt32(0)), b.getInt32(0),
-                        b.CreateSelect(b.CreateICmpUGT(index, maximum), maximum, index));
-                };
-                x = clamp_index(x, b.CreateSub(row_bytes, b.getInt32(4)));
-                y = clamp_index(y, b.CreateSub(height, b.getInt32(1))); valid = b.getTrue();
-            }
-            if (trap) {
-                // Arena word 2 is a launch fault flag, independent of the
-                // atomic representation locks. Completion reports the fault.
-                auto scope = dxil ? llvm::SyncScope::System : b.getContext().getOrInsertSyncScopeID("device");
-                b.CreateAtomicRMW(llvm::AtomicRMWInst::Or, word_pointer(0, b.getInt32(2)), b.CreateZExt(b.CreateNot(valid), b.getInt32Ty()),
-                    llvm::Align(4), llvm::AtomicOrdering::Monotonic, scope);
-            }
         }
-        auto* offset = b.CreateAdd(b.CreateMul(b.CreateMul(b.CreateZExt(y, b.getInt64Ty()), b.CreateZExt(width, b.getInt64Ty())), b.CreateZExt(texel_bytes, b.getInt64Ty())), b.CreateZExt(x, b.getInt64Ty()));
+        auto* offset = b.CreateAdd(b.CreateMul(b.CreateZExt(y, b.getInt64Ty()), b.CreateZExt(pitch, b.getInt64Ty())), b.CreateZExt(x, b.getInt64Ty()));
         // The invalid private tag routes zero-mode accesses to the memory
         // helper's no-op/zero path, without touching a real allocation.
         auto* address = b.CreateSelect(valid, b.CreateAdd(base, offset), b.getInt64(0xffffffff00000000ull));
-        if (writing) { store(address, value(instruction.getArgOperand(3))); output = nullptr; }
-        else {
-            if (texture) {
-                llvm::Value* tuple = llvm::UndefValue::get(type(instruction.getType()));
-                for (unsigned i = 0; i < 4; ++i) {
-                    auto* sampled = texture_component(object, address, i, float_texture);
-                    tuple = b.CreateInsertValue(tuple, sampled, i);
-                }
-                output = float_texture ? filter_texture(object, value(instruction.getArgOperand(1)), value(instruction.getArgOperand(2)), tuple, instruction) : tuple;
-            } else output = load(address, b.getInt32Ty());
-        }
+        llvm::Value* tuple = llvm::UndefValue::get(type(instruction.getType()));
+        for (unsigned i = 0; i < 4; ++i) tuple = b.CreateInsertValue(tuple, texture_component(object, address, i, float_texture), i);
+        output = float_texture && !fetch ? filter_texture(object, value(instruction.getArgOperand(1)), value(instruction.getArgOperand(2)), tuple, instruction) : tuple;
         return true;
     }
     llvm::Value* call(const llvm::CallInst& instruction) {

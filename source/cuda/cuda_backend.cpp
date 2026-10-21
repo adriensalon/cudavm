@@ -724,10 +724,12 @@ struct cuda_session : session {
         check(context->api->driver.get<decltype(&cuArray3DCreate)>("cuArray3DCreate_v2")(&result->value, &d), "cuArray3DCreate_v2");
         return result;
     }
-    std::shared_ptr<image_object> create_texture(buffer& storage, const CUDA_TEXTURE_DESC& texture, const CUDA_RESOURCE_VIEW_DESC* view) override {
+    std::shared_ptr<image_object> create_texture(buffer& storage, const CUDA_RESOURCE_DESC& input, size_t offset, const CUDA_TEXTURE_DESC& texture, const CUDA_RESOURCE_VIEW_DESC* view) override {
         auto result = std::make_shared<cuda_image_object>(context, false);
-        CUDA_RESOURCE_DESC resource{}; resource.resType = CU_RESOURCE_TYPE_ARRAY;
-        resource.res.array.hArray = static_cast<cuda_array_buffer&>(storage).value;
+        auto resource = input;
+        if (resource.resType == CU_RESOURCE_TYPE_ARRAY) resource.res.array.hArray = static_cast<cuda_array_buffer&>(storage).value;
+        else if (resource.resType == CU_RESOURCE_TYPE_LINEAR) resource.res.linear.devPtr = storage.native_address() + offset;
+        else resource.res.pitch2D.devPtr = storage.native_address() + offset;
         cuda_context_guard guard(*context);
         CUtexObject handle{};
         check(context->api->driver.get<decltype(&cuTexObjectCreate)>("cuTexObjectCreate")(&handle, &resource, &texture, view), "cuTexObjectCreate");

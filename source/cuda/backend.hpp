@@ -423,7 +423,7 @@ struct session {
     // Buffer storage implements allocation and byte transfers on shader
     // adapters. It does not imply native image sampling support.
     virtual std::shared_ptr<buffer> allocate_array(const CUDA_ARRAY3D_DESCRIPTOR& d) { return allocate(array_storage_bytes(d)); }
-    virtual std::shared_ptr<image_object> create_texture(buffer&, const CUDA_TEXTURE_DESC&, const CUDA_RESOURCE_VIEW_DESC*) {
+    virtual std::shared_ptr<image_object> create_texture(buffer&, const CUDA_RESOURCE_DESC&, size_t, const CUDA_TEXTURE_DESC&, const CUDA_RESOURCE_VIEW_DESC*) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "native texture objects are unavailable");
     }
     virtual std::shared_ptr<image_object> create_surface(buffer&) {

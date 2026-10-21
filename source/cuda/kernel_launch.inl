@@ -90,13 +90,13 @@ std::shared_ptr<captured_launch> prepare_launch(CUfunction handle, const launch_
         if (host) command->hosts.push_back(std::move(host));
     }
     for (auto* objects : {&global().textures, &global().surfaces}) for (auto& [handle, image] : *objects) {
-        if (image->owner != owner || image->retiring || image->array->retiring) continue;
+        if (image->owner != owner || image->retiring || (image->array && image->array->retiring)) continue;
         command->images.push_back(image);
         if (!image->descriptor) continue;
         command->bindings.push_back({handle, image->descriptor.get(), objects == &global().surfaces});
-        auto address = image->array->image_address;
+        auto address = image->backing_address;
         if (std::none_of(command->bindings.begin(), command->bindings.end(), [&](auto binding) { return binding.address == address; }))
-            command->bindings.push_back({address, image->array->native.get()});
+            command->bindings.push_back({address, image->backing.get()});
     }
     context_configuration(owner, [&] { command->function->validate_launch(shape, command->arguments, command->bindings); });
     command->parameters = std::move(layout);

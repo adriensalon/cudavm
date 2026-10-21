@@ -1,10 +1,16 @@
 RUNTIME_API(cudaCreateTextureObject, (cudaTextureObject_t* output, const cudaResourceDesc* resource, const cudaTextureDesc* texture, const cudaResourceViewDesc* view),
     require(output && resource && texture, CUDA_ERROR_INVALID_VALUE, "null texture descriptor or output"); runtime_current();
     auto r = runtime_image_resource(*resource); auto t = runtime_texture_descriptor(*texture);
-    if (texture->readMode == cudaReadModeElementType && texture->filterMode == cudaFilterModeLinear) {
-        CUDA_ARRAY3D_DESCRIPTOR array{}; check(cuArray3DGetDescriptor(&array, r.res.array.hArray));
-        symbol_require(array.Format == CU_AD_FORMAT_FLOAT || array.Format == CU_AD_FORMAT_HALF,
+    if (texture->filterMode == cudaFilterModeLinear || texture->readMode == cudaReadModeNormalizedFloat) {
+        CUDA_ARRAY3D_DESCRIPTOR array{};
+        if (r.resType == CU_RESOURCE_TYPE_ARRAY) check(cuArray3DGetDescriptor(&array, r.res.array.hArray));
+        else array.Format = r.resType == CU_RESOURCE_TYPE_LINEAR ? r.res.linear.format : r.res.pitch2D.format;
+        bool integer32 = array.Format == CU_AD_FORMAT_SIGNED_INT32 || array.Format == CU_AD_FORMAT_UNSIGNED_INT32;
+        if (texture->filterMode == cudaFilterModeLinear) symbol_require(array.Format == CU_AD_FORMAT_FLOAT || array.Format == CU_AD_FORMAT_HALF ||
+            (texture->readMode == cudaReadModeNormalizedFloat && !integer32),
             cudaErrorInvalidFilterSetting, "linear filtering requires floating-point reads");
+        symbol_require(!integer32 || texture->readMode != cudaReadModeNormalizedFloat,
+            cudaErrorInvalidNormSetting, "32-bit integer textures cannot use normalized float reads");
     }
     CUDA_RESOURCE_VIEW_DESC v{}; if (view) v = runtime_image_view(*view);
     check(cuTexObjectCreate(output, &r, &t, view ? &v : nullptr)))

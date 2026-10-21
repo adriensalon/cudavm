@@ -64,6 +64,7 @@ llvm::Value* texture_component(llvm::Value* object, llvm::Value* texel, unsigned
         auto* signed_format = b.CreateICmpEQ(kind, b.getInt32(2));
         auto* integer = b.CreateSelect(signed_format, b.CreateAShr(b.CreateShl(value, shift), shift), value);
         auto* float_alpha = b.CreateAnd(b.CreateICmpEQ(kind, b.getInt32(0)), b.CreateICmpEQ(component_index, b.getInt32(3)));
+        float_alpha = b.CreateAnd(float_alpha, b.CreateICmpNE(image_word(descriptor, 16), b.getInt32(3)));
         auto* missing = b.CreateSelect(valid,
             b.CreateSelect(float_alpha, b.getInt32(floating ? 0x3f800000 : 1), b.getInt32(0)), border);
         if (!floating) b.CreateRet(b.CreateSelect(present, integer, missing));
@@ -108,6 +109,7 @@ llvm::Value* filter_texture_component(llvm::Value* object, llvm::Value* x, llvm:
         auto* width = image_word(descriptor, 8);
         auto* height = image_word(descriptor, 12);
         auto* texel_bytes = image_word(descriptor, 52);
+        auto* pitch = image_word(descriptor, 64);
         auto* mode_x = image_word(descriptor, 24);
         auto* mode_y = image_word(descriptor, 28);
         // Quantize texel coordinates to 1/256 before subtracting the half-texel
@@ -168,7 +170,7 @@ llvm::Value* filter_texture_component(llvm::Value* object, llvm::Value* x, llvm:
                 auto xx = address(b.CreateAdd(horizontal[0], b.getInt64(column)), width, mode_x);
                 auto yy = address(b.CreateAdd(vertical[0], b.getInt64(row)), height, mode_y);
                 auto* valid = b.CreateAnd(xx[1], yy[1]);
-                auto* offset = b.CreateMul(b.CreateAdd(b.CreateMul(yy[0], b.CreateZExt(width, b.getInt64Ty())), xx[0]), b.CreateZExt(texel_bytes, b.getInt64Ty()));
+                auto* offset = b.CreateAdd(b.CreateMul(yy[0], b.CreateZExt(pitch, b.getInt64Ty())), b.CreateMul(xx[0], b.CreateZExt(texel_bytes, b.getInt64Ty())));
                 values[2*row+column] = texture_component(descriptor, b.CreateSelect(valid, b.CreateAdd(base, offset), b.getInt64(0xffffffff00000000ull)), component, floating);
             }
             return values;

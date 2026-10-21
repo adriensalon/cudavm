@@ -1,9 +1,9 @@
 // Object descriptors use private registry addresses, never public allocations.
-// The shader snapshot binds descriptor and array storage once even when several
-// objects alias one array. CUDA objects carry the native driver's opaque value.
+// The shader snapshot binds descriptor and backing storage once even when several
+// objects alias one allocation. CUDA objects carry the native driver's opaque value.
 auto& image_objects(bool surface) { return surface ? global().surfaces : global().textures; }
 uint32_t texture_integer_border(float color, unsigned bits, bool signed_format, bool normalized) {
-    unsigned mask = (1u << bits) - 1;
+    unsigned mask = UINT32_MAX >> (32 - bits);
     if (!normalized) {
         auto value = std::bit_cast<uint32_t>(color) & mask;
         return signed_format && (value & (1u << (bits - 1))) ? value | ~mask : value;
@@ -29,9 +29,51 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
     require(resource.resType >= CU_RESOURCE_TYPE_ARRAY && resource.resType <= CU_RESOURCE_TYPE_PITCH2D,
             CUDA_ERROR_INVALID_VALUE, "invalid image resource type");
     if (surface) require(resource.resType == CU_RESOURCE_TYPE_ARRAY, CUDA_ERROR_INVALID_VALUE, "surfaces require an array");
-    require(resource.resType == CU_RESOURCE_TYPE_ARRAY, CUDA_ERROR_NOT_SUPPORTED, "this image profile requires an array resource");
-    auto array = array_lookup(resource.res.array.hArray, owner);
-    if (surface) require(array->descriptor.Flags & CUDA_ARRAY3D_SURFACE_LDST, CUDA_ERROR_INVALID_VALUE, "array does not enable surface access");
+    require(resource.resType != CU_RESOURCE_TYPE_MIPMAPPED_ARRAY, CUDA_ERROR_NOT_SUPPORTED, "mipmapped texture resources are unavailable");
+    auto entry = std::make_shared<image_object_entry>(); entry->owner = owner; entry->resource = resource;
+    CUDA_ARRAY3D_DESCRIPTOR d{}; size_t pitch = 0, offset = 0; CUdeviceptr image_address = 0;
+    bool linear = resource.resType == CU_RESOURCE_TYPE_LINEAR;
+    if (resource.resType == CU_RESOURCE_TYPE_ARRAY) {
+        entry->array = array_lookup(resource.res.array.hArray, owner);
+        d = entry->array->descriptor; entry->backing = entry->array->native;
+        entry->backing_address = image_address = entry->array->image_address;
+        pitch = d.Width * array_element_bytes(d);
+        if (surface) require(d.Flags & CUDA_ARRAY3D_SURFACE_LDST, CUDA_ERROR_INVALID_VALUE, "array does not enable surface access");
+    } else {
+        require(!view, CUDA_ERROR_INVALID_VALUE, "linear and pitched resources cannot have a resource view");
+        d.Format = linear ? resource.res.linear.format : resource.res.pitch2D.format;
+        d.NumChannels = linear ? resource.res.linear.numChannels : resource.res.pitch2D.numChannels;
+        auto element = array_element_bytes(d);
+        image_address = linear ? resource.res.linear.devPtr : resource.res.pitch2D.devPtr;
+        d.Width = linear ? resource.res.linear.sizeInBytes / element : resource.res.pitch2D.width;
+        d.Height = linear ? 1 : resource.res.pitch2D.height;
+        require((linear || (d.Width && d.Height)) && d.Width <= SIZE_MAX / element, CUDA_ERROR_INVALID_VALUE, "invalid texture resource extent");
+        pitch = linear ? resource.res.linear.sizeInBytes : resource.res.pitch2D.pitchInBytes;
+        auto row = d.Width * element;
+        require(linear || (pitch >= row && d.Height - 1 <= (SIZE_MAX - row) / pitch),
+                CUDA_ERROR_INVALID_VALUE, "invalid texture resource pitch or size");
+        auto storage = resolve(image_address, linear ? pitch : (d.Height - 1) * pitch + row, owner);
+        offset = storage.offset; entry->backing = storage.value->native; entry->backing_address = image_address - offset;
+        auto alignment = global().provider->attribute(owner->device, CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT);
+        require(alignment > 0 && image_address % alignment == 0, CUDA_ERROR_INVALID_VALUE, "texture resource pointer is misaligned");
+        if (!linear) {
+            auto pitch_alignment = global().provider->attribute(owner->device, CU_DEVICE_ATTRIBUTE_TEXTURE_PITCH_ALIGNMENT);
+            require(pitch_alignment > 0 && pitch % pitch_alignment == 0, CUDA_ERROR_INVALID_VALUE, "texture resource pitch is misaligned");
+        }
+        auto limit = [&](CUdevice_attribute attribute, size_t value) {
+            auto maximum = global().provider->attribute(owner->device, attribute);
+            require(maximum > 0 && value <= size_t(maximum), CUDA_ERROR_INVALID_VALUE, "texture resource exceeds device limit");
+        };
+        if (linear) {
+            limit(CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE1D_LINEAR_WIDTH, d.Width);
+            require(global().kind == cudavmBackendCuda || d.Width, CUDA_ERROR_NOT_SUPPORTED, "shader linear textures require at least one complete texel");
+        }
+        else {
+            limit(CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE2D_LINEAR_WIDTH, d.Width);
+            limit(CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE2D_LINEAR_HEIGHT, d.Height);
+            limit(CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE2D_LINEAR_PITCH, pitch);
+        }
+    }
     if (texture) {
         for (auto mode : texture->addressMode) require(mode >= CU_TR_ADDRESS_MODE_WRAP && mode <= CU_TR_ADDRESS_MODE_BORDER, CUDA_ERROR_INVALID_VALUE, "invalid texture address mode");
         for (auto mode : {texture->filterMode, texture->mipmapFilterMode}) require(mode == CU_TR_FILTER_MODE_POINT || mode == CU_TR_FILTER_MODE_LINEAR, CUDA_ERROR_INVALID_VALUE, "invalid texture filter mode");
@@ -40,36 +82,37 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
         require(!(texture->flags & ~flags), CUDA_ERROR_INVALID_VALUE, "invalid texture flags");
     }
     capture_unsafe(owner);
-    auto entry = std::make_shared<image_object_entry>(); entry->owner = owner; entry->array = array; entry->resource = resource;
     if (texture) entry->texture = *texture;
     if (view) entry->view = *view;
     if (global().kind == cudavmBackendCuda) {
-        entry->native = context_configuration(owner, [&] { return surface ? owner->native->create_surface(*array->native)
-            : owner->native->create_texture(*array->native, *texture, view); });
+        entry->native = context_configuration(owner, [&] { return surface ? owner->native->create_surface(*entry->backing)
+            : owner->native->create_texture(*entry->backing, resource, offset, *texture, view); });
     } else {
-        auto& d = array->descriptor;
         require(d.Height && !d.Depth && !(d.Flags & (CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_CUBEMAP)),
                 CUDA_ERROR_NOT_SUPPORTED, "shader image objects require a 2D array");
-        require(d.Width <= UINT32_MAX && d.Height <= UINT32_MAX && array->native->size < (1u << 30), CUDA_ERROR_NOT_SUPPORTED, "image exceeds shader address transport");
-        if (surface) require(d.NumChannels == 1 && (d.Format == CU_AD_FORMAT_SIGNED_INT32 || d.Format == CU_AD_FORMAT_UNSIGNED_INT32 || d.Format == CU_AD_FORMAT_FLOAT),
-                CUDA_ERROR_NOT_SUPPORTED, "shader surfaces require single-channel 32-bit elements");
-        else {
+        require(d.Width <= UINT32_MAX && d.Height <= UINT32_MAX && entry->backing->size < (1u << 30), CUDA_ERROR_NOT_SUPPORTED, "image exceeds shader address transport");
+        if (!surface) {
             require((d.Format == CU_AD_FORMAT_FLOAT || d.Format == CU_AD_FORMAT_SIGNED_INT8 || d.Format == CU_AD_FORMAT_UNSIGNED_INT8 ||
-                d.Format == CU_AD_FORMAT_SIGNED_INT16 || d.Format == CU_AD_FORMAT_UNSIGNED_INT16) &&
+                d.Format == CU_AD_FORMAT_SIGNED_INT16 || d.Format == CU_AD_FORMAT_UNSIGNED_INT16 ||
+                d.Format == CU_AD_FORMAT_SIGNED_INT32 || d.Format == CU_AD_FORMAT_UNSIGNED_INT32) &&
                 !(texture->flags & ~(CU_TRSF_READ_AS_INTEGER | CU_TRSF_NORMALIZED_COORDINATES)),
-                CUDA_ERROR_NOT_SUPPORTED, "shader textures require float or 8/16-bit integer elements");
+                CUDA_ERROR_NOT_SUPPORTED, "shader textures require float or 8/16/32-bit integer elements");
             require(!view, CUDA_ERROR_NOT_SUPPORTED, "shader texture resource views are unavailable");
         }
         entry->native = std::make_shared<image_object>();
-        std::array<uint32_t, 16> descriptor{uint32_t(array->image_address), uint32_t(array->image_address >> 32), uint32_t(d.Width), uint32_t(d.Height), surface ? 2u : 1u};
+        std::array<uint32_t, 17> descriptor{uint32_t(image_address), uint32_t(image_address >> 32), uint32_t(d.Width), uint32_t(d.Height), surface ? 2u : linear ? 3u : 1u};
+        descriptor[16] = uint32_t(pitch);
         descriptor[12] = d.NumChannels; descriptor[13] = uint32_t(array_element_bytes(d));
         descriptor[14] = descriptor[13] / d.NumChannels;
         descriptor[15] = d.Format == CU_AD_FORMAT_FLOAT ? 0u :
             (d.Format == CU_AD_FORMAT_SIGNED_INT8 || d.Format == CU_AD_FORMAT_SIGNED_INT16 || d.Format == CU_AD_FORMAT_SIGNED_INT32) ? 2u : 1u;
         if (texture) {
-            descriptor[5] = unsigned(bool(texture->flags & CU_TRSF_NORMALIZED_COORDINATES)) |
-                (texture->filterMode == CU_TR_FILTER_MODE_LINEAR ? 2u : 0u) |
-                (descriptor[15] && !(texture->flags & CU_TRSF_READ_AS_INTEGER) ? 4u : 0u);
+            bool normalized_integer = descriptor[15] && descriptor[14] < 4 && !(texture->flags & CU_TRSF_READ_AS_INTEGER);
+            require(linear || texture->filterMode != CU_TR_FILTER_MODE_LINEAR || !descriptor[15] || normalized_integer,
+                    CUDA_ERROR_INVALID_VALUE, "linear filtering requires floating-point reads");
+            descriptor[5] = unsigned(!linear && bool(texture->flags & CU_TRSF_NORMALIZED_COORDINATES)) |
+                (!linear && texture->filterMode == CU_TR_FILTER_MODE_LINEAR ? 2u : 0u) |
+                (normalized_integer ? 4u : 0u);
             for (unsigned i = 0; i < 2; ++i) {
                 auto mode = texture->addressMode[i];
                 // CUDA treats unnormalized wrap and mirror as clamp. Retain
@@ -77,9 +120,9 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
                 if (!(descriptor[5] & 1u) && (mode == CU_TR_ADDRESS_MODE_WRAP || mode == CU_TR_ADDRESS_MODE_MIRROR)) mode = CU_TR_ADDRESS_MODE_CLAMP;
                 descriptor[6 + i] = uint32_t(mode);
             }
-            std::memcpy(descriptor.data() + 8, texture->borderColor, sizeof(texture->borderColor));
+            if (!linear) std::memcpy(descriptor.data() + 8, texture->borderColor, sizeof(texture->borderColor));
             if (descriptor[15]) for (unsigned component = 0; component < 4; ++component)
-                descriptor[8 + component] = component < d.NumChannels ? texture_integer_border(texture->borderColor[component],
+                descriptor[8 + component] = !linear && component < d.NumChannels ? texture_integer_border(texture->borderColor[component],
                     8 * descriptor[14], descriptor[15] == 2, descriptor[5] & 4) : 0;
         }
         entry->native->handle = reserve_device_address(sizeof(descriptor));

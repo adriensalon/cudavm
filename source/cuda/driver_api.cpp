@@ -116,6 +116,8 @@ struct array_entry {
 struct image_object_entry {
     std::shared_ptr<context> owner;
     std::shared_ptr<array_entry> array;
+    std::shared_ptr<buffer> backing;
+    CUdeviceptr backing_address = 0;
     std::shared_ptr<image_object> native;
     std::shared_ptr<buffer> descriptor;
     CUDA_RESOURCE_DESC resource{};
