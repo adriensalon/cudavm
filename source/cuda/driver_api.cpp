@@ -2,6 +2,7 @@
 #include "driver_api.hpp"
 #include "opengl_graphics.hpp"
 #include "command_queue.hpp"
+#include "graph_regions.hpp"
 #include "command_domain.hpp"
 #include "../cudavm/module_descriptor.hpp"
 #include "shader_ptx.hpp"

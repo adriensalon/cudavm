@@ -168,6 +168,7 @@ struct opengl_api {
     using write_type = void (GL_CALL*)(enum_type, size_type, size_type, const void*);
     using read_type = void (GL_CALL*)(enum_type, size_type, size_type, void*);
     using copy_type = void (GL_CALL*)(enum_type, enum_type, size_type, size_type, size_type);
+    using clear_type = void (GL_CALL*)(enum_type, enum_type, size_type, size_type, enum_type, enum_type, const void*);
     using finish_type = void (GL_CALL*)();
     using error_type = enum_type (GL_CALL*)();
     using string_type = const unsigned char* (GL_CALL*)(enum_type);
@@ -191,6 +192,7 @@ struct opengl_api {
     gen_type gen_queries;delete_type delete_queries;query_counter_type query_counter;query_result_type query_result;
     fence_type fence; wait_sync_type wait_sync; delete_sync_type delete_sync; finish_type flush;
     gen_type gen; delete_type remove; bind_type bind; data_type data; write_type write; read_type read; copy_type copy;
+    clear_type clear;
     finish_type finish; error_type error; string_type string;
     create_shader_type create_shader;shader_source_type shader_source;shader_action_type compile_shader,delete_shader;
     query_type shader_query,program_query;log_type shader_log,program_log;
@@ -220,6 +222,7 @@ struct opengl_api {
         bind = load<bind_type>(context, "glBindBuffer"); data = load<data_type>(context, "glBufferData");
         write = load<write_type>(context, "glBufferSubData"); read = load<read_type>(context, "glGetBufferSubData");
         copy = load<copy_type>(context, "glCopyBufferSubData"); finish = load<finish_type>(context, "glFinish");
+        clear = load<clear_type>(context, "glClearBufferSubData");
         error = load<error_type>(context, "glGetError"); string = load<string_type>(context, "glGetString");
         fence = load<fence_type>(context, "glFenceSync"); wait_sync = load<wait_sync_type>(context, "glClientWaitSync");
         delete_sync = load<delete_sync_type>(context, "glDeleteSync"); flush = load<finish_type>(context, "glFlush");
@@ -430,6 +433,26 @@ struct opengl_session : session {
         std::shared_ptr<buffer> staging = allocate(bytes.size());
         auto continuation = std::make_shared<device_continuation>(device_work{}, [this, staging, bytes] { read(*staging, 0, bytes); });
         continuation->task = enqueue_copy(*staging, 0, value, offset, bytes.size(), queue); return continuation;
+    }
+    device_work enqueue_fill(buffer& value, size_t offset, std::span<const std::byte> pattern, size_t bytes, native_queue* queue) override {
+        if (!bytes) return {};
+        if (&value.storage() != &value) return enqueue_fill(value.storage(), offset + value.storage_offset(), pattern, bytes, queue);
+        if (value.host_address()) return session::enqueue_fill(value, offset, pattern, bytes, queue);
+        auto word = repeated_fill_word(pattern);
+        auto format = pattern.size() == 1 ? 0x8232u : pattern.size() == 2 ? 0x8234u : 0x8236u; // R8UI/R16UI/R32UI
+        auto type = pattern.size() == 1 ? 0x1401u : pattern.size() == 2 ? 0x1403u : 0x1405u;
+        auto task = std::make_shared<opengl_task>(owner);
+        owner->invoke([&] {
+            auto& api = *owner->api;
+            api.memory_barrier(0x200 | 0x2000); // Buffer updates and shader storage.
+            api.bind(copy_write, static_cast<opengl_buffer&>(value).value);
+            api.clear(copy_write, format, size_type(offset), size_type(bytes), 0x8d94, type, &word); // RED_INTEGER
+            api.memory_barrier(0x200 | 0x2000);
+            api.check("glClearBufferSubData"); task->record();
+        }); return task;
+    }
+    void fill_device(buffer& value, size_t offset, std::span<const std::byte> pattern, size_t bytes) override {
+        wait_device(enqueue_fill(value, offset, pattern, bytes, nullptr));
     }
     void write_device(buffer& value, size_t offset, std::span<const std::byte> data) override {
         if (&value.storage() != &value) { write_device(value.storage(), offset + value.storage_offset(), data); return; }

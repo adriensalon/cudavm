@@ -213,6 +213,7 @@ struct cuda_graph_buffer : cuda_buffer {
 struct cuda_queue : native_queue {
     std::shared_ptr<cuda_context> context;
     CUstream value = nullptr;
+    bool capturing = false;
     cuda_queue(std::shared_ptr<cuda_context> owner, int priority) : context(std::move(owner)) {
         cuda_context_guard guard(*context);
         check(context->api->driver.get<decltype(&cuStreamCreateWithPriority)>("cuStreamCreateWithPriority")(&value, CU_STREAM_NON_BLOCKING, priority), "cuStreamCreateWithPriority");
@@ -264,7 +265,9 @@ struct cuda_launch_event : device_launch_event {
 };
 template<class F> device_work cuda_enqueue(std::shared_ptr<cuda_context> context, native_queue* queue, F action) {
     cuda_context_guard guard(*context);
-    auto stream = static_cast<cuda_queue*>(queue)->value;
+    auto& lane = *static_cast<cuda_queue*>(queue);
+    auto stream = lane.value;
+    if (lane.capturing) { action(stream); return {}; }
     auto done = std::make_shared<cuda_task>(context);
     try { action(stream); done->record(stream); }
     catch (...) {
@@ -274,6 +277,25 @@ template<class F> device_work cuda_enqueue(std::shared_ptr<cuda_context> context
     }
     return done;
 }
+struct cuda_graph : native_graph {
+    std::shared_ptr<cuda_context> context;
+    CUgraph graph = nullptr;
+    CUgraphExec executable = nullptr;
+    explicit cuda_graph(std::shared_ptr<cuda_context> owner) : context(std::move(owner)) {}
+    ~cuda_graph() {
+        if (context->api->push(context->value) == CUDA_SUCCESS) {
+            auto& driver = context->api->driver;
+            if (executable) driver.get<decltype(&cuGraphExecDestroy)>("cuGraphExecDestroy")(executable);
+            if (graph) driver.get<decltype(&cuGraphDestroy)>("cuGraphDestroy")(graph);
+            CUcontext previous = nullptr; context->api->pop(&previous);
+        }
+    }
+    device_work enqueue(native_queue* queue) override {
+        return cuda_enqueue(context, queue, [&](CUstream stream) {
+            check(context->api->driver.get<decltype(&cuGraphLaunch)>("cuGraphLaunch")(executable, stream), "cuGraphLaunch native region");
+        });
+    }
+};
 struct cuda_memory : external_memory, std::enable_shared_from_this<cuda_memory> {
     std::shared_ptr<cuda_context> context;
     CUexternalMemory value = nullptr;
@@ -816,6 +838,37 @@ struct cuda_session : session {
         result->mapped_host = std::move(host); return result;
     }
     std::shared_ptr<native_queue> create_queue(int priority) override { return std::make_shared<cuda_queue>(context, priority); }
+    std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_command> commands) override {
+        auto& driver = context->api->driver;
+        auto begin = reinterpret_cast<decltype(&cuStreamBeginCapture)>(driver.find("cuStreamBeginCapture_v2"));
+        auto end = reinterpret_cast<decltype(&cuStreamEndCapture)>(driver.find("cuStreamEndCapture"));
+        auto instantiate = reinterpret_cast<decltype(&cuGraphInstantiateWithFlags)>(driver.find("cuGraphInstantiateWithFlags"));
+        if (!begin || !end || !instantiate) return {};
+        cuda_context_guard guard(*context);
+        cuda_queue lane(context, 0);
+        auto result = std::make_shared<cuda_graph>(context);
+        auto status = begin(lane.value, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+        if (status == CUDA_ERROR_NOT_SUPPORTED) return {};
+        check(status, "cuStreamBeginCapture native region");
+        lane.capturing = true;
+        try {
+            for (auto& command : commands) command(&lane);
+        } catch (...) {
+            // End invalidated capture before destroying the private lane. No
+            // recorded command has reached the GPU, so fallback is atomic.
+            end(lane.value, &result->graph); lane.capturing = false;
+            try { throw; } catch (const failure& error) {
+                if (error.code == CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED || error.code == CUDA_ERROR_NOT_SUPPORTED) return {};
+                throw;
+            }
+        }
+        lane.capturing = false;
+        check(end(lane.value, &result->graph), "cuStreamEndCapture native region");
+        status = instantiate(&result->executable, result->graph, 0);
+        if (status == CUDA_ERROR_NOT_SUPPORTED) return {};
+        check(status, "cuGraphInstantiateWithFlags native region");
+        return result;
+    }
     device_work enqueue_write(buffer& value, size_t offset, std::span<const std::byte> bytes, native_queue* queue) override {
         if (&value.storage() != &value) return enqueue_write(value.storage(), offset + value.storage_offset(), bytes, queue);
         if (dynamic_cast<cuda_array_buffer*>(&value)) return transfer_array_row(&value,offset,nullptr,nullptr,0,bytes.data(),bytes.size(),queue,true);
@@ -845,6 +898,11 @@ struct cuda_session : session {
             else if (pattern.size() == 2) { unsigned short v; std::memcpy(&v, pattern.data(), 2); check(driver.get<decltype(&cuMemsetD16Async)>("cuMemsetD16Async")(address, v, bytes / 2, stream), "cuMemsetD16Async"); }
             else { unsigned v; std::memcpy(&v, pattern.data(), 4); check(driver.get<decltype(&cuMemsetD32Async)>("cuMemsetD32Async")(address, v, bytes / 4, stream), "cuMemsetD32Async"); }
         });
+    }
+    void fill_device(buffer& value, size_t offset, std::span<const std::byte> pattern, size_t bytes) override {
+        if (!bytes) return;
+        cuda_queue queue(context, 0);
+        wait_device(enqueue_fill(value, offset, pattern, bytes, &queue));
     }
     std::unique_ptr<buffer> allocate_pitched(size_t width, size_t height, unsigned element, size_t& pitch) override {
         cuda_context_guard guard(*context); CUdeviceptr pointer = 0; size_t value = 0;

@@ -89,7 +89,7 @@ struct vulkan_device {
     ENTRY(vkCreateBuffer); ENTRY(vkDestroyBuffer); ENTRY(vkGetBufferMemoryRequirements); ENTRY(vkAllocateMemory); ENTRY(vkFreeMemory);
     ENTRY(vkBindBufferMemory); ENTRY(vkMapMemory); ENTRY(vkUnmapMemory); ENTRY(vkDeviceWaitIdle);
     ENTRY(vkAllocateCommandBuffers); ENTRY(vkFreeCommandBuffers); ENTRY(vkBeginCommandBuffer); ENTRY(vkEndCommandBuffer);
-    ENTRY(vkCmdCopyBuffer); ENTRY(vkCmdPipelineBarrier); ENTRY(vkQueueSubmit); ENTRY(vkQueueWaitIdle);
+    ENTRY(vkCmdCopyBuffer); ENTRY(vkCmdFillBuffer); ENTRY(vkCmdPipelineBarrier); ENTRY(vkQueueSubmit); ENTRY(vkQueueWaitIdle);
     ENTRY(vkCreateFence); ENTRY(vkDestroyFence); ENTRY(vkGetFenceStatus); ENTRY(vkWaitForFences);
     ENTRY(vkCreateQueryPool); ENTRY(vkDestroyQueryPool); ENTRY(vkCmdResetQueryPool); ENTRY(vkCmdWriteTimestamp); ENTRY(vkGetQueryPoolResults);
     ENTRY(vkCreateShaderModule);ENTRY(vkDestroyShaderModule);ENTRY(vkCreateDescriptorSetLayout);ENTRY(vkDestroyDescriptorSetLayout);
@@ -163,7 +163,7 @@ struct vulkan_device {
             LOAD(vkCreateBuffer); LOAD(vkDestroyBuffer); LOAD(vkGetBufferMemoryRequirements); LOAD(vkAllocateMemory); LOAD(vkFreeMemory);
             LOAD(vkBindBufferMemory); LOAD(vkMapMemory); LOAD(vkUnmapMemory); LOAD(vkDeviceWaitIdle);
             LOAD(vkAllocateCommandBuffers); LOAD(vkFreeCommandBuffers); LOAD(vkBeginCommandBuffer); LOAD(vkEndCommandBuffer);
-            LOAD(vkCmdCopyBuffer); LOAD(vkCmdPipelineBarrier); LOAD(vkQueueSubmit); LOAD(vkQueueWaitIdle);
+            LOAD(vkCmdCopyBuffer); LOAD(vkCmdFillBuffer); LOAD(vkCmdPipelineBarrier); LOAD(vkQueueSubmit); LOAD(vkQueueWaitIdle);
             LOAD(vkCreateFence); LOAD(vkDestroyFence); LOAD(vkGetFenceStatus); LOAD(vkWaitForFences);
             LOAD(vkCreateQueryPool); LOAD(vkDestroyQueryPool); LOAD(vkCmdResetQueryPool); LOAD(vkCmdWriteTimestamp); LOAD(vkGetQueryPoolResults);
             LOAD(vkCreateShaderModule);LOAD(vkDestroyShaderModule);LOAD(vkCreateDescriptorSetLayout);LOAD(vkDestroyDescriptorSetLayout);
@@ -341,8 +341,11 @@ struct vulkan_session : session {
         auto& destination = static_cast<vulkan_buffer&>(to);
         auto& source = static_cast<vulkan_buffer&>(from);
         if (source.value == destination.value && source.imported) {
-            auto temporary = allocate((size + 3) & ~size_t(3));
-            copy(*temporary, 0, from, from_offset, size); copy(to, to_offset, *temporary, 0, size); return {};
+            std::shared_ptr<buffer> temporary = allocate((size + 3) & ~size_t(3));
+            auto tasks = std::make_shared<device_group>(); tasks->tasks.reserve(2);
+            auto retained = std::make_shared<device_continuation>(tasks, [temporary] {});
+            tasks->tasks.push_back(transfer(*temporary, 0, from, from_offset, size));
+            tasks->tasks.push_back(transfer(to, to_offset, *temporary, 0, size)); return retained;
         }
         // The initial 1.0 adapter stages byte-unaligned regions through actual
         // coherent GPU mappings. Aligned regions use a GPU transfer command.
@@ -413,6 +416,49 @@ struct vulkan_session : session {
         std::memcpy(static_cast<vulkan_buffer&>(*staging).mapped, bytes.data(), bytes.size());
         auto continuation = std::make_shared<device_continuation>(device_work{}, [staging] {});
         continuation->task = transfer(value, offset, *staging, 0, bytes.size()); return continuation;
+    }
+    device_work enqueue_fill(buffer& value, size_t offset, std::span<const std::byte> pattern, size_t bytes, native_queue* queue) override {
+        if (!bytes) return {};
+        if (&value.storage() != &value) return enqueue_fill(value.storage(), offset + value.storage_offset(), pattern, bytes, queue);
+        if (value.host_address()) return session::enqueue_fill(value, offset, pattern, bytes, queue);
+        auto& target = static_cast<vulkan_buffer&>(value);
+        if (((offset + target.base_offset) | bytes) & 3) return session::enqueue_fill(value, offset, pattern, bytes, queue);
+        auto word = repeated_fill_word(pattern);
+        std::lock_guard lock(owner->execution);
+        auto task = std::make_shared<vulkan_task>(owner);
+        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocation.commandPool = owner->pool; allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; allocation.commandBufferCount = 1;
+        check(owner->vkAllocateCommandBuffers(owner->value, &allocation, &task->command), "vkAllocateCommandBuffers fill");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(owner->vkBeginCommandBuffer(task->command, &begin), "vkBeginCommandBuffer fill");
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT; barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        owner->vkCmdPipelineBarrier(task->command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        auto external = [&](bool acquire) {
+            if (!target.imported) return;
+            VkBufferMemoryBarrier transition{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            transition.buffer = target.value; transition.size = VK_WHOLE_SIZE;
+            transition.srcQueueFamilyIndex = acquire ? VK_QUEUE_FAMILY_EXTERNAL : owner->family;
+            transition.dstQueueFamilyIndex = acquire ? owner->family : VK_QUEUE_FAMILY_EXTERNAL;
+            transition.srcAccessMask = acquire ? 0 : VK_ACCESS_TRANSFER_WRITE_BIT;
+            transition.dstAccessMask = acquire ? VK_ACCESS_TRANSFER_WRITE_BIT : 0;
+            owner->vkCmdPipelineBarrier(task->command, acquire ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                acquire ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 1, &transition, 0, nullptr);
+        };
+        external(true);
+        owner->vkCmdFillBuffer(task->command, target.value, offset + target.base_offset, bytes, word);
+        external(false);
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        owner->vkCmdPipelineBarrier(task->command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+            0, 1, &barrier, 0, nullptr, 0, nullptr);
+        check(owner->vkEndCommandBuffer(task->command), "vkEndCommandBuffer fill");
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.commandBufferCount = 1; submit.pCommandBuffers = &task->command;
+        check(owner->vkQueueSubmit(owner->queue, 1, &submit, task->fence), "vkQueueSubmit fill"); task->submitted = true;
+        return task;
+    }
+    void fill_device(buffer& value, size_t offset, std::span<const std::byte> pattern, size_t bytes) override {
+        wait_device(enqueue_fill(value, offset, pattern, bytes, nullptr));
     }
     device_work enqueue_read(buffer& value, size_t offset, std::span<std::byte> bytes, native_queue* queue) override {
         if (&value.storage() != &value) return enqueue_read(value.storage(), offset + value.storage_offset(), bytes, queue);

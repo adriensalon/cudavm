@@ -235,7 +235,13 @@ struct directx_session : session {
         if (&to.storage() != &to || &from.storage() != &from) return enqueue_copy(to.storage(), destination + to.storage_offset(), from.storage(), source + from.storage_offset(), bytes, queue);
         if (to.host_address() || from.host_address()) return session::enqueue_copy(to, destination, from, source, bytes, queue);
         auto& a = static_cast<directx_buffer&>(to); auto& b = static_cast<directx_buffer&>(from);
-        if (a.value == b.value) return session::enqueue_copy(to, destination, from, source, bytes, queue);
+        if (a.value == b.value) {
+            std::shared_ptr<buffer> temporary = allocate(bytes);
+            auto tasks = std::make_shared<device_group>(); tasks->tasks.reserve(2);
+            auto retained = std::make_shared<device_continuation>(tasks, [temporary] {});
+            tasks->tasks.push_back(enqueue_copy(*temporary, 0, from, source, bytes, queue));
+            tasks->tasks.push_back(enqueue_copy(to, destination, *temporary, 0, bytes, queue)); return retained;
+        }
         auto task = std::make_shared<directx_task>(owner);
         task->barrier(b, b.resting_state, D3D12_RESOURCE_STATE_COPY_SOURCE); task->barrier(a, a.resting_state, D3D12_RESOURCE_STATE_COPY_DEST);
         task->list->CopyBufferRegion(a.value.Get(), destination + a.base_offset, b.value.Get(), source + b.base_offset, bytes);
@@ -268,6 +274,41 @@ struct directx_session : session {
         task->list->CopyBufferRegion(download.Get(), 0, target.value.Get(), offset + target.base_offset, bytes.size());
         task->barrier(target, D3D12_RESOURCE_STATE_COPY_SOURCE, target.resting_state);
         task->submit(); continuation->task = task; return continuation;
+    }
+    device_work enqueue_fill(buffer& value, size_t offset, std::span<const std::byte> pattern, size_t bytes, native_queue* queue) override {
+        if (!bytes) return {};
+        if (&value.storage() != &value) return enqueue_fill(value.storage(), offset + value.storage_offset(), pattern, bytes, queue);
+        if (value.host_address()) return session::enqueue_fill(value, offset, pattern, bytes, queue);
+        auto& target = static_cast<directx_buffer&>(value);
+        if ((((offset + target.base_offset) | bytes) & 3) || bytes / 4 > std::numeric_limits<UINT>::max() ||
+            !(target.value->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+            return session::enqueue_fill(value, offset, pattern, bytes, queue);
+        auto word = repeated_fill_word(pattern);
+        D3D12_DESCRIPTOR_HEAP_DESC heap{}; heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap.NumDescriptors = 1;
+        ComPtr<ID3D12DescriptorHeap> cpu, gpu;
+        check(owner->value->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&cpu)), "CreateDescriptorHeap fill CPU");
+        heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        check(owner->value->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&gpu)), "CreateDescriptorHeap fill GPU");
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{}; view.Format = DXGI_FORMAT_R32_UINT; view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        view.Buffer.FirstElement = (offset + target.base_offset) / 4; view.Buffer.NumElements = UINT(bytes / 4);
+        owner->value->CreateUnorderedAccessView(target.value.Get(), nullptr, &view, cpu->GetCPUDescriptorHandleForHeapStart());
+        owner->value->CreateUnorderedAccessView(target.value.Get(), nullptr, &view, gpu->GetCPUDescriptorHandleForHeapStart());
+        auto retained = std::make_shared<device_continuation>(device_work{}, [cpu, gpu] {});
+        auto task = std::make_shared<directx_task>(owner);
+        if (target.resting_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            task->barrier(target, target.resting_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_RESOURCE_BARRIER barrier{}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; barrier.UAV.pResource = target.value.Get();
+        task->list->ResourceBarrier(1, &barrier);
+        ID3D12DescriptorHeap* heaps[] = {gpu.Get()}; task->list->SetDescriptorHeaps(1, heaps);
+        UINT values[] = {word, word, word, word};
+        task->list->ClearUnorderedAccessViewUint(gpu->GetGPUDescriptorHandleForHeapStart(), cpu->GetCPUDescriptorHandleForHeapStart(), target.value.Get(), values, 0, nullptr);
+        task->list->ResourceBarrier(1, &barrier);
+        if (target.resting_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            task->barrier(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, target.resting_state);
+        task->submit(); retained->task = task; return retained;
+    }
+    void fill_device(buffer& value, size_t offset, std::span<const std::byte> pattern, size_t bytes) override {
+        wait_device(enqueue_fill(value, offset, pattern, bytes, nullptr));
     }
     void write_device(buffer& value, size_t offset, std::span<const std::byte> bytes) override {
         if (&value.storage() != &value) { write_device(value.storage(), offset + value.storage_offset(), bytes); return; }

@@ -208,6 +208,20 @@ struct device_continuation : device_task {
     }
 };
 struct native_queue { virtual ~native_queue() = default; };
+// Recording must not execute work or retain temporary host spans. The graph
+// owns its native descriptors; callers retain the recorded resource snapshots.
+using native_graph_command = std::function<device_work(native_queue*)>;
+struct native_graph {
+    virtual ~native_graph() = default;
+    virtual device_work enqueue(native_queue*) = 0;
+};
+inline uint32_t repeated_fill_word(std::span<const std::byte> pattern) {
+    require(pattern.size() == 1 || pattern.size() == 2 || pattern.size() == 4, CUDA_ERROR_INVALID_VALUE, "invalid native fill pattern");
+    uint32_t word = 0;
+    for (size_t i = 0; i < sizeof(word); ++i)
+        reinterpret_cast<std::byte*>(&word)[i] = pattern[i % pattern.size()];
+    return word;
+}
 struct device_launch_event {
     CUevent handle = nullptr;
     virtual ~device_launch_event() = default;
@@ -449,6 +463,7 @@ struct session {
     virtual std::unique_ptr<host_allocation> register_host(void* pointer, size_t bytes, unsigned) { return register_locked_host(pointer, bytes); }
     virtual std::unique_ptr<buffer> map_host(std::shared_ptr<host_allocation> value) { return std::make_unique<host_buffer>(std::move(value)); }
     virtual std::shared_ptr<native_queue> create_queue(int) { return {}; }
+    virtual std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_command>) { return {}; }
     // Values are published before the returned task completes. A zero period
     // means this adapter cannot supply device-clock timing.
     virtual device_work enqueue_timestamp(std::shared_ptr<device_timestamp>, native_queue*) { return {}; }
