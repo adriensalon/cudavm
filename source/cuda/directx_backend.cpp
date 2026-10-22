@@ -1,4 +1,5 @@
 #include "dynamic_library.hpp"
+#include "command_regions.hpp"
 #include "device_resources.hpp"
 #include "../cudavm/dxil_artifact.hpp"
 #if defined(_WIN32)
@@ -22,6 +23,7 @@ struct directx_api {
     decltype(&D3D12CreateDevice) create = d3d.get<decltype(create)>("D3D12CreateDevice");
 };
 struct directx_device {
+    std::recursive_mutex execution;
     std::shared_ptr<directx_api> api;
     std::shared_ptr<ID3D12Device> resource_owner;
     ComPtr<ID3D12Device> value;
@@ -81,6 +83,7 @@ struct directx_device {
         list->ResourceBarrier(1, &barrier);
     }
     void wait() {
+        std::lock_guard lock(execution);
         check(queue->Signal(fence.Get(), ++epoch), "Signal fence");
         if (fence->GetCompletedValue() < epoch) {
             check(fence->SetEventOnCompletion(epoch, event), "SetEventOnCompletion");
@@ -127,12 +130,15 @@ struct directx_task : device_task {
         check(owner->value->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "CreateCommandAllocator");
         check(owner->value->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)), "CreateCommandList");
     }
+    directx_task(const directx_task& recorded) : owner(recorded.owner), allocator(recorded.allocator), list(recorded.list) {}
     void barrier(directx_buffer& buffer, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
         D3D12_RESOURCE_BARRIER barrier{}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barrier.Transition = {buffer.value.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to}; list->ResourceBarrier(1, &barrier);
     }
-    void submit() {
-        check(list->Close(), "Close command list"); ID3D12CommandList* commands[] = {list.Get()};
+    void submit(bool close = true) {
+        std::lock_guard lock(owner->execution);
+        if (close) check(list->Close(), "Close command list");
+        ID3D12CommandList* commands[] = {list.Get()};
         owner->queue->ExecuteCommandLists(1, commands);
         epoch = ++owner->epoch;
         try { check(owner->queue->Signal(owner->fence.Get(), epoch), "Signal fence"); }
@@ -160,6 +166,17 @@ struct directx_task : device_task {
             auto event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
             if (event) { if (SUCCEEDED(owner->fence->SetEventOnCompletion(epoch, event))) WaitForSingleObject(event, INFINITE); CloseHandle(event); }
         }
+    }
+};
+struct directx_graph : native_graph, command_region_queue, std::enable_shared_from_this<directx_graph> {
+    std::shared_ptr<directx_task> commands;
+    explicit directx_graph(std::shared_ptr<directx_device> owner) : commands(std::make_shared<directx_task>(std::move(owner))) {}
+    device_work enqueue(native_queue*) override {
+        // Executable replay tails serialize reuse of this closed command list.
+        // Updates produce an independent list and allocator for pending work.
+        auto retained = std::make_shared<device_continuation>(device_work{}, [self = shared_from_this()] {});
+        auto task = std::make_shared<directx_task>(*commands);
+        task->submit(false); retained->task = task; return retained;
     }
 };
 template<class T, class Desc> ComPtr<T> open_shared(directx_device& owner, const Desc& d) {
@@ -221,6 +238,33 @@ struct directx_pipeline : compute_pipeline {
 struct directx_session : session {
     std::shared_ptr<directx_device> owner;
     explicit directx_session(std::shared_ptr<directx_device> input) : owner(std::move(input)) {}
+    bool command_regions() const override { return true; }
+    bool can_record_copy(const buffer& to, size_t, const buffer& from, size_t, size_t) const override {
+        auto destination = dynamic_cast<const directx_buffer*>(&to.storage());
+        auto source = dynamic_cast<const directx_buffer*>(&from.storage());
+        return destination && source && destination->owner == owner && source->owner == owner &&
+            !destination->imported && !source->imported && destination->value != source->value;
+    }
+    bool can_record_fill(const buffer& value, size_t offset, size_t bytes) const override {
+        auto native = dynamic_cast<const directx_buffer*>(&value.storage());
+        return native && native->owner == owner && !native->imported &&
+            !(((offset + value.storage_offset()) | bytes) & 3) && bytes / 4 <= std::numeric_limits<UINT>::max() &&
+            (native->value->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    }
+    std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_node> nodes) override {
+        if (!command_region_compatible(nodes)) return {};
+        auto graph = std::make_shared<directx_graph>(owner);
+        try {
+            for (auto& node : nodes) if (auto resource = node.command(graph.get())) graph->resources.push_back(std::move(resource));
+        } catch (...) {
+            // Finish the private list before retiring its descriptor heaps,
+            // even when a later operation cannot be recorded.
+            graph->commands->list->Close();
+            try { throw; } catch (const failure& error) { if (error.code == CUDA_ERROR_NOT_SUPPORTED) return {}; throw; }
+        }
+        check(graph->commands->list->Close(), "Close command region");
+        return graph;
+    }
     interop_capabilities interop() override { return {handle_bit(CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP) | handle_bit(CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE), handle_bit(CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE)}; }
     std::shared_ptr<external_memory> import_memory(const CUDA_EXTERNAL_MEMORY_HANDLE_DESC& d, const cudavmExternalMemoryMetadata* = nullptr) override {
         require(interop().memory & handle_bit(d.type), CUDA_ERROR_NOT_SUPPORTED, "DirectX external memory handle type is unavailable");
@@ -232,6 +276,9 @@ struct directx_session : session {
     }
     std::unique_ptr<buffer> allocate(size_t bytes) override { return std::make_unique<directx_buffer>(owner, bytes); }
     device_work enqueue_copy(buffer& to, size_t destination, buffer& from, size_t source, size_t bytes, native_queue* queue) override {
+        auto recording = queue && queue->recording() ? dynamic_cast<directx_graph*>(queue) : nullptr;
+        require(!recording || (recording->commands->owner == owner && can_record_copy(to, destination, from, source, bytes)),
+            CUDA_ERROR_NOT_SUPPORTED, "DirectX copy cannot be recorded");
         if (&to.storage() != &to || &from.storage() != &from) return enqueue_copy(to.storage(), destination + to.storage_offset(), from.storage(), source + from.storage_offset(), bytes, queue);
         if (to.host_address() || from.host_address()) return session::enqueue_copy(to, destination, from, source, bytes, queue);
         auto& a = static_cast<directx_buffer&>(to); auto& b = static_cast<directx_buffer&>(from);
@@ -242,26 +289,35 @@ struct directx_session : session {
             tasks->tasks.push_back(enqueue_copy(*temporary, 0, from, source, bytes, queue));
             tasks->tasks.push_back(enqueue_copy(to, destination, *temporary, 0, bytes, queue)); return retained;
         }
-        auto task = std::make_shared<directx_task>(owner);
+        if (!bytes) return {};
+        auto task = recording ? recording->commands : std::make_shared<directx_task>(owner);
         task->barrier(b, b.resting_state, D3D12_RESOURCE_STATE_COPY_SOURCE); task->barrier(a, a.resting_state, D3D12_RESOURCE_STATE_COPY_DEST);
         task->list->CopyBufferRegion(a.value.Get(), destination + a.base_offset, b.value.Get(), source + b.base_offset, bytes);
         task->barrier(b, D3D12_RESOURCE_STATE_COPY_SOURCE, b.resting_state); task->barrier(a, D3D12_RESOURCE_STATE_COPY_DEST, a.resting_state);
+        if (recording) return {};
         task->submit(); return task;
     }
     device_work enqueue_write(buffer& value, size_t offset, std::span<const std::byte> bytes, native_queue* queue) override {
+        auto recording = queue && queue->recording() ? dynamic_cast<directx_graph*>(queue) : nullptr;
+        auto native = dynamic_cast<directx_buffer*>(&value.storage());
+        require(!recording || (recording->commands->owner == owner && native && native->owner == owner && !native->imported),
+            CUDA_ERROR_NOT_SUPPORTED, "DirectX upload cannot be recorded");
         if (&value.storage() != &value) return enqueue_write(value.storage(), offset + value.storage_offset(), bytes, queue);
         if (value.host_address()) return session::enqueue_write(value, offset, bytes, queue);
         auto upload = owner->resource(bytes.size(), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         void* pointer = nullptr; D3D12_RANGE empty{0, 0}; check(upload->Map(0, &empty, &pointer), "Map upload buffer");
         std::memcpy(pointer, bytes.data(), bytes.size()); D3D12_RANGE written{0, bytes.size()}; upload->Unmap(0, &written);
         auto continuation = std::make_shared<device_continuation>(device_work{}, [upload] {});
-        auto task = std::make_shared<directx_task>(owner); auto& target = static_cast<directx_buffer&>(value);
+        if (recording) recording->resources.push_back(continuation);
+        auto task = recording ? recording->commands : std::make_shared<directx_task>(owner); auto& target = static_cast<directx_buffer&>(value);
         task->barrier(target, target.resting_state, D3D12_RESOURCE_STATE_COPY_DEST);
         task->list->CopyBufferRegion(target.value.Get(), offset + target.base_offset, upload.Get(), 0, bytes.size());
         task->barrier(target, D3D12_RESOURCE_STATE_COPY_DEST, target.resting_state);
-        task->submit(); continuation->task = task; return continuation;
+        if (!recording) { task->submit(); continuation->task = task; }
+        return recording ? device_work{} : continuation;
     }
     device_work enqueue_read(buffer& value, size_t offset, std::span<std::byte> bytes, native_queue* queue) override {
+        require(!queue || !queue->recording(), CUDA_ERROR_NOT_SUPPORTED, "DirectX readback cannot be recorded");
         if (&value.storage() != &value) return enqueue_read(value.storage(), offset + value.storage_offset(), bytes, queue);
         if (value.host_address()) return session::enqueue_read(value, offset, bytes, queue);
         auto download = owner->resource(bytes.size(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -276,6 +332,9 @@ struct directx_session : session {
         task->submit(); continuation->task = task; return continuation;
     }
     device_work enqueue_fill(buffer& value, size_t offset, std::span<const std::byte> pattern, size_t bytes, native_queue* queue) override {
+        auto recording = queue && queue->recording() ? dynamic_cast<directx_graph*>(queue) : nullptr;
+        require(!recording || (recording->commands->owner == owner && can_record_fill(value, offset, bytes)),
+            CUDA_ERROR_NOT_SUPPORTED, "DirectX fill cannot be recorded");
         if (!bytes) return {};
         if (&value.storage() != &value) return enqueue_fill(value.storage(), offset + value.storage_offset(), pattern, bytes, queue);
         if (value.host_address()) return session::enqueue_fill(value, offset, pattern, bytes, queue);
@@ -294,7 +353,8 @@ struct directx_session : session {
         owner->value->CreateUnorderedAccessView(target.value.Get(), nullptr, &view, cpu->GetCPUDescriptorHandleForHeapStart());
         owner->value->CreateUnorderedAccessView(target.value.Get(), nullptr, &view, gpu->GetCPUDescriptorHandleForHeapStart());
         auto retained = std::make_shared<device_continuation>(device_work{}, [cpu, gpu] {});
-        auto task = std::make_shared<directx_task>(owner);
+        if (recording) recording->resources.push_back(retained);
+        auto task = recording ? recording->commands : std::make_shared<directx_task>(owner);
         if (target.resting_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
             task->barrier(target, target.resting_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         D3D12_RESOURCE_BARRIER barrier{}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; barrier.UAV.pResource = target.value.Get();
@@ -305,7 +365,8 @@ struct directx_session : session {
         task->list->ResourceBarrier(1, &barrier);
         if (target.resting_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
             task->barrier(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, target.resting_state);
-        task->submit(); retained->task = task; return retained;
+        if (!recording) { task->submit(); retained->task = task; }
+        return recording ? device_work{} : retained;
     }
     void fill_device(buffer& value, size_t offset, std::span<const std::byte> pattern, size_t bytes) override {
         wait_device(enqueue_fill(value, offset, pattern, bytes, nullptr));
@@ -447,13 +508,15 @@ struct directx_session : session {
     void dispatch(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters) override {
         wait_device(enqueue_dispatch(pipeline, shape, memory, parameters, nullptr));
     }
-    device_work enqueue_dispatch(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters, native_queue*) override {
-        return enqueue_dispatch_bound(pipeline,shape,memory,parameters,{},nullptr);
+    device_work enqueue_dispatch(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters, native_queue* queue) override {
+        return enqueue_dispatch_bound(pipeline,shape,memory,parameters,{},queue);
     }
-    device_work enqueue_dispatch_bound(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters,std::span<buffer* const> bindings,native_queue*) override {
+    device_work enqueue_dispatch_bound(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters,std::span<buffer* const> bindings,native_queue* queue) override {
+        auto recording = queue && queue->recording() ? dynamic_cast<directx_graph*>(queue) : nullptr;
+        require(!recording || (recording->commands->owner == owner && !profile->enabled), CUDA_ERROR_NOT_SUPPORTED, "DirectX dispatch cannot be recorded");
         require(bindings.size()==pipeline.direct_buffers,CUDA_ERROR_INVALID_VALUE,"DirectX direct binding count mismatch");
         for(auto resource:bindings)require(can_bind_direct(*resource),CUDA_ERROR_INVALID_VALUE,"incompatible DirectX direct buffer");
-        auto task = std::make_shared<directx_task>(owner);
+        auto task = recording ? recording->commands : std::make_shared<directx_task>(owner);
         auto& compiled=static_cast<directx_pipeline&>(pipeline);
         auto mem=static_cast<directx_buffer&>(memory).value.Get(),args=static_cast<directx_buffer&>(parameters).value.Get();
         task->barrier(static_cast<directx_buffer&>(parameters),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -474,7 +537,9 @@ struct directx_session : session {
             task->list->ResolveQueryData(task->timestamp_heap.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,task->timestamp_result.Get(),0);
         }
         D3D12_RESOURCE_BARRIER uav{};uav.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;uav.UAV.pResource=nullptr;task->list->ResourceBarrier(1,&uav);
-        task->barrier(static_cast<directx_buffer&>(parameters),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);task->submit(); return task;
+        task->barrier(static_cast<directx_buffer&>(parameters),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (recording) return {};
+        task->submit(); return task;
     }
 };
 struct directx_backend : shader_backend {

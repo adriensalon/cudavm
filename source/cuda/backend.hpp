@@ -176,7 +176,10 @@ struct host_allocation {
     virtual ~host_allocation() = default;
     virtual unsigned flags(unsigned requested) { return requested; }
 };
-struct native_queue { virtual ~native_queue() = default; };
+struct native_queue {
+    virtual ~native_queue() = default;
+    virtual bool recording() const { return false; }
+};
 // An immutable, already submitted GPU dependency. It never promises completion
 // of host continuations, staging readback or scheduler actions.
 struct native_signal {
@@ -361,6 +364,7 @@ struct compute_pipeline {
 struct kernel {
     virtual ~kernel() = default;
     virtual uint64_t graph_generation() const { return 0; }
+    virtual bool can_record_launch(std::span<const allocation_binding>) const { return false; }
     virtual int attribute(CUfunction_attribute) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "function resource attribute is unavailable on this adapter");
     }
@@ -508,6 +512,9 @@ struct session {
     virtual std::unique_ptr<host_allocation> register_host(void* pointer, size_t bytes, unsigned) { return register_locked_host(pointer, bytes); }
     virtual std::unique_ptr<buffer> map_host(std::shared_ptr<host_allocation> value) { return std::make_unique<host_buffer>(std::move(value)); }
     virtual std::shared_ptr<native_queue> create_queue(int) { return {}; }
+    virtual bool command_regions() const { return false; }
+    virtual bool can_record_copy(const buffer&, size_t, const buffer&, size_t, size_t) const { return false; }
+    virtual bool can_record_fill(const buffer&, size_t, size_t) const { return false; }
     virtual std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_node>) { return {}; }
     virtual device_work enqueue_marker(native_queue*) { return {}; }
     // Values are published before the returned task completes. Timing uses

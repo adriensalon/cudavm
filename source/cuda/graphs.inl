@@ -207,8 +207,12 @@ graph_operation graph_prepare(const graph_node& node, bool use_node_priority = f
         if (from.host && from.host != to.host) result.hosts.push_back(from.host);
         result.action = [to, from, width = p.WidthInBytes] { execute_copy_boxes(to, from, width); };
         result.start = [to, from, owner, width = p.WidthInBytes](native_queue* queue) { return enqueue_copy_boxes(to, from, width, queue, owner); };
-        result.native_compatible = owner->native->kind() == cudavmBackendCuda && to.owner == owner && from.owner == owner &&
+        result.native_compatible = to.owner == owner && from.owner == owner &&
             to.device_storage() && from.device_storage() && !to.array && !from.array;
+        if (result.native_compatible && owner->native->kind() != cudavmBackendCuda)
+            for (size_t i = 0; i < to.rows * to.depth; ++i)
+                result.native_compatible &= owner->native->can_record_copy(*to.storage, to.allocation_offset + to.offset(i),
+                    *from.storage, from.allocation_offset + from.offset(i), p.WidthInBytes);
         if (result.native_compatible) result.native_key = {owner->id, owner->native->graph_generation(),
             reinterpret_cast<uintptr_t>(to.storage.get()), reinterpret_cast<uintptr_t>(from.storage.get())};
     } else if (node.type == CU_GRAPH_NODE_TYPE_MEMSET) {
@@ -227,7 +231,12 @@ graph_operation graph_prepare(const graph_node& node, bool use_node_priority = f
             if (p.elementSize == 2) return enqueue_fill_box(to, static_cast<unsigned short>(p.value), bytes, queue);
             return enqueue_fill_box(to, p.value, bytes, queue);
         };
-        result.native_compatible = owner->native->kind() == cudavmBackendCuda && to.device_storage();
+        result.native_compatible = to.device_storage();
+        if (result.native_compatible && owner->native->kind() != cudavmBackendCuda) {
+            result.native_compatible = !to.storage->pool_session || to.storage->pool_session.get() == owner->native.get();
+            for (size_t i = 0; i < to.rows * to.depth; ++i)
+                result.native_compatible &= owner->native->can_record_fill(*to.storage, to.allocation_offset + to.offset(i), bytes);
+        }
         if (result.native_compatible) result.native_key = {owner->id, owner->native->graph_generation(), reinterpret_cast<uintptr_t>(to.storage.get())};
     } else {
         auto bytes = node.arguments.size();
@@ -238,7 +247,7 @@ graph_operation graph_prepare(const graph_node& node, bool use_node_priority = f
         result.hosts = command->hosts;
         result.action = [command] { command->execute(); };
         result.start = [command](native_queue* queue) { return command->enqueue(queue); };
-        result.native_compatible = owner->native->kind() == cudavmBackendCuda;
+        result.native_compatible = owner->native->kind() == cudavmBackendCuda || command->function->can_record_launch(command->bindings);
         if (result.native_compatible) {
             result.native_key = {owner->id, owner->native->graph_generation(), reinterpret_cast<uintptr_t>(command->function.get()), command->function->graph_generation()};
             for (auto& binding : command->bindings) {
@@ -731,8 +740,9 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
         };
         replay.back().lane = queue;
     }
-    if (!upload && owner->native->kind() == cudavmBackendCuda) lower_graph_regions(replay, recorders,
-        [&](auto nodes) { return owner->native->compile_graph(nodes); }, queue, &value.native_regions, native_keys, native_edges);
+    if (!upload && (owner->native->kind() == cudavmBackendCuda || owner->native->command_regions())) lower_graph_regions(replay, recorders,
+        [&](auto nodes) { return owner->native->compile_graph(nodes); }, queue, &value.native_regions, native_keys, native_edges,
+        owner->native->command_regions());
     if (!owner->queue) owner->queue = std::make_unique<command_queue>(owner->command_domain);
     std::vector<CUdeviceptr> inserted;
     inserted.reserve(memory_plan.regions.size());

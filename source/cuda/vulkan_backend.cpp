@@ -1,4 +1,5 @@
 #include "dynamic_library.hpp"
+#include "command_regions.hpp"
 #include "device_resources.hpp"
 #define VK_NO_PROTOTYPES
 #if defined(_WIN32)
@@ -257,6 +258,7 @@ struct vulkan_task : device_task {
     std::shared_ptr<vulkan_device> owner;
     VkFence fence = VK_NULL_HANDLE;
     VkCommandBuffer command = VK_NULL_HANDLE;
+    bool owns_command = true;
     bool submitted = false;
     VkDescriptorPool descriptors = VK_NULL_HANDLE;
     VkQueryPool query_pool = VK_NULL_HANDLE;
@@ -286,10 +288,40 @@ struct vulkan_task : device_task {
     ~vulkan_task() {
         std::lock_guard lock(owner->execution);
         if (submitted) owner->vkWaitForFences(owner->value, 1, &fence, VK_TRUE, UINT64_MAX);
-        if (command) owner->vkFreeCommandBuffers(owner->value, owner->pool, 1, &command);
+        if (command && owns_command) owner->vkFreeCommandBuffers(owner->value, owner->pool, 1, &command);
         if (fence) owner->vkDestroyFence(owner->value, fence, nullptr);
         if (descriptors) owner->vkDestroyDescriptorPool(owner->value, descriptors, nullptr);
         if (query_pool) owner->vkDestroyQueryPool(owner->value, query_pool, nullptr);
+    }
+};
+struct vulkan_graph : native_graph, command_region_queue, std::enable_shared_from_this<vulkan_graph> {
+    std::shared_ptr<vulkan_task> commands;
+    explicit vulkan_graph(std::shared_ptr<vulkan_device> owner) : commands(std::make_shared<vulkan_task>(owner)) {
+        std::lock_guard lock(owner->execution);
+        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocation.commandPool = owner->pool; allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; allocation.commandBufferCount = 1;
+        check(owner->vkAllocateCommandBuffers(owner->value, &allocation, &commands->command), "vkAllocateCommandBuffers region");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+        check(owner->vkBeginCommandBuffer(commands->command, &begin), "vkBeginCommandBuffer region");
+    }
+    void barrier() {
+        auto owner = commands->owner;
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        owner->vkCmdPipelineBarrier(commands->command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    }
+    device_work enqueue(native_queue*) override {
+        auto owner = commands->owner;
+        std::lock_guard lock(owner->execution);
+        auto retained = std::make_shared<device_continuation>(device_work{}, [self = shared_from_this()] {});
+        auto task = std::make_shared<vulkan_task>(owner);
+        task->command = commands->command; task->owns_command = false;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.commandBufferCount = 1; submit.pCommandBuffers = &task->command;
+        check(owner->vkQueueSubmit(owner->queue, 1, &submit, task->fence), "vkQueueSubmit region"); task->submitted = true;
+        retained->task = task; return retained;
     }
 };
 struct vulkan_session : session {
@@ -299,6 +331,25 @@ struct vulkan_session : session {
     // Create this device lazily; pool kernels and transfers stay on owner.
     std::shared_ptr<vulkan_device> synchronization;
     explicit vulkan_session(std::shared_ptr<vulkan_device> input) : owner(std::move(input)) {}
+    bool command_regions() const override { return true; }
+    bool can_record_copy(const buffer& to, size_t destination, const buffer& from, size_t source, size_t bytes) const override {
+        return can_copy_direct(to) && can_copy_direct(from) &&
+            !((destination + to.storage_offset()) & 3) && !((source + from.storage_offset()) & 3) && !(bytes & 3);
+    }
+    bool can_record_fill(const buffer& value, size_t offset, size_t bytes) const override {
+        return can_copy_direct(value) && !(((offset + value.storage_offset()) | bytes) & 3);
+    }
+    std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_node> nodes) override {
+        if (!command_region_compatible(nodes)) return {};
+        auto graph = std::make_shared<vulkan_graph>(owner);
+        try {
+            for (auto& node : nodes) if (auto resource = node.command(graph.get())) graph->resources.push_back(std::move(resource));
+        } catch (const failure& error) { if (error.code == CUDA_ERROR_NOT_SUPPORTED) return {}; throw; }
+        std::lock_guard lock(owner->execution);
+        graph->barrier();
+        check(owner->vkEndCommandBuffer(graph->commands->command), "vkEndCommandBuffer region");
+        return graph;
+    }
     interop_capabilities interop() override { return owner->caps; }
     std::shared_ptr<external_memory> import_memory(const CUDA_EXTERNAL_MEMORY_HANDLE_DESC& d, const cudavmExternalMemoryMetadata* metadata = nullptr) override {
         require(owner->caps.memory & handle_bit(d.type), CUDA_ERROR_NOT_SUPPORTED, "Vulkan external memory handle type is unavailable");
@@ -405,19 +456,46 @@ struct vulkan_session : session {
         wait_device(transfer(to, destination, from, source, bytes));
     }
     device_work enqueue_copy(buffer& to, size_t destination, buffer& from, size_t source, size_t bytes, native_queue* queue) override {
+        if (queue && queue->recording()) {
+            require(can_record_copy(to, destination, from, source, bytes), CUDA_ERROR_NOT_SUPPORTED, "Vulkan copy cannot be recorded");
+            if (!bytes) return {};
+            auto& graph = dynamic_cast<vulkan_graph&>(*queue);
+            require(graph.commands->owner == owner, CUDA_ERROR_NOT_SUPPORTED, "foreign Vulkan recording lane");
+            std::lock_guard lock(owner->execution);
+            graph.barrier();
+            VkBufferCopy copy{source + from.storage_offset(), destination + to.storage_offset(), bytes};
+            owner->vkCmdCopyBuffer(graph.commands->command, static_cast<vulkan_buffer&>(from.storage()).value,
+                static_cast<vulkan_buffer&>(to.storage()).value, 1, &copy);
+            return {};
+        }
         if (&to.storage() != &to || &from.storage() != &from) return enqueue_copy(to.storage(), destination + to.storage_offset(), from.storage(), source + from.storage_offset(), bytes, queue);
         if (to.host_address() || from.host_address()) return session::enqueue_copy(to, destination, from, source, bytes, queue);
         return transfer(to, destination, from, source, bytes);
     }
     device_work enqueue_write(buffer& value, size_t offset, std::span<const std::byte> bytes, native_queue* queue) override {
+        require(!queue || !queue->recording() || can_record_fill(value, offset, bytes.size()),
+            CUDA_ERROR_NOT_SUPPORTED, "Vulkan upload cannot be recorded");
         if (&value.storage() != &value) return enqueue_write(value.storage(), offset + value.storage_offset(), bytes, queue);
         if (value.host_address() || ((offset | bytes.size()) & 3)) return session::enqueue_write(value, offset, bytes, queue);
         std::shared_ptr<buffer> staging = allocate(bytes.size());
         std::memcpy(static_cast<vulkan_buffer&>(*staging).mapped, bytes.data(), bytes.size());
         auto continuation = std::make_shared<device_continuation>(device_work{}, [staging] {});
-        continuation->task = transfer(value, offset, *staging, 0, bytes.size()); return continuation;
+        if (queue && queue->recording()) dynamic_cast<vulkan_graph&>(*queue).resources.push_back(continuation);
+        continuation->task = enqueue_copy(value, offset, *staging, 0, bytes.size(), queue);
+        return queue && queue->recording() ? device_work{} : continuation;
     }
     device_work enqueue_fill(buffer& value, size_t offset, std::span<const std::byte> pattern, size_t bytes, native_queue* queue) override {
+        if (queue && queue->recording()) {
+            require(can_record_fill(value, offset, bytes), CUDA_ERROR_NOT_SUPPORTED, "Vulkan fill cannot be recorded");
+            if (!bytes) return {};
+            auto& graph = dynamic_cast<vulkan_graph&>(*queue);
+            require(graph.commands->owner == owner, CUDA_ERROR_NOT_SUPPORTED, "foreign Vulkan recording lane");
+            std::lock_guard lock(owner->execution);
+            graph.barrier();
+            owner->vkCmdFillBuffer(graph.commands->command, static_cast<vulkan_buffer&>(value.storage()).value,
+                offset + value.storage_offset(), bytes, repeated_fill_word(pattern));
+            return {};
+        }
         if (!bytes) return {};
         if (&value.storage() != &value) return enqueue_fill(value.storage(), offset + value.storage_offset(), pattern, bytes, queue);
         if (value.host_address()) return session::enqueue_fill(value, offset, pattern, bytes, queue);
@@ -461,6 +539,7 @@ struct vulkan_session : session {
         wait_device(enqueue_fill(value, offset, pattern, bytes, nullptr));
     }
     device_work enqueue_read(buffer& value, size_t offset, std::span<std::byte> bytes, native_queue* queue) override {
+        require(!queue || !queue->recording(), CUDA_ERROR_NOT_SUPPORTED, "Vulkan readback cannot be recorded");
         if (&value.storage() != &value) return enqueue_read(value.storage(), offset + value.storage_offset(), bytes, queue);
         if (value.host_address() || ((offset | bytes.size()) & 3)) return session::enqueue_read(value, offset, bytes, queue);
         std::shared_ptr<buffer> staging = allocate(bytes.size());
@@ -560,16 +639,19 @@ struct vulkan_session : session {
         check(owner->vkCreateComputePipelines(device,VK_NULL_HANDLE,1,&pipeline_info,nullptr,&compiled->pipeline),"vkCreateComputePipelines");
         return compiled;
     }
-    device_work enqueue_dispatch(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters, native_queue*) override {
-        return enqueue_dispatch_bound(pipeline,shape,memory,parameters,{},nullptr);
+    device_work enqueue_dispatch(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters, native_queue* queue) override {
+        return enqueue_dispatch_bound(pipeline,shape,memory,parameters,{},queue);
     }
-    device_work enqueue_dispatch_bound(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters,std::span<buffer* const> bindings,native_queue*) override {
+    device_work enqueue_dispatch_bound(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters,std::span<buffer* const> bindings,native_queue* queue) override {
         std::lock_guard lock(owner->execution);
+        auto recording = queue && queue->recording() ? dynamic_cast<vulkan_graph*>(queue) : nullptr;
+        require(!recording || (recording->commands->owner == owner && !profile->enabled), CUDA_ERROR_NOT_SUPPORTED, "Vulkan dispatch cannot be recorded");
         require(bindings.size()==pipeline.direct_buffers,CUDA_ERROR_INVALID_VALUE,"Vulkan direct binding count mismatch");
         for(auto resource:bindings)require(can_bind_direct(*resource),CUDA_ERROR_INVALID_VALUE,"incompatible Vulkan direct buffer");
         auto& compiled=static_cast<vulkan_pipeline&>(pipeline);auto device=owner->value;
         auto task = std::make_shared<vulkan_task>(owner);
         auto& descriptors = task->descriptors; auto& command = task->command;
+        if (recording) recording->resources.push_back(task);
         if(profile->enabled && owner->timestamp_bits) {
             task->dispatch_profile=profile;
             VkQueryPoolCreateInfo query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};query.queryType=VK_QUERY_TYPE_TIMESTAMP;query.queryCount=2;
@@ -585,10 +667,13 @@ struct vulkan_session : session {
             std::vector<VkWriteDescriptorSet> writes(buffers.size());
             for(unsigned i=0;i<writes.size();++i) {writes[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};writes[i].dstSet=set;writes[i].dstBinding=i;writes[i].descriptorCount=1;writes[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;writes[i].pBufferInfo=&buffers[i];}
             owner->vkUpdateDescriptorSets(device,uint32_t(writes.size()),writes.data(),0,nullptr);
-            VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};allocate.commandPool=owner->pool;allocate.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;allocate.commandBufferCount=1;
-            check(owner->vkAllocateCommandBuffers(device,&allocate,&command),"vkAllocateCommandBuffers");
-            VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};begin.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            check(owner->vkBeginCommandBuffer(command,&begin),"vkBeginCommandBuffer");
+            if (recording) { command = recording->commands->command; task->owns_command = false; }
+            else {
+                VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};allocate.commandPool=owner->pool;allocate.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;allocate.commandBufferCount=1;
+                check(owner->vkAllocateCommandBuffers(device,&allocate,&command),"vkAllocateCommandBuffers");
+                VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};begin.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                check(owner->vkBeginCommandBuffer(command,&begin),"vkBeginCommandBuffer");
+            }
             VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT|VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
             owner->vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_HOST_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT|VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
             owner->vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_COMPUTE,compiled.pipeline);owner->vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_COMPUTE,compiled.layout,0,1,&set,0,nullptr);
@@ -597,10 +682,12 @@ struct vulkan_session : session {
             if(task->query_pool) owner->vkCmdWriteTimestamp(command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,task->query_pool,1);
             barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT|VK_ACCESS_TRANSFER_READ_BIT;
             owner->vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
-            check(owner->vkEndCommandBuffer(command),"vkEndCommandBuffer");VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};submit.commandBufferCount=1;submit.pCommandBuffers=&command;
-            check(owner->vkQueueSubmit(owner->queue,1,&submit,task->fence),"vkQueueSubmit"); task->submitted = true;
+            if (!recording) {
+                check(owner->vkEndCommandBuffer(command),"vkEndCommandBuffer");VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};submit.commandBufferCount=1;submit.pCommandBuffers=&command;
+                check(owner->vkQueueSubmit(owner->queue,1,&submit,task->fence),"vkQueueSubmit"); task->submitted = true;
+            }
         } catch(...) { throw; }
-        return task;
+        return recording ? device_work{} : task;
     }
     void dispatch(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters) override {
         wait_device(enqueue_dispatch(pipeline, shape, memory, parameters, nullptr));

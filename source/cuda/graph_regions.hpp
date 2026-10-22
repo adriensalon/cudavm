@@ -25,7 +25,7 @@ using native_graph_cache = std::map<size_t, std::shared_ptr<native_graph_region>
 template<class Compile> void lower_graph_regions(std::vector<command_queue::submission>& replay,
         const std::vector<native_graph_command>& recorders, Compile compile, std::shared_ptr<native_queue> queue,
         native_graph_cache* cache = nullptr, std::span<const native_graph_key> keys = {},
-        std::span<const std::vector<CUgraphEdgeData>> edges = {}) {
+        std::span<const std::vector<CUgraphEdgeData>> edges = {}, bool command_regions = false) {
     require(recorders.size() == replay.size(), CUDA_ERROR_INVALID_VALUE, "missing native graph recorders");
     require(!cache || keys.size() == recorders.size(), CUDA_ERROR_INVALID_VALUE, "missing native graph resource keys");
     require(edges.empty() || edges.size() == replay.size(), CUDA_ERROR_INVALID_VALUE, "missing native graph edges");
@@ -38,8 +38,11 @@ template<class Compile> void lower_graph_regions(std::vector<command_queue::subm
     for (size_t first = 0; first < replay.size();) {
         size_t end = first + 1;
         if (recorders[first]) while (end < replay.size() && recorders[end] &&
-                replay[end].domain == replay[first].domain && replay[end].exclusive == replay[first].exclusive) ++end;
+                replay[end].domain == replay[first].domain &&
+                (command_regions ? replay[end].priority == replay[first].priority : replay[end].exclusive == replay[first].exclusive)) ++end;
         if (end > first + 1) {
+            bool exclusive = false;
+            for (size_t i = first; i < end; ++i) exclusive |= replay[i].exclusive;
             std::map<command_completion*, size_t> indices;
             for (size_t i = first; i < end; ++i) indices.emplace(replay[i].done.get(), i - first);
             std::vector<native_graph_node> nodes;
@@ -61,7 +64,7 @@ template<class Compile> void lower_graph_regions(std::vector<command_queue::subm
             if (cache) if (auto found = cache->find(first); found != cache->end()) {
                 auto& entry = found->second;
                 if (entry->end == end &&
-                    entry->domain == replay[first].domain.get() && entry->exclusive == replay[first].exclusive &&
+                    entry->domain == replay[first].domain.get() && entry->exclusive == exclusive &&
                     std::equal(entry->keys.begin(), entry->keys.end(), keys.begin() + first, keys.begin() + end) &&
                     std::equal(entry->nodes.begin(), entry->nodes.end(), nodes.begin(), nodes.end(), [](const auto& a, const auto& b) {
                         return a.priority == b.priority && a.dependencies == b.dependencies;
@@ -71,7 +74,7 @@ template<class Compile> void lower_graph_regions(std::vector<command_queue::subm
             if (!region) {
                 region = std::make_shared<native_graph_region>();
                 region->end = end;
-                region->domain = replay[first].domain.get(); region->exclusive = replay[first].exclusive;
+                region->domain = replay[first].domain.get(); region->exclusive = exclusive;
                 if (cache) region->keys.assign(keys.begin() + first, keys.begin() + end);
                 region->nodes = std::move(nodes);
                 region->graph = compile(region->nodes);
@@ -84,6 +87,7 @@ template<class Compile> void lower_graph_regions(std::vector<command_queue::subm
                 work.done = replay[end - 1].done;
                 work.dependencies = std::move(incoming);
                 work.priority = priority;
+                work.exclusive = exclusive;
                 work.action = {};
                 work.start = [region, queue] { return region->graph->enqueue(queue.get()); };
                 for (size_t i = first; i < end; ++i) replacements[replay[i].done.get()] = work.done;

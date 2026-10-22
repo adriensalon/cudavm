@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include "command_regions.hpp"
 #include "shader_ptx.hpp"
 #include "../cudavm/module_descriptor.hpp"
 #include "../cudavm/shader_packet.hpp"
@@ -151,7 +152,16 @@ struct shader_kernel : kernel {
     void launch_bound(const launch_shape& shape,void** parameters,void** extra,std::span<const allocation_binding> bindings) override {
         wait_device(enqueue_launch(shape, parameters, extra, bindings, nullptr));
     }
+    bool can_record_launch(std::span<const allocation_binding> bindings) const override {
+        return owner.command_regions() && !owner.profile->enabled &&
+            std::all_of(bindings.begin(), bindings.end(), [&](auto binding) {
+                return !binding.surface_descriptor && owner.can_record_fill(*binding.native, 0, binding.native->size) &&
+                    binding.native->size % 4 == 0 && binding.native->storage_offset() % 4 == 0;
+            });
+    }
     device_work enqueue_launch(const launch_shape& shape,void** parameters,void** extra,std::span<const allocation_binding> bindings, native_queue* queue) override {
+        bool recording = queue && queue->recording();
+        require(!recording || can_record_launch(bindings), CUDA_ERROR_NOT_SUPPORTED, "shader transport cannot be recorded");
         validate_shape(shape);
         size_t parameter_bytes=0;
         for(auto p:entry.parameters) parameter_bytes=std::max(parameter_bytes,size_t(p.offset)+p.size);
@@ -209,8 +219,16 @@ struct shader_kernel : kernel {
         }
         auto pipeline=prepare(shape);
         bool check_image_fault = std::any_of(bindings.begin(), bindings.end(), [](auto binding) { return binding.surface_descriptor; });
-        if(!arena || arena->size<arena_size) arena=owner.allocate(arena_size);
-        if(!args || args->size<packet.size()) args=owner.allocate(packet.size());
+        // A recorded launch must not borrow the function's mutable transport.
+        // Each region owns its arena and packet through every accepted replay.
+        std::shared_ptr<buffer> recorded_arena, recorded_args;
+        if (recording) { recorded_arena = owner.allocate(arena_size); recorded_args = owner.allocate(packet.size()); }
+        else {
+            if(!arena || arena->size<arena_size) arena=owner.allocate(arena_size);
+            if(!args || args->size<packet.size()) args=owner.allocate(packet.size());
+        }
+        auto launch_arena = recording ? recorded_arena.get() : arena.get();
+        auto launch_args = recording ? recorded_args.get() : args.get();
         // Native shaders use the arena ABI. Submit its gathers, dispatch and
         // writebacks in order on the same device queue, without a CPU wait
         // after each transfer. Byte staging and external/host allocations keep
@@ -221,20 +239,22 @@ struct shader_kernel : kernel {
             auto payload=std::make_shared<std::vector<std::byte>>(std::move(packet));
             auto zero=std::make_shared<std::array<std::byte,16>>();
             auto tasks=std::make_shared<device_group>();
+            tasks->tasks.reserve(2 * mappings.size() + 3);
             // Retain host packet storage (OpenCL borrows it), pipelines and
             // every transfer fence until writeback completes, including errors.
-            auto completion=std::make_shared<device_continuation>(tasks,[this,pipeline,payload,zero,check_image_fault] {
+            auto completion=std::make_shared<device_continuation>(tasks,[this,pipeline,payload,zero,recorded_arena,recorded_args,launch_arena,check_image_fault] {
                 if (check_image_fault) {
-                    uint32_t fault = 0; owner.read(*arena, 8, std::as_writable_bytes(std::span(&fault, 1)));
+                    uint32_t fault = 0; owner.read(*launch_arena, 8, std::as_writable_bytes(std::span(&fault, 1)));
                     require(!fault, CUDA_ERROR_ILLEGAL_ADDRESS, "surface access is outside the array bounds");
                 }
             });
-            tasks->tasks.push_back(owner.enqueue_write(*arena,0,*zero,queue));
-            for(size_t i=0;i<mappings.size();++i) {auto m=mappings[i];tasks->tasks.push_back(owner.enqueue_copy(*arena,m.offset,*m.binding.native,0,m.binding.native->size,queue));}
-            tasks->tasks.push_back(owner.enqueue_write(*args,0,*payload,queue));
-            tasks->tasks.push_back(owner.enqueue_dispatch_bound(*pipeline,shape,*arena,*args,{},queue));
-            for(size_t i=0;i<mappings.size();++i) {auto m=mappings[i];tasks->tasks.push_back(owner.enqueue_copy(*m.binding.native,0,*arena,m.offset,m.binding.native->size,queue));}
-            return completion;
+            if (recording) dynamic_cast<command_region_queue&>(*queue).resources.push_back(completion);
+            tasks->tasks.push_back(owner.enqueue_write(*launch_arena,0,*zero,queue));
+            for(size_t i=0;i<mappings.size();++i) {auto m=mappings[i];tasks->tasks.push_back(owner.enqueue_copy(*launch_arena,m.offset,*m.binding.native,0,m.binding.native->size,queue));}
+            tasks->tasks.push_back(owner.enqueue_write(*launch_args,0,*payload,queue));
+            tasks->tasks.push_back(owner.enqueue_dispatch_bound(*pipeline,shape,*launch_arena,*launch_args,{},queue));
+            for(size_t i=0;i<mappings.size();++i) {auto m=mappings[i];tasks->tasks.push_back(owner.enqueue_copy(*m.binding.native,0,*launch_arena,m.offset,m.binding.native->size,queue));}
+            return recording ? device_work{} : completion;
         }
         // Keep the reserved transport prefix initialized between launches.
         const std::array<std::byte,16> zero{};owner.write(*arena,0,zero);
