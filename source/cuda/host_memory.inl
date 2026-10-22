@@ -39,7 +39,7 @@ struct host_use {
     ~host_use() {
         if (!done) return;
         pins.clear();
-        { std::lock_guard lock(done->mutex); done->time = std::chrono::steady_clock::now(); done->ready.store(true, std::memory_order_release); }
+        { std::lock_guard lock(done->mutex); done->ready.store(true, std::memory_order_release); }
         done->changed.notify_all();
     }
 };

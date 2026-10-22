@@ -59,7 +59,7 @@ std::shared_ptr<native_queue> stream_native(const std::shared_ptr<context>& owne
 }
 completion submit_stream(const std::shared_ptr<context>& owner, CUstream handle, std::function<void()> action,
                          std::vector<completion> additional = {}, int priority = 0, std::function<device_work()> start = {}, bool exclusive = false,
-                         std::function<void(std::exception_ptr)> notify = {}) {
+                         std::function<void(std::exception_ptr)> notify = {}, std::shared_ptr<native_queue> lane = {}) {
     auto stream = stream_lookup(handle, owner);
     capture_check_stream(stream);
     if (stream->capture) {
@@ -90,7 +90,7 @@ completion submit_stream(const std::shared_ptr<context>& owner, CUstream handle,
     // the legacy stream still observes its outstanding blocking work.
     auto native_start = start ? std::function<device_work()>([stream, start = std::move(start)] { return start(); }) : std::function<device_work()>{};
     auto callback = notify ? std::function<void(std::exception_ptr)>([stream, notify = std::move(notify)](auto error) { notify(error); }) : std::function<void(std::exception_ptr)>{};
-    auto done = owner->queue->submit(std::move(dependencies), [stream, action = std::move(action)] { action(); }, priority, std::move(native_start), exclusive, std::move(order), std::move(callback));
+    auto done = owner->queue->submit(std::move(dependencies), [stream, action = std::move(action)] { action(); }, priority, std::move(native_start), exclusive, std::move(order), std::move(callback), std::move(lane));
     for (auto& target : managed_owners) target->foreign_work.push_back(done);
     ++stream->sequence; stream->tail = done; return done;
 }
@@ -169,8 +169,8 @@ void record_event(CUevent handle, CUstream stream, unsigned flags) {
     auto lane = stream_native(owner,stream_lookup(stream,owner));
     auto record = submit_stream(owner, stream, [] {}, {}, 0, [owner,lane,timestamp] {
         std::lock_guard lock(owner->execution);
-        return timestamp ? owner->native->enqueue_timestamp(timestamp,lane.get()) : device_work{};
-    });
+        return timestamp ? owner->native->enqueue_timestamp(timestamp,lane.get()) : owner->native->enqueue_marker(lane.get());
+    }, false, {}, lane);
     event.record = std::move(record); event.timestamp = std::move(timestamp);
     event.capture.reset(); event.capture_dependencies.clear(); event.capture_edges.clear();
 }
@@ -178,12 +178,16 @@ void wait_event(CUstream stream, CUevent handle, unsigned flags) {
     if (capture_wait(stream, handle, flags)) return;
     require(flags == 0, CUDA_ERROR_INVALID_VALUE, "external event waits require stream capture");
     auto record = event_lookup(handle).record;
-    submit_stream(current(), stream, [] {}, record ? std::vector<completion>{record} : std::vector<completion>{});
+    auto owner = current(); auto lane = stream_native(owner, stream_lookup(stream, owner));
+    submit_stream(owner, stream, [] {}, record ? std::vector<completion>{record} : std::vector<completion>{}, 0, [owner, lane] {
+        std::lock_guard lock(owner->execution);
+        return owner->native->enqueue_marker(lane.get());
+    }, false, {}, lane);
 }
 void event_status(CUevent handle, bool wait) {
     if (auto capture = event_lookup(handle).capture.lock()) {
         capture->invalidated = true;
-        throw failure(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, "cannot query or synchronize a captured event");
+        throw failure(CUDA_ERROR_CAPTURED_EVENT, "cannot query or synchronize a captured event");
     }
     auto& event = event_lookup(handle);
     auto done = event.record;
@@ -194,12 +198,14 @@ void event_status(CUevent handle, bool wait) {
 void event_elapsed(float* output, CUevent start, CUevent end) {
     require(output, CUDA_ERROR_INVALID_VALUE, "null elapsed time output");
     auto& a = event_lookup(start); auto& b = event_lookup(end);
-    if (auto capture = a.capture.lock()) { capture->invalidated = true; throw failure(CUDA_ERROR_CAPTURED_EVENT, "elapsed time cannot query a captured event"); }
-    if (auto capture = b.capture.lock()) { capture->invalidated = true; throw failure(CUDA_ERROR_CAPTURED_EVENT, "elapsed time cannot query a captured event"); }
+    require(a.capture.expired() && b.capture.expired(), CUDA_ERROR_CAPTURED_EVENT, "elapsed time cannot query a captured event");
     require(a.record && b.record && !(a.flags & CU_EVENT_DISABLE_TIMING) && !(b.flags & CU_EVENT_DISABLE_TIMING),
             CUDA_ERROR_INVALID_HANDLE, "elapsed time requires recorded timing events");
     require(a.owner.lock() == b.owner.lock(), CUDA_ERROR_INVALID_HANDLE, "timing events belong to different contexts");
     a.record->query(); b.record->query();
+    if (a.timestamp && b.timestamp && a.timestamp->timer && b.timestamp->timer) {
+        *output = a.timestamp->timer->elapsed(*b.timestamp->timer); return;
+    }
     if(a.timestamp && b.timestamp && a.timestamp->nanoseconds_per_tick && b.timestamp->nanoseconds_per_tick) {
         require(a.timestamp->nanoseconds_per_tick==b.timestamp->nanoseconds_per_tick && a.timestamp->valid_bits==b.timestamp->valid_bits,
                 CUDA_ERROR_INVALID_HANDLE,"event device clocks differ");
@@ -208,8 +214,7 @@ void event_elapsed(float* output, CUevent start, CUevent end) {
         if(bits<64) delta&=(uint64_t(1)<<bits)-1;
         *output=float(double(delta)*a.timestamp->nanoseconds_per_tick/1000000.0); return;
     }
-    require(a.owner.lock()->native->kind()==cudavmBackendCuda,CUDA_ERROR_NOT_SUPPORTED,"GPU event timestamps are unavailable for this event or adapter");
-    *output = std::chrono::duration<float, std::milli>(b.record->time - a.record->time).count();
+    throw failure(CUDA_ERROR_NOT_SUPPORTED,"GPU event timestamps are unavailable for this event or adapter");
 }
 void host_function(CUstream stream, CUhostFn function, void* data) {
     require(function, CUDA_ERROR_INVALID_VALUE, "null host function");

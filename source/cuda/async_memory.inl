@@ -49,7 +49,8 @@ void async_copy_boxes(const memory_box& to, const memory_box& from, size_t width
     if (capture_node(to.owner, stream, capture_copy_boxes(to, from, width, to.owner))) return;
     auto hosts = prepare_async_hosts(to, from);
     auto queue = stream_native(to.owner, stream_lookup(stream, to.owner));
-    auto done = submit_stream(to.owner, stream, {}, {}, 0, [to, from, width, queue] { return enqueue_copy_boxes(to, from, width, queue.get()); });
+    bool native_only = to.owner->native->kind() == cudavmBackendCuda && to.device_storage() && from.device_storage();
+    auto done = submit_stream(to.owner, stream, {}, {}, 0, [to, from, width, queue] { return enqueue_copy_boxes(to, from, width, queue.get()); }, false, {}, native_only ? queue : nullptr);
     for (auto& entry : hosts) host_track(entry, done);
 }
 void async_copy_linear(CUdeviceptr to, const void* to_host, CUmemorytype to_type,
@@ -124,7 +125,7 @@ template<class T> void async_fill_box(CUdeviceptr pointer, size_t pitch, size_t 
     }
     auto queue = stream_native(owner, stream_lookup(stream, owner));
     auto hosts = prepare_async_hosts(to, {});
-    auto done = submit_stream(owner, stream, {}, {}, 0, [to, value, bytes, queue] { return enqueue_fill_box(to, value, bytes, queue.get()); });
+    auto done = submit_stream(owner, stream, {}, {}, 0, [to, value, bytes, queue] { return enqueue_fill_box(to, value, bytes, queue.get()); }, false, {}, owner->native->kind() == cudavmBackendCuda && to.device_storage() ? queue : nullptr);
     for (auto& host : hosts) host_track(host, done);
 }
 template<class T> void async_fill_linear(CUdeviceptr pointer, T value, size_t count, CUstream stream) {
@@ -140,6 +141,6 @@ template<class T> void async_fill_linear(CUdeviceptr pointer, T value, size_t co
     if (capture_node(owner, stream, std::move(node))) return;
     auto queue = stream_native(owner, stream_lookup(stream, owner));
     auto hosts = prepare_async_hosts(to, {});
-    auto done = submit_stream(owner, stream, {}, {}, 0, [to, value, bytes, queue] { return enqueue_fill_box(to, value, bytes, queue.get()); });
+    auto done = submit_stream(owner, stream, {}, {}, 0, [to, value, bytes, queue] { return enqueue_fill_box(to, value, bytes, queue.get()); }, false, {}, owner->native->kind() == cudavmBackendCuda && to.device_storage() ? queue : nullptr);
     for (auto& host : hosts) host_track(host, done);
 }

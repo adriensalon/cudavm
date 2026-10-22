@@ -225,28 +225,57 @@ struct cuda_queue : native_queue {
         }
     }
 };
-struct cuda_task : device_task {
+struct cuda_event : native_signal, device_timer {
     std::shared_ptr<cuda_context> context;
     CUevent value = nullptr;
-    bool recorded = false;
-    explicit cuda_task(std::shared_ptr<cuda_context> owner) : context(std::move(owner)) {
+    explicit cuda_event(std::shared_ptr<cuda_context> owner, unsigned flags) : context(std::move(owner)) {
         cuda_context_guard guard(*context);
-        check(context->api->driver.get<decltype(&cuEventCreate)>("cuEventCreate")(&value, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+        check(context->api->driver.get<decltype(&cuEventCreate)>("cuEventCreate")(&value, flags), "cuEventCreate");
     }
+    bool can_wait(native_queue* queue) const override {
+        // CUDA permits event waits from another CUDA context. Other adapters
+        // retain scheduler completion, without attempting native handle casts.
+        return dynamic_cast<cuda_queue*>(queue) != nullptr;
+    }
+    void enqueue_wait(native_queue* queue) const override {
+        auto& lane = *static_cast<cuda_queue*>(queue);
+        cuda_context_guard guard(*lane.context);
+        check(lane.context->api->driver.get<decltype(&cuStreamWaitEvent)>("cuStreamWaitEvent")(lane.value, value, 0), "cuStreamWaitEvent");
+    }
+    float elapsed(const device_timer& end) const override {
+        auto* last = dynamic_cast<const cuda_event*>(&end);
+        require(last && last->context == context, CUDA_ERROR_INVALID_HANDLE, "event device clocks differ");
+        cuda_context_guard guard(*context); float milliseconds = 0;
+        check(context->api->driver.get<decltype(&cuEventElapsedTime)>("cuEventElapsedTime")(&milliseconds, value, last->value), "cuEventElapsedTime");
+        return milliseconds;
+    }
+    ~cuda_event() {
+        if (value && context->api->push(context->value) == CUDA_SUCCESS) {
+            context->api->driver.get<decltype(&cuEventDestroy)>("cuEventDestroy_v2")(value);
+            CUcontext previous = nullptr; context->api->pop(&previous);
+        }
+    }
+};
+struct cuda_task : device_task {
+    std::shared_ptr<cuda_event> event;
+    bool recorded = false;
+    explicit cuda_task(std::shared_ptr<cuda_context> owner, unsigned flags = CU_EVENT_DISABLE_TIMING)
+        : event(std::make_shared<cuda_event>(std::move(owner), flags)) {}
+    std::shared_ptr<native_signal> signal() const override { return recorded ? event : nullptr; }
     void record(CUstream stream) {
-        check(context->api->driver.get<decltype(&cuEventRecord)>("cuEventRecord")(value, stream), "cuEventRecord"); recorded = true;
+        check(event->context->api->driver.get<decltype(&cuEventRecord)>("cuEventRecord")(event->value, stream), "cuEventRecord"); recorded = true;
     }
     bool query() override {
-        cuda_context_guard guard(*context);
-        auto result = context->api->driver.get<decltype(&cuEventQuery)>("cuEventQuery")(value);
+        cuda_context_guard guard(*event->context);
+        auto result = event->context->api->driver.get<decltype(&cuEventQuery)>("cuEventQuery")(event->value);
         if (result == CUDA_ERROR_NOT_READY) return false;
         check(result, "cuEventQuery"); return true;
     }
     ~cuda_task() {
-        if (value && context->api->push(context->value) == CUDA_SUCCESS) {
-            if (recorded) context->api->driver.get<decltype(&cuEventSynchronize)>("cuEventSynchronize")(value);
-            context->api->driver.get<decltype(&cuEventDestroy)>("cuEventDestroy_v2")(value);
-            CUcontext previous = nullptr; context->api->pop(&previous);
+        auto& context = *event->context;
+        if (recorded && context.api->push(context.value) == CUDA_SUCCESS) {
+            context.api->driver.get<decltype(&cuEventSynchronize)>("cuEventSynchronize")(event->value);
+            CUcontext previous = nullptr; context.api->pop(&previous);
         }
     }
 };
@@ -838,6 +867,16 @@ struct cuda_session : session {
         result->mapped_host = std::move(host); return result;
     }
     std::shared_ptr<native_queue> create_queue(int priority) override { return std::make_shared<cuda_queue>(context, priority); }
+    device_work enqueue_marker(native_queue* queue) override {
+        return cuda_enqueue(context, queue, [](CUstream) {});
+    }
+    device_work enqueue_timestamp(std::shared_ptr<device_timestamp> timestamp, native_queue* queue) override {
+        cuda_context_guard guard(*context);
+        auto task = std::make_shared<cuda_task>(context, 0);
+        task->record(static_cast<cuda_queue*>(queue)->value);
+        timestamp->timer = task->event;
+        return task;
+    }
     std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_command> commands) override {
         auto& driver = context->api->driver;
         auto begin = reinterpret_cast<decltype(&cuStreamBeginCapture)>(driver.find("cuStreamBeginCapture_v2"));

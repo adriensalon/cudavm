@@ -176,17 +176,44 @@ struct host_allocation {
     virtual ~host_allocation() = default;
     virtual unsigned flags(unsigned requested) { return requested; }
 };
+struct native_queue { virtual ~native_queue() = default; };
+// An immutable, already submitted GPU dependency. It never promises completion
+// of host continuations, staging readback or scheduler actions.
+struct native_signal {
+    virtual ~native_signal() = default;
+    virtual bool can_wait(native_queue*) const = 0;
+    virtual void enqueue_wait(native_queue*) const = 0;
+};
 // Polling never waits for device execution. A task owns its native fence and
 // any staging storage until the fence completes, including on error paths.
 struct device_task {
     virtual ~device_task() = default;
     virtual bool query() = 0;
+    virtual std::shared_ptr<native_signal> signal() const { return {}; }
     // Cooperative memory waits have no native work between polling transfers.
     virtual bool yields_to_exclusive() const { return false; }
 };
 using device_work = std::shared_ptr<device_task>;
+struct native_signal_group : native_signal {
+    std::vector<std::shared_ptr<native_signal>> signals;
+    bool can_wait(native_queue* queue) const override {
+        return std::all_of(signals.begin(), signals.end(), [&](const auto& signal) { return signal->can_wait(queue); });
+    }
+    void enqueue_wait(native_queue* queue) const override {
+        for (const auto& signal : signals) signal->enqueue_wait(queue);
+    }
+};
 struct device_group : device_task {
     std::vector<device_work> tasks;
+    std::shared_ptr<native_signal> signal() const override {
+        auto result = std::make_shared<native_signal_group>();
+        for (const auto& task : tasks) if (task) {
+            auto signal = task->signal();
+            if (!signal) return {};
+            result->signals.push_back(std::move(signal));
+        }
+        return result->signals.empty() ? nullptr : result;
+    }
     bool query() override {
         bool ready = true;
         for (auto& task : tasks) if (task) { if (task->query()) task.reset(); else ready = false; }
@@ -207,7 +234,6 @@ struct device_continuation : device_task {
         task.reset(); return true;
     }
 };
-struct native_queue { virtual ~native_queue() = default; };
 // Recording must not execute work or retain temporary host spans. The graph
 // owns its native descriptors; callers retain the recorded resource snapshots.
 using native_graph_command = std::function<device_work(native_queue*)>;
@@ -226,7 +252,12 @@ struct device_launch_event {
     CUevent handle = nullptr;
     virtual ~device_launch_event() = default;
 };
+struct device_timer {
+    virtual ~device_timer() = default;
+    virtual float elapsed(const device_timer& end) const = 0;
+};
 struct device_timestamp {
+    std::shared_ptr<device_timer> timer;
     uint64_t ticks = 0;
     double nanoseconds_per_tick = 0;
     unsigned valid_bits = 64;
@@ -464,8 +495,9 @@ struct session {
     virtual std::unique_ptr<buffer> map_host(std::shared_ptr<host_allocation> value) { return std::make_unique<host_buffer>(std::move(value)); }
     virtual std::shared_ptr<native_queue> create_queue(int) { return {}; }
     virtual std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_command>) { return {}; }
-    // Values are published before the returned task completes. A zero period
-    // means this adapter cannot supply device-clock timing.
+    virtual device_work enqueue_marker(native_queue*) { return {}; }
+    // Values are published before the returned task completes. Timing uses
+    // either a native timer pair or ticks with a nonzero clock period.
     virtual device_work enqueue_timestamp(std::shared_ptr<device_timestamp>, native_queue*) { return {}; }
     virtual std::unique_ptr<buffer> allocate_pitched(size_t width, size_t height, unsigned, size_t& pitch) {
         require(width <= std::numeric_limits<size_t>::max() - 255, CUDA_ERROR_INVALID_VALUE, "pitched width overflow");

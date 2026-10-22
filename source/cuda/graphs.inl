@@ -605,6 +605,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
             if (transport) dependencies.push_back(transport);
             std::function<void()> action = [] {};
             std::function<device_work()> start;
+            std::shared_ptr<native_queue> native_lane;
             native_graph_command recorder;
             int priority = 0;
             if (top ? value.enabled[i] : !node.snapshot_disabled) {
@@ -632,21 +633,28 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
                         if (node_owner == owner || node.type == CU_GRAPH_NODE_TYPE_BATCH_MEM_OP)
                             start = [operation = operation.start, queue] { return operation(queue.get()); };
                         if (node_owner == owner && operation.native_compatible) recorder = std::move(operation.start);
+                        if (recorder) native_lane = queue;
                     }
                     for (auto& host : operation.hosts) if (std::find(hosts.begin(), hosts.end(), host) == hosts.end()) hosts.push_back(host);
                     if (node.type == CU_GRAPH_NODE_TYPE_EVENT_RECORD) {
                         records[node.event] = done;
                         auto timestamp=(event_lookup(node.event).flags & CU_EVENT_DISABLE_TIMING) ? std::shared_ptr<device_timestamp>{} : std::make_shared<device_timestamp>();
                         timestamps[node.event]=timestamp;
-                        auto node_owner=node.owner.lock();auto lane=node_owner==owner ? queue : std::shared_ptr<native_queue>{};
+                        auto node_owner=node.owner.lock();auto lane=node_owner==owner ? queue : node_owner->native->create_queue(0);
+                        native_lane = lane;
                         start=[node_owner,lane,timestamp] {
                             std::lock_guard lock(node_owner->execution);
-                            return timestamp ? node_owner->native->enqueue_timestamp(timestamp,lane.get()) : device_work{};
+                            return timestamp ? node_owner->native->enqueue_timestamp(timestamp,lane.get()) : node_owner->native->enqueue_marker(lane.get());
                         };
                     }
                     if (node.type == CU_GRAPH_NODE_TYPE_WAIT_EVENT) {
                         auto it = records.find(node.event); auto record = it == records.end() ? event_lookup(node.event).record : it->second;
                         if (record) { dependencies.push_back(record); inherit_order(done->order, record); }
+                        native_lane = queue;
+                        start = [owner, queue] {
+                            std::lock_guard lock(owner->execution);
+                            return owner->native->enqueue_marker(queue.get());
+                        };
                     }
                 }
                 if (node.type == CU_GRAPH_NODE_TYPE_GRAPH) {
@@ -657,7 +665,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
             bool exclusive = node.type == CU_GRAPH_NODE_TYPE_KERNEL && global().kind != cudavmBackendCuda;
             auto node_owner = node.owner.lock();
             auto domain = node_owner ? node_owner->command_domain : owner->command_domain;
-            replay.push_back({done, std::move(dependencies), std::move(action), priority, std::move(start), exclusive, std::move(domain)}); indices.emplace(node.handle, done);
+            replay.push_back({done, std::move(dependencies), std::move(action), priority, std::move(start), exclusive, std::move(domain), {}, std::move(native_lane)}); indices.emplace(node.handle, done);
             recorders.push_back(std::move(recorder));
             submitted.push_back(done);
         }
@@ -682,6 +690,16 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
     replay.push_back({done, std::move(final_dependencies), [target, objects = std::move(objects), contexts,
         memory_resources = std::move(memory_resources), instance = value.memory_instance] {}, 0, {}});
     recorders.emplace_back();
+    if (!upload && owner->native->kind() == cudavmBackendCuda) {
+        // Retain the replay snapshot through its GPU join, while allowing a
+        // subsequent native stream command to consume that join's signal.
+        auto retained = std::move(replay.back().action);
+        replay.back().start = [owner, queue, retained = std::move(retained)] {
+            std::lock_guard lock(owner->execution);
+            return owner->native->enqueue_marker(queue.get());
+        };
+        replay.back().lane = queue;
+    }
     if (!upload && owner->native->kind() == cudavmBackendCuda) lower_graph_regions(replay, recorders,
         [&](auto commands) { return owner->native->compile_graph(commands); }, queue);
     if (!owner->queue) owner->queue = std::make_unique<command_queue>(owner->command_domain);

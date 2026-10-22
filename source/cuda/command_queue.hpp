@@ -25,7 +25,9 @@ struct command_completion {
     std::mutex mutex;
     std::condition_variable changed;
     std::exception_ptr error;
-    std::chrono::steady_clock::time_point time;
+    // Published only after submission, and retained independently of public
+    // event handles and the worker's polling task.
+    std::atomic<std::shared_ptr<native_signal>> signal;
     void wait(unsigned schedule = CU_CTX_SCHED_BLOCKING_SYNC) {
         if (schedule == CU_CTX_SCHED_SPIN || schedule == CU_CTX_SCHED_YIELD) {
             while (!ready.load(std::memory_order_acquire))
@@ -59,6 +61,7 @@ class command_queue {
         bool exclusive = false;
         std::shared_ptr<command_domain> domain{};
         std::function<void(std::exception_ptr)> notify;
+        std::shared_ptr<native_queue> lane;
     };
     std::mutex mutex;
     std::condition_variable changed;
@@ -70,7 +73,7 @@ class command_queue {
     std::thread worker;
 
     void run() noexcept {
-        struct flight { command work; device_work task; bool domain_locked = false; };
+        struct flight { command work; device_work task; bool domain_locked = false; bool task_ready = false; };
         std::list<flight> active;
         auto unlock_domain = [&](const command& work) {
             if (work.exclusive) work.domain->unlock(); else work.domain->unlock_shared();
@@ -79,7 +82,8 @@ class command_queue {
             return !work.domain || (work.exclusive ? work.domain->try_lock() : work.domain->try_lock_shared());
         };
         auto finish = [&](command& work) {
-            work.done->time = std::chrono::steady_clock::now();
+            for (const auto& dependency : work.dependencies)
+                if (dependency && dependency->ready.load(std::memory_order_acquire) && dependency->error && !work.done->error) work.done->error = dependency->error;
             work.action = {}; work.start = {}; work.notify = {}; work.dependencies.clear();
             if (work.done->error) {
                 std::lock_guard lock(mutex);
@@ -92,8 +96,15 @@ class command_queue {
             work.done->changed.notify_all();
         };
         for (;;) {
-            bool exclusive_active = std::any_of(active.begin(), active.end(), [](const auto& item) { return item.work.exclusive; });
+            bool exclusive_active = std::any_of(active.begin(), active.end(), [](const auto& item) { return item.work.exclusive && !item.task_ready; });
             for (auto item = active.begin(); item != active.end();) {
+                if (item->task_ready) {
+                    if (std::all_of(item->work.dependencies.begin(), item->work.dependencies.end(), [](const completion& dependency) {
+                        return !dependency || dependency->ready.load(std::memory_order_acquire);
+                    })) { item->task.reset(); finish(item->work); item = active.erase(item); }
+                    else ++item;
+                    continue;
+                }
                 if (item->work.domain && !item->work.exclusive && item->task->yields_to_exclusive() && item->domain_locked) {
                     unlock_domain(item->work); item->domain_locked = false;
                 }
@@ -108,7 +119,13 @@ class command_queue {
                 if (item->domain_locked && (ready || (!item->work.exclusive && item->task->yields_to_exclusive()))) {
                     unlock_domain(item->work); item->domain_locked = false;
                 }
-                if (ready) { item->task.reset(); finish(item->work); item = active.erase(item); }
+                // A native consumer may finish before another worker publishes
+                // its producer. Keep error propagation and public completion
+                // ordered even when GPU submissions have already progressed.
+                item->task_ready = ready;
+                if (ready && std::all_of(item->work.dependencies.begin(), item->work.dependencies.end(), [](const completion& dependency) {
+                    return !dependency || dependency->ready.load(std::memory_order_acquire);
+                })) { item->task.reset(); finish(item->work); item = active.erase(item); }
                 else ++item;
             }
             command work;
@@ -118,13 +135,15 @@ class command_queue {
                 for (;;) {
                     if (stopping && pending.empty() && active.empty()) return;
                     auto candidate = pending.end();
-                    bool exclusive = std::any_of(active.begin(), active.end(), [](const auto& item) { return item.work.exclusive; });
+                    bool exclusive = std::any_of(active.begin(), active.end(), [](const auto& item) { return item.work.exclusive && !item.task_ready; });
                     for (auto item = pending.begin(); item != pending.end(); ++item) {
                         if (exclusive || (item->exclusive && std::any_of(active.begin(), active.end(), [](const auto& flight) {
-                            return !flight.task->yields_to_exclusive();
+                            return !flight.task_ready && !flight.task->yields_to_exclusive();
                         }))) continue;
-                        bool ready = std::all_of(item->dependencies.begin(), item->dependencies.end(), [](const completion& dependency) {
-                            return !dependency || dependency->ready.load(std::memory_order_acquire);
+                        bool ready = std::all_of(item->dependencies.begin(), item->dependencies.end(), [&](const completion& dependency) {
+                            if (!dependency || dependency->ready.load(std::memory_order_acquire)) return true;
+                            auto signal = dependency->signal.load(std::memory_order_acquire);
+                            return item->lane && item->start && !item->exclusive && !item->notify && signal && signal->can_wait(item->lane.get());
                         });
                         if (ready && (candidate == pending.end() || item->priority < candidate->priority)) candidate = item;
                     }
@@ -148,7 +167,7 @@ class command_queue {
                 command_domain_scope scope(domain_locked ? work.domain.get() : nullptr);
                 std::exception_ptr error;
                 for (const auto& dependency : work.dependencies)
-                    if (dependency && dependency->error) { error = dependency->error; break; }
+                    if (dependency && dependency->ready.load(std::memory_order_acquire) && dependency->error) { error = dependency->error; break; }
                 if (work.notify) {
                     { std::lock_guard lock(mutex); if (!error) error = first_error; }
                     // Callbacks run exactly once, including on a failed stream.
@@ -157,10 +176,32 @@ class command_queue {
                 } else if (error) std::rethrow_exception(error);
                 else if (work.start) {
                     active.emplace_back(); slot = std::prev(active.end());
+                    for (const auto& dependency : work.dependencies)
+                        if (dependency && !dependency->ready.load(std::memory_order_acquire))
+                            dependency->signal.load(std::memory_order_acquire)->enqueue_wait(work.lane.get());
                     auto task = work.start();
-                    if (task) { slot->task = std::move(task); slot->work = std::move(work); slot->domain_locked = domain_locked; continue; }
+                    if (task) {
+                        work.done->signal.store(task->signal(), std::memory_order_release);
+                        slot->task = std::move(task); slot->work = std::move(work); slot->domain_locked = domain_locked; continue;
+                    }
+                    // Even a submission failure or empty native operation must
+                    // wait for outstanding producers before publishing an error.
+                    if (!std::all_of(work.dependencies.begin(), work.dependencies.end(), [](const completion& dependency) {
+                        return !dependency || dependency->ready.load(std::memory_order_acquire);
+                    })) {
+                        slot->work = std::move(work); slot->task_ready = true;
+                        if (domain_locked) unlock_domain(slot->work);
+                        continue;
+                    }
                 } else work.action();
-            } catch (...) { work.done->error = std::current_exception(); }
+            } catch (...) {
+                work.done->error = std::current_exception();
+                if (slot != active.end()) {
+                    slot->work = std::move(work); slot->task_ready = true;
+                    if (domain_locked) unlock_domain(slot->work);
+                    continue;
+                }
+            }
             if (slot != active.end()) active.erase(slot);
             if (domain_locked) unlock_domain(work);
             finish(work);
@@ -176,20 +217,22 @@ public:
         bool exclusive = false;
         std::shared_ptr<command_domain> domain{};
         std::function<void(std::exception_ptr)> notify;
+        // Opt in only when start submits GPU work without host side effects.
+        std::shared_ptr<native_queue> lane;
     };
     explicit command_queue(std::shared_ptr<command_domain> value = {}) : domain(std::move(value)), worker([this] { run(); }) {}
     ~command_queue() {
         { std::lock_guard lock(mutex); stopping = true; }
         changed.notify_all(); worker.join();
     }
-    completion submit(std::vector<completion> dependencies, std::function<void()> action, int priority = 0, std::function<device_work()> start = {}, bool exclusive = false, command_order order = {}, std::function<void(std::exception_ptr)> notify = {}) {
+    completion submit(std::vector<completion> dependencies, std::function<void()> action, int priority = 0, std::function<device_work()> start = {}, bool exclusive = false, command_order order = {}, std::function<void(std::exception_ptr)> notify = {}, std::shared_ptr<native_queue> lane = {}) {
         auto done = std::make_shared<command_completion>();
         done->order = std::move(order);
         {
             std::lock_guard lock(mutex);
             std::erase_if(issued, [](const auto& item) { return item.expired(); });
             issued.push_back(done);
-            try { pending.push_back({done, std::move(dependencies), std::move(action), priority, std::move(start), exclusive, domain, std::move(notify)}); }
+            try { pending.push_back({done, std::move(dependencies), std::move(action), priority, std::move(start), exclusive, domain, std::move(notify), std::move(lane)}); }
             catch (...) { issued.pop_back(); throw; }
         }
         changed.notify_one(); return done;
@@ -204,7 +247,7 @@ public:
                 issued.reserve(issued.size() + work.size());
                 for (auto& item : work) {
                     issued.push_back(item.done);
-                    pending.push_back({std::move(item.done), std::move(item.dependencies), std::move(item.action), item.priority, std::move(item.start), item.exclusive, item.domain ? std::move(item.domain) : domain, std::move(item.notify)});
+                    pending.push_back({std::move(item.done), std::move(item.dependencies), std::move(item.action), item.priority, std::move(item.start), item.exclusive, item.domain ? std::move(item.domain) : domain, std::move(item.notify), std::move(item.lane)});
                 }
             } catch (...) {
                 while (pending.size() > pending_size) pending.pop_back();
