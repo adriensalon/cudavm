@@ -407,6 +407,8 @@ cudaError_t runtime_launch(const void* token, dim3 grid, dim3 block, void** para
         if (extended) {
             std::vector<CUlaunchAttribute> attributes; auto config = driver_launch_config(extended, attributes);
             check(runtime_driver_wait([&] { return cuLaunchKernelEx(&config, launch_function, parameters, nullptr); }));
+            for (size_t i = 0; i < attributes.size(); ++i) if (attributes[i].id == CU_LAUNCH_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE)
+                extended->attrs[i].val = runtime_launch_value(cudaLaunchAttributeDeviceUpdatableKernelNode, attributes[i].value);
         } else if (cooperative) {
             check(runtime_driver_wait([&] { return cuLaunchCooperativeKernel(launch_function, grid.x, grid.y, grid.z, block.x, block.y, block.z, static_cast<unsigned>(shared), reinterpret_cast<CUstream>(stream), parameters); }));
         } else {

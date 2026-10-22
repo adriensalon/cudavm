@@ -75,6 +75,7 @@ void graph_destroy(CUgraph handle) {
     global().graphs.erase(handle);
     for (auto& node : value.nodes) {
         if (node.child) graph_destroy(node.child);
+        for (auto body : node.conditional_graphs) graph_destroy(body);
         global().graph_nodes.erase(node.handle);
     }
 }
@@ -94,8 +95,8 @@ CUgraphNode graph_add(CUgraph handle, const CUgraphNode* dependencies, size_t co
     node.local_id = static_cast<unsigned>(value.next_local_id);
     auto output = node.handle;
     value.nodes.push_back(std::move(node));
-    try { global().graph_nodes.emplace(output, handle); }
-    catch (...) { value.nodes.pop_back(); throw; }
+    try { global().graph_nodes.emplace(output, handle); graph_native_add(handle, value.nodes.back()); }
+    catch (...) { global().graph_nodes.erase(output); value.nodes.pop_back(); throw; }
     ++value.next_local_id;
     return output;
 }
@@ -148,6 +149,17 @@ graph_operation graph_prepare(const graph_node& node, bool use_node_priority = f
             result.contexts.insert(result.contexts.end(), operation.contexts.begin(), operation.contexts.end());
         }
         result.action = [] {}; return result; // Replay expands the child DAG.
+    }
+    if (node.type == CU_GRAPH_NODE_TYPE_CONDITIONAL) {
+        for (size_t i = 0; i < node.conditional_graphs.size(); ++i) {
+            const auto nodes = node.conditional_nodes.empty() ? graph_order(graph_lookup(node.conditional_graphs[i]).nodes) : *node.conditional_nodes[i];
+            for (auto& child : nodes) {
+                auto operation = graph_prepare(child, use_node_priority);
+                result.hosts.insert(result.hosts.end(), operation.hosts.begin(), operation.hosts.end());
+                result.contexts.insert(result.contexts.end(), operation.contexts.begin(), operation.contexts.end());
+            }
+        }
+        result.action = [] {}; return result;
     }
     if (node.type == CU_GRAPH_NODE_TYPE_EVENT_RECORD || node.type == CU_GRAPH_NODE_TYPE_WAIT_EVENT) {
         auto& event = event_lookup(node.event); auto owner = node.owner.lock();
@@ -281,7 +293,8 @@ void graph_replace(graph_node& existing, graph_node replacement) {
     replacement.snapshot_disabled = existing.snapshot_disabled;
     replacement.local_id = existing.local_id;
     if (auto owner = replacement.owner.lock()) replacement.parameter_context = owner->handle;
-    replacement.parameter_history = std::move(existing.parameter_history);
+    replacement.parameter_history = existing.parameter_history;
+    graph_native_replace(existing, replacement);
     existing = std::move(replacement);
 }
 void graph_edit_dependencies(CUgraph handle, const CUgraphNode* from, const CUgraphNode* to, const CUgraphEdgeData* data, size_t count, bool adding) {
@@ -304,13 +317,20 @@ void graph_edit_dependencies(CUgraph handle, const CUgraphNode* from, const CUgr
         else { dependencies.erase(dependencies.begin() + index); edges.erase(edges.begin() + index); }
     }
     // CUDA permits cycles while editing, but rejects them on instantiation.
+    if (value.native && count) {
+        std::vector<CUgraphNode> sources, destinations; std::vector<CUgraphEdgeData> edges(count);
+        for (size_t i = 0; i < count; ++i) { sources.push_back(graph_node_lookup(from[i]).native_node); destinations.push_back(graph_node_lookup(to[i]).native_node); if (data) edges[i] = data[i]; }
+        value.native->edges(sources, destinations, edges, adding);
+    }
     value.nodes.swap(candidate);
 }
 void graph_destroy_node(CUgraphNode handle) {
-    auto child = graph_node_lookup(handle).child;
+    auto& removing = graph_node_lookup(handle); auto child = removing.child; auto bodies = removing.conditional_graphs;
+    require(!removing.device_node, CUDA_ERROR_INVALID_VALUE, "device-updatable kernel nodes cannot be removed");
     if (child) graph_capture_guard(child);
     auto graph = global().graph_nodes.at(handle); auto& value = graph_lookup(graph);
     require(!graph_has_memory(value.nodes), CUDA_ERROR_INVALID_VALUE, "memory graph nodes cannot be deleted");
+    if (value.native) value.native->remove(removing.native_node);
     for (auto& node : value.nodes) for (size_t i = node.dependencies.size(); i-- > 0;) if (node.dependencies[i] == handle) {
         node.dependencies.erase(node.dependencies.begin() + i); node.dependency_edges.erase(node.dependency_edges.begin() + i);
     }
@@ -318,15 +338,25 @@ void graph_destroy_node(CUgraphNode handle) {
     global().graph_nodes.erase(handle);
     std::erase_if(value.originals, [&](auto& pair) { return pair.second == handle; });
     if (child) graph_destroy(child);
+    for (auto body : bodies) graph_destroy(body);
 }
 CUgraph graph_clone(CUgraph original) {
     require(!graph_has_memory(graph_lookup(original).nodes), CUDA_ERROR_NOT_SUPPORTED, "memory graphs cannot be cloned");
+    require(!graph_has_conditionals(graph_lookup(original).nodes), CUDA_ERROR_NOT_SUPPORTED, "conditional graphs cannot be cloned");
     auto source = graph_lookup(original);
     graph_state copy; copy.nodes = std::move(source.nodes); copy.objects = std::move(source.objects);
+    if (source.native) {
+        auto owner = source.native_owner.lock(); require(owner && !owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "native graph context was destroyed");
+        copy.native = source.native->clone(); copy.native_owner = source.native_owner;
+    }
     copy.id = graph_id(); copy.next_local_id = source.next_local_id;
     for (auto& node : copy.nodes) copy.originals.emplace(node.handle, graph_handle<CUgraphNode>(global().next_graph_node));
     for (auto& node : copy.nodes) {
         node.handle = copy.originals.at(node.handle);
+        if (copy.native) {
+            node.native_node = copy.native->find_in_clone(node.native_node);
+            if (node.device_node) node.device_node = copy.native->attribute(node.native_node, CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE).deviceUpdatableKernelNode.devNode;
+        }
         for (auto& dependency : node.dependencies) dependency = copy.originals.at(dependency);
     }
     auto handle = graph_handle<CUgraph>(global().next_graph);
@@ -339,6 +369,7 @@ CUgraph graph_clone(CUgraph original) {
             if (child) { auto cloned = graph_clone(child); graph_lookup(cloned).parent = handle; graph_lookup(handle).nodes[i].child = cloned; }
             global().graph_nodes.emplace(graph_lookup(handle).nodes[i].handle, handle);
         }
+        if (graph_lookup(handle).native) graph_native_bind_clone(handle, original, graph_lookup(handle).native);
     }
     catch (...) { graph_destroy(handle); throw; }
     return handle;
@@ -391,10 +422,13 @@ std::vector<graph_node> graph_snapshot(CUgraph graph, CUDA_GRAPH_INSTANTIATE_PAR
         node.child_nodes = std::make_shared<const std::vector<graph_node>>(graph_snapshot(node.child, info));
         node.child_objects = graph_lookup(node.child).objects;
     }
+    for (auto& node : nodes) for (auto body : node.conditional_graphs)
+        node.conditional_nodes.push_back(std::make_shared<const std::vector<graph_node>>(graph_snapshot(body, info)));
     return nodes;
 }
 graph_node graph_child(CUgraph graph) {
-    graph_lookup(graph); graph_node node; node.type = CU_GRAPH_NODE_TYPE_GRAPH; node.child = graph;
+    require(!graph_lookup(graph).conditional_body && !graph_has_conditionals(graph_lookup(graph).nodes), CUDA_ERROR_NOT_SUPPORTED, "conditional graphs cannot be child graph inputs");
+    graph_node node; node.type = CU_GRAPH_NODE_TYPE_GRAPH; node.child = graph;
     return node;
 }
 CUgraphNode graph_add_child(CUgraph parent, const CUgraphNode* dependencies, size_t count, CUgraph child, const CUgraphEdgeData* data = nullptr) {
@@ -426,6 +460,7 @@ graph_node graph_event(CUevent event, CUgraphNodeType type) {
     return node;
 }
 CUgraphExec graph_instantiate(CUgraph graph, unsigned long long flags, CUDA_GRAPH_INSTANTIATE_PARAMS* info = nullptr) {
+    require(!graph_lookup(graph).conditional_body, CUDA_ERROR_INVALID_VALUE, "conditional body graphs cannot be independently instantiated");
     require(!graph_lookup(graph).moved, CUDA_ERROR_INVALID_VALUE, "moved child graphs cannot be independently instantiated");
     require(!(flags & ~15ull), CUDA_ERROR_INVALID_VALUE, "unknown graph instantiation flags");
     require(!(flags & ~static_cast<unsigned long long>(CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY | CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)), CUDA_ERROR_NOT_SUPPORTED, "graph instantiation flag is not implemented");
@@ -437,9 +472,10 @@ CUgraphExec graph_instantiate(CUgraph graph, unsigned long long flags, CUDA_GRAP
     std::function<void(CUgraph)> retain_tree = [&](CUgraph description) {
         auto& state = graph_lookup(description);
         std::erase_if(state.instances, [](auto& item) { return item.expired(); });
-        require(!memory_graph || state.instances.empty(), CUDA_ERROR_NOT_SUPPORTED, "memory graph already has an executable");
+        require(!(memory_graph || graph_has_device_nodes(nodes)) || state.instances.empty(), CUDA_ERROR_NOT_SUPPORTED, "graph already has an executable");
         descriptions.push_back(description);
         for (auto& node : state.nodes) if (node.child) retain_tree(node.child);
+        for (auto& node : state.nodes) for (auto body : node.conditional_graphs) retain_tree(body);
     };
     retain_tree(graph);
     graph_memory_validate(nodes);
@@ -449,7 +485,9 @@ CUgraphExec graph_instantiate(CUgraph graph, unsigned long long flags, CUDA_GRAP
     for (auto& node : value.nodes) value.enabled.push_back(!node.snapshot_disabled);
     value.flags = flags;
     value.memory_instance = std::make_shared<graph_memory_instance>();
+    value.memory_instance->executable_id = value.id;
     value.objects = graph_lookup(graph).objects;
+    graph_native_instantiate(value, graph);
     auto handle = graph_handle<CUgraphExec>(global().next_graph_exec);
     auto instance = value.memory_instance;
     for (auto description : descriptions) {
@@ -463,6 +501,7 @@ CUgraphExec graph_instantiate(CUgraph graph, unsigned long long flags, CUDA_GRAP
 void graph_exec_replace(CUgraphExec handle, CUgraphNode node, graph_node replacement) {
     auto& value = graph_exec_lookup(handle); auto index = graph_exec_index(value, node);
     auto& existing = value.nodes[index];
+    if (value.native) value.native_updates.reserve(value.native_updates.size() + 1);
     require(existing.type == replacement.type, CUDA_ERROR_INVALID_VALUE, "wrong executable graph node type");
     require(existing.owner.lock() == replacement.owner.lock(), CUDA_ERROR_INVALID_VALUE, "executable graph node context cannot change");
     if (replacement.type == CU_GRAPH_NODE_TYPE_BATCH_MEM_OP)
@@ -475,8 +514,8 @@ void graph_exec_replace(CUgraphExec handle, CUgraphNode node, graph_node replace
     }
     if (replacement.type == CU_GRAPH_NODE_TYPE_MEMSET) {
         require(existing.fill.elementSize == replacement.fill.elementSize, CUDA_ERROR_INVALID_VALUE, "executable fill element size cannot change");
-        require(existing.fill.width == replacement.fill.width && existing.fill.height == replacement.fill.height &&
-                (existing.fill.height == 1 || existing.fill.pitch == replacement.fill.pitch), CUDA_ERROR_INVALID_VALUE, "executable fill geometry changes are not implemented");
+        require(existing.fill.height == replacement.fill.height && (existing.fill.height == 1 ||
+                (existing.fill.width == replacement.fill.width && existing.fill.pitch == replacement.fill.pitch)), CUDA_ERROR_INVALID_VALUE, "executable two-dimensional fill geometry cannot change");
     }
     if (replacement.type == CU_GRAPH_NODE_TYPE_EXT_SEMAS_SIGNAL || replacement.type == CU_GRAPH_NODE_TYPE_EXT_SEMAS_WAIT)
         require(existing.semaphores.size() == replacement.semaphores.size(), CUDA_ERROR_INVALID_VALUE, "executable semaphore operation count cannot change");
@@ -486,7 +525,13 @@ void graph_exec_replace(CUgraphExec handle, CUgraphNode node, graph_node replace
         candidate[index].dependency_edges = existing.dependency_edges;
         graph_memory_validate(candidate);
     }
-    graph_replace(existing, std::move(replacement));
+    // Executable snapshots never edit the source graph's native description.
+    auto native_node = existing.native_node; auto device_node = existing.device_node;
+    existing.native_node = nullptr;
+    try { graph_replace(existing, std::move(replacement)); }
+    catch (...) { existing.native_node = native_node; throw; }
+    existing.native_node = native_node; existing.device_node = device_node;
+    if (value.native) value.native_updates.push_back(existing);
     value.native_regions.clear();
 }
 bool graph_enable_type(CUgraphNodeType type) { return type == CU_GRAPH_NODE_TYPE_KERNEL || type == CU_GRAPH_NODE_TYPE_MEMCPY || type == CU_GRAPH_NODE_TYPE_MEMSET; }
@@ -504,6 +549,7 @@ bool graph_update_nodes(const std::vector<graph_node>& existing, const std::vect
             if (old_indices.at(a.dependencies[j]) != new_indices.at(b.dependencies[j]) || !graph_edge_equal(a.dependency_edges[j], b.dependency_edges[j]))
                 return fail(CU_GRAPH_EXEC_UPDATE_ERROR_TOPOLOGY_CHANGED, b.handle, b.dependencies[j]);
         if (a.type != b.type) return fail(CU_GRAPH_EXEC_UPDATE_ERROR_NODE_TYPE_CHANGED, b.handle);
+        if (a.memory != b.memory) return fail(CU_GRAPH_EXEC_UPDATE_ERROR_PARAMETERS_CHANGED, b.handle);
         if (a.owner.lock() != b.owner.lock()) return fail(CU_GRAPH_EXEC_UPDATE_ERROR_PARAMETERS_CHANGED, b.handle);
         if (a.type == CU_GRAPH_NODE_TYPE_BATCH_MEM_OP && !memops_compatible(a, b))
             return fail(CU_GRAPH_EXEC_UPDATE_ERROR_PARAMETERS_CHANGED, b.handle);
@@ -525,6 +571,12 @@ bool graph_update_nodes(const std::vector<graph_node>& existing, const std::vect
             a.fill.height != b.fill.height || (a.fill.height != 1 && (a.fill.width != b.fill.width || a.fill.pitch != b.fill.pitch))))
             return fail(CU_GRAPH_EXEC_UPDATE_ERROR_PARAMETERS_CHANGED, b.handle);
         if (a.type == CU_GRAPH_NODE_TYPE_GRAPH && !graph_update_nodes(*a.child_nodes, *b.child_nodes, info, node_priority)) return false;
+        if (a.type == CU_GRAPH_NODE_TYPE_CONDITIONAL) {
+            if (a.conditional.type != b.conditional.type || a.conditional.size != b.conditional.size)
+                return fail(CU_GRAPH_EXEC_UPDATE_ERROR_PARAMETERS_CHANGED, b.handle);
+            for (size_t j = 0; j < a.conditional_nodes.size(); ++j)
+                if (!graph_update_nodes(*a.conditional_nodes[j], *b.conditional_nodes[j], info, node_priority)) return false;
+        }
     }
     return true;
 }
@@ -542,27 +594,53 @@ void graph_update(CUgraphExec handle, CUgraph graph, CUgraphExecUpdateResultInfo
     require(info, CUDA_ERROR_INVALID_VALUE, "null graph update result"); *info = {CU_GRAPH_EXEC_UPDATE_ERROR, nullptr, nullptr};
     require(!graph_lookup(graph).moved, CUDA_ERROR_INVALID_VALUE, "moved child graphs cannot be executable update sources");
     auto& value = graph_exec_lookup(handle); auto nodes = graph_snapshot(graph);
-    if (graph_has_memory(value.nodes) || graph_has_memory(nodes)) {
+    if (graph_has_device_nodes(value.nodes) || graph_has_device_nodes(nodes)) {
         info->result = CU_GRAPH_EXEC_UPDATE_ERROR_NOT_SUPPORTED;
-        throw failure(CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE, "whole executable memory graph updates are unavailable");
+        throw failure(CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE, "device-updatable graphs cannot be whole-graph updated");
     }
+    std::vector<CUgraph> descriptions;
+    const bool memory_graph = graph_has_memory(nodes);
+    std::function<void(CUgraph)> retain_tree = [&](CUgraph description) {
+        auto& state = graph_lookup(description);
+        std::erase_if(state.instances, [](auto& item) { return item.expired(); });
+        if (memory_graph) for (auto& item : state.instances) if (auto instance = item.lock())
+            require(instance->executable_id == value.id, CUDA_ERROR_NOT_SUPPORTED, "memory update source has another executable");
+        state.instances.reserve(state.instances.size() + 1); descriptions.push_back(description);
+        for (auto& node : state.nodes) { if (node.child) retain_tree(node.child); for (auto body : node.conditional_graphs) retain_tree(body); }
+    };
+    retain_tree(graph);
     require(graph_update_nodes(value.nodes, nodes, *info, (value.flags & CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY) != 0), CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE, "executable graph update is incompatible");
     for (auto& node : nodes) graph_prepare(node);
+    graph_memory_validate(nodes);
     auto objects = graph_lookup(graph).objects;
-    graph_rebind_nodes(nodes, value.nodes); value.nodes.swap(nodes); value.objects.swap(objects);
+    auto instance = std::make_shared<graph_memory_instance>();
+    instance->executable_id = value.id;
+    graph_rebind_nodes(nodes, value.nodes);
+    graph_native_update(value, graph, nodes);
+    for (auto description : descriptions) graph_lookup(description).instances.push_back(instance);
+    value.nodes.swap(nodes); value.objects.swap(objects);
     value.native_regions.clear();
+    value.memory_instance = std::move(instance);
     *info = {CU_GRAPH_EXEC_UPDATE_SUCCESS, nullptr, nullptr};
 }
 void graph_exec_child_replace(CUgraphExec handle, CUgraphNode node, CUgraph child) {
     auto& value = graph_exec_lookup(handle); auto index = graph_exec_index(value, node); auto& existing = value.nodes[index];
-    require(!graph_has_memory(value.nodes) && !graph_has_memory(graph_lookup(child).nodes), CUDA_ERROR_NOT_SUPPORTED, "executable memory child updates are unavailable");
     require(existing.type == CU_GRAPH_NODE_TYPE_GRAPH, CUDA_ERROR_INVALID_VALUE, "not a child graph node");
+    require(!graph_has_memory(*existing.child_nodes) && !graph_has_memory(graph_lookup(child).nodes), CUDA_ERROR_NOT_SUPPORTED, "executable memory child replacement is unavailable");
     auto nodes = graph_snapshot(child); CUgraphExecUpdateResultInfo info{};
     require(graph_update_nodes(*existing.child_nodes, nodes, info, (value.flags & CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY) != 0), CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE, "replacement child graph is incompatible");
     for (auto& item : nodes) graph_prepare(item);
     graph_rebind_nodes(nodes, *existing.child_nodes);
     auto objects = graph_lookup(child).objects;
-    existing.child_nodes = std::make_shared<const std::vector<graph_node>>(std::move(nodes));
+    auto snapshot = std::make_shared<const std::vector<graph_node>>(std::move(nodes));
+    auto replacement = existing; replacement.child_nodes = snapshot;
+    if (graph_has_memory(value.nodes)) { auto candidate = value.nodes; candidate[index] = replacement; graph_memory_validate(candidate); }
+    if (value.native) {
+        require(!graph_has_device_nodes(*existing.child_nodes) && !graph_has_device_nodes(*snapshot), CUDA_ERROR_NOT_SUPPORTED, "device-updatable child replacement is unavailable");
+        replacement.native_child = graph_native_materialize(child, value.owner.lock())->clone();
+        value.native_updates.reserve(value.native_updates.size() + 1); value.native_updates.push_back(std::move(replacement));
+    }
+    existing.child_nodes = std::move(snapshot);
     existing.child_objects.swap(objects);
     value.native_regions.clear();
 }
@@ -571,9 +649,9 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
     require(current() == owner, CUDA_ERROR_INVALID_CONTEXT, "executable graph belongs to another context");
     auto target = stream_lookup(stream, owner); capture_check_stream(target);
     if (target->capture) {
-        if (graph_has_memory(value.nodes)) {
+        if (graph_has_memory(value.nodes) || value.native) {
             target->capture->invalidated = true;
-            throw failure(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, "memory graph launch capture is unavailable");
+            throw failure(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, "stateful graph launch capture is unavailable");
         }
         if (upload) {
             target->capture->invalidated = true;
@@ -581,6 +659,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
         }
         capture_graph_launch(owner, stream, value); return;
     }
+    if (graph_native_launch(value, owner, target, stream, upload)) return;
     std::vector<command_queue::submission> replay;
     std::vector<native_graph_command> recorders;
     std::vector<native_graph_key> native_keys;

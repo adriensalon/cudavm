@@ -17,25 +17,44 @@ void graph_priority_attribute(CUkernelNodeAttrID attribute) {
     case CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT:
     case CU_LAUNCH_ATTRIBUTE_NVLINK_UTIL_CENTRIC_SCHEDULING:
     case CU_LAUNCH_ATTRIBUTE_PORTABLE_CLUSTER_SIZE_MODE: return;
-    case CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE:
-        throw failure(CUDA_ERROR_NOT_SUPPORTED, "device-updatable graph execution is unavailable");
+    case CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE: return;
     default: throw failure(CUDA_ERROR_INVALID_VALUE, "invalid kernel graph attribute");
     }
 }
 void graph_launch_attribute(CUgraphNode handle, CUkernelNodeAttrID attribute, const CUkernelNodeAttrValue& value) {
     auto& node = graph_priority_node(handle); graph_priority_attribute(attribute);
     auto owner = node.owner.lock(); require(owner && !owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "kernel graph context was destroyed");
-    if (attribute == CU_KERNEL_NODE_ATTRIBUTE_PRIORITY) { node.priority = value.priority; return; }
+    if (attribute == CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE) {
+        require(value.deviceUpdatableKernelNode.deviceUpdatable == 0 || value.deviceUpdatableKernelNode.deviceUpdatable == 1, CUDA_ERROR_INVALID_VALUE, "invalid device-updatable flag");
+        require(!node.device_node || value.deviceUpdatableKernelNode.deviceUpdatable, CUDA_ERROR_INVALID_VALUE, "device-updatable nodes cannot opt out");
+        if (!node.device_node && !value.deviceUpdatableKernelNode.deviceUpdatable) return;
+        auto graph = global().graph_nodes.at(handle); bool materialized = bool(graph_lookup(graph).native);
+        try { auto native = graph_native_materialize(graph, owner);
+            auto result = native->attribute(node.native_node, attribute, &value);
+            node.device_node = result.deviceUpdatableKernelNode.devNode; }
+        catch (...) { if (!materialized) { auto& state = graph_lookup(graph); state.native.reset(); state.native_owner.reset(); for (auto& item : state.nodes) item.native_node = nullptr; } throw; }
+        return;
+    }
+    if (attribute == CU_KERNEL_NODE_ATTRIBUTE_PRIORITY) {
+        if (node.native_node) graph_lookup(global().graph_nodes.at(handle)).native->attribute(node.native_node, attribute, &value);
+        node.priority = value.priority; return;
+    }
     auto shape = node.shape; launch_attribute(shape.options, static_cast<CUlaunchAttributeID>(attribute), value);
     access_policy_resources(owner, shape.options);
     auto function = function_lookup(node.function, owner).native;
     context_configuration(owner, [&] { function->validate_configuration(shape); });
+    if (node.native_node) graph_lookup(global().graph_nodes.at(handle)).native->attribute(node.native_node, attribute, &value);
     node.shape = std::move(shape);
 }
 CUkernelNodeAttrValue graph_launch_attribute(CUgraphNode handle, CUkernelNodeAttrID attribute) {
     auto& node = graph_priority_node(handle); graph_priority_attribute(attribute); CUkernelNodeAttrValue value{};
     const auto& options = node.shape.options;
     switch (attribute) {
+    case CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE: {
+        auto owner = node.owner.lock(); require(owner && !owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "kernel graph context was destroyed");
+        value.deviceUpdatableKernelNode.deviceUpdatable = node.device_node != nullptr;
+        value.deviceUpdatableKernelNode.devNode = node.device_node; break;
+    }
     case CU_KERNEL_NODE_ATTRIBUTE_ACCESS_POLICY_WINDOW: value.accessPolicyWindow = access_policy_to_native(options.access_policy.value_or(access_policy_window{})); break;
     case CU_KERNEL_NODE_ATTRIBUTE_PRIORITY: {
         auto owner = node.owner.lock(); require(owner && !owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "kernel graph context was destroyed");
@@ -70,11 +89,17 @@ CUkernelNodeAttrValue graph_launch_attribute(CUgraphNode handle, CUkernelNodeAtt
 }
 void graph_priority_copy(CUgraphNode destination, CUgraphNode source) {
     auto& from = graph_priority_node(source); auto& to = graph_priority_node(destination);
+    require(!from.device_node && !to.device_node, CUDA_ERROR_INVALID_VALUE, "device-updatable node attributes cannot be copied");
     auto owner = from.owner.lock();
     require(owner && !owner->retiring && to.owner.lock() == owner, CUDA_ERROR_INVALID_CONTEXT, "kernel graph attribute contexts differ or were destroyed");
     auto shape = to.shape; shape.options = from.shape.options;
     access_policy_resources(owner, shape.options);
     auto function = function_lookup(to.function, owner).native;
     context_configuration(owner, [&] { function->validate_configuration(shape); });
+    if (to.native_node || from.native_node) {
+        auto native = graph_native_materialize(global().graph_nodes.at(destination), owner);
+        graph_native_materialize(global().graph_nodes.at(source), owner);
+        native->copy_attributes(to.native_node, from.native_node);
+    }
     to.priority = from.priority; to.shape = std::move(shape);
 }

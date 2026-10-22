@@ -17,7 +17,7 @@ struct graph_memory_region {
         return std::any_of(frees.begin(), frees.end(), [](auto& entry) { return entry.internal && !entry.token.expired(); });
     }
 };
-struct graph_memory_instance {};
+struct graph_memory_instance { unsigned executable_id = 0; };
 inline thread_local bool resolving_graph_memory = false;
 struct graph_memory_scope {
     bool previous = resolving_graph_memory;

@@ -105,6 +105,7 @@ struct buffer {
     // Native CUDA allocations preserve their native addresses. Other adapters
     // receive stable CUDA virtual addresses from the common allocation registry.
     virtual uint64_t native_address() const { return 0; }
+    virtual CUarray cuda_array() const { return nullptr; }
     virtual bool is_managed() const { return false; }
     virtual buffer& storage() { return *this; }
     virtual const buffer& storage() const { return *this; }
@@ -256,6 +257,30 @@ struct native_graph {
     virtual ~native_graph() = default;
     virtual device_work enqueue(native_queue*) = 0;
 };
+// Editable native CUDA graphs are needed when the device owns graph state.
+// Unlike recorded regions, their node and conditional handles must stay stable.
+struct native_graph_definition;
+struct native_graph_executable : native_graph {
+    virtual device_work upload(native_queue*) = 0;
+    virtual void set_params(CUgraphNode, CUgraphNodeParams&) = 0;
+    virtual void set_enabled(CUgraphNode, bool) = 0;
+};
+struct native_graph_definition {
+    virtual ~native_graph_definition() = default;
+    virtual CUgraph handle() const = 0;
+    virtual CUgraphNode add(CUgraphNodeParams&, std::span<const CUgraphNode>, std::span<const CUgraphEdgeData>) = 0;
+    virtual void remove(CUgraphNode) = 0;
+    virtual void edges(std::span<const CUgraphNode>, std::span<const CUgraphNode>, std::span<const CUgraphEdgeData>, bool) = 0;
+    virtual void set_params(CUgraphNode, CUgraphNodeParams&) = 0;
+    virtual CUkernelNodeAttrValue attribute(CUgraphNode, CUkernelNodeAttrID, const CUkernelNodeAttrValue* = nullptr) = 0;
+    virtual void copy_attributes(CUgraphNode, CUgraphNode) = 0;
+    virtual CUgraphConditionalHandle condition(unsigned, unsigned) = 0;
+    virtual std::shared_ptr<native_graph_definition> body(CUgraph) = 0;
+    virtual std::shared_ptr<native_graph_definition> child(CUgraphNode) = 0;
+    virtual std::shared_ptr<native_graph_definition> clone() = 0;
+    virtual CUgraphNode find_in_clone(CUgraphNode) = 0;
+    virtual std::shared_ptr<native_graph_executable> instantiate(unsigned long long) = 0;
+};
 inline uint32_t repeated_fill_word(std::span<const std::byte> pattern) {
     require(pattern.size() == 1 || pattern.size() == 2 || pattern.size() == 4, CUDA_ERROR_INVALID_VALUE, "invalid native fill pattern");
     uint32_t word = 0;
@@ -363,6 +388,7 @@ struct compute_pipeline {
 };
 struct kernel {
     virtual ~kernel() = default;
+    virtual CUfunction cuda_function() const { return nullptr; }
     virtual uint64_t graph_generation() const { return 0; }
     virtual bool can_record_launch(std::span<const allocation_binding>) const { return false; }
     virtual int attribute(CUfunction_attribute) {
@@ -516,6 +542,9 @@ struct session {
     virtual bool can_record_copy(const buffer&, size_t, const buffer&, size_t, size_t) const { return false; }
     virtual bool can_record_fill(const buffer&, size_t, size_t) const { return false; }
     virtual std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_node>) { return {}; }
+    virtual std::shared_ptr<native_graph_definition> create_graph() {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "device graph state requires native CUDA graph services");
+    }
     virtual device_work enqueue_marker(native_queue*) { return {}; }
     // Values are published before the returned task completes. Timing uses
     // either a native timer pair or ticks with a nonzero clock period.

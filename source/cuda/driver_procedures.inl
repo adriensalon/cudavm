@@ -184,6 +184,7 @@ DRIVER_PROCEDURE(cuGraphKernelNodeGetAttribute, 11000, cuGraphKernelNodeGetAttri
 DRIVER_PROCEDURE(cuGraphKernelNodeGetParams, 10000, cuGraphKernelNodeGetParams)
 DRIVER_PROCEDURE(cuGraphKernelNodeGetParams, 12000, cuGraphKernelNodeGetParams_v2)
 DRIVER_PROCEDURE(cuGraphKernelNodeSetAttribute, 11000, cuGraphKernelNodeSetAttribute)
+DRIVER_PROCEDURE(cuGraphConditionalHandleCreate, 12030, cuGraphConditionalHandleCreate)
 DRIVER_PROCEDURE(cuGraphKernelNodeSetParams, 10000, cuGraphKernelNodeSetParams)
 DRIVER_PROCEDURE(cuGraphKernelNodeSetParams, 12000, cuGraphKernelNodeSetParams_v2)
 DRIVER_PROCEDURE(cuGraphLaunch, 10000, cuGraphLaunch)

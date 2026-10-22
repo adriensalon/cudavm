@@ -112,6 +112,7 @@ struct cuda_mipmapped_storage {
 };
 struct cuda_array_buffer : cuda_buffer {
     CUarray value = nullptr;
+    CUarray cuda_array() const override { return value; }
     CUDA_ARRAY3D_DESCRIPTOR descriptor{};
     std::shared_ptr<cuda_mipmapped_storage> mipmapped;
     cuda_array_buffer(std::shared_ptr<cuda_context> owner, const CUDA_ARRAY3D_DESCRIPTOR& d)
@@ -342,6 +343,7 @@ struct cuda_graph : native_graph {
         });
     }
 };
+#include "cuda_graph_definition.inl"
 struct cuda_memory : external_memory, std::enable_shared_from_this<cuda_memory> {
     std::shared_ptr<cuda_context> context;
     CUexternalMemory value = nullptr;
@@ -464,6 +466,7 @@ CUlaunchConfig cuda_launch_config(const launch_shape& shape, CUstream stream, st
 struct cuda_kernel : kernel {
     std::shared_ptr<cuda_module> module;
     CUfunction value = nullptr;
+    CUfunction cuda_function() const override { return value; }
     uint64_t generation = 0;
     uint64_t graph_generation() const override { return generation; }
     explicit cuda_kernel(std::shared_ptr<cuda_module> input) : module(std::move(input)) {}
@@ -940,6 +943,9 @@ struct cuda_session : session {
         if (status == CUDA_ERROR_NOT_SUPPORTED) return {};
         check(status, "cuGraphInstantiateWithFlags native region");
         return result;
+    }
+    std::shared_ptr<native_graph_definition> create_graph() override {
+        return std::make_shared<cuda_graph_definition>(context);
     }
     device_work enqueue_write(buffer& value, size_t offset, std::span<const std::byte> bytes, native_queue* queue) override {
         if (&value.storage() != &value) return enqueue_write(value.storage(), offset + value.storage_offset(), bytes, queue);

@@ -27,6 +27,8 @@ CUDA_KERNEL_NODE_PARAMS graph_kernel_parameters(graph_node& node, bool retain = 
 CUgraphNodeParams graph_node_parameters(graph_node& node) {
     CUgraphNodeParams result{}; result.type = node.type;
     switch (node.type) {
+    case CU_GRAPH_NODE_TYPE_CONDITIONAL:
+        result.conditional = node.conditional; result.conditional.phGraph_out = node.conditional_graphs.data(); break;
     case CU_GRAPH_NODE_TYPE_EMPTY: break;
     case CU_GRAPH_NODE_TYPE_BATCH_MEM_OP: {
         auto& view = graph_parameter_view(node, true);

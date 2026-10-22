@@ -53,7 +53,7 @@ void launch_attribute(launch_options& options, CUlaunchAttributeID id, const CUl
     case CU_LAUNCH_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE:
         require(value.deviceUpdatableKernelNode.deviceUpdatable == 0 || value.deviceUpdatableKernelNode.deviceUpdatable == 1,
             CUDA_ERROR_INVALID_VALUE, "invalid device-updatable kernel node flag");
-        throw failure(CUDA_ERROR_NOT_SUPPORTED, "device-updatable graph execution is unavailable");
+        return; // cuLaunchKernelEx applies this graphs-only attribute to capture.
     default: throw failure(CUDA_ERROR_INVALID_VALUE, "invalid launch attribute");
     }
 }

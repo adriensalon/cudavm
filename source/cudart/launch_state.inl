@@ -19,7 +19,9 @@ CUlaunchAttributeValue driver_launch_value(cudaLaunchAttributeID id, const cudaL
     case cudaLaunchAttributeProgrammaticStreamSerialization: result.programmaticStreamSerializationAllowed = value.programmaticStreamSerializationAllowed; break;
     case cudaLaunchAttributeProgrammaticEvent: result.programmaticEvent = {reinterpret_cast<CUevent>(value.programmaticEvent.event), value.programmaticEvent.flags, value.programmaticEvent.triggerAtBlockStart}; break;
     case cudaLaunchAttributeLaunchCompletionEvent: result.launchCompletionEvent = {reinterpret_cast<CUevent>(value.launchCompletionEvent.event), value.launchCompletionEvent.flags}; break;
-    case cudaLaunchAttributeDeviceUpdatableKernelNode: result.deviceUpdatableKernelNode.deviceUpdatable = value.deviceUpdatableKernelNode.deviceUpdatable; break;
+    case cudaLaunchAttributeDeviceUpdatableKernelNode:
+        result.deviceUpdatableKernelNode.deviceUpdatable = value.deviceUpdatableKernelNode.deviceUpdatable;
+        result.deviceUpdatableKernelNode.devNode = reinterpret_cast<CUgraphDeviceNode>(value.deviceUpdatableKernelNode.devNode); break;
     default: break; // The Driver rejects unsupported IDs without reading opaque values.
     }
     return result;
@@ -56,7 +58,9 @@ cudaLaunchAttributeValue runtime_launch_value(cudaLaunchAttributeID id, const CU
     case cudaLaunchAttributeProgrammaticStreamSerialization: result.programmaticStreamSerializationAllowed = value.programmaticStreamSerializationAllowed; break;
     case cudaLaunchAttributeProgrammaticEvent: result.programmaticEvent = {reinterpret_cast<cudaEvent_t>(value.programmaticEvent.event), value.programmaticEvent.flags, value.programmaticEvent.triggerAtBlockStart}; break;
     case cudaLaunchAttributeLaunchCompletionEvent: result.launchCompletionEvent = {reinterpret_cast<cudaEvent_t>(value.launchCompletionEvent.event), value.launchCompletionEvent.flags}; break;
-    case cudaLaunchAttributeDeviceUpdatableKernelNode: result.deviceUpdatableKernelNode.deviceUpdatable = value.deviceUpdatableKernelNode.deviceUpdatable; break;
+    case cudaLaunchAttributeDeviceUpdatableKernelNode:
+        result.deviceUpdatableKernelNode.deviceUpdatable = value.deviceUpdatableKernelNode.deviceUpdatable;
+        result.deviceUpdatableKernelNode.devNode = reinterpret_cast<cudaGraphDeviceNode_t>(value.deviceUpdatableKernelNode.devNode); break;
     default: break;
     }
     return result;

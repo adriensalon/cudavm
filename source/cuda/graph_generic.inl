@@ -68,6 +68,7 @@ graph_node graph_generic(const CUgraphNodeParams& p, const launch_options& optio
     }
 }
 CUgraphNode graph_generic_add(CUgraph graph, const CUgraphNode* dependencies, const CUgraphEdgeData* data, size_t count, CUgraphNodeParams& params) {
+    if (params.type == CU_GRAPH_NODE_TYPE_CONDITIONAL) { graph_union_validate(params, params.conditional); return graph_conditional_add(graph, dependencies, data, count, params); }
     if (params.type == CU_GRAPH_NODE_TYPE_MEM_ALLOC) {
         graph_union_validate(params, params.alloc);
         CUDA_MEM_ALLOC_NODE_PARAMS allocation{}; std::memcpy(&allocation, &params.alloc, sizeof(allocation));

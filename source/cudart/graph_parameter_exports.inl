@@ -18,6 +18,9 @@ cudaGraphNodeParams runtime_graph_node_parameters(const CUgraphNodeParams& p, CU
     cudaGraphNodeParams result{}; result.type = static_cast<cudaGraphNodeType>(p.type);
     auto context = [&](CUcontext value) { require(!value || value == owner, CUDA_ERROR_NOT_SUPPORTED, "foreign Runtime execution context queries are unavailable"); };
     switch (p.type) {
+    case CU_GRAPH_NODE_TYPE_CONDITIONAL:
+        result.conditional.handle = p.conditional.handle; result.conditional.type = static_cast<cudaGraphConditionalNodeType>(p.conditional.type);
+        result.conditional.size = p.conditional.size; result.conditional.phGraph_out = graph_cast<cudaGraph_t*>(p.conditional.phGraph_out); break;
     case CU_GRAPH_NODE_TYPE_EMPTY: break;
     case CU_GRAPH_NODE_TYPE_MEM_ALLOC: {
         CUDA_MEM_ALLOC_NODE_PARAMS allocation{}; std::memcpy(&allocation, &p.alloc, sizeof(allocation));

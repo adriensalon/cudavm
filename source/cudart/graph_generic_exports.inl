@@ -16,6 +16,13 @@ struct runtime_generic_node {
     explicit runtime_generic_node(const cudaGraphNodeParams& p, CUcontext owner) {
         params.type = static_cast<CUgraphNodeType>(p.type);
         switch (p.type) {
+        case cudaGraphNodeTypeConditional:
+            runtime_graph_union_validate(p, p.conditional);
+            require(!p.conditional.ctx, CUDA_ERROR_NOT_SUPPORTED, "explicit Runtime conditional execution contexts are unavailable");
+            params.conditional.handle = p.conditional.handle;
+            params.conditional.type = static_cast<CUgraphConditionalNodeType>(p.conditional.type);
+            params.conditional.size = p.conditional.size; params.conditional.ctx = owner;
+            params.conditional.phGraph_out = graph_cast<CUgraph*>(p.conditional.phGraph_out); break;
         case cudaGraphNodeTypeEmpty:
             runtime_graph_union_validate(p, char{});
             require(!p.reserved1[0], CUDA_ERROR_INVALID_VALUE, "nonzero empty node union"); break;
@@ -99,6 +106,7 @@ RUNTIME_API(cudaGraphAddNode, (cudaGraphNode_t* output, cudaGraph_t graph, const
     auto nodes = graph_dependencies(dependencies, count); auto edges = graph_edge_data(data, count); CUgraphNode node{};
     check(cuGraphAddNode(&node, graph_cast<CUgraph>(graph), nodes.data(), edges.data(), count, &converted.params));
     if (params->type == cudaGraphNodeTypeMemAlloc) params->alloc.dptr = reinterpret_cast<void*>(uintptr_t(converted.params.alloc.dptr));
+    if (params->type == cudaGraphNodeTypeConditional) params->conditional.phGraph_out = graph_cast<cudaGraph_t*>(converted.params.conditional.phGraph_out);
     *output = graph_cast<cudaGraphNode_t>(node))
 RUNTIME_API(cudaGraphNodeSetParams, (cudaGraphNode_t node, cudaGraphNodeParams* params),
     require(params, CUDA_ERROR_INVALID_VALUE, "null generic graph node parameters"); runtime_generic_node converted(*params, runtime_current());
@@ -109,3 +117,11 @@ RUNTIME_API(cudaGraphExecNodeSetParams, (cudaGraphExec_t handle, cudaGraphNode_t
 RUNTIME_API(cudaGraphExecGetFlags, (cudaGraphExec_t handle, unsigned long long* flags),
     require(flags, CUDA_ERROR_INVALID_VALUE, "null executable graph flags output"); runtime_current(); cuuint64_t value{};
     check(cuGraphExecGetFlags(graph_cast<CUgraphExec>(handle), &value)); *flags = value)
+RUNTIME_API(cudaGraphConditionalHandleCreate, (cudaGraphConditionalHandle* output, cudaGraph_t graph, unsigned initial, unsigned flags),
+    require(output, CUDA_ERROR_INVALID_VALUE, "null conditional handle output"); auto owner = runtime_current();
+    CUgraphConditionalHandle result{}; check(cuGraphConditionalHandleCreate(&result, graph_cast<CUgraph>(graph), owner, initial, flags)); *output = result)
+RUNTIME_API(cudaGraphConditionalHandleCreate_v2, (cudaGraphConditionalHandle* output, cudaGraph_t graph, cudaExecutionContext_t context, unsigned initial, unsigned flags),
+    require(output, CUDA_ERROR_INVALID_VALUE, "null conditional handle output");
+    require(!context, CUDA_ERROR_NOT_SUPPORTED, "explicit Runtime conditional execution contexts are unavailable");
+    auto owner = runtime_current(); CUgraphConditionalHandle result{};
+    check(cuGraphConditionalHandleCreate(&result, graph_cast<CUgraph>(graph), owner, initial, flags)); *output = result)

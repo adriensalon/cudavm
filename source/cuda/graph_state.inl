@@ -53,6 +53,12 @@ struct graph_node {
     std::vector<CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS> signals;
     std::vector<CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS> waits;
     std::vector<CUstreamBatchMemOpParams> memops;
+    CUgraphNode native_node = nullptr;
+    CUgraphDeviceNode device_node = nullptr;
+    std::shared_ptr<native_graph_definition> native_child;
+    CUDA_CONDITIONAL_NODE_PARAMS conditional{};
+    std::vector<CUgraph> conditional_graphs;
+    std::vector<std::shared_ptr<const std::vector<graph_node>>> conditional_nodes;
 };
 struct graph_state {
     unsigned id = 0;
@@ -64,6 +70,11 @@ struct graph_state {
     CUgraph parent = nullptr;
     bool moved = false;
     std::vector<std::weak_ptr<graph_memory_instance>> instances;
+    std::shared_ptr<native_graph_definition> native;
+    std::weak_ptr<context> native_owner;
+    struct condition { CUgraphConditionalHandle handle; unsigned initial, flags; };
+    std::vector<condition> conditions;
+    bool conditional_body = false;
 };
 struct capture_state {
     CUgraph graph = nullptr;
@@ -85,4 +96,10 @@ struct graph_exec {
     completion tail;
     std::shared_ptr<graph_memory_instance> memory_instance;
     native_graph_cache native_regions;
+    std::shared_ptr<native_graph_executable> native;
+    // Host changes are applied immediately before their queued native launch.
+    // Earlier launches retain their own update list and parameter bytes.
+    std::vector<graph_node> native_updates;
+    std::vector<std::pair<CUgraphNode, bool>> native_enables;
+    std::vector<graph_state::condition> conditions;
 };
