@@ -71,6 +71,7 @@ std::vector<std::shared_ptr<buffer>> graph_memory_prepare(const std::vector<grap
 }
 void graph_memory_trim(int device) {
     valid_device(device);
+    invalidate_native_graphs();
     // Workers own storage directly. Do not wait for them, or unmap buffers
     // protected by a scheduled replay, upload, transfer or kernel snapshot.
     for (auto& [address, entry] : global().allocations) if (entry.graph_owned && entry.owner->device == device &&

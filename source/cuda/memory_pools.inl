@@ -451,4 +451,5 @@ void pool_free(CUdeviceptr pointer, CUstream handle) {
             CUDA_ERROR_INVALID_VALUE, "allocation cannot be freed asynchronously");
     auto native = entry.native;
     entry.async_free = submit_stream(owner, handle, [native] {}); entry.free_stream_id = stream->id;
+    invalidate_native_graphs();
 }

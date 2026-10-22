@@ -113,6 +113,7 @@ void release_host(void* pointer, bool registration) {
     std::vector<completion> work;
     for (auto& item : entry->work) if (auto done = item.lock()) work.push_back(std::move(done));
     entry->retiring = true;
+    invalidate_native_graphs();
     std::exception_ptr error;
     if (!work.empty()) driver_wait([&] { for (auto& done : work) { try { done->wait(); } catch (...) { if (!error) error = std::current_exception(); } } });
     found = global().hosts.find(address);

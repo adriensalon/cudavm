@@ -60,6 +60,7 @@ struct cuda_context {
     std::shared_ptr<cuda_api> api;
     CUcontext value = nullptr;
     CUdevice device;
+    uint64_t graph_generation = 0;
     explicit cuda_context(std::shared_ptr<cuda_api> input, CUdevice device, unsigned flags) : api(std::move(input)), device(device) {
         check(api->create(&value, flags, device), "cuCtxCreate_v2");
         CUcontext popped = nullptr;
@@ -210,10 +211,14 @@ struct cuda_graph_buffer : cuda_buffer {
         address = 0;
     }
 };
+struct cuda_event;
 struct cuda_queue : native_queue {
     std::shared_ptr<cuda_context> context;
     CUstream value = nullptr;
     bool capturing = false;
+    std::mutex completion_mutex;
+    std::vector<std::shared_ptr<cuda_event>> completion_events;
+    std::shared_ptr<cuda_event> acquire_completion();
     cuda_queue(std::shared_ptr<cuda_context> owner, int priority) : context(std::move(owner)) {
         cuda_context_guard guard(*context);
         check(context->api->driver.get<decltype(&cuStreamCreateWithPriority)>("cuStreamCreateWithPriority")(&value, CU_STREAM_NON_BLOCKING, priority), "cuStreamCreateWithPriority");
@@ -261,6 +266,7 @@ struct cuda_task : device_task {
     bool recorded = false;
     explicit cuda_task(std::shared_ptr<cuda_context> owner, unsigned flags = CU_EVENT_DISABLE_TIMING)
         : event(std::make_shared<cuda_event>(std::move(owner), flags)) {}
+    explicit cuda_task(std::shared_ptr<cuda_event> input) : event(std::move(input)) {}
     std::shared_ptr<native_signal> signal() const override { return recorded ? event : nullptr; }
     void record(CUstream stream) {
         check(event->context->api->driver.get<decltype(&cuEventRecord)>("cuEventRecord")(event->value, stream), "cuEventRecord"); recorded = true;
@@ -279,6 +285,16 @@ struct cuda_task : device_task {
         }
     }
 };
+std::shared_ptr<cuda_event> cuda_queue::acquire_completion() {
+    std::lock_guard lock(completion_mutex);
+    // A completed task may still have native waiters or a published signal.
+    // Only pool ownership permits re-recording; task completion alone does not.
+    for (auto& event : completion_events) if (event.use_count() == 1) return event;
+    auto event = std::make_shared<cuda_event>(context, CU_EVENT_DISABLE_TIMING);
+    // Bound idle command resources even when many replays are queued at once.
+    if (completion_events.size() < 8) completion_events.push_back(event);
+    return event;
+}
 struct cuda_launch_event : device_launch_event {
     std::shared_ptr<cuda_context> context;
     explicit cuda_launch_event(std::shared_ptr<cuda_context> owner) : context(std::move(owner)) {
@@ -297,7 +313,7 @@ template<class F> device_work cuda_enqueue(std::shared_ptr<cuda_context> context
     auto& lane = *static_cast<cuda_queue*>(queue);
     auto stream = lane.value;
     if (lane.capturing) { action(stream); return {}; }
-    auto done = std::make_shared<cuda_task>(context);
+    auto done = std::make_shared<cuda_task>(lane.acquire_completion());
     try { action(stream); done->record(stream); }
     catch (...) {
         // Submission may have partially succeeded. Retain arguments and buffers
@@ -447,6 +463,8 @@ CUlaunchConfig cuda_launch_config(const launch_shape& shape, CUstream stream, st
 struct cuda_kernel : kernel {
     std::shared_ptr<cuda_module> module;
     CUfunction value = nullptr;
+    uint64_t generation = 0;
+    uint64_t graph_generation() const override { return generation; }
     explicit cuda_kernel(std::shared_ptr<cuda_module> input) : module(std::move(input)) {}
     void launch(const launch_shape&, void**, void**) override;
     device_work enqueue_launch(const launch_shape&, void**, void**, std::span<const allocation_binding>, native_queue*) override;
@@ -573,14 +591,17 @@ int cuda_kernel::attribute(CUfunction_attribute which) {
 void cuda_kernel::set_attribute(CUfunction_attribute which, int input) {
     cuda_context_guard guard(*module->context);
     check(module->context->api->driver.get<decltype(&cuFuncSetAttribute)>("cuFuncSetAttribute")(value, which, input), "cuFuncSetAttribute");
+    ++generation;
 }
 void cuda_kernel::set_cache_config(CUfunc_cache config) {
     cuda_context_guard guard(*module->context);
     check(module->context->api->driver.get<decltype(&cuFuncSetCacheConfig)>("cuFuncSetCacheConfig")(value, config), "cuFuncSetCacheConfig");
+    ++generation;
 }
 void cuda_kernel::set_shared_config(CUsharedconfig config) {
     cuda_context_guard guard(*module->context);
     check(module->context->api->driver.get<decltype(&cuFuncSetSharedMemConfig)>("cuFuncSetSharedMemConfig")(value, config), "cuFuncSetSharedMemConfig");
+    ++generation;
 }
 int cuda_kernel::active_blocks(int block, size_t shared, unsigned flags) {
     cuda_context_guard guard(*module->context); int result = 0;
@@ -675,6 +696,7 @@ void cuda_kernel::validate_configuration(const launch_shape& shape) {
     }
 }
 struct cuda_session : session {
+    uint64_t graph_generation() const override { return context->graph_generation; }
     std::shared_ptr<cuda_context> context;
     cuda_session(std::shared_ptr<cuda_api> api, CUdevice device, unsigned flags = CU_CTX_MAP_HOST)
         : context(std::make_shared<cuda_context>(std::move(api), device, flags)) {}
@@ -711,6 +733,7 @@ struct cuda_session : session {
     unsigned set_context_flags(unsigned flags) override {
         cuda_context_guard guard(*context);
         check(context->api->driver.get<decltype(&cuCtxSetFlags)>("cuCtxSetFlags")(flags), "cuCtxSetFlags");
+        ++context->graph_generation;
         return get_context_flags(flags);
     }
     unsigned context_api_version() override {
@@ -724,6 +747,7 @@ struct cuda_session : session {
     void set_context_limit(CUlimit limit, size_t value) override {
         cuda_context_guard guard(*context);
         check(context->api->driver.get<decltype(&cuCtxSetLimit)>("cuCtxSetLimit")(limit, value), "cuCtxSetLimit");
+        ++context->graph_generation;
     }
     CUfunc_cache context_cache_config() override {
         cuda_context_guard guard(*context); CUfunc_cache value{};
@@ -732,6 +756,7 @@ struct cuda_session : session {
     void set_context_cache_config(CUfunc_cache config) override {
         cuda_context_guard guard(*context);
         check(context->api->driver.get<decltype(&cuCtxSetCacheConfig)>("cuCtxSetCacheConfig")(config), "cuCtxSetCacheConfig");
+        ++context->graph_generation;
     }
     CUsharedconfig context_shared_config() override {
         cuda_context_guard guard(*context); CUsharedconfig value{};
@@ -740,6 +765,7 @@ struct cuda_session : session {
     void set_context_shared_config(CUsharedconfig config) override {
         cuda_context_guard guard(*context);
         check(context->api->driver.get<decltype(&cuCtxSetSharedMemConfig)>("cuCtxSetSharedMemConfig")(config), "cuCtxSetSharedMemConfig");
+        ++context->graph_generation;
     }
     interop_capabilities interop() override {
         interop_capabilities result;

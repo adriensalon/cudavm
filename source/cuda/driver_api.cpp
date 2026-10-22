@@ -278,6 +278,13 @@ state& global() {
     static state* value = new state;
     return *value;
 }
+void invalidate_native_graphs() {
+    // Resource retirement must release idle snapshots too. Accepted submissions
+    // own their regions independently, so invalidation never changes queued work.
+    // Conservatively invalidate all executables: kernels can follow indirect
+    // pointers into any allocation in their retained binding snapshot.
+    for (auto& [handle, executable] : global().graph_execs) executable.native_regions.clear();
+}
 std::vector<CUcontext>& context_stack() {
     static thread_local std::vector<CUcontext> value;
     return value;
@@ -417,6 +424,7 @@ void set_current(CUcontext handle) {
 void destroy(const std::shared_ptr<context>& owner, bool pop_current = true) {
     capture_retire_context(owner);
     owner->retiring = true;
+    invalidate_native_graphs();
     retire_context(owner);
     if (owner->primary) retire_primary_hosts(owner);
     pool_retire_context(owner);
@@ -613,6 +621,7 @@ void collect_graph_memory() {
             global().graph_cache.push_back({entry.owner, entry.native});
             entry.native->graph_charge->associate(false);
         }
+        invalidate_native_graphs();
         it = global().allocations.erase(it);
     }
 }
@@ -656,6 +665,7 @@ void release(CUdeviceptr pointer, const std::shared_ptr<context>& owner) {
     synchronize_context(expected->is_managed() ? storage_owner : owner);
     it = global().allocations.find(pointer);
     require(it != global().allocations.end() && it->second.native == expected, CUDA_ERROR_INVALID_VALUE, "allocation changed while waiting for free");
+    invalidate_native_graphs();
     if (memory) {
         require(memory->live.load(), CUDA_ERROR_INVALID_VALUE, "graph allocation is not live");
         memory->live = false; memory->planned_live = false; memory->transition.reset();
@@ -962,7 +972,7 @@ DRIVER_API(cuModuleLoadData, (CUmodule* output, const void* image), driver_ready
 DRIVER_API(cuModuleLoadDataEx, (CUmodule* output, const void* image, unsigned count, CUjit_option* options, void** values), driver_ready(); require(output && image && (!count || (options && values)), CUDA_ERROR_INVALID_VALUE, "invalid module JIT arguments"); auto owner = current(); auto native = native_call(owner, [&] { return owner->native->load_image(image, count, options, values); }, true); *output = add_module(owner, std::move(native)))
 DRIVER_API(cuModuleGetFunction, (CUfunction* output, CUmodule module, const char* name), driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null function output"); *output = find_function(module, name, current()))
 DRIVER_API(cuModuleGetGlobal, (CUdeviceptr* output, size_t* bytes, CUmodule module, const char* name), driver_ready(); require(output || bytes, CUDA_ERROR_INVALID_VALUE, "missing global query outputs"); auto symbol=find_global(module,name,current()); if(output)*output=symbol.address; if(bytes)*bytes=symbol.bytes)
-DRIVER_API(cuModuleUnload, (CUmodule module), driver_ready(); auto owner = current(); require(!module_lookup(module, owner).library, CUDA_ERROR_NOT_PERMITTED, "library modules are unloaded with their library"); auto native = module_lookup(module, owner).native; synchronize_context(owner); require(module_lookup(module, owner).native == native, CUDA_ERROR_INVALID_HANDLE, "module changed while waiting"); native->unload(); std::erase_if(global().functions, [&](auto& item) { return item.second.module == module; }); std::erase_if(global().allocations,[&](auto& item){return item.second.module==module;}); global().modules.erase(module))
+DRIVER_API(cuModuleUnload, (CUmodule module), driver_ready(); auto owner = current(); require(!module_lookup(module, owner).library, CUDA_ERROR_NOT_PERMITTED, "library modules are unloaded with their library"); auto native = module_lookup(module, owner).native; synchronize_context(owner); require(module_lookup(module, owner).native == native, CUDA_ERROR_INVALID_HANDLE, "module changed while waiting"); invalidate_native_graphs(); native->unload(); std::erase_if(global().functions, [&](auto& item) { return item.second.module == module; }); std::erase_if(global().allocations,[&](auto& item){return item.second.module==module;}); global().modules.erase(module))
 DRIVER_API(cuFuncGetParamInfo, (CUfunction function, size_t index, size_t* offset, size_t* size), driver_ready(); require(offset, CUDA_ERROR_INVALID_VALUE, "null parameter offset output"); auto& value = function_lookup(function, current()); size_t local_offset = 0, local_size = 0; value.native->parameter_info(index, local_offset, local_size); *offset = local_offset; if (size) *size = local_size)
 DRIVER_API(cuFuncGetParamCount, (CUfunction function, size_t* count), driver_ready(); require(count, CUDA_ERROR_INVALID_VALUE, "null parameter count output"); *count = function_lookup(function, current()).native->parameter_layout().size())
 DRIVER_API(cuFuncGetModule, (CUmodule* output, CUfunction function), driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null function module output"); *output = function_lookup(function, current()).module)

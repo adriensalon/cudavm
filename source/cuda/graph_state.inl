@@ -84,4 +84,5 @@ struct graph_exec {
     unsigned long long flags = 0;
     completion tail;
     std::shared_ptr<graph_memory_instance> memory_instance;
+    native_graph_cache native_regions;
 };

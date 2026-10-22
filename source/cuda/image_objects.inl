@@ -138,6 +138,6 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
 }
 void destroy_image_object(uint64_t handle, bool surface) {
     auto entry = image_object_lookup(handle, surface); capture_unsafe(entry->owner);
-    entry->retiring = true; drain_context_work(entry->owner);
+    entry->retiring = true; invalidate_native_graphs(); drain_context_work(entry->owner);
     image_objects(surface).erase(handle);
 }

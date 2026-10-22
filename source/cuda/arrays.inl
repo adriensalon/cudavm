@@ -48,6 +48,7 @@ void destroy_array(CUarray handle) {
     auto owner = current(); auto entry = array_lookup(handle, owner);
     require(!entry->parent, CUDA_ERROR_INVALID_VALUE, "mipmap levels are owned by their parent");
     capture_unsafe(owner); entry->retiring = true;
+    invalidate_native_graphs();
     drain_context_work(owner); global().arrays.erase(handle);
 }
 void destroy_mipmapped_array(CUmipmappedArray handle) {
@@ -56,6 +57,7 @@ void destroy_mipmapped_array(CUmipmappedArray handle) {
     require(it->second.owner == owner, CUDA_ERROR_INVALID_CONTEXT, "mipmapped array belongs to a different context");
     capture_unsafe(owner);
     auto levels = it->second.levels; it->second.retiring = true;
+    invalidate_native_graphs();
     for (auto level : levels) global().arrays.at(level)->retiring = true;
     drain_context_work(owner);
     for (auto level : levels) global().arrays.erase(level);

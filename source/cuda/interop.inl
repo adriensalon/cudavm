@@ -145,5 +145,6 @@ void unmap_graphics(unsigned count, CUgraphicsResource* handles, CUstream stream
             owner->gl->write(entry->object, bytes);
         }
     }
+    invalidate_native_graphs();
     for (auto* entry : entries) { global().allocations.erase(entry->mapped); entry->mapped = 0; }
 }

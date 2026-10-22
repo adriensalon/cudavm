@@ -131,6 +131,7 @@ struct graph_operation {
     std::vector<std::shared_ptr<host_entry>> hosts;
     std::vector<std::shared_ptr<context>> contexts;
     bool native_compatible = false;
+    native_graph_key native_key;
 };
 graph_operation graph_prepare(const graph_node& node, bool use_node_priority = false, bool use_snapshot_enabled = true) {
     graph_memory_scope memory_scope;
@@ -208,6 +209,8 @@ graph_operation graph_prepare(const graph_node& node, bool use_node_priority = f
         result.start = [to, from, owner, width = p.WidthInBytes](native_queue* queue) { return enqueue_copy_boxes(to, from, width, queue, owner); };
         result.native_compatible = owner->native->kind() == cudavmBackendCuda && to.owner == owner && from.owner == owner &&
             to.device_storage() && from.device_storage() && !to.array && !from.array;
+        if (result.native_compatible) result.native_key = {owner->id, owner->native->graph_generation(),
+            reinterpret_cast<uintptr_t>(to.storage.get()), reinterpret_cast<uintptr_t>(from.storage.get())};
     } else if (node.type == CU_GRAPH_NODE_TYPE_MEMSET) {
         auto& p = node.fill; auto bytes = memory_mul(p.width, p.elementSize);
         auto pitch = p.height == 1 ? bytes : p.pitch;
@@ -225,6 +228,7 @@ graph_operation graph_prepare(const graph_node& node, bool use_node_priority = f
             return enqueue_fill_box(to, p.value, bytes, queue);
         };
         result.native_compatible = owner->native->kind() == cudavmBackendCuda && to.device_storage();
+        if (result.native_compatible) result.native_key = {owner->id, owner->native->graph_generation(), reinterpret_cast<uintptr_t>(to.storage.get())};
     } else {
         auto bytes = node.arguments.size();
         void* extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, const_cast<std::byte*>(node.arguments.data()), CU_LAUNCH_PARAM_BUFFER_SIZE, &bytes, CU_LAUNCH_PARAM_END};
@@ -235,6 +239,14 @@ graph_operation graph_prepare(const graph_node& node, bool use_node_priority = f
         result.action = [command] { command->execute(); };
         result.start = [command](native_queue* queue) { return command->enqueue(queue); };
         result.native_compatible = owner->native->kind() == cudavmBackendCuda && shape.options == launch_options{};
+        if (result.native_compatible) {
+            result.native_key = {owner->id, owner->native->graph_generation(), reinterpret_cast<uintptr_t>(command->function.get()), command->function->graph_generation()};
+            for (auto& binding : command->bindings) {
+                result.native_key.push_back(binding.address);
+                result.native_key.push_back(reinterpret_cast<uintptr_t>(binding.native));
+                result.native_key.push_back(binding.surface_descriptor);
+            }
+        }
     }
     return result;
 }
@@ -466,6 +478,7 @@ void graph_exec_replace(CUgraphExec handle, CUgraphNode node, graph_node replace
         graph_memory_validate(candidate);
     }
     graph_replace(existing, std::move(replacement));
+    value.native_regions.clear();
 }
 bool graph_enable_type(CUgraphNodeType type) { return type == CU_GRAPH_NODE_TYPE_KERNEL || type == CU_GRAPH_NODE_TYPE_MEMCPY || type == CU_GRAPH_NODE_TYPE_MEMSET; }
 bool graph_update_nodes(const std::vector<graph_node>& existing, const std::vector<graph_node>& candidate, CUgraphExecUpdateResultInfo& info, bool node_priority) {
@@ -528,6 +541,7 @@ void graph_update(CUgraphExec handle, CUgraph graph, CUgraphExecUpdateResultInfo
     for (auto& node : nodes) graph_prepare(node);
     auto objects = graph_lookup(graph).objects;
     graph_rebind_nodes(nodes, value.nodes); value.nodes.swap(nodes); value.objects.swap(objects);
+    value.native_regions.clear();
     *info = {CU_GRAPH_EXEC_UPDATE_SUCCESS, nullptr, nullptr};
 }
 void graph_exec_child_replace(CUgraphExec handle, CUgraphNode node, CUgraph child) {
@@ -541,6 +555,7 @@ void graph_exec_child_replace(CUgraphExec handle, CUgraphNode node, CUgraph chil
     auto objects = graph_lookup(child).objects;
     existing.child_nodes = std::make_shared<const std::vector<graph_node>>(std::move(nodes));
     existing.child_objects.swap(objects);
+    value.native_regions.clear();
 }
 void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
     auto& value = graph_exec_lookup(handle); auto owner = value.owner.lock();
@@ -559,6 +574,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
     }
     std::vector<command_queue::submission> replay;
     std::vector<native_graph_command> recorders;
+    std::vector<native_graph_key> native_keys;
     bool auto_free = (value.flags & CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH) != 0;
     auto memory_plan = graph_memory_validate(value.nodes, !upload, auto_free, &value.enabled);
     auto memory_resources = graph_memory_prepare(value.nodes);
@@ -577,6 +593,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
         replay.push_back({reset, initial, [allocations = memory_plan.allocations] { for (auto& memory : allocations) memory->live = false; }, 0, {}});
         initial = {reset};
         recorders.emplace_back();
+        native_keys.emplace_back();
     }
     std::vector<std::shared_ptr<host_entry>> hosts;
     std::vector<std::shared_ptr<context>> contexts;
@@ -607,6 +624,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
             std::function<device_work()> start;
             std::shared_ptr<native_queue> native_lane;
             native_graph_command recorder;
+            native_graph_key native_key;
             int priority = 0;
             if (top ? value.enabled[i] : !node.snapshot_disabled) {
                 auto operation = graph_prepare(node, bool(value.flags & CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY), !top);
@@ -632,7 +650,9 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
                         // graphs keep their existing synchronous foreign path.
                         if (node_owner == owner || node.type == CU_GRAPH_NODE_TYPE_BATCH_MEM_OP)
                             start = [operation = operation.start, queue] { return operation(queue.get()); };
-                        if (node_owner == owner && operation.native_compatible) recorder = std::move(operation.start);
+                        if (node_owner == owner && operation.native_compatible) {
+                            recorder = std::move(operation.start); native_key = std::move(operation.native_key);
+                        }
                         if (recorder) native_lane = queue;
                     }
                     for (auto& host : operation.hosts) if (std::find(hosts.begin(), hosts.end(), host) == hosts.end()) hosts.push_back(host);
@@ -667,6 +687,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
             auto domain = node_owner ? node_owner->command_domain : owner->command_domain;
             replay.push_back({done, std::move(dependencies), std::move(action), priority, std::move(start), exclusive, std::move(domain), {}, std::move(native_lane)}); indices.emplace(node.handle, done);
             recorders.push_back(std::move(recorder));
+            native_keys.push_back(std::move(native_key));
             submitted.push_back(done);
         }
         // Joining the leaves also waits for every ancestor, including failures.
@@ -690,6 +711,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
     replay.push_back({done, std::move(final_dependencies), [target, objects = std::move(objects), contexts,
         memory_resources = std::move(memory_resources), instance = value.memory_instance] {}, 0, {}});
     recorders.emplace_back();
+    native_keys.emplace_back();
     if (!upload && owner->native->kind() == cudavmBackendCuda) {
         // Retain the replay snapshot through its GPU join, while allowing a
         // subsequent native stream command to consume that join's signal.
@@ -701,7 +723,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
         replay.back().lane = queue;
     }
     if (!upload && owner->native->kind() == cudavmBackendCuda) lower_graph_regions(replay, recorders,
-        [&](auto commands) { return owner->native->compile_graph(commands); }, queue);
+        [&](auto commands) { return owner->native->compile_graph(commands); }, queue, &value.native_regions, native_keys);
     if (!owner->queue) owner->queue = std::make_unique<command_queue>(owner->command_domain);
     std::vector<CUdeviceptr> inserted;
     inserted.reserve(memory_plan.regions.size());

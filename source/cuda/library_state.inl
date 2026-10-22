@@ -106,6 +106,7 @@ void library_configure(CUkernel kernel, CUfunction_attribute attribute, int valu
         library_lookup(item->library);
         if (cache) entry->native->set_cache_config(item->name.c_str(), static_cast<CUfunc_cache>(value), device);
         else entry->native->set_attribute(item->name.c_str(), attribute, value, device);
+        invalidate_native_graphs();
         if (!entry->registration) return;
         if (cache) item->caches[device] = static_cast<CUfunc_cache>(value); else item->attributes[device][attribute] = value;
         std::vector<CUfunction> functions;
@@ -156,6 +157,7 @@ void library_unload(CUlibrary handle) {
     for (auto& [address, allocation] : global().allocations) if (allocation.library == handle) owners.push_back(allocation.owner);
     for (auto& owner : owners) capture_unsafe(owner);
     entry->retiring = true;
+    invalidate_native_graphs();
     try { for (auto& owner : owners) synchronize_context(owner); }
     catch (...) { entry->retiring = false; throw; }
     std::unordered_set<CUmodule> modules; for (auto& [id, module] : entry->modules) modules.insert(module);
@@ -276,6 +278,7 @@ void registered_module_release(CUmodule module, const std::shared_ptr<context>& 
         synchronize_context(owner);
         auto found = global().modules.find(module);
         require(found != global().modules.end() && found->second.native == native, CUDA_ERROR_INVALID_HANDLE, "registered module changed while waiting");
+        invalidate_native_graphs();
         native->unload();
     } catch (...) {
         entry->resetting.erase(owner->id);

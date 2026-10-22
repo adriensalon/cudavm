@@ -348,6 +348,7 @@ struct compute_pipeline {
 };
 struct kernel {
     virtual ~kernel() = default;
+    virtual uint64_t graph_generation() const { return 0; }
     virtual int attribute(CUfunction_attribute) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "function resource attribute is unavailable on this adapter");
     }
@@ -421,6 +422,7 @@ struct executable {
     virtual void unload() = 0;
 };
 struct session {
+    virtual uint64_t graph_generation() const { return 0; }
     std::mutex pool_execution;
     std::shared_ptr<compute_profile> profile=std::make_shared<compute_profile>();
     virtual ~session() = default;
