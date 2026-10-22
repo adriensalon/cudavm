@@ -238,7 +238,7 @@ graph_operation graph_prepare(const graph_node& node, bool use_node_priority = f
         result.hosts = command->hosts;
         result.action = [command] { command->execute(); };
         result.start = [command](native_queue* queue) { return command->enqueue(queue); };
-        result.native_compatible = owner->native->kind() == cudavmBackendCuda && shape.options == launch_options{};
+        result.native_compatible = owner->native->kind() == cudavmBackendCuda;
         if (result.native_compatible) {
             result.native_key = {owner->id, owner->native->graph_generation(), reinterpret_cast<uintptr_t>(command->function.get()), command->function->graph_generation()};
             for (auto& binding : command->bindings) {
@@ -575,6 +575,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
     std::vector<command_queue::submission> replay;
     std::vector<native_graph_command> recorders;
     std::vector<native_graph_key> native_keys;
+    std::vector<std::vector<CUgraphEdgeData>> native_edges;
     bool auto_free = (value.flags & CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH) != 0;
     auto memory_plan = graph_memory_validate(value.nodes, !upload, auto_free, &value.enabled);
     auto memory_resources = graph_memory_prepare(value.nodes);
@@ -594,6 +595,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
         initial = {reset};
         recorders.emplace_back();
         native_keys.emplace_back();
+        native_edges.emplace_back(replay.back().dependencies.size());
     }
     std::vector<std::shared_ptr<host_entry>> hosts;
     std::vector<std::shared_ptr<context>> contexts;
@@ -612,12 +614,15 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
             if (!upload && node.memory) memory_transitions[node.memory.get()] = done;
             for (auto& [object, reference] : node.child_objects) objects.push_back(reference.object);
             auto dependencies = node.dependencies.empty() ? roots : std::vector<completion>{};
+            std::vector<CUgraphEdgeData> dependency_edges(dependencies.size());
             done->order = node.dependencies.empty() ? root_order : command_order{};
-            // Ports allow earlier execution without requiring overlap. The
-            // shared scheduler waits for native completion and visibility.
-            for (auto dependency : node.dependencies) {
+            // Native regions preserve ports; scheduler boundaries conservatively
+            // wait for full completion and visibility.
+            for (size_t j = 0; j < node.dependencies.size(); ++j) {
+                auto dependency = node.dependencies[j];
                 parents.insert(dependency);
                 dependencies.push_back(indices.at(dependency)); inherit_order(done->order, indices.at(dependency));
+                dependency_edges.push_back(node.dependency_edges[j]);
             }
             if (transport) dependencies.push_back(transport);
             std::function<void()> action = [] {};
@@ -679,6 +684,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
                 }
                 if (node.type == CU_GRAPH_NODE_TYPE_GRAPH) {
                     dependencies = expand(*node.child_nodes, dependencies, done->order, false);
+                    dependency_edges.assign(dependencies.size(), {});
                     for (auto& dependency : dependencies) inherit_order(done->order, dependency);
                 }
             }
@@ -688,6 +694,8 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
             replay.push_back({done, std::move(dependencies), std::move(action), priority, std::move(start), exclusive, std::move(domain), {}, std::move(native_lane)}); indices.emplace(node.handle, done);
             recorders.push_back(std::move(recorder));
             native_keys.push_back(std::move(native_key));
+            dependency_edges.resize(replay.back().dependencies.size());
+            native_edges.push_back(std::move(dependency_edges));
             submitted.push_back(done);
         }
         // Joining the leaves also waits for every ancestor, including failures.
@@ -712,6 +720,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
         memory_resources = std::move(memory_resources), instance = value.memory_instance] {}, 0, {}});
     recorders.emplace_back();
     native_keys.emplace_back();
+    native_edges.emplace_back(replay.back().dependencies.size());
     if (!upload && owner->native->kind() == cudavmBackendCuda) {
         // Retain the replay snapshot through its GPU join, while allowing a
         // subsequent native stream command to consume that join's signal.
@@ -723,7 +732,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
         replay.back().lane = queue;
     }
     if (!upload && owner->native->kind() == cudavmBackendCuda) lower_graph_regions(replay, recorders,
-        [&](auto commands) { return owner->native->compile_graph(commands); }, queue, &value.native_regions, native_keys);
+        [&](auto nodes) { return owner->native->compile_graph(nodes); }, queue, &value.native_regions, native_keys, native_edges);
     if (!owner->queue) owner->queue = std::make_unique<command_queue>(owner->command_domain);
     std::vector<CUdeviceptr> inserted;
     inserted.reserve(memory_plan.regions.size());

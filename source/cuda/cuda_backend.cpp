@@ -1,4 +1,5 @@
 #include "dynamic_library.hpp"
+#include "cuda_graph_capture.hpp"
 #include "ptx_parameters.hpp"
 #include "nvidia_image.hpp"
 #include "nvidia_managed_image.hpp"
@@ -903,12 +904,18 @@ struct cuda_session : session {
         timestamp->timer = task->event;
         return task;
     }
-    std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_command> commands) override {
+    std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_node> nodes) override {
         auto& driver = context->api->driver;
         auto begin = reinterpret_cast<decltype(&cuStreamBeginCapture)>(driver.find("cuStreamBeginCapture_v2"));
         auto end = reinterpret_cast<decltype(&cuStreamEndCapture)>(driver.find("cuStreamEndCapture"));
         auto instantiate = reinterpret_cast<decltype(&cuGraphInstantiateWithFlags)>(driver.find("cuGraphInstantiateWithFlags"));
-        if (!begin || !end || !instantiate) return {};
+        cuda_graph_capture capture{
+            reinterpret_cast<cuda_graph_capture::capture_info>(driver.find("cuStreamGetCaptureInfo_v2")),
+            reinterpret_cast<cuda_graph_capture::capture_dependencies>(driver.find("cuStreamUpdateCaptureDependencies")),
+            reinterpret_cast<decltype(&cuStreamUpdateCaptureDependencies)>(driver.find("cuStreamUpdateCaptureDependencies_v2")),
+            reinterpret_cast<decltype(&cuGraphKernelNodeSetAttribute)>(driver.find("cuGraphKernelNodeSetAttribute")),
+            reinterpret_cast<decltype(&cuGraphNodeGetType)>(driver.find("cuGraphNodeGetType"))};
+        if (!begin || !end || !instantiate || !capture.available(nodes)) return {};
         cuda_context_guard guard(*context);
         cuda_queue lane(context, 0);
         auto result = std::make_shared<cuda_graph>(context);
@@ -917,7 +924,7 @@ struct cuda_session : session {
         check(status, "cuStreamBeginCapture native region");
         lane.capturing = true;
         try {
-            for (auto& command : commands) command(&lane);
+            capture.record(nodes, &lane, lane.value);
         } catch (...) {
             // End invalidated capture before destroying the private lane. No
             // recorded command has reached the GPU, so fallback is atomic.
@@ -929,7 +936,7 @@ struct cuda_session : session {
         }
         lane.capturing = false;
         check(end(lane.value, &result->graph), "cuStreamEndCapture native region");
-        status = instantiate(&result->executable, result->graph, 0);
+        status = instantiate(&result->executable, result->graph, capture.set_attribute ? CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY : 0);
         if (status == CUDA_ERROR_NOT_SUPPORTED) return {};
         check(status, "cuGraphInstantiateWithFlags native region");
         return result;

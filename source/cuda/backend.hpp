@@ -237,6 +237,18 @@ struct device_continuation : device_task {
 // Recording must not execute work or retain temporary host spans. The graph
 // owns its native descriptors; callers retain the recorded resource snapshots.
 using native_graph_command = std::function<device_work(native_queue*)>;
+struct native_graph_dependency {
+    size_t node = 0;
+    CUgraphEdgeData edge{};
+    bool operator==(const native_graph_dependency& other) const {
+        return node == other.node && std::memcmp(&edge, &other.edge, sizeof(edge)) == 0;
+    }
+};
+struct native_graph_node {
+    native_graph_command command;
+    std::vector<native_graph_dependency> dependencies;
+    int priority = 0;
+};
 struct native_graph {
     virtual ~native_graph() = default;
     virtual device_work enqueue(native_queue*) = 0;
@@ -496,7 +508,7 @@ struct session {
     virtual std::unique_ptr<host_allocation> register_host(void* pointer, size_t bytes, unsigned) { return register_locked_host(pointer, bytes); }
     virtual std::unique_ptr<buffer> map_host(std::shared_ptr<host_allocation> value) { return std::make_unique<host_buffer>(std::move(value)); }
     virtual std::shared_ptr<native_queue> create_queue(int) { return {}; }
-    virtual std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_command>) { return {}; }
+    virtual std::shared_ptr<native_graph> compile_graph(std::span<const native_graph_node>) { return {}; }
     virtual device_work enqueue_marker(native_queue*) { return {}; }
     // Values are published before the returned task completes. Timing uses
     // either a native timer pair or ticks with a nonzero clock period.
