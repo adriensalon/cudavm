@@ -1,14 +1,14 @@
 #include "nvrtc_frontend.hpp"
-#include "../cudavm/spirv_emitter.hpp"
-#include "../cudavm/dxil_emitter.hpp"
+#include "spirv_emitter.hpp"
+#include "dxil_emitter.hpp"
 #include "data_alias_frontend.hpp"
-#include "../cudavm/device_conversions.hpp"
-#include "../cudavm/device_integers.hpp"
-#include "../cudavm/device_simd.hpp"
-#include "../cudavm/device_dpx.hpp"
-#include "../cudavm/device_math.hpp"
-#include "../cudavm/device_warp.hpp"
-#include "../cudavm/device_math_source.hpp"
+#include "device_conversions.hpp"
+#include "device_integers.hpp"
+#include "device_simd.hpp"
+#include "device_dpx.hpp"
+#include "device_math.hpp"
+#include "device_warp.hpp"
+#include "device_math_source.hpp"
 #include "nvrtc_headers.hpp"
 #include <filesystem>
 #include <mutex>
@@ -270,8 +270,7 @@ nvrtc_output compile_nvrtc_source(const std::string& source, const std::string& 
     const std::vector<std::string>& expressions, const nvrtc_options& settings, std::string& log) {
     // The current in-process LLVM pipeline has shared target state. Keep
     // concurrent public programs isolated while their compiler requests run.
-    static std::mutex compilation_mutex;
-    std::lock_guard compilation_lock(compilation_mutex);
+    std::lock_guard compilation_lock(compiler_mutex());
     // Each request has its own virtual files, diagnostics, frontend and IR context.
     // Neither source nor virtual headers are materialized on disk.
     auto root = (std::filesystem::current_path() / "__cudavm_nvrtc_virtual__").generic_string();

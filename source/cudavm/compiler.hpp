@@ -1,10 +1,13 @@
 #pragma once
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <llvm/Support/JSON.h>
 namespace llvm { class LLVMContext; class Module; }
 namespace cudavm {
+// Source, link and import entry points share LLVM target state in one library.
+std::mutex& compiler_mutex();
 struct frontend_resources {
     std::string origin, resource_dir, wrapper, cuda_include, cuda_crt_include, public_include;
 };

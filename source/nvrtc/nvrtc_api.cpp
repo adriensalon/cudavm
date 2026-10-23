@@ -1,4 +1,6 @@
-#include "nvrtc_frontend.hpp"
+#include "../cudavm/compiler_client.hpp"
+#include <map>
+#include <vector>
 #include <cudavm/export.h>
 #include <nvrtc.h>
 #include <algorithm>
@@ -9,11 +11,15 @@
 #include <list>
 #include <unordered_map>
 #if defined(__clang__)
-// Public NVIDIA declarations are kept pristine; this component owns exports.
 #pragma clang diagnostic ignored "-Wdll-attribute-on-redeclaration"
 #endif
 namespace cudavm {
 namespace {
+struct nvrtc_options {
+    std::string standard = "c++17", architecture = "sm_75";
+    bool relocatable = false;
+    std::vector<std::string> includes, defines, undefines;
+};
 struct program {
     std::mutex mutex;
     std::string source, name, ptx, log;
@@ -165,10 +171,35 @@ extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcCompileProgram(nvrtcProgram handle,
         value.ptx.clear(); value.log.clear();
         auto settings = parse_options(count, options, value.log);
         try {
-            auto output = cudavm::compile_nvrtc_source(value.source, value.name,
-                value.headers, value.expressions, settings, value.log);
-            value.lowered_names.push_back(std::move(output.lowered_names));
-            value.ptx = std::move(output.ptx);
+            auto pointers = [](const std::vector<std::string>& strings) {
+                std::vector<const char*> output;
+                for (const auto& text : strings) output.push_back(text.c_str());
+                return output;
+            };
+            std::vector<compiler_source_header> headers;
+            for (const auto& [name, contents] : value.headers)
+                headers.push_back({name.c_str(), contents.c_str()});
+            auto expressions = pointers(value.expressions);
+            auto includes = pointers(settings.includes), defines = pointers(settings.defines), undefines = pointers(settings.undefines);
+            compiler_source_request request{1, value.source.c_str(), value.name.c_str(),
+                settings.standard.c_str(), settings.architecture.c_str(), unsigned(settings.relocatable),
+                headers.size(), headers.data(), expressions.size(), expressions.data(),
+                includes.size(), includes.data(), defines.size(), defines.data(), undefines.size(), undefines.data()};
+            compiler_result* result = nullptr;
+            auto status = cudavm_compiler_compile_source_v1(&request, &result);
+            compiler_result_ptr owned(result);
+            value.log = cudavm_compiler_result_diagnostics_v1(result);
+            if (status == compiler_status::out_of_memory) throw std::bad_alloc();
+            require(status == compiler_status::success && result, NVRTC_ERROR_COMPILATION);
+            std::map<std::string, std::string> lowered_names;
+            for (const auto& expression : value.expressions) {
+                auto* name = cudavm_compiler_result_lowered_name_v1(result, expression.c_str());
+                require(name, NVRTC_ERROR_INTERNAL_ERROR);
+                lowered_names.emplace(expression, name);
+            }
+            std::string ptx = cudavm_compiler_result_output_v1(result);
+            value.lowered_names.push_back(std::move(lowered_names));
+            value.ptx = std::move(ptx);
             value.compiled = true;
         } catch (const std::bad_alloc&) { throw; }
         catch (const std::exception& error) {

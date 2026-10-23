@@ -5,6 +5,7 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
 namespace cudavm {
+std::mutex& compiler_mutex() { static std::mutex value; return value; }
 void write_file(const std::string& path, const std::string& content) {
     if (path.empty()) return;
     std::error_code error;

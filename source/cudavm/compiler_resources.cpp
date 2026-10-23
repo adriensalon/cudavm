@@ -1,6 +1,6 @@
 #include "compiler.hpp"
 #include "embedded_headers.hpp"
-#include "../cudavm/device_math_source.hpp"
+#include "device_math_source.hpp"
 #include <filesystem>
 #include <stdexcept>
 #include <utility>

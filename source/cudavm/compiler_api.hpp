@@ -1,8 +1,14 @@
 #pragma once
 #include "compiler.hpp"
+#include "compiler_service.hpp"
+#include <map>
 #include <new>
 #include <stdexcept>
 namespace cudavm {
+struct compiler_result {
+    std::string output, diagnostics;
+    std::map<std::string, std::string, std::less<>> lowered_names;
+};
 inline std::string compiler_option_text(const char* value) { return value ? value : ""; }
 inline void append_compiler_option_strings(size_t count, const char* const* input, std::vector<std::string>& output) {
     if (count && !input) throw std::runtime_error("null compiler option array");
