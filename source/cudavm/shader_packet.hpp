@@ -15,6 +15,10 @@ inline constexpr uint32_t packet_private_high_word = 0xffffffffu;
 inline constexpr uint32_t packet_shared_tag = 0x40000000u;
 inline constexpr uint32_t packet_local_tag = 0x80000000u;
 inline constexpr uint32_t packet_parameter_tag = 0xc0000000u;
+inline constexpr uint32_t packet_private_stack_bytes = 16384;
+inline constexpr uint32_t packet_arena_header_bytes = 32;
+inline constexpr uint32_t packet_stack_fault_word = 3;
+inline constexpr uint32_t packet_stack_base_word = 4;
 constexpr packet_word64 make_packet_private_pointer(uint32_t space, uint32_t offset) { return {space | offset, packet_private_high_word}; }
 
 // Packet words 0..5: grid and block dimensions. Word 6: byte offset of this

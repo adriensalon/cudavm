@@ -1,4 +1,6 @@
 #pragma once
+#include "shader_packet.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -13,7 +15,7 @@ struct kernel_descriptor {
     std::string symbol;
     uint32_t shared_bytes = 0, local_bytes = 0;
     std::vector<kernel_parameter_descriptor> parameters;
-    
+    uint32_t stack_bytes = 0;
 };
 struct global_relocation { uint32_t offset, target; uint64_t addend; };
 struct global_descriptor { std::string symbol; uint32_t alignment; std::string initializer; std::vector<global_relocation> relocations; };
@@ -37,6 +39,12 @@ inline std::string encode_module_descriptor(const std::vector<kernel_descriptor>
             string(g.symbol); number(g.alignment); string(g.initializer); number(uint32_t(g.relocations.size()));
             for(auto r:g.relocations) { number(r.offset); number(r.target); number(uint32_t(r.addend)); number(uint32_t(r.addend>>32)); }
         }
+    }
+    if (std::any_of(entries.begin(), entries.end(), [](const auto& entry) { return entry.stack_bytes != 0; })) {
+        // Optional STK1 trailer. Older loaders reject the extra payload instead
+        // of executing shaders with a missing stack base or fault observation.
+        number(0x314b5453); number(uint32_t(entries.size()));
+        for (const auto& entry : entries) number(entry.stack_bytes);
     }
     std::string out(module_descriptor_begin);
     constexpr char hex[] = "0123456789abcdef";
@@ -80,6 +88,14 @@ inline module_descriptor decode_module_descriptor(std::string_view ptx) {
             if(relocations>bytes.size()/16) throw std::runtime_error("too many native module relocations");
             for(uint32_t j=0;j<relocations;++j) { auto offset=number(),target=number(),low=number(),high=number(); g.relocations.push_back({offset,target,uint64_t(low)|(uint64_t(high)<<32)}); }
             result.globals.push_back(std::move(g));
+        }
+    }
+    if (pos != bytes.size()) {
+        if (number() != 0x314b5453 || number() != result.entries.size()) throw std::runtime_error("invalid native stack descriptor");
+        for (auto& entry : result.entries) {
+            entry.stack_bytes = number();
+            if (entry.stack_bytes && (entry.stack_bytes != packet_private_stack_bytes || entry.local_bytes != entry.stack_bytes))
+                throw std::runtime_error("invalid native stack budget");
         }
     }
     if(pos!=bytes.size()) throw std::runtime_error("extra native module payload data");

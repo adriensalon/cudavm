@@ -1,6 +1,7 @@
 #include "compiler.hpp"
 #include "shader_lowering.hpp"
 #include "shader_collectives.hpp"
+#include "shader_local.hpp"
 #include "module_descriptor.hpp"
 #include <algorithm>
 #include <map>
@@ -140,17 +141,8 @@ std::string emit_native_module(const llvm::Module& input) {
         if(named_barriers) shared+=native_named_barrier_shared_bytes;
         if(shared>32768) throw std::runtime_error("native shared storage and collective scratch exceed 32 KiB");
         entry.shared_bytes = uint32_t(shared);
-        uint64_t local=0;
-        for(const auto& bb:f) for(const auto& input:bb) if(auto* allocation=llvm::dyn_cast<llvm::AllocaInst>(&input)) {
-            auto* count=llvm::dyn_cast<llvm::ConstantInt>(allocation->getArraySize()); if(!count) continue;
-            local=llvm::alignTo(local,allocation->getAlign().value()); local+=dl.getTypeAllocSize(allocation->getAllocatedType()).getFixedValue()*count->getZExtValue();
-        }
-        for(const auto& argument:f.args()) if(auto* byval=f.getParamByValType(argument.getArgNo())) {
-            local=llvm::alignTo(local,f.getParamAlign(argument.getArgNo()).value_or(dl.getABITypeAlign(byval)).value());
-            local+=dl.getTypeAllocSize(byval).getFixedValue();
-        }
-        if(local>16384) throw std::runtime_error("native invocation-private storage exceeds 16 KiB");
-        entry.local_bytes=uint32_t(local);
+        entry.local_bytes=shader_local_layout(f).bytes();
+        if (entry.local_bytes == shader_local_capacity) entry.stack_bytes = shader_local_capacity;
         entries.push_back(std::move(entry));
     }
     return cudavm::encode_module_descriptor(entries, globals);

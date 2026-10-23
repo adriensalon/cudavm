@@ -35,6 +35,7 @@ struct directx_device {
     uint64_t epoch = 0;
     bool native_dxil = false;
     bool native_double = false;
+    shader_device_resources resources;
     directx_device(std::shared_ptr<directx_api> input, std::shared_ptr<ID3D12Device> device)
         : api(std::move(input)), resource_owner(std::move(device)), value(resource_owner.get()) {
         D3D12_COMMAND_QUEUE_DESC description{};
@@ -51,8 +52,13 @@ struct directx_device {
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 features{};
         D3D12_FEATURE_DATA_D3D12_OPTIONS base{};
         native_double = SUCCEEDED(value->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,&base,sizeof(base))) && base.DoublePrecisionFloatShaderOps;
+        auto wave_features = value->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1,&features,sizeof(features));
+        if (SUCCEEDED(wave_features) && features.WaveOps) {
+            resources.subgroup_min = features.WaveLaneCountMin; resources.subgroup_max = features.WaveLaneCountMax;
+            resources.total_lanes = features.TotalLaneCount;
+        }
         native_dxil = SUCCEEDED(value->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL,&model,sizeof(model))) && model.HighestShaderModel>=D3D_SHADER_MODEL_6_0
-            && SUCCEEDED(value->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1,&features,sizeof(features))) && features.Int64ShaderOps;
+            && SUCCEEDED(wave_features) && features.Int64ShaderOps;
 #endif
     }
     ~directx_device() { if (event) CloseHandle(event); }
@@ -469,6 +475,7 @@ struct directx_session : session {
         } catch(const std::exception&) { return false; }
     }
     unsigned native_block_limit() const override { return D3D12_CS_THREAD_GROUP_MAX_THREADS_PER_GROUP; }
+    shader_device_resources execution_resources() const override { return owner->resources; }
     shader_resource_limits shader_limits() const override {
         return {D3D12_CS_THREAD_GROUP_MAX_THREADS_PER_GROUP,
             {D3D12_CS_THREAD_GROUP_MAX_X, D3D12_CS_THREAD_GROUP_MAX_Y, D3D12_CS_THREAD_GROUP_MAX_Z},

@@ -75,6 +75,7 @@ struct vulkan_device {
     bool native_spirv = false;
     VkPhysicalDeviceFeatures native_features{};
     bool native_int8 = false;
+    shader_device_resources resources;
     PFN_vkGetDeviceProcAddr get = nullptr;
     interop_capabilities caps;
     uint32_t family = 0;
@@ -147,6 +148,12 @@ struct vulkan_device {
         info.enabledExtensionCount = uint32_t(extensions.size()); info.ppEnabledExtensionNames = extensions.data();
         VkPhysicalDeviceShaderFloat16Int8Features narrow{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
         if (native_spirv) {
+            VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; properties.pNext = &subgroup;
+            instance->load<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &properties);
+            if (subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) {
+                resources.subgroup_min = subgroup.subgroupSize; resources.subgroup_max = subgroup.subgroupSize;
+            }
             VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; features.pNext = &narrow;
             instance->load<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &features);
             native_features.shaderInt64 = features.features.shaderInt64;
@@ -603,6 +610,7 @@ struct vulkan_session : session {
         return true;
     }
     unsigned native_block_limit() const override { return owner->limits.maxComputeWorkGroupInvocations; }
+    shader_device_resources execution_resources() const override { return owner->resources; }
     shader_resource_limits shader_limits() const override {
         shader_resource_limits result; result.threads = owner->limits.maxComputeWorkGroupInvocations;
         std::copy_n(owner->limits.maxComputeWorkGroupSize, 3, result.block.begin());

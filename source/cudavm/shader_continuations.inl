@@ -160,6 +160,12 @@ llvm::Function* make_collective_poll() {
 }
 void make_continuations() {
     if(!kernel_entry) fail(kernel,"collective helper must be inlined into its CUDA kernel");
+    // Fold lowered cmpxchg tuples before spilling live values. Otherwise a
+    // failed CAS can leave an aggregate load/store across scheduler steps,
+    // which the shader targets cannot represent as invocation-private state.
+    llvm::FunctionAnalysisManager analyses;llvm::PassBuilder builder;builder.registerFunctionAnalyses(analyses);
+    llvm::InstSimplifyPass().run(*entry,analyses);
+    analyses.clear();
     struct rendezvous {llvm::CallInst* call;llvm::BasicBlock* wait;unsigned operation;llvm::AllocaInst* generation=nullptr;llvm::BasicBlock* warp_wait=nullptr;llvm::BasicBlock* arrival=nullptr;};
     std::vector<rendezvous> sites;
     for(auto& bb:*entry) for(auto& input:bb) if(auto* call=llvm::dyn_cast<llvm::CallInst>(&input))
@@ -192,7 +198,6 @@ void make_continuations() {
     // Values live across a yield belong to the invocation, including PHI edge
     // updates. Demote before changing edges so loops and critical edges retain
     // their source meaning. Native allocas are hoisted into the new prologue.
-    llvm::FunctionAnalysisManager analyses;llvm::PassBuilder builder;builder.registerFunctionAnalyses(analyses);
     llvm::RegToMemPass().run(*entry,analyses);
     std::vector<llvm::BasicBlock*> quanta;
     std::map<llvm::BasicBlock*,unsigned> states;
@@ -209,6 +214,12 @@ void make_continuations() {
     auto* latch=llvm::BasicBlock::Create(b.getContext(),"continuation.yield",entry);
     auto* exit=llvm::BasicBlock::Create(b.getContext(),"continuation.exit",entry);
     b.SetInsertPoint(prologue);
+    if (local_storage) {
+        // Anchor user private storage in the entry as well as the step helper.
+        // SPIR-V optimizers may otherwise give it a new lifetime on each call.
+        b.CreateStore(b.getInt32(0), b.CreateInBoundsGEP(local_storage->getValueType(), local_storage,
+            {b.getInt32(0), b.getInt32(1)}))->setVolatile(true);
+    }
     std::vector<llvm::AllocaInst*> slots;
     for(auto* bb:quanta) for(auto& input:*bb) if(auto* slot=llvm::dyn_cast<llvm::AllocaInst>(&input)) slots.push_back(slot);
     for(auto* slot:slots) {slot->removeFromParent();b.Insert(slot);}

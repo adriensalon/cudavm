@@ -43,6 +43,25 @@ struct shader_resource_limits {
     std::array<unsigned, 3> grid{65535, 65535, 65535};
     unsigned shared_bytes = 32768;
 };
+// Native execution information is separate from transport admission limits.
+// Missing measurements stay unknown; subgroup widths and storage budgets do
+// not establish kernel residency or forward progress between workgroups.
+struct shader_device_resources {
+    std::optional<unsigned> compute_units, subgroup_min, subgroup_max, total_lanes;
+    std::optional<uint64_t> shared_bytes;
+};
+struct shader_pipeline_resources {
+    std::optional<size_t> max_threads, preferred_thread_multiple;
+    // OpenCL reports workgroup local storage and a minimum private byte count
+    // per work-item. Neither is a bound on the device's resident workgroups.
+    std::optional<uint64_t> shared_bytes, private_bytes;
+    std::optional<unsigned> resident_blocks_per_unit;
+    std::optional<bool> cooperative_progress;
+};
+struct shader_execution_resources {
+    shader_device_resources device;
+    shader_pipeline_resources pipeline;
+};
 int shader_device_attribute(const shader_resource_limits&, CUdevice_attribute);
 struct device_luid_info { std::array<char, 8> bytes{}; unsigned node_mask = 0; };
 struct pci_address {
@@ -388,10 +407,14 @@ struct image_object {
 struct kernel_parameter { size_t offset, size; };
 struct compute_pipeline {
     unsigned direct_buffers = 0;
+    shader_pipeline_resources resources;
     virtual ~compute_pipeline() = default;
 };
 struct kernel {
     virtual ~kernel() = default;
+    virtual shader_execution_resources execution_resources(const launch_shape&) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "native shader resource information is unavailable");
+    }
     virtual CUfunction cuda_function() const { return nullptr; }
     virtual uint64_t graph_generation() const { return 0; }
     virtual bool can_record_launch(std::span<const allocation_binding>) const { return false; }
@@ -478,6 +501,7 @@ struct session {
     virtual shader_resource_limits shader_limits() const {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "shader dispatch resource limits are unavailable");
     }
+    virtual shader_device_resources execution_resources() const { return {}; }
     virtual std::shared_ptr<device_launch_event> create_launch_event() {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "native launch dependency events are unavailable");
     }

@@ -259,6 +259,12 @@ struct opencl_session : session {
         return unsigned(std::min(maximum, size_t(std::numeric_limits<unsigned>::max())));
     }
     shader_resource_limits shader_limits() const override { return opencl_shader_limits(*owner->api, owner->device); }
+    shader_device_resources execution_resources() const override {
+        cl_uint units = 0; cl_ulong shared = 0;
+        check(owner->api->clGetDeviceInfo(owner->device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(units), &units, nullptr), "CL_DEVICE_MAX_COMPUTE_UNITS");
+        check(owner->api->clGetDeviceInfo(owner->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(shared), &shared, nullptr), "CL_DEVICE_LOCAL_MEM_SIZE");
+        shader_device_resources result; result.compute_units = units; result.shared_bytes = shared; return result;
+    }
     void validate_native_spirv_shape(const launch_shape& shape) const override {
         size_t maximum = 0; cl_uint dimensions = 0;
         check(owner->api->clGetDeviceInfo(owner->device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(maximum), &maximum, nullptr), "CL_DEVICE_MAX_WORK_GROUP_SIZE");
@@ -282,9 +288,13 @@ struct opencl_session : session {
             throw failure(CUDA_ERROR_INVALID_IMAGE,"OpenCL native SPIR-V build failed: " + log);
         }
         compiled->kernel = owner->api->clCreateKernel(compiled->program, "main_kernel", &status); check(status,"clCreateKernel native SPIR-V");
-        size_t kernel_threads = 0; cl_ulong local_bytes = 0, local_limit = 0;
+        size_t kernel_threads = 0, preferred = 0; cl_ulong local_bytes = 0, private_bytes = 0, local_limit = 0;
         check(owner->api->clGetKernelWorkGroupInfo(compiled->kernel, owner->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(kernel_threads), &kernel_threads, nullptr), "CL_KERNEL_WORK_GROUP_SIZE");
         check(owner->api->clGetKernelWorkGroupInfo(compiled->kernel, owner->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(local_bytes), &local_bytes, nullptr), "CL_KERNEL_LOCAL_MEM_SIZE");
+        check(owner->api->clGetKernelWorkGroupInfo(compiled->kernel, owner->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(private_bytes), &private_bytes, nullptr), "CL_KERNEL_PRIVATE_MEM_SIZE");
+        check(owner->api->clGetKernelWorkGroupInfo(compiled->kernel, owner->device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(preferred), &preferred, nullptr), "CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE");
+        compiled->resources.max_threads = kernel_threads; compiled->resources.preferred_thread_multiple = preferred;
+        compiled->resources.shared_bytes = local_bytes; compiled->resources.private_bytes = private_bytes;
         check(owner->api->clGetDeviceInfo(owner->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(local_limit), &local_limit, nullptr), "CL_DEVICE_LOCAL_MEM_SIZE");
         require(local_bytes <= local_limit, CUDA_ERROR_NOT_SUPPORTED, "native SPIR-V static shared memory exceeds OpenCL device storage");
         require(uint64_t(shape.block[0]) * shape.block[1] * shape.block[2] <= kernel_threads, CUDA_ERROR_INVALID_VALUE, "native SPIR-V block exceeds compiled OpenCL kernel limits");

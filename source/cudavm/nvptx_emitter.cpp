@@ -38,6 +38,19 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
     resolve_device_function_aliases(*module, true, true);
     resolve_device_data_aliases(*module, true);
     normalize_device_relocations(*module);
+    // NVPTX's legacy alloca-hoisting pass moves every constant-count alloca
+    // to the entry, including repeated allocations whose live addresses escape
+    // a loop iteration. Keep those counts in a native register so they retain
+    // PTX's dynamic stack-allocation semantics at their original program point.
+    for (auto& function : *module) for (auto& block : function) for (auto& instruction : block)
+        if (auto* allocation = llvm::dyn_cast<llvm::AllocaInst>(&instruction); allocation && !allocation->isStaticAlloca())
+            if (auto* count = llvm::dyn_cast<llvm::ConstantInt>(allocation->getArraySize())) {
+                if (count->getValue().getActiveBits() > 64) throw std::runtime_error("native stack allocation count exceeds 64 bits");
+                llvm::IRBuilder<> builder(allocation);
+                auto* signature = llvm::FunctionType::get(builder.getInt64Ty(), {builder.getInt64Ty()}, false);
+                auto* move = llvm::InlineAsm::get(signature, "mov.b64 $0, $1;", "=l,l", false);
+                allocation->setOperand(0, builder.CreateCall(move, {builder.getInt64(count->getZExtValue())}));
+            }
     // Keep an explicit floating-point register before NVPTX splits a packed
     // float store into bytes. Reusing the integer result register directly for
     // add.f32 and byte stores produces a one-bit error in the NVIDIA PTX JIT.
@@ -62,16 +75,23 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
     llvm::TargetOptions settings;
     // Inline instructions from CUDA headers also impose a PTX dialect floor.
     // Packed half comparisons need PTX 6.5; the pinned tanh assembly needs
-    // PTX 7.0 even on SM 75. Never lower a newer architecture's default floor.
+    // PTX 7.0 even on SM 75. Dynamic alloca needs PTX 7.3 and SM 52.
+    // Never lower a newer architecture's default floor.
     unsigned dialect=0;
-    for(const auto& function:*module)for(const auto& block:function)for(const auto& instruction:block)
+    for(const auto& function:*module)for(const auto& block:function)for(const auto& instruction:block) {
+        if (auto* allocation=llvm::dyn_cast<llvm::AllocaInst>(&instruction); allocation && !allocation->isStaticAlloca()) dialect=std::max(dialect,73u);
         if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->isInlineAsm()) {
             auto text=llvm::cast<llvm::InlineAsm>(call->getCalledOperand())->getAsmString();
             if(text.contains(".u32.f16x2"))dialect=std::max(dialect,65u);
             if(text.contains("tanh.approx."))dialect=std::max(dialect,70u);
         }
+    }
     std::string features;
-    if(dialect && architecture.starts_with("sm_") && std::stoi(architecture.substr(3))<80)features="+ptx"+std::to_string(dialect);
+    if (architecture.starts_with("sm_")) {
+        auto sm=std::stoi(architecture.substr(3));
+        if (dialect>=73 && sm<52) throw std::runtime_error("dynamic invocation-private storage requires SM 52 or later");
+        if (dialect && sm<(dialect>=73?87:80)) features="+ptx"+std::to_string(dialect);
+    }
     std::unique_ptr<llvm::TargetMachine> machine(target->createTargetMachine(module->getTargetTriple(), architecture, features, settings, std::nullopt));
     if (!machine) throw std::runtime_error("NVPTX target machine creation failed");
     module->setDataLayout(machine->createDataLayout());

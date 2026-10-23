@@ -1,5 +1,6 @@
 #include "shader_lowering.hpp"
 #include "shader_collectives.hpp"
+#include "shader_local.hpp"
 #include "device_conversions.hpp"
 #include "ptx_import.hpp"
 
@@ -31,12 +32,14 @@
 #include <llvm/Transforms/IPO/GlobalDCE.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Scalar/SCCP.h>
+#include <llvm/Transforms/Scalar/TailRecursionElimination.h>
 #include <llvm/Transforms/Scalar/Scalarizer.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Scalar/InstSimplifyPass.h>
 #include <llvm/Transforms/Scalar/Reg2Mem.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/CallPromotionUtils.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Utils/LowerSwitch.h>
 #include <llvm/Transforms/Utils/FixIrreducible.h>
@@ -163,6 +166,79 @@ void scalar_math(llvm::Module& module) {
         if (replacement) { instruction->replaceAllUsesWith(replacement); instruction->eraseFromParent(); }
     }
 }
+// A closed SSA set of function pointers needs no device code addresses. Carry
+// an integer discriminator through the same selects/PHIs and inline each arm.
+bool lower_local_calls(llvm::Module& module) {
+    std::vector<llvm::CallInst*> pending;
+    for (auto& function : module) for (auto& block : function) for (auto& instruction : block)
+        if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction); call && !call->getCalledFunction() && !call->isInlineAsm()) pending.push_back(call);
+    bool changed = false;
+    for (auto* call : pending) {
+        std::set<llvm::Value*> visited;
+        std::vector<llvm::Function*> targets;
+        std::function<bool(llvm::Value*)> collect = [&](llvm::Value* value) {
+            if (!visited.insert(value).second) return true;
+            if (auto* target = llvm::dyn_cast<llvm::Function>(value)) {
+                if (target->isDeclaration() || target->getFunctionType() != call->getFunctionType() || !llvm::isLegalToPromote(*call, target)) return false;
+                if (std::find(targets.begin(), targets.end(), target) == targets.end()) targets.push_back(target);
+                return true;
+            }
+            if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value)) return collect(select->getTrueValue()) && collect(select->getFalseValue());
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value)) return llvm::all_of(phi->incoming_values(), [&](auto& incoming) { return collect(incoming.get()); });
+            return false;
+        };
+        if (!collect(call->getCalledOperand()) || targets.empty()) continue;
+        std::map<llvm::Value*, llvm::Value*> tags;
+        llvm::IRBuilder<> builder(call);
+        std::function<llvm::Value*(llvm::Value*)> discriminator = [&](llvm::Value* value) -> llvm::Value* {
+            if (auto found = tags.find(value); found != tags.end()) return found->second;
+            if (auto* target = llvm::dyn_cast<llvm::Function>(value))
+                return builder.getInt32(unsigned(std::find(targets.begin(), targets.end(), target) - targets.begin()));
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+                auto* tag = llvm::PHINode::Create(builder.getInt32Ty(), phi->getNumIncomingValues(), "callee.tag", phi->getIterator());
+                tags[value] = tag;
+                for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) tag->addIncoming(discriminator(phi->getIncomingValue(i)), phi->getIncomingBlock(i));
+                return tag;
+            }
+            auto* select = llvm::cast<llvm::SelectInst>(value);
+            auto* yes = discriminator(select->getTrueValue()); auto* no = discriminator(select->getFalseValue());
+            llvm::IRBuilder<> at(select);
+            return tags[value] = at.CreateSelect(select->getCondition(), yes, no, "callee.tag");
+        };
+        auto* tag = discriminator(call->getCalledOperand());
+        auto* before = call->getParent(); auto* function = before->getParent();
+        auto* after = before->splitBasicBlock(call, "call.return"); before->getTerminator()->eraseFromParent();
+        auto* invalid = llvm::BasicBlock::Create(module.getContext(), "call.invalid", function, after);
+        llvm::IRBuilder<>(invalid).CreateUnreachable();
+        builder.SetInsertPoint(before); auto* dispatch = builder.CreateSwitch(tag, invalid, unsigned(targets.size()));
+        auto* result = call->getType()->isVoidTy() ? nullptr : llvm::PHINode::Create(call->getType(), unsigned(targets.size()), "call.result", call->getIterator());
+        for (unsigned i = 0; i < targets.size(); ++i) {
+            auto* arm = llvm::BasicBlock::Create(module.getContext(), "call.target", function, after);
+            auto* direct = llvm::cast<llvm::CallInst>(call->clone()); direct->setCalledFunction(targets[i]); direct->setTailCallKind(llvm::CallInst::TCK_None);
+            builder.SetInsertPoint(arm); builder.Insert(direct); builder.CreateBr(after);
+            dispatch->addCase(builder.getInt32(i), arm); if (result) result->addIncoming(direct, arm);
+        }
+        if (result) call->replaceAllUsesWith(result);
+        call->eraseFromParent(); changed = true;
+        // Dead pointer PHI/select cycles are not trivially dead instruction
+        // chains. Remove the closed dead set so no function addresses reach
+        // target lowering; retain nodes with any remaining observable user.
+        std::set<llvm::Instruction*> dead;
+        for (auto* value : visited) if (auto* instruction = llvm::dyn_cast<llvm::Instruction>(value)) dead.insert(instruction);
+        bool removed;
+        do {
+            removed = false;
+            for (auto at = dead.begin(); at != dead.end();) {
+                if (llvm::any_of((*at)->users(), [&](auto* user) { return !dead.contains(llvm::dyn_cast<llvm::Instruction>(user)); })) {
+                    at = dead.erase(at); removed = true;
+                } else ++at;
+            }
+        } while (removed);
+        for (auto* instruction : dead) instruction->dropAllReferences();
+        for (auto* instruction : dead) instruction->eraseFromParent();
+    }
+    return changed;
+}
 void optimize(llvm::Module& module) {
     for (auto& f : module) if (!f.isDeclaration()) {
         f.removeFnAttr(llvm::Attribute::OptimizeNone); f.removeFnAttr(llvm::Attribute::NoInline);
@@ -177,7 +253,9 @@ void optimize(llvm::Module& module) {
     pb.registerModuleAnalyses(modules); pb.registerCGSCCAnalyses(calls);
     pb.registerFunctionAnalyses(functions); pb.registerLoopAnalyses(loops);
     pb.crossRegisterProxies(loops, functions, calls, modules);
-    llvm::ModulePassManager passes; passes.addPass(llvm::AlwaysInlinerPass());
+    llvm::ModulePassManager passes;
+    passes.addPass(llvm::createModuleToFunctionPassAdaptor(llvm::TailCallElimPass()));
+    passes.addPass(llvm::AlwaysInlinerPass());
     llvm::FunctionPassManager fp;
     fp.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG)); fp.addPass(llvm::PromotePass());
     fp.addPass(llvm::InstCombinePass()); fp.addPass(llvm::SimplifyCFGPass());
@@ -207,7 +285,9 @@ struct lowering {
     std::map<const llvm::Argument*, uint32_t> byval_offsets;
     llvm::GlobalVariable* local_storage = nullptr;
     llvm::AllocaInst* opencl_local = nullptr;
+    llvm::AllocaInst* stack_top = nullptr;
     uint32_t local_bytes = 0;
+    bool arena_local = false;
     bool partial_stores = false;
     bool dynamic_shared = false, collective_storage = false, named_barriers = false;
     llvm::GlobalVariable* named_barrier_state = nullptr;
@@ -373,7 +453,20 @@ struct lowering {
         if (local_space) {
           b.SetInsertPoint(local_space);
           auto* offset = b.CreateURem(b.CreateLShr(b.CreateAnd(lo,b.getInt32(0x3fffffffu)),b.getInt32(2)),b.getInt32(std::max(2u,(local_bytes+3)/4)));
-          auto* ptr = opencl ? b.CreateInBoundsGEP(b.getInt32Ty(),function->getArg(store ? 4 : 2),offset)
+          llvm::Value* ptr = nullptr;
+          if (arena_local) {
+              auto index = [&](bool block, unsigned axis) {
+                  return b.CreateIntrinsic(b.getInt32Ty(), dxil
+                      ? (block ? llvm::Intrinsic::dx_group_id : llvm::Intrinsic::dx_thread_id_in_group)
+                      : (block ? llvm::Intrinsic::spv_group_id : llvm::Intrinsic::spv_thread_id_in_group), {b.getInt32(axis)});
+              };
+              auto* block = b.CreateAdd(index(true,0), b.CreateMul(packet(b.getInt32(0)), b.CreateAdd(index(true,1), b.CreateMul(packet(b.getInt32(1)), index(true,2)))));
+              auto* thread = b.CreateAdd(index(false,0), b.CreateMul(packet(b.getInt32(3)), b.CreateAdd(index(false,1), b.CreateMul(packet(b.getInt32(4)), index(false,2)))));
+              auto* count = b.CreateMul(packet(b.getInt32(3)), b.CreateMul(packet(b.getInt32(4)), packet(b.getInt32(5))));
+              auto* invocation = b.CreateAdd(b.CreateMul(block, count), thread);
+              auto* base = b.CreateLoad(b.getInt32Ty(), word_pointer(0, b.getInt32(packet_stack_base_word)));
+              ptr = word_pointer(0, b.CreateAdd(base, b.CreateAdd(b.CreateMul(invocation, b.getInt32(shader_local_capacity/4)), offset)));
+          } else ptr = opencl ? b.CreateInBoundsGEP(b.getInt32Ty(),function->getArg(store ? 4 : 2),offset)
               : b.CreateInBoundsGEP(local_storage->getValueType(),local_storage,{b.getInt32(0),offset});
           if (store) {
             auto* previous = b.CreateAlignedLoad(b.getInt32Ty(), ptr, llvm::Align(4));
@@ -386,6 +479,28 @@ struct lowering {
         else { b.SetInsertPoint(parameter_space); b.CreateBr(invalid); }
         b.SetInsertPoint(invalid); if (store) b.CreateRetVoid(); else b.CreateRet(b.getInt32(0));
         return function;
+    }
+    llvm::Value* allocate_local(const llvm::AllocaInst& allocation) {
+        if (allocation.getArraySize()->getType()->getIntegerBitWidth() > 64)
+            fail(allocation, "invocation-private allocation count exceeds 64 bits");
+        auto alignment = allocation.getAlign().value();
+        if (alignment > shader_local_capacity) fail(allocation, "invocation-private alignment exceeds 16 KiB");
+        auto size = dl.getTypeAllocSize(allocation.getAllocatedType()).getFixedValue();
+        auto* count = b.CreateZExtOrTrunc(value(allocation.getArraySize()), b.getInt64Ty());
+        auto* top = b.CreateZExt(b.CreateLoad(b.getInt32Ty(), stack_top), b.getInt64Ty());
+        auto* aligned = b.CreateAnd(b.CreateAdd(top, b.getInt64(alignment - 1)), b.getInt64(~uint64_t(alignment - 1)));
+        auto* fits = b.CreateICmpULE(aligned, b.getInt64(shader_local_capacity));
+        if (size) {
+            // Check before multiplying, so a wrapped size cannot alias a frame.
+            auto* available = b.CreateSub(b.getInt64(shader_local_capacity), b.CreateSelect(fits, aligned, b.getInt64(shader_local_capacity)));
+            fits = b.CreateAnd(fits, b.CreateICmpULE(count, b.CreateUDiv(available, b.getInt64(size))));
+        }
+        auto* end = b.CreateAdd(aligned, b.CreateMul(count, b.getInt64(size)));
+        b.CreateStore(b.CreateSelect(fits, b.CreateTrunc(end, b.getInt32Ty()), b.getInt32(shader_local_capacity + 1)), stack_top);
+        auto scope = dxil ? llvm::SyncScope::System : b.getContext().getOrInsertSyncScopeID("device");
+        b.CreateAtomicRMW(llvm::AtomicRMWInst::Or, word_pointer(0, b.getInt32(packet_stack_fault_word)), b.CreateZExt(b.CreateNot(fits), b.getInt32Ty()),
+            llvm::Align(4), llvm::AtomicOrdering::Monotonic, scope);
+        return b.CreateSelect(fits, b.CreateAdd(b.getInt64(0xffffffff80000000ull), aligned), b.getInt64(0xffffffff00000000ull));
     }
     llvm::Value* gep(const llvm::GEPOperator& pointer) {
         llvm::SmallMapVector<llvm::Value*, llvm::APInt, 4> variables; llvm::APInt constant(64, 0);
@@ -968,6 +1083,12 @@ struct lowering {
             if (function->getIntrinsicID() == llvm::Intrinsic::lifetime_start || function->getIntrinsicID() == llvm::Intrinsic::lifetime_end ||
                 function->getIntrinsicID() == llvm::Intrinsic::assume || function->getIntrinsicID() == llvm::Intrinsic::experimental_noalias_scope_decl) return nullptr;
             switch (function->getIntrinsicID()) {
+            case llvm::Intrinsic::stacksave:
+                return stack_top ? b.CreateOr(b.getInt64(0xffffffff80000000ull), b.CreateZExt(b.CreateLoad(b.getInt32Ty(), stack_top), b.getInt64Ty()))
+                    : b.getInt64(0xffffffff80000000ull + local_bytes);
+            case llvm::Intrinsic::stackrestore:
+                if (stack_top) b.CreateStore(b.CreateAnd(b.CreateTrunc(value(instruction.getArgOperand(0)), b.getInt32Ty()), b.getInt32(0x3fffffffu)), stack_top);
+                return nullptr;
             case llvm::Intrinsic::fabs: case llvm::Intrinsic::copysign: {
                 auto* magnitude=b.CreateBitCast(value(instruction.getArgOperand(0)),b.getInt32Ty());
                 auto* bits=b.CreateAnd(magnitude,b.getInt32(0x7fffffffu));
@@ -1088,7 +1209,12 @@ struct lowering {
             auto* previous = atomic(100,value(operation->getPointerOperand()),value(operation->getNewValOperand()),expected,operation->getSuccessOrdering(),operation->getFailureOrdering(),operation->getSyncScopeID());
             values[&input] = b.CreateInsertValue(b.CreateInsertValue(llvm::UndefValue::get(type(input.getType())),previous,0),b.CreateICmpEQ(previous,expected),1); return;
         }
-        if (auto* allocation = llvm::dyn_cast<llvm::AllocaInst>(&input)) { values[&input] = b.getInt64(0xffffffff80000000ull + local_offsets.at(allocation)); return; }
+        if (auto* allocation = llvm::dyn_cast<llvm::AllocaInst>(&input)) {
+            if (auto found = local_offsets.find(allocation); found != local_offsets.end())
+                values[&input] = b.getInt64(0xffffffff80000000ull + found->second);
+            else values[&input] = allocate_local(*allocation);
+            return;
+        }
         if (auto* branch = llvm::dyn_cast<llvm::BranchInst>(&input)) {
             if (branch->isConditional()) b.CreateCondBr(value(branch->getCondition()), blocks.at(branch->getSuccessor(0)), blocks.at(branch->getSuccessor(1)));
             else b.CreateBr(blocks.at(branch->getSuccessor(0))); return;
@@ -1195,20 +1321,10 @@ struct lowering {
             auto* function=call->getCalledFunction(); auto name=function->hasFnAttribute("cudavm.cuda.origin")?function->getFnAttribute("cudavm.cuda.origin").getValueAsString():function->getName();
             auto operation=native_collective(name); collective_storage|=operation>=0; named_barriers|=operation>=36;
         }
-        for (const auto& bb : kernel) for (const auto& input : bb) if (auto* allocation = llvm::dyn_cast<llvm::AllocaInst>(&input)) {
-            auto* count = llvm::dyn_cast<llvm::ConstantInt>(allocation->getArraySize()); if (!count) fail(input, "dynamic invocation-private allocation is unsupported");
-            local_bytes = uint32_t(llvm::alignTo(local_bytes, allocation->getAlign().value()));
-            auto bytes = dl.getTypeAllocSize(allocation->getAllocatedType()).getFixedValue() * count->getZExtValue();
-            if (bytes > 16384 || local_bytes > 16384 - bytes) fail(input, "invocation-private storage exceeds 16 KiB");
-            local_offsets[allocation] = local_bytes; local_bytes += uint32_t(bytes);
-        }
-        if(kernel_entry) for(const auto& argument:kernel.args()) if(auto* byval=kernel.getParamByValType(argument.getArgNo())) {
-            auto alignment=kernel.getParamAlign(argument.getArgNo()).value_or(dl.getABITypeAlign(byval)).value();
-            local_bytes=uint32_t(llvm::alignTo(local_bytes,alignment));
-            auto bytes=dl.getTypeAllocSize(byval).getFixedValue();
-            if(bytes>16384 || local_bytes>16384-bytes) fail(argument,"invocation-private by-value storage exceeds 16 KiB");
-            byval_offsets[&argument]=local_bytes;local_bytes+=uint32_t(bytes);
-        }
+        shader_local_layout local_layout(kernel);
+        local_offsets = local_layout.allocations; byval_offsets = local_layout.arguments;
+        local_bytes = local_layout.bytes();
+        arena_local = !opencl && local_bytes == shader_local_capacity;
         std::set<const llvm::Constant*> visited;
         std::function<void(const llvm::Value*)> collect = [&](const llvm::Value* value) {
             auto* constant = llvm::dyn_cast<llvm::Constant>(value); if (!constant || !visited.insert(constant).second) return;
@@ -1255,7 +1371,7 @@ struct lowering {
             collective_control->setAlignment(llvm::Align(8));
             if(named_barriers) named_barrier_state=make_state(48,"cudavm.barrier.state");
         }
-        if (local_bytes && !opencl) {
+        if (local_bytes && !opencl && !arena_local) {
             auto* local_type = llvm::ArrayType::get(b.getInt32Ty(), std::max(2u,(local_bytes + 3) / 4));
             local_storage = new llvm::GlobalVariable(*result, local_type, false, llvm::GlobalValue::InternalLinkage, llvm::UndefValue::get(local_type), "cudavm.local", nullptr, llvm::GlobalVariable::NotThreadLocal, dxil ? 0 : 10);
         }
@@ -1272,6 +1388,10 @@ struct lowering {
         for (const auto& block : kernel) blocks[&block] = llvm::BasicBlock::Create(b.getContext(), block.getName(), entry);
         b.SetInsertPoint(blocks.at(&kernel.getEntryBlock()));
         if (local_bytes && opencl) opencl_local=b.CreateAlloca(llvm::ArrayType::get(b.getInt32Ty(),std::max(2u,(local_bytes+3)/4)),nullptr,"cudavm.local");
+        if (local_layout.dynamic) {
+            stack_top = b.CreateAlloca(b.getInt32Ty(), nullptr, "cudavm.stack.top");
+            b.CreateStore(b.getInt32(local_layout.static_bytes), stack_top);
+        }
         uint64_t offset = 0;
         for (unsigned i = 0; i < kernel.arg_size(); ++i) {
             if(!kernel_entry) {values[kernel.getArg(i)]=entry->getArg(i);continue;}
@@ -1355,6 +1475,7 @@ std::unique_ptr<llvm::Module> prepare_native_shader_module(const llvm::Module& i
     lower_half_math_intrinsics(*module);
     scalar_math(*module);
     optimize(*module);
+    while (lower_local_calls(*module)) optimize(*module);
     return module;
 }
 std::unique_ptr<llvm::Module> lower_native_shader(const llvm::Module& input, const std::string& symbol, shader_environment environment, const std::array<unsigned,3>& block) {
@@ -1413,13 +1534,13 @@ std::unique_ptr<llvm::Module> lower_native_shader(const llvm::Module& input, con
         std::string text;llvm::raw_string_ostream output(text);module->print(output,nullptr);
         write_file(std::string(directory)+"/"+std::to_string(std::hash<std::string>{}(symbol))+"-"+std::to_string(unsigned(environment))+".ll",text);
     }
-    // GLSL switch selectors are 32-bit. Expand wider selectors into ordinary
+    // Shader switch selectors are 32-bit. Expand other selectors into ordinary
     // comparisons/branches in LLVM, with the pass updating PHI predecessors.
     // The same native CFG works on every shader adapter.
     for(auto& function:*module) if(!function.isDeclaration()) {
         bool wide=false;
         for(const auto& bb:function) if(auto* dispatch=llvm::dyn_cast<llvm::SwitchInst>(bb.getTerminator()))
-            wide|=dispatch->getCondition()->getType()->isIntegerTy(64) || function.getName().starts_with("cudavm.native.helper.");
+            wide|=!dispatch->getCondition()->getType()->isIntegerTy(32) || function.getName().starts_with("cudavm.native.helper.");
         if(wide) {
             llvm::FunctionAnalysisManager analyses;llvm::PassBuilder builder;builder.registerFunctionAnalyses(analyses);
             llvm::LowerSwitchPass().run(function,analyses);
