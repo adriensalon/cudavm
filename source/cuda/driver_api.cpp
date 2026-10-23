@@ -263,12 +263,22 @@ void drain_context_work(const std::shared_ptr<context>& owner) {
     });
     require(!owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "context is being destroyed");
 }
+template<class F> auto observe_context_errors(const std::shared_ptr<context>& owner, F function) {
+    try { return function(); }
+    catch (const failure& error) {
+        if (error.code == CUDA_ERROR_ASSERT) owner->native->device_fault.store(CUDA_ERROR_ASSERT);
+        throw;
+    }
+}
 template<class F> auto native_call(const std::shared_ptr<context>& owner, F function, bool capture_safe = false) {
-    if (!capture_safe) capture_unsafe(owner);
-    drain_context_work(owner);
-    auto domain = command_domain_read(owner->command_domain);
-    std::lock_guard lock(owner->execution);
-    return function();
+    owner->native->check_device_fault();
+    return observe_context_errors(owner, [&] {
+        if (!capture_safe) capture_unsafe(owner);
+        drain_context_work(owner);
+        auto domain = command_domain_read(owner->command_domain);
+        std::lock_guard lock(owner->execution);
+        return function();
+    });
 }
 state& global() {
     // GPU drivers and the OpenGL owner thread cannot be called from Windows
@@ -362,7 +372,7 @@ void validate_context_flags(unsigned flags, bool allow_map_host = true) {
         CUDA_ERROR_NOT_SUPPORTED, "GPU coredump flags require native CUDA support");
 }
 template<class F> auto context_configuration(const std::shared_ptr<context>& owner, F function) {
-    std::lock_guard lock(owner->execution); return function();
+    std::lock_guard lock(owner->execution); owner->native->check_device_fault(); return observe_context_errors(owner, function);
 }
 void set_context_flags(const std::shared_ptr<context>& owner, unsigned flags) {
     validate_context_flags(flags);

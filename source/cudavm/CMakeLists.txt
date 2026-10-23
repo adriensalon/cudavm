@@ -3,7 +3,7 @@
 cudavm_add_component(compiler compiler_api.cpp translation_unit_api.cpp linker_api.cpp source_api.cpp
     compiler_resources.cpp cuda_frontend.cpp nvrtc_frontend.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/embedded_headers.cpp"
-    ptx_import.cpp image_api.cpp device_numeric_ir.cpp nvptx_emitter.cpp native_emission.cpp
+    ptx_import.cpp image_api.cpp device_numeric_ir.cpp device_services.cpp nvptx_emitter.cpp native_emission.cpp
     spirv_emitter.cpp shader_lowering.cpp dxil_emitter.cpp module_descriptor.cpp
     device_passes.cpp host_embedding.cpp compiler_io.cpp)
 set(cudavm_install_targets ${cudavm_install_targets} PARENT_SCOPE)

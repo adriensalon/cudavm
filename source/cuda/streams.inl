@@ -60,6 +60,7 @@ std::shared_ptr<native_queue> stream_native(const std::shared_ptr<context>& owne
 completion submit_stream(const std::shared_ptr<context>& owner, CUstream handle, std::function<void()> action,
                          std::vector<completion> additional = {}, int priority = 0, std::function<device_work()> start = {}, bool exclusive = false,
                          std::function<void(std::exception_ptr)> notify = {}, std::shared_ptr<native_queue> lane = {}) {
+    owner->native->check_device_fault();
     auto stream = stream_lookup(handle, owner);
     capture_check_stream(stream);
     if (stream->capture) {
@@ -95,11 +96,13 @@ completion submit_stream(const std::shared_ptr<context>& owner, CUstream handle,
     ++stream->sequence; stream->tail = done; return done;
 }
 void wait_stream(const std::shared_ptr<context>& owner, CUstream handle) {
+    owner->native->check_device_fault();
     auto done = submit_stream(owner, handle, [] {});
     auto schedule = stream_schedule(owner, stream_lookup(handle, owner));
-    driver_wait([&] { done->wait(schedule); });
+    observe_context_errors(owner, [&] { driver_wait([&] { done->wait(schedule); }); });
 }
 void synchronize_context(const std::shared_ptr<context>& owner) {
+    owner->native->check_device_fault();
     for (auto& item : owner->streams) if (auto stream = item.lock()) if (stream->capture) {
         stream->capture->invalidated = true;
         throw failure(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, "cannot synchronize a context containing capturing streams");
@@ -128,10 +131,13 @@ void stream_status(CUstream handle, bool wait) {
     }
     auto owner = stream->owner.lock();
     // NULL/legacy queries and synchronization include previous blocking work.
+    owner->native->check_device_fault();
     auto dependencies = stream->legacy ? stream_dependencies(owner, stream) : std::vector<completion>{stream->tail};
     auto schedule = stream_schedule(owner, stream);
-    if (wait) driver_wait([&] { for (auto& done : dependencies) if (done) done->wait(schedule); });
-    else for (auto& done : dependencies) if (done) done->query();
+    observe_context_errors(owner, [&] {
+        if (wait) driver_wait([&] { for (auto& done : dependencies) if (done) done->wait(schedule); });
+        else for (auto& done : dependencies) if (done) done->query();
+    });
     if (wait) pool_synchronize();
 }
 CUstream create_stream(unsigned flags, int priority) {
@@ -190,9 +196,10 @@ void event_status(CUevent handle, bool wait) {
         throw failure(CUDA_ERROR_CAPTURED_EVENT, "cannot query or synchronize a captured event");
     }
     auto& event = event_lookup(handle);
+    auto owner = event.owner.lock(); owner->native->check_device_fault();
     auto done = event.record;
     auto schedule = event.flags & CU_EVENT_BLOCKING_SYNC ? unsigned(CU_CTX_SCHED_BLOCKING_SYNC) : context_schedule(event.owner.lock());
-    if (done) { if (wait) driver_wait([&] { done->wait(schedule); }); else done->query(); }
+    observe_context_errors(owner, [&] { if (done) { if (wait) driver_wait([&] { done->wait(schedule); }); else done->query(); } });
     if (wait) pool_synchronize();
 }
 void event_elapsed(float* output, CUevent start, CUevent end) {

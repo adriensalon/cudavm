@@ -4,10 +4,13 @@
 #include "shader_memory.hpp"
 #include "../cudavm/module_descriptor.hpp"
 #include "../cudavm/shader_packet.hpp"
+#include "../cudavm/device_services.hpp"
 #include "../cudavm/spirv_artifact.hpp"
 #include "../cudavm/dxil_artifact.hpp"
 #include <cstdlib>
 #include <array>
+#include <bit>
+#include <cstdio>
 #include <cctype>
 #include <fstream>
 #include <iterator>
@@ -64,9 +67,11 @@ struct shader_kernel : kernel {
         auto found = std::find_if(variants.begin(), variants.end(), [&](const auto& v) { return v.key == key; });
         if (found != variants.end()) variants.splice(variants.begin(), variants, found);
         else {
+            if (std::getenv("CUDAVM_TRACE_NATIVE")) std::fprintf(stderr, "shader prepare %s\n", entry.symbol.c_str());
             auto pipeline = owner.kind() == cudavmBackendDirectX ? owner.compile_native_dxil(native_code(shape), shape)
                 : owner.compile_native_spirv(cudavm::decode_spirv_words(native_code(shape), owner.kind() == cudavmBackendOpenCL ? nullptr : shape.block, owner.kind() != cudavmBackendOpenCL), shape);
             variants.push_front({key, std::shared_ptr<compute_pipeline>(std::move(pipeline))});
+            if (std::getenv("CUDAVM_TRACE_NATIVE")) std::fprintf(stderr, "shader prepared %s\n", entry.symbol.c_str());
             if (variants.size() > 16) variants.pop_back();
         }
         return variants.front().pipeline;
@@ -117,12 +122,18 @@ struct shader_kernel : kernel {
         for (auto parameter : entry.parameters) result.push_back({parameter.offset, parameter.size});
         return result;
     }
+    uint32_t private_stride_bytes() const {
+        if (entry.services & device_service_output) return std::bit_ceil(std::max(16u, entry.local_bytes));
+        if (owner.kind() == cudavmBackendOpenCL && !entry.call_frames) return 0;
+        return entry.stack_bytes;
+    }
     size_t stack_backing_bytes(const launch_shape& shape, size_t arena_bytes) const {
-        if (!entry.stack_bytes || (owner.kind() == cudavmBackendOpenCL && !entry.call_frames)) return 0;
+        auto stride = private_stride_bytes();
+        if (!stride) return 0;
         uint64_t invocations = 1;
         auto capacity = std::min(owner.shader_arena_capacity(), packet_arena_capacity);
         require(arena_bytes <= capacity, CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES, "shader arena exceeds native capacity");
-        auto available = (capacity - arena_bytes) / entry.stack_bytes;
+        auto available = (capacity - arena_bytes) / stride;
         auto multiply = [&](unsigned dimension) {
             require(dimension && invocations <= available / dimension, CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES,
                 "shader invocation stacks exceed device transport capacity");
@@ -130,9 +141,10 @@ struct shader_kernel : kernel {
         };
         for (auto dimension : shape.grid) multiply(dimension);
         for (auto dimension : shape.block) multiply(dimension);
-        return size_t(invocations) * entry.stack_bytes;
+        return size_t(invocations) * stride;
     }
     void validate_shape(const launch_shape& shape) {
+        owner.check_device_fault();
         const auto& options = shape.options;
         if (options.access_policy) {
             validate_access_policy(*options.access_policy);
@@ -164,6 +176,7 @@ struct shader_kernel : kernel {
             uint64_t pointer = 0; std::memcpy(&pointer, bytes.data() + parameter.offset, sizeof(pointer));
             if (!pointer) continue;
             if (uint32_t(pointer >> 32) == packet_function_high_word) continue;
+            if (owner.device_heap && pointer >= device_heap_address && pointer - device_heap_address < owner.device_heap->size) continue;
             bool found = std::any_of(bindings.begin(), bindings.end(), [&](auto binding) {
                 return pointer >= binding.address && (pointer - binding.address <= binding.native->size);
             });
@@ -175,7 +188,7 @@ struct shader_kernel : kernel {
         wait_device(enqueue_launch(shape, parameters, extra, bindings, nullptr));
     }
     bool can_record_launch(std::span<const allocation_binding> bindings) const override {
-        return owner.command_regions() && !entry.stack_bytes && !owner.profile->enabled &&
+        return owner.command_regions() && !entry.stack_bytes && !entry.services && !owner.device_heap && !owner.profile->enabled &&
             std::all_of(bindings.begin(), bindings.end(), [&](auto binding) {
                 return !binding.surface_descriptor && owner.can_record_fill(*binding.native, 0, binding.native->size) &&
                     binding.native->size % 4 == 0 && binding.native->storage_offset() % 4 == 0;
@@ -200,11 +213,33 @@ struct shader_kernel : kernel {
             require(ended&&got_buffer&&got_size&&packed_size>=parameter_bytes&&(!parameter_bytes||packed),CUDA_ERROR_INVALID_VALUE,"incomplete packed launch parameters");
         } else require(entry.parameters.empty()||parameters,CUDA_ERROR_INVALID_VALUE,"missing kernel parameters");
         require_native(shape);
-        auto memory = plan_shader_memory(owner, bindings);
+        std::vector<allocation_binding> service_bindings(bindings.begin(), bindings.end());
+        prepare_shader_services(owner, entry.services);
+        auto heap = owner.device_heap;
+        std::shared_ptr<buffer> output;
+        std::shared_ptr<std::vector<std::byte>> output_initial;
+        if (heap) service_bindings.push_back({device_heap_address, heap.get()});
+        if (entry.services & device_service_output) {
+            output = owner.allocate(owner.device_output_limit);
+            output_initial = std::make_shared<std::vector<std::byte>>(output->size);
+            uint32_t slots = uint32_t((output->size - device_output_header_bytes) / device_output_record_bytes);
+            std::memcpy(output_initial->data() + 4, &slots, 4);
+            service_bindings.push_back({device_output_address, output.get()});
+            owner.device_output_used = true;
+        }
+        auto memory = plan_shader_memory(owner, service_bindings);
+        std::array<uint32_t, 2> service_routes{};
+        for (const auto& record : memory.records) {
+            auto address = join_packet_word64(record.address);
+            if (address == device_heap_address || address == device_output_address) {
+                require(record.offset % 4 == 0 && record.offset / 4 < (1ull << 30), CUDA_ERROR_OUT_OF_MEMORY, "device service route exceeds native capacity");
+                service_routes[address == device_heap_address ? 0 : 1] = uint32_t(record.offset / 4) | (record.binding << 30);
+            }
+        }
         size_t arena_size = memory.arena_bytes;
         uint32_t stack_word_offset = 0;
         if (auto stack_bytes = stack_backing_bytes(shape, arena_size)) {
-            stack_word_offset = uint32_t(arena_size / 4);
+            stack_word_offset = entry.services & device_service_output ? uint32_t(arena_size) | uint32_t(std::countr_zero(private_stride_bytes() / 4)) : uint32_t(arena_size / 4);
             arena_size += stack_bytes;
         }
         std::vector<std::byte> packet((32+parameter_bytes+15)&~size_t(15));
@@ -259,11 +294,13 @@ struct shader_kernel : kernel {
             auto payload=std::make_shared<std::vector<std::byte>>(std::move(packet));
             auto zero=std::make_shared<std::array<std::byte,packet_arena_header_bytes>>();
             std::memcpy(zero->data()+packet_stack_base_word*4, &stack_word_offset, 4);
+            std::memcpy(zero->data() + 24, service_routes.data(), sizeof(service_routes));
             auto tasks=std::make_shared<device_group>();
             tasks->tasks.reserve(2 * memory.staged.size() + 3);
             // Retain host packet storage (OpenCL borrows it), pipelines and
             // every transfer fence until writeback completes, including errors.
-            auto completion=std::make_shared<device_continuation>(tasks,[this,pipeline,payload,zero,recorded_arena,recorded_args,launch_arena,check_image_fault,check_stack_fault] {
+            auto completion=std::make_shared<device_continuation>(tasks,[this,pipeline,payload,zero,recorded_arena,recorded_args,launch_arena,check_image_fault,check_stack_fault,heap,output,output_initial] {
+                complete_shader_services(owner, output.get(), launch_arena, entry.services);
                 if (check_image_fault) {
                     uint32_t fault = 0; owner.read(*launch_arena, 8, std::as_writable_bytes(std::span(&fault, 1)));
                     require(!fault, CUDA_ERROR_ILLEGAL_ADDRESS, "surface access is outside the array bounds");
@@ -275,6 +312,7 @@ struct shader_kernel : kernel {
             });
             if (recording) dynamic_cast<command_region_queue&>(*queue).resources.push_back(completion);
             tasks->tasks.push_back(owner.enqueue_write(*launch_arena,0,*zero,queue));
+            if (output) tasks->tasks.push_back(owner.enqueue_write(*output, 0, *output_initial, queue));
             for(auto range:memory.staged) tasks->tasks.push_back(owner.enqueue_copy(*launch_arena,range.offset,*range.native,range.first,range.bytes,queue));
             tasks->tasks.push_back(owner.enqueue_write(*launch_args,0,*payload,queue));
             tasks->tasks.push_back(owner.enqueue_dispatch_bound(*pipeline,shape,*launch_arena,*launch_args,direct,queue));
@@ -282,14 +320,17 @@ struct shader_kernel : kernel {
             return recording ? device_work{} : completion;
         }
         // Keep the reserved transport prefix initialized between launches.
-        std::array<std::byte,packet_arena_header_bytes> zero{};std::memcpy(zero.data()+packet_stack_base_word*4, &stack_word_offset, 4);owner.write(*launch_arena,0,zero);
+        if (output) owner.write(*output, 0, *output_initial);
+        std::array<std::byte,packet_arena_header_bytes> zero{};std::memcpy(zero.data()+packet_stack_base_word*4, &stack_word_offset, 4);
+        std::memcpy(zero.data() + 24, service_routes.data(), sizeof(service_routes)); owner.write(*launch_arena,0,zero);
         for(auto range:memory.staged) owner.copy(*launch_arena,range.offset,*range.native,range.first,range.bytes);
         owner.write(*launch_args,0,packet);
         // Context transport ordering prevents another command from changing
         // the shared heap before its complete writeback has been published.
-        auto continuation = std::make_shared<device_continuation>(device_work{}, [this, staged = std::move(memory.staged), pipeline,recorded_arena,recorded_args,launch_arena,check_image_fault,check_stack_fault] {
+        auto continuation = std::make_shared<device_continuation>(device_work{}, [this, staged = std::move(memory.staged), pipeline,recorded_arena,recorded_args,launch_arena,check_image_fault,check_stack_fault,heap,output,output_initial] {
             (void)pipeline; // Keep evicted pipeline variants alive through GPU completion.
             for(auto range:staged) owner.copy(*range.native,range.first,*launch_arena,range.offset,range.bytes);
+            complete_shader_services(owner, output.get(), launch_arena, entry.services);
             if (check_image_fault) {
                 uint32_t fault = 0; owner.read(*launch_arena, 8, std::as_writable_bytes(std::span(&fault, 1)));
                 require(!fault, CUDA_ERROR_ILLEGAL_ADDRESS, "surface access is outside the array bounds");
@@ -386,6 +427,7 @@ std::shared_ptr<executable> session::load_image(const void* image,unsigned count
             if(!entry.code.empty()) cudavm::decode_dxil_variants(entry.code);
             auto symbol=entry.symbol; result->dxil_entries.emplace(std::move(symbol),std::move(entry));
         }
+        for (const auto& entry : result->entries) prepare_shader_services(*this, entry.services);
         return result;
     }
     catch(const failure&) { throw; }

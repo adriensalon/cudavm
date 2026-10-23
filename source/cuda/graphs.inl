@@ -647,6 +647,7 @@ void graph_exec_child_replace(CUgraphExec handle, CUgraphNode node, CUgraph chil
 void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
     auto& value = graph_exec_lookup(handle); auto owner = value.owner.lock();
     require(current() == owner, CUDA_ERROR_INVALID_CONTEXT, "executable graph belongs to another context");
+    owner->native->check_device_fault();
     auto target = stream_lookup(stream, owner); capture_check_stream(target);
     if (target->capture) {
         if (graph_has_memory(value.nodes) || value.native) {

@@ -3,7 +3,7 @@ foreach(backend IN LISTS CUDAVM_ENABLED_BACKENDS)
     list(APPEND backend_sources "${backend}_backend.cpp")
 endforeach()
 cudavm_add_component(cuda driver_api.cpp procedure_address.cpp opengl_graphics.cpp registry.cpp host_memory.cpp
-    shader_module.cpp shader_ptx.cpp ${backend_sources})
+    shader_module.cpp shader_services.cpp shader_ptx.cpp ${backend_sources})
 set(cudavm_install_targets ${cudavm_install_targets} PARENT_SCOPE)
 foreach(linkage shared static)
     if(NOT TARGET cudavm_cuda_${linkage})

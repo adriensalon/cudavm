@@ -69,6 +69,12 @@ __device__ inline __cuda_builtin_gridDim_t::operator uint3() const { return uint
 extern "C" __device__ void __cudavm_rtc_syncthreads();
 #define __syncthreads() __cudavm_rtc_syncthreads()
 extern "C" __device__ void __trap();
+extern "C" __device__ void* malloc(__SIZE_TYPE__);
+extern "C" __device__ void free(void*);
+extern "C" __device__ void* __nv_aligned_device_malloc(__SIZE_TYPE__, __SIZE_TYPE__);
+extern "C" __device__ int printf(const char*, ...);
+extern "C" __device__ int vprintf(const char*, const char*);
+extern "C" __device__ void __assertfail(const char*, const char*, unsigned, const char*, __SIZE_TYPE__);
 extern "C" __device__ inline void* memcpy(void* destination,const void* source,__SIZE_TYPE__ bytes) {return __builtin_memcpy(destination,source,bytes);}
 extern "C" __device__ __attribute__((convergent)) void __cudavm_rtc_barrier_sync(unsigned);
 extern "C" __device__ __attribute__((convergent)) void __cudavm_rtc_barrier_count(unsigned,unsigned);

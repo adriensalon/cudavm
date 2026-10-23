@@ -17,7 +17,7 @@
 namespace cudavm {
 inline constexpr uint64_t shader_function_address_base = uint64_t(packet_function_high_word) << 32;
 inline bool shader_native_helper(const llvm::Function& function) {
-    return function.hasFnAttribute("cudavm.math") || function.getName().starts_with("_ZN13cudavm")
+    return function.hasFnAttribute("cudavm.math") || function.hasFnAttribute("cudavm.service.helper") || function.getName().starts_with("_ZN13cudavm")
         || function.getName().starts_with("__cudavm_native_");
 }
 struct shader_call_frame {

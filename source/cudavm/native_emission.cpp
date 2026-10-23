@@ -1,4 +1,5 @@
 #include "native_emission.hpp"
+#include "device_services.hpp"
 #include "spirv_emitter.hpp"
 #include "dxil_emitter.hpp"
 #include <algorithm>
@@ -137,7 +138,7 @@ llvm::json::Object inspect_native(const llvm::Module& portable, native_target ta
         if (function.getName().starts_with("llvm.nvvm."))
             throw std::runtime_error("native NVVM operation in portable IR: " + function.getName().str());
         if (function.isDeclaration() && !function.use_empty() && !function.isIntrinsic()
-            && !function.hasFnAttribute("cudavm.cuda.origin"))
+            && !function.hasFnAttribute("cudavm.cuda.origin") && !device_service(function.getName().str()))
             throw std::runtime_error("unresolved native device function: " + function.getName().str());
         if (function.hasFnAttribute("cudavm.cuda.origin")) {
             requirements.insert("cuda-semantic-operations");

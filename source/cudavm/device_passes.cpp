@@ -4,6 +4,7 @@
 #include "device_simd.hpp"
 #include "device_dpx.hpp"
 #include "device_math.hpp"
+#include "device_services.hpp"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -84,6 +85,14 @@ void optimize_closed(llvm::Module& module, bool specialize) {
     passes.run(module, modules);
 }
 void close_graph(llvm::Module& module) {
+    if (auto* output = module.getFunction("vprintf")) {
+        // CUDA defines the null-format return value. Host stdio declarations
+        // can otherwise attach nonnull to Clang's lowered device call.
+        output->removeParamAttr(0, llvm::Attribute::NonNull);
+        for (auto* user : output->users()) if (auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+            call->removeParamAttr(0, llvm::Attribute::NonNull);
+    }
+    validate_device_services(module);
     for (auto& function : module) {
         if (function.isDeclaration() || function.hasFnAttribute("cudavm.kernel")) continue;
         // Device linking is complete. Only kernels are public roots; LLVM's
@@ -94,7 +103,7 @@ void close_graph(llvm::Module& module) {
     optimize_closed(module, false);
     for (auto& function : module) {
         if (!function.isDeclaration() || function.use_empty() || function.isIntrinsic()
-            || function.hasFnAttribute("cudavm.cuda.origin")) continue;
+            || function.hasFnAttribute("cudavm.cuda.origin") || device_service(function.getName().str())) continue;
         throw std::runtime_error("unresolved device symbol: " + function.getName().str());
     }
     for (auto& function : module)

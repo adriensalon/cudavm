@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <optional>
 #include <mutex>
+#include <string_view>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/IRBuilder.h>
@@ -26,6 +27,36 @@ std::string emit_cuda(const llvm::Module& portable, const std::string& architect
 }
 std::string emit_cuda_ir(const llvm::Module& input, const std::string& architecture, std::string* target_data_layout) {
     auto module = llvm::CloneModule(input);
+    // Clang lowers printf to the driver's vprintf protocol. Preserve CUDA's
+    // null-format result even when that lower-level service expects a string.
+    // Device malloc also cannot represent an allocation whose size wraps its
+    // mandatory sixteen-byte alignment. Guard before calling the native service.
+    for (const char* name : {"vprintf", "malloc"}) if (auto* native = module->getFunction(name); native && native->isDeclaration()) {
+        bool output = std::string_view(name) == "vprintf";
+        auto* signature = native->getFunctionType();
+        bool supported = !signature->isVarArg() && (output
+            ? signature->getNumParams() == 2 && signature->getReturnType()->isIntegerTy(32) && signature->getParamType(0)->isPointerTy() && signature->getParamType(1)->isPointerTy()
+            : signature->getNumParams() == 1 && signature->getReturnType()->isPointerTy() && signature->getParamType(0)->isIntegerTy(64));
+        if (!supported) continue;
+        std::vector<llvm::CallInst*> calls;
+        for (auto* user : native->users()) if (auto* call = llvm::dyn_cast<llvm::CallInst>(user); call && call->getCalledFunction() == native) calls.push_back(call);
+        if (calls.empty()) continue;
+        if (output) { native->removeParamAttr(0, llvm::Attribute::NonNull); for (auto* call : calls) call->removeParamAttr(0, llvm::Attribute::NonNull); }
+        auto* checked = llvm::Function::Create(signature, llvm::GlobalValue::InternalLinkage, std::string("__cudavm_native_checked_") + name, *module);
+        checked->setCallingConv(native->getCallingConv()); checked->addFnAttr(llvm::Attribute::AlwaysInline);
+        auto* first = llvm::BasicBlock::Create(module->getContext(), "entry", checked);
+        auto* failed = llvm::BasicBlock::Create(module->getContext(), "unavailable", checked);
+        auto* invoke = llvm::BasicBlock::Create(module->getContext(), "native", checked);
+        llvm::IRBuilder<> builder(first);
+        auto* invalid = output ? builder.CreateICmpEQ(checked->getArg(0), llvm::Constant::getNullValue(checked->getArg(0)->getType()))
+            : builder.CreateICmpUGT(checked->getArg(0), builder.getInt64(UINT64_MAX - 15));
+        builder.CreateCondBr(invalid, failed, invoke);
+        builder.SetInsertPoint(failed); builder.CreateRet(output ? static_cast<llvm::Value*>(builder.getInt32(-1)) : llvm::Constant::getNullValue(signature->getReturnType()));
+        builder.SetInsertPoint(invoke);
+        std::vector<llvm::Value*> arguments; for (auto& argument : checked->args()) arguments.push_back(&argument);
+        auto* result = builder.CreateCall(native, arguments); result->setCallingConv(native->getCallingConv()); builder.CreateRet(result);
+        for (auto* call : calls) call->setCalledFunction(checked);
+    }
     lower_half_math_intrinsics(*module);
     for(const auto& function:*module)for(const auto& block:function)for(const auto& instruction:block)
         if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->getType()->isHalfTy() && call->getCalledFunction() && call->getCalledFunction()->isIntrinsic()) {

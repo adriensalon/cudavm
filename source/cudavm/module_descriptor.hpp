@@ -18,6 +18,7 @@ struct kernel_descriptor {
     uint32_t stack_bytes = 0;
     uint32_t memory_abi = packet_memory_abi;
     bool call_frames = false;
+    uint32_t services = 0;
 };
 struct global_relocation { uint32_t offset, target; uint64_t addend; };
 struct global_descriptor { std::string symbol; uint32_t alignment; std::string initializer; std::vector<global_relocation> relocations; };
@@ -51,6 +52,10 @@ inline std::string encode_module_descriptor(const std::vector<kernel_descriptor>
     if (std::any_of(entries.begin(), entries.end(), [](const auto& entry) { return entry.call_frames; })) {
         number(0x314c4143); number(uint32_t(entries.size()));
         for (const auto& entry : entries) number(entry.call_frames ? 1u : 0u);
+    }
+    if (std::any_of(entries.begin(), entries.end(), [](const auto& entry) { return entry.services != 0; })) {
+        number(0x31565253); number(uint32_t(entries.size()));
+        for (const auto& entry : entries) number(entry.services);
     }
     // ADR2 makes incompatible loaders reject widened records and native slots.
     number(0x32524441); number(uint32_t(entries.size()));
@@ -117,6 +122,14 @@ inline module_descriptor decode_module_descriptor(std::string_view ptx) {
                 auto flags = number();
                 if (flags > 1 || (flags && !entry.stack_bytes)) throw std::runtime_error("invalid native call stack");
                 entry.call_frames = flags != 0;
+            }
+            trailer = number();
+        }
+        if (trailer == 0x31565253) {
+            if (number() != result.entries.size()) throw std::runtime_error("invalid native service descriptor");
+            for (auto& entry : result.entries) {
+                entry.services = number();
+                if (entry.services & ~7u || ((entry.services & 4u) && !(entry.services & 2u))) throw std::runtime_error("invalid native service flags");
             }
             trailer = number();
         }

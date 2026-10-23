@@ -18,7 +18,16 @@ extern "C" NATIVE_OPT_EXPORT int cudavmOptimizeNativeSpirv(const uint32_t* input
     try {
         spvtools::Optimizer optimizer(SPV_ENV_OPENGL_4_5);std::string message;
         optimizer.SetMessageConsumer([&](spv_message_level_t,const char*,const spv_position_t&,const char* text) {if(text)message+=std::string(text)+"\n";});
-        optimizer.RegisterPerformancePasses();std::vector<uint32_t> words;
+        // The owned emitter deliberately keeps dispatcher spill slots in
+        // memory. SSA promotion makes a PHI arm for every slot/state pair,
+        // causing quadratic GLSL growth and pathological driver compilation.
+        optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass());
+        optimizer.RegisterPass(spvtools::CreateEliminateDeadFunctionsPass());
+        optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+        optimizer.RegisterPass(spvtools::CreateSimplificationPass());
+        optimizer.RegisterPass(spvtools::CreateCFGCleanupPass());
+        optimizer.RegisterPass(spvtools::CreateCompactIdsPass());
+        std::vector<uint32_t> words;
         if(!optimizer.Run(input,count,&words)) {report(message);return 1;}
         output(words.data(),words.size(),user);return 0;
     } catch(const std::bad_alloc&) {report("native SPIR-V optimization allocation failed");return 2;}

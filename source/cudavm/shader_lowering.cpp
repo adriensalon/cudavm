@@ -2,6 +2,7 @@
 #include "shader_collectives.hpp"
 #include "shader_local.hpp"
 #include "shader_calls.hpp"
+#include "device_services.hpp"
 #include "device_conversions.hpp"
 #include "ptx_import.hpp"
 
@@ -16,6 +17,7 @@
 #include <llvm/Analysis/CFG.h>
 #include <llvm/Analysis/CallGraph.h>
 #include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/Analysis/PostDominators.h>
 #include <llvm/IR/IRBuilder.h>
@@ -45,6 +47,7 @@
 #include <llvm/Transforms/Utils/CallPromotionUtils.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Utils/LowerSwitch.h>
+#include <llvm/Transforms/Utils/LowerMemIntrinsics.h>
 #include <llvm/Transforms/Utils/FixIrreducible.h>
 #include <llvm/Transforms/Utils/Local.h>
 namespace cudavm {
@@ -289,10 +292,13 @@ struct lowering {
     std::unique_ptr<llvm::Module> result;
     llvm::IRBuilder<> b;
     llvm::Function *entry = nullptr, *resolve = nullptr, *read = nullptr, *write = nullptr;
+    llvm::Function *output_read = nullptr, *output_write = nullptr;
+    std::map<llvm::Function*, llvm::Value*> output_routes;
     llvm::GlobalVariable* shared = nullptr;
     llvm::Constant* names[packet_resource_count]{};
     std::map<const llvm::Value*, llvm::Value*> values;
     std::map<const llvm::BasicBlock*, llvm::BasicBlock*> blocks;
+    std::map<const llvm::BasicBlock*, llvm::BasicBlock*> tails;
     std::map<const llvm::GlobalVariable*, uint32_t> globals, shared_offsets;
     std::map<const llvm::AllocaInst*, uint32_t> local_offsets;
     std::map<const llvm::Argument*, uint32_t> byval_offsets;
@@ -315,10 +321,12 @@ struct lowering {
     bool dxil;
     std::array<unsigned,3> group;
     bool kernel_entry;
-    lowering(llvm::Module& module, llvm::Function& f, shader_environment environment, const std::array<unsigned,3>& block) : source(module), kernel(f), dl(module.getDataLayout()),
+    bool assert_cancellation = false;
+    unsigned service_shared_words;
+    lowering(llvm::Module& module, llvm::Function& f, shader_environment environment, const std::array<unsigned,3>& block, unsigned shared_words = 0) : source(module), kernel(f), dl(module.getDataLayout()),
         result(std::make_unique<llvm::Module>("cudavm.native.shader." + f.getName().str(), module.getContext())), b(module.getContext()),
         opencl(environment == shader_environment::opencl), dxil(environment == shader_environment::dxil), group(block),
-        kernel_entry(f.hasFnAttribute("cudavm.kernel") || f.getCallingConv()==llvm::CallingConv::PTX_Kernel) {}
+        kernel_entry(f.hasFnAttribute("cudavm.kernel") || f.getCallingConv()==llvm::CallingConv::PTX_Kernel), service_shared_words(shared_words) {}
     [[noreturn]] void fail(const llvm::Value& value, const char* reason) {
         std::string text; llvm::raw_string_ostream out(text); value.print(out);
         throw std::runtime_error(std::string("native ") + (dxil ? "DXIL" : "SPIR-V") + " kernel " + kernel.getName().str() + ": " + reason + "\n" + text);
@@ -367,6 +375,15 @@ struct lowering {
                 return b.CreateAlignedStore(b.CreateOr(b.CreateAnd(previous, b.CreateNot(*(first + 2))), b.CreateAnd(*(first + 1), *(first + 2))), pointer, llvm::Align(4));
             }
         }
+        if (function == read || function == write) {
+            auto known = llvm::computeKnownBits(*first, result->getDataLayout());
+            llvm::APInt mask(64, 0xffffffff00000000ull), tag(64, device_output_address);
+            if ((known.One & mask) == tag && (known.Zero & mask) == (mask ^ tag)) {
+                auto*& helper = function == read ? output_read : output_write;
+                if (!helper) helper = make_output_access(function == write);
+                function = helper;
+            }
+        }
         std::vector<llvm::Value*> args{b.CreateTrunc(*first, b.getInt32Ty()), b.CreateTrunc(b.CreateLShr(*first, b.getInt64(32)), b.getInt32Ty())};
         args.insert(args.end(), first + 1, base.end());
         if (function->hasFnAttribute("cudavm.native.local")) {
@@ -374,12 +391,44 @@ struct lowering {
             if (caller == entry) args.push_back(b.CreateInBoundsGEP(opencl_local->getAllocatedType(),opencl_local,{b.getInt32(0),b.getInt32(0)}));
             else args.push_back(caller->getArg(unsigned(caller->arg_size()-packet_resource_count-1)));
         }
+        if (function->hasFnAttribute("cudavm.native.output")) {
+            auto* caller = b.GetInsertBlock()->getParent();
+            auto [at, inserted] = output_routes.try_emplace(caller);
+            if (inserted) {
+                auto saved = b.saveIP(); b.SetInsertPoint(&caller->getEntryBlock(), caller->getEntryBlock().getFirstInsertionPt());
+                at->second = b.CreateAlignedLoad(b.getInt32Ty(), word_pointer(0, b.getInt32(7)), llvm::Align(4)); b.restoreIP(saved);
+            }
+            args.push_back(at->second);
+        }
         if (opencl) {
             auto* caller = b.GetInsertBlock()->getParent();
             for (unsigned i=0;i<packet_resource_count;++i)
                 args.push_back(caller->getArg(unsigned(caller->arg_size() - packet_resource_count + i)));
         }
         return b.CreateCall(function, args);
+    }
+    llvm::Function* make_output_access(bool store) {
+        auto saved = b.saveIP();
+        auto signature = store ? arguments({b.getInt32Ty(), b.getInt32Ty(), b.getInt32Ty(), b.getInt32Ty(), b.getInt32Ty()})
+            : arguments({b.getInt32Ty(), b.getInt32Ty(), b.getInt32Ty()});
+        auto* function = llvm::Function::Create(llvm::FunctionType::get(store ? b.getVoidTy() : b.getInt32Ty(), signature, false),
+            llvm::GlobalValue::InternalLinkage, store ? "cudavm.output.store" : "cudavm.output.load", *result);
+        function->addFnAttr("cudavm.native.output");
+        b.SetInsertPoint(llvm::BasicBlock::Create(b.getContext(), "entry", function));
+        auto* route = function->getArg(store ? 4 : 2);
+        auto* offset = b.CreateAdd(b.CreateShl(b.CreateZExt(b.CreateAnd(route, b.getInt32(0x3fffffffu)), b.getInt64Ty()), b.getInt64(2)),
+            b.CreateZExt(function->getArg(0), b.getInt64Ty()));
+        auto* physical = b.CreateOr(offset, b.CreateShl(b.CreateZExt(b.CreateLShr(route, b.getInt32(30)), b.getInt64Ty()), b.getInt64(packet_binding_shift)));
+        access_resolved(physical, [&](auto*, const auto& pointer) {
+            auto* at = pointer(); auto* previous = b.CreateAlignedLoad(b.getInt32Ty(), at, llvm::Align(4));
+            if (store) {
+                // A published FIFO record has one owner until its release.
+                // Its byte updates need no shared-word CAS or address lookup.
+                b.CreateAlignedStore(b.CreateOr(b.CreateAnd(previous, b.CreateNot(function->getArg(3))),
+                    b.CreateAnd(function->getArg(2), function->getArg(3))), at, llvm::Align(4)); b.CreateRetVoid();
+            } else b.CreateRet(previous);
+        });
+        b.restoreIP(saved); return function;
     }
     llvm::Value* word_pointer(unsigned binding, llvm::Value* index) {
         if (dxil) {
@@ -431,6 +480,8 @@ struct lowering {
     void make_resolver() {
         resolve = llvm::Function::Create(llvm::FunctionType::get(b.getInt64Ty(), arguments({b.getInt32Ty(), b.getInt32Ty()}), false), llvm::GlobalValue::InternalLinkage, "cudavm.resolve.address", *result);
         auto* first = llvm::BasicBlock::Create(b.getContext(), "entry", resolve);
+        auto* allocations = llvm::BasicBlock::Create(b.getContext(), "lookup", resolve);
+        auto* service = llvm::BasicBlock::Create(b.getContext(), "service", resolve);
         auto* loop = llvm::BasicBlock::Create(b.getContext(), "allocations", resolve);
         auto* test = llvm::BasicBlock::Create(b.getContext(), "range", resolve);
         auto* next = llvm::BasicBlock::Create(b.getContext(), "next", resolve);
@@ -438,11 +489,19 @@ struct lowering {
         auto* absent = llvm::BasicBlock::Create(b.getContext(), "absent", resolve);
         b.SetInsertPoint(first);
         auto* address = pair(resolve->getArg(0), resolve->getArg(1));
+        auto* heap = b.CreateICmpEQ(resolve->getArg(1), b.getInt32(uint32_t(device_heap_address >> 32)));
+        auto* output = b.CreateICmpEQ(resolve->getArg(1), b.getInt32(uint32_t(device_output_address >> 32)));
+        b.CreateCondBr(b.CreateOr(heap, output), service, allocations);
+        b.SetInsertPoint(service);
+        auto* route = b.CreateAlignedLoad(b.getInt32Ty(), word_pointer(0, b.CreateSelect(heap, b.getInt32(6), b.getInt32(7))), llvm::Align(4));
+        auto* byte_offset = b.CreateAdd(b.CreateShl(b.CreateZExt(b.CreateAnd(route, b.getInt32(0x3fffffffu)), b.getInt64Ty()), b.getInt64(2)), b.CreateZExt(resolve->getArg(0), b.getInt64Ty()));
+        b.CreateRet(b.CreateOr(byte_offset, b.CreateShl(b.CreateZExt(b.CreateLShr(route, b.getInt32(30)), b.getInt64Ty()), b.getInt64(packet_binding_shift))));
+        b.SetInsertPoint(allocations);
         auto* table = b.CreateLShr(packet(b.getInt32(6)), b.getInt32(2));
         auto* count = packet(b.getInt32(7)); b.CreateBr(loop);
         b.SetInsertPoint(loop);
-        auto* low = b.CreatePHI(b.getInt32Ty(), 2); low->addIncoming(b.getInt32(0), first);
-        auto* high = b.CreatePHI(b.getInt32Ty(), 2); high->addIncoming(count, first);
+        auto* low = b.CreatePHI(b.getInt32Ty(), 2); low->addIncoming(b.getInt32(0), allocations);
+        auto* high = b.CreatePHI(b.getInt32Ty(), 2); high->addIncoming(count, allocations);
         b.CreateCondBr(b.CreateICmpULT(low, high), test, absent);
         b.SetInsertPoint(test);
         auto* middle = b.CreateAdd(low, b.CreateLShr(b.CreateSub(high, low), b.getInt32(1)));
@@ -565,8 +624,13 @@ struct lowering {
         auto* block = b.CreateAdd(index(true,0), b.CreateMul(packet(b.getInt32(0)), b.CreateAdd(index(true,1), b.CreateMul(packet(b.getInt32(1)), index(true,2)))));
         if (!thread) thread = linear_thread();
         auto* linear = b.CreateAdd(b.CreateMul(block, thread_count()), thread);
-        auto* base = b.CreateLoad(b.getInt32Ty(), word_pointer(0, b.getInt32(packet_stack_base_word)));
-        auto* first = b.CreateAdd(base, b.CreateMul(linear, b.getInt32(shader_local_capacity/4)));
+        llvm::Value* base = b.CreateLoad(b.getInt32Ty(), word_pointer(0, b.getInt32(packet_stack_base_word)));
+        llvm::Value* stride = b.getInt32(shader_local_capacity / 4);
+        if (kernel.hasFnAttribute("cudavm.service.storage")) {
+            stride = b.CreateShl(b.getInt32(1), b.CreateAnd(base, b.getInt32(15)));
+            base = b.CreateLShr(b.CreateAnd(base, b.getInt32(~15u)), b.getInt32(2));
+        }
+        auto* first = b.CreateAdd(base, b.CreateMul(linear, stride));
         if (invocation) { invocation_stack_bases[function] = first; b.restoreIP(saved); }
         return word_pointer(0, b.CreateAdd(first, offset));
     }
@@ -643,6 +707,10 @@ struct lowering {
     llvm::Value* packet_pair(llvm::Value* address, llvm::Value* lo) { return pair(lo, call_helper(read, {b.CreateAdd(address, b.getInt64(4))})); }
     llvm::Value* byte_shift(llvm::Value* address) {
         auto* lo = b.CreateTrunc(address, b.getInt32Ty());
+        auto known = llvm::computeKnownBits(address, result->getDataLayout());
+        auto high = known.One.lshr(32).getZExtValue();
+        if (known.Zero.lshr(32).getZExtValue() == (uint32_t(~high)) && (high == packet_private_high_word || high == uint32_t(device_output_address >> 32)))
+            return b.CreateMul(b.CreateAnd(lo, b.getInt32(3)), b.getInt32(8));
         auto* hi = b.CreateTrunc(b.CreateLShr(address, b.getInt64(32)), b.getInt32Ty());
         auto* physical = b.CreateSelect(b.CreateICmpEQ(hi, b.getInt32(0xffffffffu)), lo, b.CreateTrunc(call_helper(resolve, {address}), b.getInt32Ty()));
         return b.CreateMul(b.CreateAnd(physical, b.getInt32(3)), b.getInt32(8));
@@ -1108,6 +1176,27 @@ struct lowering {
         if (!function) fail(instruction, "indirect calls or CUDA inline assembly require fallback");
         if (function->getName() == "cudavm.shader.stack.valid")
             return stack_top ? b.CreateICmpULE(b.CreateLoad(b.getInt32Ty(), stack_top), b.getInt32(shader_local_capacity)) : b.getTrue();
+        if (function->getName() == "__cudavm_service_buffer") {
+            auto* index = llvm::dyn_cast<llvm::ConstantInt>(instruction.getArgOperand(0));
+            if (!index || index->getZExtValue() > 1) fail(instruction, "invalid device service buffer");
+            return b.getInt64(index->isZero() ? device_heap_address : device_output_address);
+        }
+        if (function->getName() == "__cudavm_service_id") {
+            auto* index = value(instruction.getArgOperand(0));
+            llvm::Value* coordinate = b.getInt32(0);
+            for (unsigned axis = 0; axis < 6; ++axis) {
+                auto id = dxil ? llvm::Intrinsic::ID(axis < 3 ? llvm::Intrinsic::dx_group_id : llvm::Intrinsic::dx_thread_id_in_group)
+                    : llvm::Intrinsic::ID(axis < 3 ? llvm::Intrinsic::spv_group_id : llvm::Intrinsic::spv_thread_id_in_group);
+                auto* component = b.CreateZExtOrTrunc(b.CreateIntrinsic(opencl ? b.getInt64Ty() : b.getInt32Ty(), id, {b.getInt32(axis % 3)}), b.getInt32Ty());
+                coordinate = b.CreateSelect(b.CreateICmpEQ(index, b.getInt32(axis)), component, coordinate);
+            }
+            return coordinate;
+        }
+        if (function->getName() == "__cudavm_service_assert") {
+            b.CreateAtomicRMW(llvm::AtomicRMWInst::Or, word_pointer(0, b.getInt32(device_assert_fault_word)), b.getInt32(1),
+                llvm::Align(4), llvm::AtomicOrdering::Monotonic, b.getContext().getOrInsertSyncScopeID("device"));
+            return nullptr;
+        }
         if(instruction.getType()->isHalfTy() || llvm::any_of(instruction.args(),[](const auto& argument){return argument->getType()->isHalfTy();}))
             fail(instruction,"remaining half operation requires explicit native shader lowering");
         auto name = function->hasFnAttribute("cudavm.cuda.origin") ? function->getFnAttribute("cudavm.cuda.origin").getValueAsString() : function->getName();
@@ -1119,10 +1208,10 @@ struct lowering {
             return nullptr;
         }
         if(name=="llvm.nvvm.membar.sys") fail(instruction,"shader system fence requires host/device coherent memory");
-        if(!function->isDeclaration() && (function->hasFnAttribute("cudavm.math") || function->getName().starts_with("_ZN13cudavm") || function->getName().starts_with("__cudavm_native_"))) {
+        if(!function->isDeclaration() && shader_native_helper(*function)) {
             std::vector<llvm::Type*> signature; std::vector<llvm::Value*> args;
             for(const auto& argument:instruction.args()) {
-                if(argument->getType()->isPointerTy() || !argument->getType()->isSingleValueType()) fail(instruction,"native math helper requires scalar arguments");
+                if((argument->getType()->isPointerTy() && !function->hasFnAttribute("cudavm.service.helper")) || !argument->getType()->isSingleValueType()) fail(instruction,"native helper requires scalar arguments");
                 signature.push_back(type(argument->getType())); args.push_back(value(argument.get()));
             }
             if(opencl) for(unsigned i=0;i<packet_resource_count;++i) {signature.push_back(resource_pointer_type());args.push_back(entry->getArg(unsigned(entry->arg_size()-packet_resource_count+i)));}
@@ -1270,6 +1359,7 @@ struct lowering {
             && integer->getBitWidth() != 16 && integer->getBitWidth() != 32 && integer->getBitWidth() != 64)
             fail(input, "unsupported native integer width");
         if (llvm::isa<llvm::PHINode>(input)) return;
+        if (auto* frozen = llvm::dyn_cast<llvm::FreezeInst>(&input)) { values[&input] = value(frozen->getOperand(0)); return; }
         if(auto* fence=llvm::dyn_cast<llvm::FenceInst>(&input)) {
             if(!opencl && fence->getOrdering()==llvm::AtomicOrdering::SequentiallyConsistent)
                 atomic(101,b.getInt64(0),b.getInt32(0),nullptr,fence->getOrdering(),llvm::AtomicOrdering::Monotonic,fence->getSyncScopeID());
@@ -1293,10 +1383,22 @@ struct lowering {
             return;
         }
         if (auto* branch = llvm::dyn_cast<llvm::BranchInst>(&input)) {
+            if (assert_cancellation) {
+                auto* ready = llvm::BasicBlock::Create(b.getContext(), "assert.continue", entry);
+                auto* stopped = llvm::BasicBlock::Create(b.getContext(), "assert.stop", entry);
+                auto* observed = b.CreateAtomicCmpXchg(word_pointer(0, b.getInt32(device_assert_fault_word)), b.getInt32(0), b.getInt32(0),
+                    llvm::Align(4), llvm::AtomicOrdering::Monotonic, llvm::AtomicOrdering::Monotonic, b.getContext().getOrInsertSyncScopeID("device"));
+                b.CreateCondBr(b.CreateICmpEQ(b.CreateExtractValue(observed, 0), b.getInt32(0)), ready, stopped);
+                b.SetInsertPoint(stopped); b.CreateRetVoid(); b.SetInsertPoint(ready); tails[branch->getParent()] = ready;
+            }
             if (branch->isConditional()) b.CreateCondBr(value(branch->getCondition()), blocks.at(branch->getSuccessor(0)), blocks.at(branch->getSuccessor(1)));
             else b.CreateBr(blocks.at(branch->getSuccessor(0))); return;
         }
         if (auto* returned=llvm::dyn_cast<llvm::ReturnInst>(&input)) { if(returned->getReturnValue()) b.CreateRet(value(returned->getReturnValue()));else b.CreateRetVoid(); return; }
+        if (llvm::isa<llvm::UnreachableInst>(input)) {
+            if (entry->getReturnType()->isVoidTy()) b.CreateRetVoid(); else b.CreateRet(llvm::Constant::getNullValue(entry->getReturnType()));
+            return;
+        }
         if (auto* pointer = llvm::dyn_cast<llvm::GetElementPtrInst>(&input)) { values[&input] = gep(*llvm::cast<llvm::GEPOperator>(pointer)); return; }
         if (auto* cast = llvm::dyn_cast<llvm::CastInst>(&input); cast && (input.getType()->isPointerTy() || cast->getOperand(0)->getType()->isPointerTy())) {
             auto* address = value(cast->getOperand(0));
@@ -1391,6 +1493,7 @@ struct lowering {
         b.Insert(out); values[&input] = out;
     }
     std::unique_ptr<llvm::Module> run() {
+        assert_cancellation = kernel_entry && (shader_service_requirements(kernel) & device_service_assert);
         collective_storage=native_atomic_polling(kernel);
         for (const auto& bb : kernel) for (const auto& input : bb) if (auto* stored = llvm::dyn_cast<llvm::StoreInst>(&input))
             partial_stores |= stored->getAlign().value() < 4 || stored->getValueOperand()->getType()->isIntegerTy(1) || stored->getValueOperand()->getType()->isIntegerTy(8) || stored->getValueOperand()->getType()->isIntegerTy(16);
@@ -1401,7 +1504,11 @@ struct lowering {
         shader_local_layout local_layout(kernel);
         local_offsets = local_layout.allocations; byval_offsets = local_layout.arguments;
         local_bytes = local_layout.bytes();
-        arena_local = (!opencl || kernel.hasFnAttribute("cudavm.call.frames")) && local_bytes == shader_local_capacity;
+        if (!kernel_entry && kernel.hasFnAttribute("cudavm.service.storage")) {
+            if (local_bytes) fail(kernel, "device output helper retained private allocations");
+            local_bytes = shader_local_capacity;
+        }
+        arena_local = kernel.hasFnAttribute("cudavm.service.storage") || ((!opencl || kernel.hasFnAttribute("cudavm.call.frames")) && local_bytes == shader_local_capacity);
         std::set<const llvm::Constant*> visited;
         std::function<void(const llvm::Value*)> collect = [&](const llvm::Value* value) {
             auto* constant = llvm::dyn_cast<llvm::Constant>(value); if (!constant || !visited.insert(constant).second) return;
@@ -1436,8 +1543,11 @@ struct lowering {
         // CUDA offsets were computed with dl above. Physical resource pointers
         // belong to the SPIR-V environment and must use its pointer layout.
         result->setDataLayout(result->getTargetTriple().computeDataLayout());
-        auto* storage = llvm::ArrayType::get(b.getInt32Ty(), dynamic_shared?(32768-scratch)/4:std::max(2u, (shared_bytes + 3) / 4));
-        shared = new llvm::GlobalVariable(*result, storage, false, llvm::GlobalValue::InternalLinkage, llvm::UndefValue::get(storage), "cudavm.shared", nullptr, llvm::GlobalVariable::NotThreadLocal, 3);
+        auto words = service_shared_words ? service_shared_words : dynamic_shared?(32768-scratch)/4:std::max(2u, (shared_bytes + 3) / 4);
+        auto* storage = llvm::ArrayType::get(b.getInt32Ty(), words);
+        bool service_storage = kernel.hasFnAttribute("cudavm.service.storage");
+        shared = new llvm::GlobalVariable(*result, storage, false, service_storage ? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage,
+            service_shared_words ? nullptr : llvm::UndefValue::get(storage), "cudavm.shared", nullptr, llvm::GlobalVariable::NotThreadLocal, 3);
         if(collective_storage) {
             auto* scratch_type=llvm::ArrayType::get(b.getInt32Ty(),2048);
             collective_data=new llvm::GlobalVariable(*result,scratch_type,false,llvm::GlobalValue::InternalLinkage,llvm::UndefValue::get(scratch_type),"cudavm.collective.data",nullptr,llvm::GlobalVariable::NotThreadLocal,3);
@@ -1458,12 +1568,13 @@ struct lowering {
         if(!kernel_entry) for(const auto& argument:kernel.args()) signature.push_back(type(argument.getType()));
         if(opencl) for (unsigned i=0;i<packet_resource_count;++i) signature.push_back(resource_pointer_type());
         entry = llvm::Function::Create(llvm::FunctionType::get(kernel_entry?b.getVoidTy():type(kernel.getReturnType()),signature,false),llvm::GlobalValue::ExternalLinkage,kernel_entry?(opencl?"main_kernel":"main"):"cudavm.native.helper."+kernel.getName().str(),*result);
+        if (kernel.hasFnAttribute("cudavm.service.helper")) entry->addFnAttr(llvm::Attribute::NoInline);
         if (opencl && kernel_entry) entry->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
         else if(kernel_entry) { entry->addFnAttr("hlsl.numthreads", std::to_string(group[0]) + "," + std::to_string(group[1]) + "," + std::to_string(group[2])); entry->addFnAttr("hlsl.shader", "compute"); }
         result->getOrInsertNamedMetadata("cudavm.ir.stage")->addOperand(llvm::MDNode::get(b.getContext(), llvm::MDString::get(b.getContext(), dxil ? "cudavm.native.dxil" : "cudavm.native.spirv")));
         if (dxil && kernel_entry) result->getOrInsertNamedMetadata("dx.valver")->addOperand(llvm::MDNode::get(b.getContext(),
             {llvm::ConstantAsMetadata::get(b.getInt32(1)), llvm::ConstantAsMetadata::get(b.getInt32(8))}));
-        for (const auto& block : kernel) blocks[&block] = llvm::BasicBlock::Create(b.getContext(), block.getName(), entry);
+        for (const auto& block : kernel) tails[&block] = blocks[&block] = llvm::BasicBlock::Create(b.getContext(), block.getName(), entry);
         b.SetInsertPoint(blocks.at(&kernel.getEntryBlock()));
         if (local_bytes && opencl && !arena_local) opencl_local=b.CreateAlloca(llvm::ArrayType::get(b.getInt32Ty(),std::max(2u,(local_bytes+3)/4)),nullptr,"cudavm.local");
         if (local_layout.dynamic) {
@@ -1472,7 +1583,13 @@ struct lowering {
         }
         uint64_t offset = 0;
         for (unsigned i = 0; i < kernel.arg_size(); ++i) {
-            if(!kernel_entry) {values[kernel.getArg(i)]=entry->getArg(i);continue;}
+            if(!kernel_entry) {
+                llvm::Value* argument = entry->getArg(i);
+                // Planned printf buffers come from a checked caller alloca.
+                if (i == 1 && kernel.getName().starts_with("__cudavm_service_printf"))
+                    argument = b.CreateOr(b.CreateAnd(argument, b.getInt64(shader_local_capacity - 1)), b.getInt64(0xffffffff80000000ull));
+                values[kernel.getArg(i)] = argument; continue;
+            }
             auto* byval = kernel.getParamByValType(i); auto* t = byval ? byval : kernel.getArg(i)->getType();
             auto alignment = byval && kernel.getParamAlign(i) ? kernel.getParamAlign(i)->value() : dl.getABITypeAlign(t).value();
             offset = llvm::alignTo(offset, alignment);
@@ -1508,15 +1625,15 @@ struct lowering {
         for (const auto& block : kernel) for (const auto& input : block) if (auto* phi = llvm::dyn_cast<llvm::PHINode>(&input)) {
             auto* out = llvm::cast<llvm::PHINode>(values.at(phi));
             for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
-                b.SetInsertPoint(blocks.at(phi->getIncomingBlock(i))->getTerminator());
-                out->addIncoming(value(phi->getIncomingValue(i)), blocks.at(phi->getIncomingBlock(i)));
+                b.SetInsertPoint(tails.at(phi->getIncomingBlock(i))->getTerminator());
+                out->addIncoming(value(phi->getIncomingValue(i)), tails.at(phi->getIncomingBlock(i)));
             }
         }
         if(collective_storage) make_continuations();
-        if (kernel.hasFnAttribute("cudavm.call.frames") && !collective_storage && !opencl && !dxil) {
+        if ((kernel.hasFnAttribute("cudavm.call.frames") || shader_service_requirements(kernel)) && !collective_storage && !opencl && !dxil) {
             // Residual calls already have explicit return continuations. Use
             // the owned target's deterministic CFG dispatcher directly instead
-            // of speculatively restructuring the multi-entry call/return DAG.
+            // of speculatively restructuring call/return or service retry CFGs.
             // Collective kernels already have an acyclic step dispatcher;
             // wrapping it in a second dispatcher makes driver compilation grow.
             entry->addFnAttr("cudavm.spirv.force.dispatch");
@@ -1557,12 +1674,39 @@ void scalarize_native_aggregate_phis(llvm::Module& module) {
 std::unique_ptr<llvm::Module> prepare_native_shader_module(const llvm::Module& input) {
     auto module = llvm::CloneModule(input);
     resolve_device_function_aliases(*module, true); resolve_device_data_aliases(*module, true); normalize_device_relocations(*module);
+    link_shader_services(*module);
+    // Device string literals and constant local-array initializers can use
+    // generic-address-space globals. Give them persistent module storage with
+    // the same bytes, retaining generic pointer uses through an address cast.
+    std::vector<llvm::GlobalVariable*> constants;
+    for (auto& global : module->globals())
+        if (global.getAddressSpace() == 0 && global.isConstant() && global.hasInitializer() && !global.getName().starts_with("llvm.")) constants.push_back(&global);
+    for (auto* global : constants) {
+        auto* replacement = new llvm::GlobalVariable(*module, global->getValueType(), true, global->getLinkage(),
+            global->getInitializer(), "", nullptr, global->getThreadLocalMode(), 4);
+        replacement->copyAttributesFrom(global); replacement->takeName(global);
+        global->replaceAllUsesWith(llvm::ConstantExpr::getAddrSpaceCast(replacement, global->getType())); global->eraseFromParent();
+    }
+    std::vector<llvm::MemIntrinsic*> memory_operations;
+    for (auto& function : *module) for (auto& block : function) for (auto& instruction : block)
+        if (auto* memory = llvm::dyn_cast<llvm::MemIntrinsic>(&instruction)) memory_operations.push_back(memory);
+    llvm::TargetTransformInfo memory_target(module->getDataLayout());
+    for (auto* memory : memory_operations) {
+        if (auto* copy = llvm::dyn_cast<llvm::MemCpyInst>(memory)) llvm::expandMemCpyAsLoop(copy, memory_target);
+        else if (auto* move = llvm::dyn_cast<llvm::MemMoveInst>(memory)) {
+            if (!llvm::expandMemMoveAsLoop(move, memory_target)) throw std::runtime_error("cannot lower device memmove");
+        } else if (auto* set = llvm::dyn_cast<llvm::MemSetInst>(memory)) llvm::expandMemSetAsLoop(set);
+        else throw std::runtime_error("unsupported device memory intrinsic");
+        memory->eraseFromParent();
+    }
     lower_shader_half(*module);
     lower_half_math_intrinsics(*module);
     scalar_math(*module);
     optimize(*module);
     while (lower_local_calls(*module)) optimize(*module);
     lower_shader_calls(*module);
+    for (auto& function : *module) if (function.hasFnAttribute("cudavm.kernel") || function.getCallingConv() == llvm::CallingConv::PTX_Kernel)
+        if (shader_service_requirements(function) & device_service_output) function.addFnAttr("cudavm.service.storage");
     return module;
 }
 std::unique_ptr<llvm::Module> lower_native_shader(const llvm::Module& input, const std::string& symbol, shader_environment environment, const std::array<unsigned,3>& block) {
@@ -1601,10 +1745,14 @@ std::unique_ptr<llvm::Module> lower_native_shader(const llvm::Module& input, con
         if(!imported.insert(symbol).second) throw std::runtime_error("native math helper definition is unavailable: "+symbol);
         auto* helper=portable->getFunction(symbol);
         if(!helper || helper->isDeclaration()) throw std::runtime_error("native math helper is absent: "+symbol);
-        auto lowered=lowering(*portable,*helper,environment,block).run();
+        unsigned shared_words = 0;
+        if (helper->hasFnAttribute("cudavm.service.storage"))
+            shared_words = unsigned(llvm::cast<llvm::ArrayType>(module->getNamedGlobal("cudavm.shared")->getValueType())->getNumElements());
+        auto lowered=lowering(*portable,*helper,environment,block,shared_words).run();
         if(llvm::Linker(*module).linkInModule(std::move(lowered))) throw std::runtime_error("native math helper linking failed: "+symbol);
     }
     trace("verify");
+    if (auto* storage = module->getNamedGlobal("cudavm.shared"); storage && storage->hasInitializer()) storage->setLinkage(llvm::GlobalValue::InternalLinkage);
     if (llvm::any_of(*module, [](const auto& function) { return function.hasFnAttribute("cudavm.image.operations"); })) {
         llvm::LoopAnalysisManager loops; llvm::FunctionAnalysisManager functions;
         llvm::CGSCCAnalysisManager calls; llvm::ModuleAnalysisManager modules; llvm::PassBuilder builder;

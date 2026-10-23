@@ -31,12 +31,12 @@ inline constexpr unsigned native_collective_shared_bytes = 16392;
 inline constexpr unsigned native_named_barrier_shared_bytes = 192;
 inline bool native_atomic_polling(const llvm::Function& function) {
     for(const auto& block:function) for(const auto& input:block)
-        if(auto* load=llvm::dyn_cast<llvm::LoadInst>(&input);load && load->isAtomic()) return true;
+        if(auto* load=llvm::dyn_cast<llvm::LoadInst>(&input);load && load->isAtomic() && !input.getMetadata("cudavm.nonblocking")) return true;
     // CAS/RMW polling also needs independent lane progress. Limit the extra
     // scheduler storage to cyclic CFG regions rather than every atomic kernel.
     for(auto region=llvm::scc_begin(&function);!region.isAtEnd();++region)
         if(region.hasCycle()) for(auto* block:*region) for(const auto& input:*block)
-            if(llvm::isa<llvm::AtomicCmpXchgInst,llvm::AtomicRMWInst>(input)) return true;
+        if(llvm::isa<llvm::AtomicCmpXchgInst,llvm::AtomicRMWInst>(input) && !input.getMetadata("cudavm.nonblocking")) return true;
     return false;
 }
 }

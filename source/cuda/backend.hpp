@@ -25,6 +25,11 @@
 
 namespace cudavm {
 struct session;
+struct buffer;
+size_t shader_service_limit(session&, CUlimit);
+void set_shader_service_limit(session&, CUlimit, size_t);
+void prepare_shader_services(session&, uint32_t);
+void complete_shader_services(session&, buffer*, buffer*, uint32_t);
 struct failure : std::runtime_error {
     CUresult code;
     failure(CUresult value, std::string message) : std::runtime_error(std::move(message)), code(value) {}
@@ -496,6 +501,11 @@ struct executable {
     virtual void unload() = 0;
 };
 struct session {
+    std::shared_ptr<buffer> device_heap;
+    size_t device_heap_limit = 8u * 1024 * 1024, device_output_limit = 1024u * 1024;
+    bool device_output_used = false;
+    std::atomic<CUresult> device_fault{CUDA_SUCCESS};
+    void check_device_fault() const { require(device_fault.load() == CUDA_SUCCESS, device_fault.load(), "device assertion requires context reset"); }
     virtual uint64_t graph_generation() const { return 0; }
     std::mutex pool_execution;
     std::shared_ptr<compute_profile> profile=std::make_shared<compute_profile>();
@@ -524,9 +534,9 @@ struct session {
     virtual void reset_persisting_cache() {} // No persisting L2 partition on shader transports.
     virtual size_t context_limit(CUlimit limit) {
         if (limit == CU_LIMIT_MAX_L2_FETCH_GRANULARITY || limit == CU_LIMIT_PERSISTING_L2_CACHE_SIZE) return 0;
-        throw failure(CUDA_ERROR_UNSUPPORTED_LIMIT, "this context resource limit is not implemented on the adapter");
+        return shader_service_limit(*this, limit);
     }
-    virtual void set_context_limit(CUlimit limit, size_t) { (void)context_limit(limit); }
+    virtual void set_context_limit(CUlimit limit, size_t value) { set_shader_service_limit(*this, limit, value); }
     // Shader adapters expose no cache partition control. These CUDA preferences
     // may be ignored; they do not change shader resource admission.
     virtual CUfunc_cache context_cache_config() { return CU_FUNC_CACHE_PREFER_NONE; }

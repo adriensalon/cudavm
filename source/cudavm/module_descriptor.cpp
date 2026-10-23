@@ -3,6 +3,7 @@
 #include "shader_collectives.hpp"
 #include "shader_local.hpp"
 #include "module_descriptor.hpp"
+#include "device_services.hpp"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -143,6 +144,7 @@ std::string emit_native_module(const llvm::Module& input) {
             auto operation=native_collective(name); collectives|=operation>=0; named_barriers|=operation>=36;
         }
         entry.call_frames=f.hasFnAttribute("cudavm.call.frames");
+        entry.services = shader_service_requirements(f);
         if(collectives) shared+=native_collective_shared_bytes+(entry.call_frames?4096u:0u);
         if(named_barriers) shared+=native_named_barrier_shared_bytes;
         if(shared>32768) throw std::runtime_error("native shared storage and collective scratch exceed 32 KiB");
