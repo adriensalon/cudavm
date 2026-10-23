@@ -277,7 +277,7 @@ struct lowering {
     llvm::IRBuilder<> b;
     llvm::Function *entry = nullptr, *resolve = nullptr, *read = nullptr, *write = nullptr;
     llvm::GlobalVariable* shared = nullptr;
-    llvm::Constant* names[2]{};
+    llvm::Constant* names[packet_resource_count]{};
     std::map<const llvm::Value*, llvm::Value*> values;
     std::map<const llvm::BasicBlock*, llvm::BasicBlock*> blocks;
     std::map<const llvm::GlobalVariable*, uint32_t> globals, shared_offsets;
@@ -332,7 +332,7 @@ struct lowering {
     llvm::Type* resource_pointer_type() { return llvm::PointerType::get(b.getContext(), 1); }
     std::vector<llvm::Type*> arguments(std::initializer_list<llvm::Type*> base) {
         std::vector<llvm::Type*> args(base);
-        if (opencl) { args.push_back(resource_pointer_type()); args.push_back(resource_pointer_type()); }
+        if (opencl) for (unsigned i=0;i<packet_resource_count;++i) args.push_back(resource_pointer_type());
         return args;
     }
     llvm::Value* call_helper(llvm::Function* function, std::initializer_list<llvm::Value*> base) {
@@ -342,31 +342,32 @@ struct lowering {
         if (function->hasFnAttribute("cudavm.native.local")) {
             auto* caller = b.GetInsertBlock()->getParent();
             if (caller == entry) args.push_back(b.CreateInBoundsGEP(opencl_local->getAllocatedType(),opencl_local,{b.getInt32(0),b.getInt32(0)}));
-            else args.push_back(caller->getArg(unsigned(caller->arg_size()-3)));
+            else args.push_back(caller->getArg(unsigned(caller->arg_size()-packet_resource_count-1)));
         }
         if (opencl) {
             auto* caller = b.GetInsertBlock()->getParent();
-            args.push_back(caller->getArg(unsigned(caller->arg_size() - 2)));
-            args.push_back(caller->getArg(unsigned(caller->arg_size() - 1)));
+            for (unsigned i=0;i<packet_resource_count;++i)
+                args.push_back(caller->getArg(unsigned(caller->arg_size() - packet_resource_count + i)));
         }
         return b.CreateCall(function, args);
     }
     llvm::Value* word_pointer(unsigned binding, llvm::Value* index) {
         if (dxil) {
-            auto* resource = llvm::TargetExtType::get(b.getContext(), "dx.RawBuffer", {b.getInt8Ty()}, {binding ? 0u : 1u, 0});
+            auto* resource = llvm::TargetExtType::get(b.getContext(), "dx.RawBuffer", {b.getInt8Ty()}, {binding == 1 ? 0u : 1u, 0});
             auto* handle = b.CreateIntrinsic(resource, llvm::Intrinsic::dx_resource_handlefrombinding,
-                {b.getInt32(0), b.getInt32(0), b.getInt32(1), b.getInt32(0), llvm::ConstantPointerNull::get(b.getPtrTy())});
-            return b.CreateIntrinsic(b.getPtrTy(), llvm::Intrinsic::dx_resource_getpointer, {handle, b.CreateMul(index, b.getInt32(4))});
+                {b.getInt32(0), b.getInt32(binding < 2 ? 0 : binding-1), b.getInt32(1), b.getInt32(0), llvm::ConstantPointerNull::get(b.getPtrTy())});
+            return b.CreateIntrinsic(b.getPtrTy(), llvm::Intrinsic::dx_resource_getpointer, {handle, b.CreateMul(b.CreateZExtOrTrunc(index, b.getInt32Ty()), b.getInt32(4))});
         }
         if (opencl) {
             auto* function = b.GetInsertBlock()->getParent();
-            return b.CreateGEP(b.getInt32Ty(), function->getArg(unsigned(function->arg_size() - 2 + binding)), index);
+            return b.CreateGEP(b.getInt32Ty(), function->getArg(unsigned(function->arg_size() - packet_resource_count + binding)), index);
         }
         auto* buffer = llvm::TargetExtType::get(b.getContext(), "spirv.VulkanBuffer", {llvm::ArrayType::get(b.getInt32Ty(), 0)}, {12, 1});
-        if (!names[binding]) names[binding] = b.CreateGlobalString(binding ? "P" : "M");
+        if (!names[binding]) names[binding] = b.CreateGlobalString("cudavm.resource." + std::to_string(binding));
         auto* handle = b.CreateIntrinsic(buffer, llvm::Intrinsic::spv_resource_handlefrombinding,
             {b.getInt32(0), b.getInt32(binding), b.getInt32(1), b.getInt32(0), names[binding]});
-        return b.CreateIntrinsic(llvm::PointerType::get(b.getContext(), 11), llvm::Intrinsic::spv_resource_getpointer, {handle, index});
+        return b.CreateIntrinsic(llvm::PointerType::get(b.getContext(), 11), llvm::Intrinsic::spv_resource_getpointer,
+            {handle, b.CreateZExtOrTrunc(index, b.getInt32Ty())});
     }
     llvm::Value* packet(llvm::Value* index) { return b.CreateAlignedLoad(b.getInt32Ty(), word_pointer(1, index), llvm::Align(4)); }
     llvm::Value* pair(llvm::Value* lo, llvm::Value* hi) {
@@ -380,8 +381,25 @@ struct lowering {
         auto* index=b.CreateURem(b.CreateLShr(offset,b.getInt32(2)),b.getInt32(uint32_t(words)));
         return b.CreateInBoundsGEP(shared->getValueType(), shared, {b.getInt32(0),index});
     }
+    // Branch on resource identity before forming pointers. No pointer PHI or
+    // Vulkan variable-pointer capability is needed for native resource access.
+    void access_resolved(llvm::Value* physical, const std::function<void(llvm::BasicBlock*, const std::function<llvm::Value*()>&)>& access) {
+        auto* function = b.GetInsertBlock()->getParent();
+        auto* offset = b.CreateAnd(physical, b.getInt64(packet_offset_mask));
+        auto* binding = b.CreateTrunc(b.CreateLShr(physical, b.getInt64(packet_binding_shift)), b.getInt32Ty());
+        auto* invalid = llvm::BasicBlock::Create(b.getContext(), "resource.invalid", function);
+        auto* dispatch = b.CreateSwitch(binding, invalid, packet_direct_bindings+1);
+        for (unsigned i=0;i<=packet_direct_bindings;++i) {
+            auto* block = llvm::BasicBlock::Create(b.getContext(), "resource.access", function);
+            dispatch->addCase(b.getInt32(i), block); b.SetInsertPoint(block);
+            access(block, [&, i] { return word_pointer(i ? i+1 : 0, b.CreateLShr(offset, b.getInt64(2))); });
+        }
+        b.SetInsertPoint(invalid);
+        if (function->getReturnType()->isVoidTy()) b.CreateRetVoid();
+        else b.CreateRet(llvm::Constant::getNullValue(function->getReturnType()));
+    }
     void make_resolver() {
-        resolve = llvm::Function::Create(llvm::FunctionType::get(b.getInt32Ty(), arguments({b.getInt32Ty(), b.getInt32Ty()}), false), llvm::GlobalValue::InternalLinkage, "cudavm.resolve.address", *result);
+        resolve = llvm::Function::Create(llvm::FunctionType::get(b.getInt64Ty(), arguments({b.getInt32Ty(), b.getInt32Ty()}), false), llvm::GlobalValue::InternalLinkage, "cudavm.resolve.address", *result);
         auto* first = llvm::BasicBlock::Create(b.getContext(), "entry", resolve);
         auto* loop = llvm::BasicBlock::Create(b.getContext(), "allocations", resolve);
         auto* test = llvm::BasicBlock::Create(b.getContext(), "range", resolve);
@@ -392,21 +410,31 @@ struct lowering {
         auto* address = pair(resolve->getArg(0), resolve->getArg(1));
         auto* table = b.CreateLShr(packet(b.getInt32(6)), b.getInt32(2));
         auto* count = packet(b.getInt32(7)); b.CreateBr(loop);
-        b.SetInsertPoint(loop); auto* i = b.CreatePHI(b.getInt32Ty(), 2); i->addIncoming(b.getInt32(0), first);
-        b.CreateCondBr(b.CreateICmpULT(i, count), test, absent);
-        b.SetInsertPoint(test); auto* row = b.CreateAdd(table, b.CreateMul(i, b.getInt32(4)));
+        b.SetInsertPoint(loop);
+        auto* low = b.CreatePHI(b.getInt32Ty(), 2); low->addIncoming(b.getInt32(0), first);
+        auto* high = b.CreatePHI(b.getInt32Ty(), 2); high->addIncoming(count, first);
+        b.CreateCondBr(b.CreateICmpULT(low, high), test, absent);
+        b.SetInsertPoint(test);
+        auto* middle = b.CreateAdd(low, b.CreateLShr(b.CreateSub(high, low), b.getInt32(1)));
+        auto* row = b.CreateAdd(table, b.CreateMul(middle, b.getInt32(packet_allocation_words)));
         auto* base = packet64(row); auto* delta = b.CreateSub(address, base);
-        auto* size = b.CreateZExt(packet(b.CreateAdd(row, b.getInt32(2))), b.getInt64Ty());
+        auto* size = packet64(b.CreateAdd(row, b.getInt32(2)));
         b.CreateCondBr(b.CreateAnd(b.CreateICmpUGE(address, base), b.CreateICmpULT(delta, size)), found, next);
-        b.SetInsertPoint(next); auto* increment = b.CreateAdd(i, b.getInt32(1)); i->addIncoming(increment, next); b.CreateBr(loop);
-        b.SetInsertPoint(found); b.CreateRet(b.CreateAdd(packet(b.CreateAdd(row, b.getInt32(3))), b.CreateTrunc(delta, b.getInt32Ty())));
-        b.SetInsertPoint(absent); b.CreateRet(b.getInt32(0));
+        b.SetInsertPoint(next);
+        auto* before = b.CreateICmpULT(address, base);
+        low->addIncoming(b.CreateSelect(before, low, b.CreateAdd(middle, b.getInt32(1))), next);
+        high->addIncoming(b.CreateSelect(before, middle, high), next); b.CreateBr(loop);
+        b.SetInsertPoint(found);
+        auto* offset = b.CreateAdd(packet64(b.CreateAdd(row, b.getInt32(4))), delta);
+        auto* binding = b.CreateZExt(packet(b.CreateAdd(row, b.getInt32(6))), b.getInt64Ty());
+        b.CreateRet(b.CreateOr(offset, b.CreateShl(binding, b.getInt64(packet_binding_shift))));
+        b.SetInsertPoint(absent); b.CreateRet(b.getInt64(0));
     }
     llvm::Function* make_access(bool store) {
         auto base = store ? std::vector<llvm::Type*>{b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()}
             : std::vector<llvm::Type*>{b.getInt32Ty(),b.getInt32Ty()};
         if (opencl && local_bytes) base.push_back(b.getPtrTy());
-        if (opencl) {base.push_back(resource_pointer_type());base.push_back(resource_pointer_type());}
+        if (opencl) for (unsigned i=0;i<packet_resource_count;++i) base.push_back(resource_pointer_type());
         auto* function = llvm::Function::Create(llvm::FunctionType::get(store ? b.getVoidTy() : b.getInt32Ty(),
             base, false),
             llvm::GlobalValue::InternalLinkage, store ? "cudavm.store.word" : "cudavm.load.word", *result);
@@ -448,7 +476,7 @@ struct lowering {
             }
             else b.CreateRet(b.CreateAlignedLoad(b.getInt32Ty(), pointer(), llvm::Align(4),true));
         };
-        access(global_space, [&] { return word_pointer(0, b.CreateLShr(call_helper(resolve, {address}), b.getInt32(2))); });
+        b.SetInsertPoint(global_space); access_resolved(call_helper(resolve, {address}), access);
         access(shared_space, [&] { return shared_pointer(b.CreateAnd(lo, b.getInt32(0x3fffffffu))); });
         if (local_space) {
           b.SetInsertPoint(local_space);
@@ -515,7 +543,7 @@ struct lowering {
         if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(input)) {
             if (auto at = shared_offsets.find(global); at != shared_offsets.end()) return b.getInt64(0xffffffff40000000ull + at->second);
             if (auto at = globals.find(global); at != globals.end()) {
-                auto* start = b.CreateAdd(b.CreateLShr(packet(b.getInt32(6)), b.getInt32(2)), b.CreateMul(packet(b.getInt32(7)), b.getInt32(4)));
+                auto* start = b.CreateAdd(b.CreateLShr(packet(b.getInt32(6)), b.getInt32(2)), b.CreateMul(packet(b.getInt32(7)), b.getInt32(packet_allocation_words)));
                 return packet64(b.CreateAdd(start, b.getInt32(at->second * 2)));
             }
             fail(*input, "unavailable global storage");
@@ -576,7 +604,7 @@ struct lowering {
     llvm::Value* byte_shift(llvm::Value* address) {
         auto* lo = b.CreateTrunc(address, b.getInt32Ty());
         auto* hi = b.CreateTrunc(b.CreateLShr(address, b.getInt64(32)), b.getInt32Ty());
-        auto* physical = b.CreateSelect(b.CreateICmpEQ(hi, b.getInt32(0xffffffffu)), lo, call_helper(resolve, {address}));
+        auto* physical = b.CreateSelect(b.CreateICmpEQ(hi, b.getInt32(0xffffffffu)), lo, b.CreateTrunc(call_helper(resolve, {address}), b.getInt32Ty()));
         return b.CreateMul(b.CreateAnd(physical, b.getInt32(3)), b.getInt32(8));
     }
     void store(llvm::Value* address, llvm::Value* stored, unsigned alignment = 4, llvm::Type* source_type = nullptr) {
@@ -603,7 +631,7 @@ struct lowering {
         auto* integer = llvm::IntegerType::get(b.getContext(), bits);
         std::vector<llvm::Type*> signature{b.getInt32Ty(),b.getInt32Ty(),integer,integer};
         if (opencl && local_bytes && bits==64) signature.push_back(b.getPtrTy());
-        if (opencl) {signature.push_back(resource_pointer_type());signature.push_back(resource_pointer_type());}
+        if (opencl) for (unsigned i=0;i<packet_resource_count;++i) signature.push_back(resource_pointer_type());
         auto* function = llvm::Function::Create(llvm::FunctionType::get(integer,
             signature,false), llvm::GlobalValue::InternalLinkage,
             "cudavm.atomic." + std::to_string(operation) + "." + std::to_string(bits), *result);
@@ -648,12 +676,11 @@ struct lowering {
             auto* global_space=llvm::BasicBlock::Create(b.getContext(),"global",function);
             auto* shared_space=llvm::BasicBlock::Create(b.getContext(),"shared",function);
             b.CreateCondBr(b.CreateICmpEQ(function->getArg(1),b.getInt32(0xffffffffu)),shared_space,global_space);
-            auto access=[&](llvm::BasicBlock* block,bool group_memory) {
+            auto access=[&](llvm::BasicBlock* block,bool group_memory,const std::function<llvm::Value*()>& global_pointer) {
                 b.SetInsertPoint(block);
                 auto pointer=[&]() -> llvm::Value* {
                     if(group_memory)return shared_pointer(b.CreateAnd(function->getArg(0),b.getInt32(0x3fffffffu)));
-                    auto* offset=call_helper(resolve,{address});
-                    return b.CreateGEP(b.getInt64Ty(),function->getArg(unsigned(function->arg_size()-2)),b.CreateLShr(offset,b.getInt32(3)));
+                    return global_pointer();
                 };
                 if(operation==llvm::AtomicRMWInst::FAdd || operation==llvm::AtomicRMWInst::FSub) {
                     auto* initial=b.CreateExtractValue(b.CreateAtomicCmpXchg(pointer(),b.getInt64(0),b.getInt64(0),llvm::Align(8),llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,scope),0);
@@ -668,12 +695,13 @@ struct lowering {
                 } else if(operation==100) b.CreateRet(b.CreateExtractValue(b.CreateAtomicCmpXchg(pointer(),function->getArg(3),function->getArg(2),llvm::Align(8),native_order,native_failure,scope),0));
                 else b.CreateRet(b.CreateAtomicRMW(llvm::AtomicRMWInst::BinOp(operation),pointer(),function->getArg(2),llvm::Align(8),native_order,scope));
             };
-            access(global_space,false);access(shared_space,true);
+            b.SetInsertPoint(global_space); access_resolved(call_helper(resolve,{address}), [&](auto* block, const auto& pointer) { access(block,false,pointer); });
+            access(shared_space,true,{});
         } else if (bits == 32) {
             auto* global_space = llvm::BasicBlock::Create(b.getContext(), "global", function);
             auto* shared_space = llvm::BasicBlock::Create(b.getContext(), "shared", function);
             b.CreateCondBr(b.CreateICmpEQ(function->getArg(1), b.getInt32(0xffffffffu)), shared_space, global_space);
-            auto access = [&](llvm::BasicBlock* block, bool group_memory) {
+            auto access = [&](llvm::BasicBlock* block, bool group_memory, const std::function<llvm::Value*()>& global_pointer) {
                 b.SetInsertPoint(block);
                 if(dxil && group_memory && operation!=100 && operation!=llvm::AtomicRMWInst::FAdd && operation!=llvm::AtomicRMWInst::FSub) {
                     // DXIL's legacy bitcode reader rejects LLVM's remaining
@@ -704,7 +732,7 @@ struct lowering {
                     b.SetInsertPoint(done);b.CreateRet(expected);return;
                 }
                 if(operation==llvm::AtomicRMWInst::FAdd || operation==llvm::AtomicRMWInst::FSub) {
-                    auto pointer=[&](){return group_memory?shared_pointer(b.CreateAnd(function->getArg(0),b.getInt32(0x3fffffffu))):word_pointer(0,b.CreateLShr(call_helper(resolve,{address}),b.getInt32(2)));};
+                    auto pointer=[&](){return group_memory?shared_pointer(b.CreateAnd(function->getArg(0),b.getInt32(0x3fffffffu))):global_pointer();};
                     auto* retry=llvm::BasicBlock::Create(b.getContext(),"add.retry",function);
                     auto* done=llvm::BasicBlock::Create(b.getContext(),"add.done",function);
                     auto* initial=b.CreateExtractValue(b.CreateAtomicCmpXchg(pointer(),b.getInt32(0),b.getInt32(0),llvm::Align(4),llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,scope),0);
@@ -716,11 +744,12 @@ struct lowering {
                     expected->addIncoming(b.CreateExtractValue(exchange,0),retry);b.CreateCondBr(b.CreateExtractValue(exchange,1),done,retry);b.SetInsertPoint(done);b.CreateRet(expected);return;
                 }
                 auto* ptr = group_memory ? shared_pointer(b.CreateAnd(function->getArg(0),b.getInt32(0x3fffffffu)))
-                    : word_pointer(0,b.CreateLShr(call_helper(resolve,{address}),b.getInt32(2)));
+                    : global_pointer();
                 if (operation == 100) b.CreateRet(b.CreateExtractValue(b.CreateAtomicCmpXchg(ptr,function->getArg(3),function->getArg(2),llvm::Align(4),native_order,native_failure,scope),0));
                 else b.CreateRet(b.CreateAtomicRMW(llvm::AtomicRMWInst::BinOp(operation),ptr,function->getArg(2),llvm::Align(4),native_order,scope));
             };
-            access(global_space,false); access(shared_space,true);
+            b.SetInsertPoint(global_space); access_resolved(call_helper(resolve,{address}), [&](auto* block, const auto& pointer) { access(block,false,pointer); });
+            access(shared_space,true,{});
         } else {
             // A device-scoped 32-bit lock protects each complete 64-bit update,
             // including the compare and both words. Release occurs before retry
@@ -793,7 +822,7 @@ struct lowering {
     llvm::Value* numeric_call(const std::string& name,llvm::Type* output,std::initializer_list<llvm::Value*> inputs) {
         auto* original=source.getFunction(name);if(!original || original->isDeclaration()) fail(kernel,"exact native numeric helper is unavailable");
         std::vector<llvm::Value*> args(inputs);std::vector<llvm::Type*> signature;for(auto* arg:args)signature.push_back(arg->getType());
-        if(opencl) {auto* caller=b.GetInsertBlock()->getParent();signature.push_back(resource_pointer_type());signature.push_back(resource_pointer_type());args.push_back(caller->getArg(unsigned(caller->arg_size()-2)));args.push_back(caller->getArg(unsigned(caller->arg_size()-1)));}
+        if(opencl) {auto* caller=b.GetInsertBlock()->getParent();for(unsigned i=0;i<packet_resource_count;++i) {signature.push_back(resource_pointer_type());args.push_back(caller->getArg(unsigned(caller->arg_size()-packet_resource_count+i)));}}
         auto callee=result->getOrInsertFunction("cudavm.native.helper."+name,llvm::FunctionType::get(output,signature,false));
         llvm::cast<llvm::Function>(callee.getCallee())->addFnAttr("cudavm.source.helper",name);return b.CreateCall(callee,args);
     }
@@ -906,7 +935,7 @@ struct lowering {
         auto* high=operation==9 || operation==11?b.CreateTrunc(b.CreateLShr(data,b.getInt64(32)),b.getInt32Ty()):b.getInt32(0);
         if(data->getType()->isFloatTy()) data=b.CreateBitCast(data,b.getInt32Ty()); else data=b.CreateZExtOrTrunc(data,b.getInt32Ty());
         std::vector<llvm::Value*> args{mask,data,operation<4?value(call.getArgOperand(2)):high,operation<4?value(call.getArgOperand(3)):b.getInt32(0)};
-        if(opencl) {args.push_back(entry->getArg(0));args.push_back(entry->getArg(1));}
+        if(opencl) for (unsigned i=0;i<packet_resource_count;++i) args.push_back(entry->getArg(unsigned(entry->arg_size()-packet_resource_count+i)));
         auto* out=b.CreateCall(helper,args); out->setConvergent();
         if(call.getType()->isVoidTy()) return nullptr;
         if(operation==10 || operation==11) return b.CreateInsertValue(b.CreateInsertValue(llvm::UndefValue::get(type(call.getType())),b.CreateTrunc(out,b.getInt32Ty()),0),b.CreateICmpNE(b.CreateLShr(out,b.getInt64(32)),b.getInt64(0)),1);
@@ -946,7 +975,7 @@ struct lowering {
             assembly->getConstraintString() != constraints) fail(instruction, "invalid texture instruction signature");
         auto* object = value(instruction.getArgOperand(0));
         object = b.CreateZExt(call_helper(resolve, {object}), b.getInt64Ty());
-        auto descriptor_word = [&](unsigned offset) { return image_word(object, offset); };
+        auto descriptor_word = [&](unsigned offset) { return image_descriptor_word(object, offset); };
         auto* base = b.CreateZExt(call_helper(resolve, {pair(descriptor_word(0), descriptor_word(4))}), b.getInt64Ty());
         auto* width = descriptor_word(8);
         auto* height = descriptor_word(12);
@@ -1048,7 +1077,7 @@ struct lowering {
                 if(argument->getType()->isPointerTy() || !argument->getType()->isSingleValueType()) fail(instruction,"native math helper requires scalar arguments");
                 signature.push_back(type(argument->getType())); args.push_back(value(argument.get()));
             }
-            if(opencl) {signature.push_back(resource_pointer_type());signature.push_back(resource_pointer_type());args.push_back(entry->getArg(unsigned(entry->arg_size()-2)));args.push_back(entry->getArg(unsigned(entry->arg_size()-1)));}
+            if(opencl) for(unsigned i=0;i<packet_resource_count;++i) {signature.push_back(resource_pointer_type());args.push_back(entry->getArg(unsigned(entry->arg_size()-packet_resource_count+i)));}
             auto callee=result->getOrInsertFunction("cudavm.native.helper."+function->getName().str(),llvm::FunctionType::get(type(function->getReturnType()),signature,false));
             llvm::cast<llvm::Function>(callee.getCallee())->addFnAttr("cudavm.source.helper",function->getName());
             return b.CreateCall(callee,args);
@@ -1378,7 +1407,7 @@ struct lowering {
         make_resolver(); read = make_access(false); write = make_access(true);
         std::vector<llvm::Type*> signature;
         if(!kernel_entry) for(const auto& argument:kernel.args()) signature.push_back(type(argument.getType()));
-        if(opencl) {signature.push_back(resource_pointer_type());signature.push_back(resource_pointer_type());}
+        if(opencl) for (unsigned i=0;i<packet_resource_count;++i) signature.push_back(resource_pointer_type());
         entry = llvm::Function::Create(llvm::FunctionType::get(kernel_entry?b.getVoidTy():type(kernel.getReturnType()),signature,false),llvm::GlobalValue::ExternalLinkage,kernel_entry?(opencl?"main_kernel":"main"):"cudavm.native.helper."+kernel.getName().str(),*result);
         if (opencl && kernel_entry) entry->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
         else if(kernel_entry) { entry->addFnAttr("hlsl.numthreads", std::to_string(group[0]) + "," + std::to_string(group[1]) + "," + std::to_string(group[2])); entry->addFnAttr("hlsl.shader", "compute"); }

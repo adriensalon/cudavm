@@ -234,7 +234,7 @@ struct opencl_session : session {
     }
     bool can_bind_direct(const buffer& value) const override {
         auto native=dynamic_cast<const opencl_buffer*>(&value.storage());
-        return native && native->owner==owner && !native->imported && value.size%4==0 && value.storage_offset()%4==0 && value.size<=UINT32_MAX && value.storage_offset()<=UINT32_MAX-value.size;
+        return native && native->owner==owner && !native->imported && value.size%4==0 && value.storage_offset()%4==0;
     }
     bool supports_native_spirv(std::span<const uint32_t> code) const override {
         if (!owner->native_il || code.size() < 5 || code[1] > owner->native_il_version) return false;
@@ -279,7 +279,7 @@ struct opencl_session : session {
     std::unique_ptr<compute_pipeline> compile_native_spirv(std::span<const uint32_t> code, const launch_shape& shape) override {
         require(supports_native_spirv(code), CUDA_ERROR_NOT_SUPPORTED, "OpenCL SPIR-V IL ingestion is unavailable on this device");
         validate_native_spirv_shape(shape);
-        auto compiled = std::make_unique<opencl_pipeline>(owner); cl_int status = CL_SUCCESS;
+        auto compiled = std::make_unique<opencl_pipeline>(owner); compiled->direct_buffers=packet_direct_bindings; cl_int status = CL_SUCCESS;
         compiled->program = owner->create_program_il(owner->context, code.data(), code.size() * 4, &status); check(status,"clCreateProgramWithIL");
         status = owner->api->clBuildProgram(compiled->program, 1, &owner->device, "", nullptr, nullptr);
         if (status != CL_SUCCESS) {
@@ -307,6 +307,8 @@ struct opencl_session : session {
         return enqueue_dispatch_bound(pipeline,shape,memory,parameters,{},queue);
     }
     device_work enqueue_dispatch_bound(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters,std::span<buffer* const> bindings,native_queue* queue) override {
+        std::array<buffer*,packet_direct_bindings> unused; unused.fill(&memory);
+        if (bindings.empty()) bindings = unused;
         require(bindings.size()==pipeline.direct_buffers,CUDA_ERROR_INVALID_VALUE,"OpenCL direct binding count mismatch");
         auto& api=*owner->api;auto kernel=static_cast<opencl_pipeline&>(pipeline).kernel;
         auto mem=static_cast<opencl_buffer&>(memory).value,args=static_cast<opencl_buffer&>(parameters).value;

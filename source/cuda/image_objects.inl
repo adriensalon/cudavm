@@ -90,7 +90,8 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
     } else {
         require(d.Height && !d.Depth && !(d.Flags & (CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_CUBEMAP)),
                 CUDA_ERROR_NOT_SUPPORTED, "shader image objects require a 2D array");
-        require(d.Width <= UINT32_MAX && d.Height <= UINT32_MAX && entry->backing->size < (1u << 30), CUDA_ERROR_NOT_SUPPORTED, "image exceeds shader address transport");
+        require(d.Width <= UINT32_MAX && d.Height <= UINT32_MAX && (linear || pitch <= UINT32_MAX),
+            CUDA_ERROR_NOT_SUPPORTED, "image dimensions or row pitch exceed shader descriptor capacity");
         if (!surface) {
             require((d.Format == CU_AD_FORMAT_FLOAT || d.Format == CU_AD_FORMAT_SIGNED_INT8 || d.Format == CU_AD_FORMAT_UNSIGNED_INT8 ||
                 d.Format == CU_AD_FORMAT_SIGNED_INT16 || d.Format == CU_AD_FORMAT_UNSIGNED_INT16 ||

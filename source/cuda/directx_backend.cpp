@@ -449,9 +449,9 @@ struct directx_session : session {
     }
     bool can_bind_direct(const buffer& value) const override {
         auto native=dynamic_cast<const directx_buffer*>(&value.storage());
-        return native && native->owner->value==owner->value && !native->imported && value.size%4==0 && value.storage_offset()%4==0 && value.size<=UINT32_MAX && value.storage_offset()<=UINT32_MAX-value.size;
+        return native && native->owner->value==owner->value && !native->imported && value.size%4==0 && value.storage_offset()%4==0 && value.size<=packet_arena_capacity && value.storage_offset()<=packet_arena_capacity-value.size;
     }
-    std::unique_ptr<compute_pipeline> compile_binary(const void* code_data,size_t code_size,unsigned direct_buffers=0) {
+    std::unique_ptr<compute_pipeline> compile_binary(const void* code_data,size_t code_size,unsigned direct_buffers=packet_direct_bindings) {
         auto compiled=std::make_unique<directx_pipeline>(owner); compiled->direct_buffers=direct_buffers;
         auto serialize=owner->api->d3d.get<decltype(&D3D12SerializeRootSignature)>("D3D12SerializeRootSignature");
         ComPtr<ID3DBlob> errors;
@@ -521,6 +521,8 @@ struct directx_session : session {
     device_work enqueue_dispatch_bound(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters,std::span<buffer* const> bindings,native_queue* queue) override {
         auto recording = queue && queue->recording() ? dynamic_cast<directx_graph*>(queue) : nullptr;
         require(!recording || (recording->commands->owner == owner && !profile->enabled), CUDA_ERROR_NOT_SUPPORTED, "DirectX dispatch cannot be recorded");
+        std::array<buffer*,packet_direct_bindings> unused; unused.fill(&memory);
+        if (bindings.empty()) bindings = unused;
         require(bindings.size()==pipeline.direct_buffers,CUDA_ERROR_INVALID_VALUE,"DirectX direct binding count mismatch");
         for(auto resource:bindings)require(can_bind_direct(*resource),CUDA_ERROR_INVALID_VALUE,"incompatible DirectX direct buffer");
         auto task = recording ? recording->commands : std::make_shared<directx_task>(owner);

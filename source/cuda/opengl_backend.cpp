@@ -199,6 +199,7 @@ struct opengl_api {
     create_program_type create_program;attach_type attach;shader_action_type link_program,use_program,delete_program;
     bind_base_type bind_base;dispatch_type dispatch;barrier_type memory_barrier;
     unsigned direct_buffers = 0;
+    uint64_t storage_buffer_bytes = 0;
     shader_binary_type shader_binary = nullptr;
     specialize_type specialize = nullptr;
     std::atomic<bool> native_spirv{false};
@@ -240,6 +241,9 @@ struct opengl_api {
         auto get_integer=load<void (GL_CALL*)(enum_type,int*)>(context,"glGetIntegerv");
         int blocks=0,bindings=0;get_integer(0x90db,&blocks);get_integer(0x90dd,&bindings);
         direct_buffers=unsigned(std::max(0,std::min({6,blocks-2,bindings-2})));
+        auto get_integer64=load<void (GL_CALL*)(enum_type,int64_t*)>(context,"glGetInteger64v");
+        int64_t storage_bytes=0; get_integer64(0x90de,&storage_bytes);
+        storage_buffer_bytes=uint64_t(std::max(int64_t(0),storage_bytes));
         auto indexed = load<void (GL_CALL*)(enum_type,uint,int*)>(context,"glGetIntegeri_v");
         for (unsigned axis = 0; axis < 3; ++axis) {
             int count = 0, size = 0; indexed(0x91be, axis, &count); indexed(0x91bf, axis, &size);
@@ -490,13 +494,14 @@ struct opengl_session : session {
         });return task;
     }
     unsigned direct_binding_limit() const override { return owner->api->direct_buffers; }
+    uint64_t shader_arena_capacity() const override { return std::min(packet_arena_capacity,owner->api->storage_buffer_bytes); }
     bool can_copy_direct(const buffer& value) const override {
         auto native = dynamic_cast<const opengl_buffer*>(&value.storage());
         return native && native->owner->resource_owner() == owner->resource_owner() && !native->imported;
     }
     bool can_bind_direct(const buffer& value) const override {
         auto native=dynamic_cast<const opengl_buffer*>(&value.storage());
-        return native && native->owner->resource_owner()==owner->resource_owner() && !native->imported && value.size%4==0 && value.storage_offset()%4==0 && value.size<=UINT32_MAX && value.storage_offset()<=UINT32_MAX-value.size;
+        return native && native->owner->resource_owner()==owner->resource_owner() && !native->imported && value.size%4==0 && value.storage_offset()%4==0 && value.size<=packet_arena_capacity && value.storage_offset()<=packet_arena_capacity-value.size && value.storage().size<=owner->api->storage_buffer_bytes;
     }
     bool supports_native_spirv(std::span<const uint32_t> code) const override {
         if ((!owner->api->native_spirv && !native_glsl_configured) || !owner->api->native_int64) return false;
@@ -523,7 +528,7 @@ struct opengl_session : session {
         // Binary specialization is unreliable on some otherwise conforming GL
         // drivers. GLSL ingestion of the same native IR avoids that vendor JIT.
         if(native_glsl_configured) return compile_native_glsl(native_glsl(code));
-        auto compiled = std::make_unique<opengl_pipeline>(owner);
+        auto compiled = std::make_unique<opengl_pipeline>(owner); compiled->direct_buffers=packet_direct_bindings;
         compiled->program = owner->invoke([&] {
             auto& api = *owner->api; api.check("OpenGL native SPIR-V preflight");
             uint shader = api.create_shader(0x91b9), program = 0;
@@ -555,7 +560,7 @@ struct opengl_session : session {
     }
     std::unique_ptr<compute_pipeline> compile_native_glsl(const std::string& source) {
         auto compiled=std::make_unique<opengl_pipeline>(owner);
-        compiled->direct_buffers=0;
+        compiled->direct_buffers=packet_direct_bindings;
         compiled->program=owner->invoke([&] {
             auto& api=*owner->api;uint shader=api.create_shader(0x91b9),program=0;
             try {
@@ -577,6 +582,8 @@ struct opengl_session : session {
         return enqueue_dispatch_bound(pipeline,shape,memory,parameters,{},nullptr);
     }
     device_work enqueue_dispatch_bound(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters,std::span<buffer* const> bindings,native_queue*) override {
+        std::array<buffer*,packet_direct_bindings> unused; unused.fill(&memory);
+        if (bindings.empty()) bindings = unused;
         require(bindings.size()==pipeline.direct_buffers,CUDA_ERROR_INVALID_VALUE,"OpenGL direct binding count mismatch");
         for(auto resource:bindings) require(can_bind_direct(*resource),CUDA_ERROR_INVALID_VALUE,"incompatible OpenGL direct buffer");
         auto task = std::make_shared<opengl_task>(owner);

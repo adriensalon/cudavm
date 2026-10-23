@@ -89,13 +89,15 @@ std::shared_ptr<captured_launch> prepare_launch(CUfunction handle, const launch_
         command->bindings.push_back({address, allocation.native.get()});
         if (host) command->hosts.push_back(std::move(host));
     }
+    std::unordered_set<uint64_t> bound_addresses;
+    for (auto binding : command->bindings) bound_addresses.insert(binding.address);
     for (auto* objects : {&global().textures, &global().surfaces}) for (auto& [handle, image] : *objects) {
         if (image->owner != owner || image->retiring || (image->array && image->array->retiring)) continue;
         command->images.push_back(image);
         if (!image->descriptor) continue;
-        command->bindings.push_back({handle, image->descriptor.get(), objects == &global().surfaces});
+        command->bindings.push_back({handle, image->descriptor.get(), objects == &global().surfaces, true});
         auto address = image->backing_address;
-        if (std::none_of(command->bindings.begin(), command->bindings.end(), [&](auto binding) { return binding.address == address; }))
+        if (bound_addresses.insert(address).second)
             command->bindings.push_back({address, image->backing.get()});
     }
     context_configuration(owner, [&] { command->function->validate_launch(shape, command->arguments, command->bindings); });

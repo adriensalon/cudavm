@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <algorithm>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -23,24 +24,38 @@ constexpr packet_word64 make_packet_private_pointer(uint32_t space, uint32_t off
 
 // Packet words 0..5: grid and block dimensions. Word 6: byte offset of this
 // table, word 7: record count. Parameter bytes still begin at byte 32.
-// Allocation extents and arena offsets are bounded below 1 GiB by the runtime.
-struct packet_allocation { packet_word64 address; uint32_t size, offset; };
+// Sorted by virtual base. Binding zero selects the arena; other bindings select
+// persistent native backing storage. Translation never changes CUDA pointer bits.
+inline constexpr uint32_t packet_memory_abi = 2;
+inline constexpr uint32_t packet_direct_bindings = 2;
+inline constexpr uint32_t packet_resource_count = 2 + packet_direct_bindings;
+inline constexpr unsigned packet_binding_shift = 61;
+inline constexpr uint64_t packet_offset_mask = (uint64_t(1) << packet_binding_shift) - 1;
+inline constexpr uint64_t packet_arena_capacity = uint64_t(1) << 32;
+struct packet_allocation {
+    packet_word64 address;
+    uint64_t size, offset;
+    uint32_t binding = 0, reserved = 0;
+};
 inline constexpr uint32_t packet_parameter_header_bytes = 32;
-inline constexpr uint32_t packet_allocation_words = 4;
-static_assert(sizeof(packet_word64) == 8 && sizeof(packet_allocation) == 16);
+inline constexpr uint32_t packet_allocation_words = 8;
+static_assert(sizeof(packet_word64) == 8 && sizeof(packet_allocation) == 32);
 static_assert(std::is_trivially_copyable_v<packet_allocation>);
 
 // Host contract for the shader's address resolver. Bounds describe accesses,
 // not pointer values: one-past pointers can be stored/compared but not resolved.
-inline std::optional<uint32_t> resolve_packet_address(packet_word64 pointer, std::span<const packet_allocation> table) {
+inline std::optional<uint64_t> resolve_packet_address(packet_word64 pointer, std::span<const packet_allocation> table) {
     if (pointer.hi == packet_private_high_word) return pointer.lo;
     auto address = join_packet_word64(pointer);
     if (!address) return {};
-    for (auto record : table) {
-        auto base = join_packet_word64(record.address);
-        if (address >= base && address - base < record.size)
-            return record.offset + uint32_t(address - base);
-    }
+    auto at = std::upper_bound(table.begin(), table.end(), address,
+        [](uint64_t value, const auto& record) { return value < join_packet_word64(record.address); });
+    if (at == table.begin()) return {};
+    const auto& record = *--at;
+    auto delta = address - join_packet_word64(record.address);
+    if (delta < record.size && record.offset <= packet_offset_mask && delta <= packet_offset_mask - record.offset &&
+        record.binding <= packet_direct_bindings)
+        return (uint64_t(record.binding) << packet_binding_shift) | (record.offset + delta);
     return {};
 }
 }

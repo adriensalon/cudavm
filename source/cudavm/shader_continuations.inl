@@ -290,7 +290,7 @@ void make_continuations() {
         }
         auto* mask=collective_load(collective_pointer(collective_masks,linear_thread()));
         std::vector<llvm::Value*> args{mask,b.getInt32(states.at(site.wait)),b.getInt32(site.operation)};
-        if(opencl) {args.push_back(entry->getArg(0));args.push_back(entry->getArg(1));}
+        if(opencl) for(unsigned i=0;i<packet_resource_count;++i) args.push_back(entry->getArg(i));
         auto* status=b.CreateCall(poll,args);
         auto* members=b.CreateTrunc(status,b.getInt32Ty());
         b.CreateCondBr(b.CreateICmpNE(b.CreateLShr(status,b.getInt64(32)),b.getInt64(0)),execute,latch);branch->eraseFromParent();
@@ -307,7 +307,7 @@ void make_continuations() {
     std::vector<llvm::Type*> signature;
     if(opencl) {
         for(auto* slot:slots) signature.push_back(slot->getType());
-        signature.push_back(resource_pointer_type());signature.push_back(resource_pointer_type());
+        for(unsigned i=0;i<packet_resource_count;++i) signature.push_back(resource_pointer_type());
     }
     auto* step=llvm::Function::Create(llvm::FunctionType::get(b.getVoidTy(),signature,false),llvm::GlobalValue::InternalLinkage,"cudavm.continuation.step",*result);
     step->addFnAttr(llvm::Attribute::NoInline);step->addFnAttr(llvm::Attribute::Convergent);
@@ -327,8 +327,8 @@ void make_continuations() {
         for(auto& bb:*step) for(auto& input:bb) for(unsigned i=0;i<input.getNumOperands();++i) {
             auto* operand=input.getOperand(i);
             for(unsigned slot=0;slot<slots.size();++slot) if(operand==slots[slot])input.setOperand(i,step->getArg(slot));
-            if(operand==entry->getArg(0))input.setOperand(i,step->getArg(unsigned(slots.size())));
-            if(operand==entry->getArg(1))input.setOperand(i,step->getArg(unsigned(slots.size()+1)));
+            for(unsigned resource=0;resource<packet_resource_count;++resource)
+                if(operand==entry->getArg(resource))input.setOperand(i,step->getArg(unsigned(slots.size()+resource)));
         }
     } else for(auto* slot:slots) {
         auto* storage=new llvm::GlobalVariable(*result,slot->getAllocatedType(),false,llvm::GlobalValue::InternalLinkage,llvm::UndefValue::get(slot->getAllocatedType()),"cudavm.continuation.value",nullptr,llvm::GlobalVariable::NotThreadLocal,dxil?0:10);
@@ -347,6 +347,6 @@ void make_continuations() {
     auto* conditional=llvm::cast<llvm::BranchInst>(dispatch->getTerminator());conditional->setSuccessor(0,invoke);
     b.SetInsertPoint(invoke);
     std::vector<llvm::Value*> arguments;
-    if(opencl) {for(auto* slot:slots)arguments.push_back(slot);arguments.push_back(entry->getArg(0));arguments.push_back(entry->getArg(1));}
+    if(opencl) {for(auto* slot:slots)arguments.push_back(slot);for(unsigned i=0;i<packet_resource_count;++i) arguments.push_back(entry->getArg(i));}
     b.CreateCall(step,arguments);b.CreateBr(latch);
 }

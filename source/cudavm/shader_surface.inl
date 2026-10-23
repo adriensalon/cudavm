@@ -1,4 +1,4 @@
-// Surface storage is already resolved into the arena. Keep masked writes in a
+// Surface storage is already resolved into a native resource. Keep masked writes in a
 // small helper without the general pointer helper's address-space dispatch.
 void store_surface_word(llvm::Value* address, llvm::Value* value, llvm::Value* mask, bool partial) {
     auto saved = b.saveIP();
@@ -9,23 +9,26 @@ void store_surface_word(llvm::Value* address, llvm::Value* value, llvm::Value* m
             llvm::GlobalValue::InternalLinkage, name, *result);
         auto* first = llvm::BasicBlock::Create(b.getContext(), "entry", helper);
         auto* active = llvm::BasicBlock::Create(b.getContext(), "active", helper);
-        auto* done = llvm::BasicBlock::Create(b.getContext(), "done", helper);
-        b.SetInsertPoint(first); b.CreateCondBr(b.CreateICmpEQ(helper->getArg(1), b.getInt32(0)), active, done);
+        auto* ignored = llvm::BasicBlock::Create(b.getContext(), "ignored", helper);
+        b.SetInsertPoint(first); b.CreateCondBr(b.CreateICmpNE(helper->getArg(1), b.getInt32(0xffffffffu)), active, ignored);
+        b.SetInsertPoint(ignored); b.CreateRetVoid();
         b.SetInsertPoint(active);
-        auto* pointer = word_pointer(0, b.CreateLShr(helper->getArg(0), b.getInt32(2)));
-        if (!partial) { b.CreateAlignedStore(helper->getArg(2), pointer, llvm::Align(4), true); b.CreateBr(done); }
-        else {
+        access_resolved(pair(helper->getArg(0),helper->getArg(1)), [&](auto* block, const auto& resource_pointer) {
+            auto* pointer = resource_pointer();
+            if (!partial) { b.CreateAlignedStore(helper->getArg(2), pointer, llvm::Align(4), true); b.CreateRetVoid(); return; }
             auto scope = dxil ? llvm::SyncScope::System : b.getContext().getOrInsertSyncScopeID("device");
             auto* initial = b.CreateExtractValue(b.CreateAtomicCmpXchg(pointer, b.getInt32(0), b.getInt32(0), llvm::Align(4),
                 llvm::AtomicOrdering::Monotonic, llvm::AtomicOrdering::Monotonic, scope), 0);
-            auto* retry = llvm::BasicBlock::Create(b.getContext(), "retry", helper); b.CreateBr(retry); b.SetInsertPoint(retry);
-            auto* previous = b.CreatePHI(b.getInt32Ty(), 2); previous->addIncoming(initial, active);
+            auto* retry = llvm::BasicBlock::Create(b.getContext(), "retry", helper);
+            auto* done = llvm::BasicBlock::Create(b.getContext(), "done", helper);
+            b.CreateBr(retry); b.SetInsertPoint(retry);
+            auto* previous = b.CreatePHI(b.getInt32Ty(), 2); previous->addIncoming(initial, block);
             auto* merged = b.CreateOr(b.CreateAnd(previous, b.CreateNot(helper->getArg(3))), b.CreateAnd(helper->getArg(2), helper->getArg(3)));
             auto* exchange = b.CreateAtomicCmpXchg(pointer, previous, merged, llvm::Align(4), llvm::AtomicOrdering::Monotonic, llvm::AtomicOrdering::Monotonic, scope);
             previous->addIncoming(b.CreateExtractValue(exchange, 0), retry);
             b.CreateCondBr(b.CreateExtractValue(exchange, 1), done, retry);
-        }
-        b.SetInsertPoint(done); b.CreateRetVoid();
+            b.SetInsertPoint(done); b.CreateRetVoid();
+        });
     }
     b.restoreIP(saved); call_helper(helper, {address, value, mask});
 }
@@ -78,12 +81,12 @@ bool surface_operation(const llvm::CallInst& instruction, llvm::InlineAsm& assem
         resolve->addFnAttr(llvm::Attribute::AlwaysInline);
     }
     auto* object = b.CreateZExt(call_helper(resolve, {value(instruction.getArgOperand(0))}), b.getInt64Ty());
-    auto* base = pair(image_word(object), image_word(object, 4));
+    auto* base = pair(image_descriptor_word(object), image_descriptor_word(object, 4));
     auto* physical = b.CreateZExt(call_helper(resolve, {base}), b.getInt64Ty());
-    auto* width = image_word(object, 8);
-    auto* height = image_word(object, 12);
-    auto* texel_bytes = image_word(object, 52);
-    auto* pitch = image_word(object, 64);
+    auto* width = image_descriptor_word(object, 8);
+    auto* height = image_descriptor_word(object, 12);
+    auto* texel_bytes = image_descriptor_word(object, 52);
+    auto* pitch = image_descriptor_word(object, 64);
     auto* row = b.CreateMul(width, texel_bytes);
     auto* transfer = b.getInt32(components * bits / 8);
     llvm::Value *x = value(instruction.getArgOperand(1)), *y = value(instruction.getArgOperand(2));

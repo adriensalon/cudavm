@@ -1,8 +1,25 @@
-// Image descriptors and their complete array backing each occupy one arena
-// record. Resolve those records once, then access their physical byte offsets.
+// Resolve descriptor and backing records once, then access their native
+// resource offsets without repeating virtual-address translation.
+llvm::Value* image_descriptor_word(llvm::Value* physical, unsigned offset = 0) {
+    // Immutable image descriptors always stage. Keeping their resource identity
+    // static avoids multiplying every field load through native resource arms.
+    auto* index=b.CreateLShr(b.CreateAdd(b.CreateTrunc(physical,b.getInt32Ty()),b.getInt32(offset)),b.getInt32(2));
+    return b.CreateAlignedLoad(b.getInt32Ty(),word_pointer(0,index),llvm::Align(4),true);
+}
 llvm::Value* image_word(llvm::Value* physical, unsigned offset = 0) {
-    auto* index = b.CreateLShr(b.CreateAdd(b.CreateTrunc(physical, b.getInt32Ty()), b.getInt32(offset)), b.getInt32(2));
-    return b.CreateAlignedLoad(b.getInt32Ty(), word_pointer(0, index), llvm::Align(4), true);
+    auto saved = b.saveIP();
+    auto* helper = result->getFunction("cudavm.image.load.word");
+    if (!helper) {
+        helper = llvm::Function::Create(llvm::FunctionType::get(b.getInt32Ty(), arguments({b.getInt32Ty(), b.getInt32Ty()}), false),
+            llvm::GlobalValue::InternalLinkage, "cudavm.image.load.word", *result);
+        if (dxil) helper->addFnAttr(llvm::Attribute::AlwaysInline);
+        b.SetInsertPoint(llvm::BasicBlock::Create(b.getContext(), "entry", helper));
+        access_resolved(pair(helper->getArg(0),helper->getArg(1)), [&](auto*, const auto& pointer) {
+            b.CreateRet(b.CreateAlignedLoad(b.getInt32Ty(), pointer(), llvm::Align(4), true));
+        });
+    }
+    b.restoreIP(saved);
+    return call_helper(helper, {b.CreateAdd(physical, b.getInt64(offset))});
 }
 llvm::Value* normalize_texture_integer(llvm::Value* integer, llvm::Value* bits, llvm::Value* signed_format) {
     // n/(2^k-1) has the repeating binary fraction 0.(n's k bits). Retain
@@ -40,17 +57,17 @@ llvm::Value* texture_component(llvm::Value* object, llvm::Value* texel, unsigned
     if (!helper) {
         std::vector<llvm::Type*> signature(5, b.getInt32Ty());
         if (opencl && local_bytes) signature.push_back(b.getPtrTy());
-        if (opencl) { signature.push_back(resource_pointer_type()); signature.push_back(resource_pointer_type()); }
+        if (opencl) for (unsigned i=0;i<packet_resource_count;++i) signature.push_back(resource_pointer_type());
         helper = llvm::Function::Create(llvm::FunctionType::get(b.getInt32Ty(), signature, false), llvm::GlobalValue::InternalLinkage, name, *result);
         if (opencl && local_bytes) helper->addFnAttr("cudavm.native.local");
         helper->addFnAttr(llvm::Attribute::AlwaysInline);
         b.SetInsertPoint(llvm::BasicBlock::Create(b.getContext(), "entry", helper));
         auto* descriptor = pair(helper->getArg(0), helper->getArg(1));
         auto* component_index = helper->getArg(4);
-        auto* channels = image_word(descriptor, 48);
-        auto* bytes = image_word(descriptor, 56);
-        auto* kind = image_word(descriptor, 60);
-        auto* flags = image_word(descriptor, 20);
+        auto* channels = image_descriptor_word(descriptor, 48);
+        auto* bytes = image_descriptor_word(descriptor, 56);
+        auto* kind = image_descriptor_word(descriptor, 60);
+        auto* flags = image_descriptor_word(descriptor, 20);
         auto* present = b.CreateICmpULT(component_index, channels);
         auto* texel_address = pair(helper->getArg(2), helper->getArg(3));
         auto* valid = b.CreateICmpNE(texel_address, b.getInt64(0xffffffff00000000ull));
@@ -59,12 +76,12 @@ llvm::Value* texture_component(llvm::Value* object, llvm::Value* texel, unsigned
         auto* shift = b.CreateSub(b.getInt32(32), bits);
         auto* byte_offset = b.CreateAnd(b.CreateTrunc(address, b.getInt32Ty()), b.getInt32(3));
         auto* word = b.CreateLShr(image_word(address), b.CreateMul(byte_offset, b.getInt32(8)));
-        auto* border = image_word(b.CreateAdd(descriptor, b.CreateZExt(b.CreateMul(component_index, b.getInt32(4)), b.getInt64Ty())), 32);
+        auto* border = image_descriptor_word(b.CreateAdd(descriptor, b.CreateZExt(b.CreateMul(component_index, b.getInt32(4)), b.getInt64Ty())), 32);
         auto* value = b.CreateAnd(b.CreateSelect(valid, word, border), b.CreateLShr(b.getInt32(UINT32_MAX), shift));
         auto* signed_format = b.CreateICmpEQ(kind, b.getInt32(2));
         auto* integer = b.CreateSelect(signed_format, b.CreateAShr(b.CreateShl(value, shift), shift), value);
         auto* float_alpha = b.CreateAnd(b.CreateICmpEQ(kind, b.getInt32(0)), b.CreateICmpEQ(component_index, b.getInt32(3)));
-        float_alpha = b.CreateAnd(float_alpha, b.CreateICmpNE(image_word(descriptor, 16), b.getInt32(3)));
+        float_alpha = b.CreateAnd(float_alpha, b.CreateICmpNE(image_descriptor_word(descriptor, 16), b.getInt32(3)));
         auto* missing = b.CreateSelect(valid,
             b.CreateSelect(float_alpha, b.getInt32(floating ? 0x3f800000 : 1), b.getInt32(0)), border);
         if (!floating) b.CreateRet(b.CreateSelect(present, integer, missing));
@@ -91,7 +108,7 @@ llvm::Value* filter_texture_component(llvm::Value* object, llvm::Value* x, llvm:
     if (!helper) {
         std::vector<llvm::Type*> signature{b.getInt32Ty(), b.getInt32Ty(), b.getInt32Ty(), b.getInt32Ty(), point->getType()};
         if (opencl && local_bytes) signature.push_back(b.getPtrTy());
-        if (opencl) { signature.push_back(resource_pointer_type()); signature.push_back(resource_pointer_type()); }
+        if (opencl) for (unsigned i=0;i<packet_resource_count;++i) signature.push_back(resource_pointer_type());
         helper = llvm::Function::Create(llvm::FunctionType::get(point->getType(), signature, false),
             llvm::GlobalValue::InternalLinkage, name, *result);
         if (opencl && local_bytes) helper->addFnAttr("cudavm.native.local");
@@ -101,17 +118,17 @@ llvm::Value* filter_texture_component(llvm::Value* object, llvm::Value* x, llvm:
         auto* linear = llvm::BasicBlock::Create(b.getContext(), "linear", helper);
         b.SetInsertPoint(first);
         auto* descriptor = pair(helper->getArg(0), helper->getArg(1));
-        auto* flags = image_word(descriptor, 20);
+        auto* flags = image_descriptor_word(descriptor, 20);
         b.CreateCondBr(b.CreateICmpNE(b.CreateAnd(flags, b.getInt32(2)), b.getInt32(0)), linear, nearest);
         b.SetInsertPoint(nearest); b.CreateRet(helper->getArg(4)); b.SetInsertPoint(linear);
         auto* normalized = b.CreateICmpNE(b.CreateAnd(flags, b.getInt32(1)), b.getInt32(0));
-        auto* base = b.CreateZExt(call_helper(resolve, {pair(image_word(descriptor), image_word(descriptor, 4))}), b.getInt64Ty());
-        auto* width = image_word(descriptor, 8);
-        auto* height = image_word(descriptor, 12);
-        auto* texel_bytes = image_word(descriptor, 52);
-        auto* pitch = image_word(descriptor, 64);
-        auto* mode_x = image_word(descriptor, 24);
-        auto* mode_y = image_word(descriptor, 28);
+        auto* base = b.CreateZExt(call_helper(resolve, {pair(image_descriptor_word(descriptor), image_descriptor_word(descriptor, 4))}), b.getInt64Ty());
+        auto* width = image_descriptor_word(descriptor, 8);
+        auto* height = image_descriptor_word(descriptor, 12);
+        auto* texel_bytes = image_descriptor_word(descriptor, 52);
+        auto* pitch = image_descriptor_word(descriptor, 64);
+        auto* mode_x = image_descriptor_word(descriptor, 24);
+        auto* mode_y = image_descriptor_word(descriptor, 28);
         // Quantize texel coordinates to 1/256 before subtracting the half-texel
         // offset. Significand products avoid overflow, FP-to-int poison and
         // premature FP rounding at coefficient halfways. Ties round upward.
@@ -180,8 +197,8 @@ llvm::Value* filter_texture_component(llvm::Value* object, llvm::Value* x, llvm:
         b.CreateCondBr(b.CreateICmpNE(b.CreateAnd(flags, b.getInt32(4)), b.getInt32(0)), integer_linear, float_linear);
         b.SetInsertPoint(integer_linear);
         auto integers = samples(false);
-        auto* signed_format = b.CreateICmpEQ(image_word(descriptor, 60), b.getInt32(2));
-        auto* byte_format = b.CreateICmpEQ(image_word(descriptor, 56), b.getInt32(1));
+        auto* signed_format = b.CreateICmpEQ(image_descriptor_word(descriptor, 60), b.getInt32(2));
+        auto* byte_format = b.CreateICmpEQ(image_descriptor_word(descriptor, 56), b.getInt32(1));
         auto integer_blend = [&](llvm::Value* a, llvm::Value* c, llvm::Value* weight) {
             return b.CreateAdd(b.CreateMul(a, b.CreateSub(b.getInt32(256), weight)), b.CreateMul(c, weight));
         };

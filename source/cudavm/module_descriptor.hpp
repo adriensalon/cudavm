@@ -16,6 +16,7 @@ struct kernel_descriptor {
     uint32_t shared_bytes = 0, local_bytes = 0;
     std::vector<kernel_parameter_descriptor> parameters;
     uint32_t stack_bytes = 0;
+    uint32_t memory_abi = packet_memory_abi;
 };
 struct global_relocation { uint32_t offset, target; uint64_t addend; };
 struct global_descriptor { std::string symbol; uint32_t alignment; std::string initializer; std::vector<global_relocation> relocations; };
@@ -46,6 +47,9 @@ inline std::string encode_module_descriptor(const std::vector<kernel_descriptor>
         number(0x314b5453); number(uint32_t(entries.size()));
         for (const auto& entry : entries) number(entry.stack_bytes);
     }
+    // ADR2 makes incompatible loaders reject widened records and native slots.
+    number(0x32524441); number(uint32_t(entries.size()));
+    for (const auto& entry : entries) number(entry.memory_abi);
     std::string out(module_descriptor_begin);
     constexpr char hex[] = "0123456789abcdef";
     for (size_t i=0;i<bytes.size();++i) {
@@ -76,7 +80,7 @@ inline module_descriptor decode_module_descriptor(std::string_view ptx) {
     auto count=number(); if(count>4096) throw std::runtime_error("too many native module entries");
     module_descriptor result;
     for(uint32_t i=0;i<count;++i) {
-        kernel_descriptor e; e.symbol=string(); e.shared_bytes=number(); e.local_bytes=number(); auto params=number();
+        kernel_descriptor e; e.memory_abi=1; e.symbol=string(); e.shared_bytes=number(); e.local_bytes=number(); auto params=number();
         if(params>4096) throw std::runtime_error("too many native module parameters");
         for(uint32_t j=0;j<params;++j) e.parameters.push_back({number(),number(),number(),number()});
         result.entries.push_back(std::move(e));
@@ -91,11 +95,21 @@ inline module_descriptor decode_module_descriptor(std::string_view ptx) {
         }
     }
     if (pos != bytes.size()) {
-        if (number() != 0x314b5453 || number() != result.entries.size()) throw std::runtime_error("invalid native stack descriptor");
+        auto trailer = number();
+        if (trailer == 0x314b5453) {
+            if (number() != result.entries.size()) throw std::runtime_error("invalid native stack descriptor");
+            for (auto& entry : result.entries) {
+                entry.stack_bytes = number();
+                if (entry.stack_bytes && (entry.stack_bytes != packet_private_stack_bytes || entry.local_bytes != entry.stack_bytes))
+                    throw std::runtime_error("invalid native stack budget");
+            }
+            if (pos == bytes.size()) return result;
+            trailer = number();
+        }
+        if (trailer != 0x32524441 || number() != result.entries.size()) throw std::runtime_error("invalid native memory descriptor");
         for (auto& entry : result.entries) {
-            entry.stack_bytes = number();
-            if (entry.stack_bytes && (entry.stack_bytes != packet_private_stack_bytes || entry.local_bytes != entry.stack_bytes))
-                throw std::runtime_error("invalid native stack budget");
+            entry.memory_abi = number();
+            if (entry.memory_abi != packet_memory_abi) throw std::runtime_error("unsupported native memory ABI");
         }
     }
     if(pos!=bytes.size()) throw std::runtime_error("extra native module payload data");

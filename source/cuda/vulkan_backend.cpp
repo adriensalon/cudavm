@@ -576,6 +576,7 @@ struct vulkan_session : session {
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};submit.commandBufferCount=1;submit.pCommandBuffers=&task->command;
         check(owner->vkQueueSubmit(owner->queue,1,&submit,task->fence),"vkQueueSubmit timestamp");task->submitted=true;return task;
     }
+    uint64_t shader_arena_capacity() const override { return std::min(packet_arena_capacity, uint64_t(owner->limits.maxStorageBufferRange)); }
     unsigned direct_binding_limit() const override {
         auto slots=std::min(owner->limits.maxPerStageDescriptorStorageBuffers,owner->limits.maxDescriptorSetStorageBuffers);
         slots=std::min(slots,owner->limits.maxPerStageResources);
@@ -583,7 +584,7 @@ struct vulkan_session : session {
     }
     bool can_bind_direct(const buffer& value) const override {
         auto native=dynamic_cast<const vulkan_buffer*>(&value.storage());
-        return native && native->owner==owner && !native->imported && value.size%4==0 && value.storage_offset()%4==0 && value.size<=UINT32_MAX && value.storage_offset()<=UINT32_MAX-value.size && value.storage().size<=owner->limits.maxStorageBufferRange;
+        return native && native->owner==owner && !native->imported && value.size%4==0 && value.storage_offset()%4==0 && value.size<=packet_arena_capacity && value.storage_offset()<=packet_arena_capacity-value.size && value.storage().size<=owner->limits.maxStorageBufferRange;
     }
     bool can_copy_direct(const buffer& value) const override {
         auto native = dynamic_cast<const vulkan_buffer*>(&value.storage());
@@ -628,7 +629,7 @@ struct vulkan_session : session {
     std::unique_ptr<compute_pipeline> compile_native_spirv(std::span<const uint32_t> code, const launch_shape& shape) override {
         require(supports_native_spirv(code), CUDA_ERROR_NOT_SUPPORTED, "native SPIR-V device capabilities are unavailable");
         validate_native_spirv_shape(shape);
-        return compile_binary(code, 0);
+        return compile_binary(code, packet_direct_bindings);
     }
     std::unique_ptr<compute_pipeline> compile_binary(std::span<const uint32_t> code, unsigned direct_buffers) {
         auto device=owner->value;
@@ -654,6 +655,8 @@ struct vulkan_session : session {
         std::lock_guard lock(owner->execution);
         auto recording = queue && queue->recording() ? dynamic_cast<vulkan_graph*>(queue) : nullptr;
         require(!recording || (recording->commands->owner == owner && !profile->enabled), CUDA_ERROR_NOT_SUPPORTED, "Vulkan dispatch cannot be recorded");
+        std::array<buffer*,packet_direct_bindings> unused; unused.fill(&memory);
+        if (bindings.empty()) bindings = unused;
         require(bindings.size()==pipeline.direct_buffers,CUDA_ERROR_INVALID_VALUE,"Vulkan direct binding count mismatch");
         for(auto resource:bindings)require(can_bind_direct(*resource),CUDA_ERROR_INVALID_VALUE,"incompatible Vulkan direct buffer");
         auto& compiled=static_cast<vulkan_pipeline&>(pipeline);auto device=owner->value;

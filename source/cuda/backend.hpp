@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #include "../cudavm/data_view_descriptor.hpp"
+#include "../cudavm/shader_packet.hpp"
 
 namespace cudavm {
 struct session;
@@ -399,7 +400,11 @@ struct launch_shape {
     unsigned grid[3], block[3], shared_bytes;
     launch_options options{};
 };
-struct allocation_binding { uint64_t address; buffer* native; bool surface_descriptor = false; };
+struct allocation_binding {
+    uint64_t address;
+    buffer* native;
+    bool surface_descriptor = false, image_descriptor = false;
+};
 struct image_object {
     uint64_t handle = 0;
     virtual ~image_object() = default;
@@ -663,6 +668,7 @@ struct session {
     // Direct resources must share this session's native resource owner and
     // support word accesses. Other allocations use the staged transport.
     virtual unsigned direct_binding_limit() const { return 0; }
+    virtual uint64_t shader_arena_capacity() const { return packet_arena_capacity; }
     virtual bool can_bind_direct(const buffer&) const { return false; }
     virtual device_work enqueue_dispatch_bound(compute_pipeline& pipeline, const launch_shape& shape,
             buffer& memory, buffer& arguments, std::span<buffer* const> bindings, native_queue* queue) {
