@@ -70,6 +70,11 @@ struct global_initializer {
                 || dl.isNonIntegralPointerType(address->getType()))fail(*c);
             relocate(address,offset);return;
         }
+        if (auto* expression=llvm::dyn_cast<llvm::ConstantExpr>(c); expression && expression->getOpcode()==llvm::Instruction::IntToPtr) {
+            auto* bits=llvm::dyn_cast<llvm::ConstantInt>(expression->getOperand(0));
+            if(!bits || bits->getBitWidth()>64 || !type->isPointerTy())fail(*c);
+            scalar(bits->getZExtValue(),unsigned(dl.getTypeStoreSize(type).getFixedValue()),offset);return;
+        }
         if(type->isPointerTy()) {
             relocate(c,offset);return;
         }
@@ -137,7 +142,8 @@ std::string emit_native_module(const llvm::Module& input) {
             auto* function=call->getCalledFunction(); auto name=function->hasFnAttribute("cudavm.cuda.origin")?function->getFnAttribute("cudavm.cuda.origin").getValueAsString():function->getName();
             auto operation=native_collective(name); collectives|=operation>=0; named_barriers|=operation>=36;
         }
-        if(collectives) shared+=native_collective_shared_bytes;
+        entry.call_frames=f.hasFnAttribute("cudavm.call.frames");
+        if(collectives) shared+=native_collective_shared_bytes+(entry.call_frames?4096u:0u);
         if(named_barriers) shared+=native_named_barrier_shared_bytes;
         if(shared>32768) throw std::runtime_error("native shared storage and collective scratch exceed 32 KiB");
         entry.shared_bytes = uint32_t(shared);

@@ -17,6 +17,7 @@ struct kernel_descriptor {
     std::vector<kernel_parameter_descriptor> parameters;
     uint32_t stack_bytes = 0;
     uint32_t memory_abi = packet_memory_abi;
+    bool call_frames = false;
 };
 struct global_relocation { uint32_t offset, target; uint64_t addend; };
 struct global_descriptor { std::string symbol; uint32_t alignment; std::string initializer; std::vector<global_relocation> relocations; };
@@ -46,6 +47,10 @@ inline std::string encode_module_descriptor(const std::vector<kernel_descriptor>
         // of executing shaders with a missing stack base or fault observation.
         number(0x314b5453); number(uint32_t(entries.size()));
         for (const auto& entry : entries) number(entry.stack_bytes);
+    }
+    if (std::any_of(entries.begin(), entries.end(), [](const auto& entry) { return entry.call_frames; })) {
+        number(0x314c4143); number(uint32_t(entries.size()));
+        for (const auto& entry : entries) number(entry.call_frames ? 1u : 0u);
     }
     // ADR2 makes incompatible loaders reject widened records and native slots.
     number(0x32524441); number(uint32_t(entries.size()));
@@ -104,6 +109,15 @@ inline module_descriptor decode_module_descriptor(std::string_view ptx) {
                     throw std::runtime_error("invalid native stack budget");
             }
             if (pos == bytes.size()) return result;
+            trailer = number();
+        }
+        if (trailer == 0x314c4143) {
+            if (number() != result.entries.size()) throw std::runtime_error("invalid native call descriptor");
+            for (auto& entry : result.entries) {
+                auto flags = number();
+                if (flags > 1 || (flags && !entry.stack_bytes)) throw std::runtime_error("invalid native call stack");
+                entry.call_frames = flags != 0;
+            }
             trailer = number();
         }
         if (trailer != 0x32524441 || number() != result.entries.size()) throw std::runtime_error("invalid native memory descriptor");

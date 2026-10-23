@@ -118,7 +118,7 @@ struct shader_kernel : kernel {
         return result;
     }
     size_t stack_backing_bytes(const launch_shape& shape, size_t arena_bytes) const {
-        if (!entry.stack_bytes || owner.kind() == cudavmBackendOpenCL) return 0;
+        if (!entry.stack_bytes || (owner.kind() == cudavmBackendOpenCL && !entry.call_frames)) return 0;
         uint64_t invocations = 1;
         auto capacity = std::min(owner.shader_arena_capacity(), packet_arena_capacity);
         require(arena_bytes <= capacity, CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES, "shader arena exceeds native capacity");
@@ -163,6 +163,7 @@ struct shader_kernel : kernel {
         for (auto parameter : entry.parameters) if (parameter.pointer) {
             uint64_t pointer = 0; std::memcpy(&pointer, bytes.data() + parameter.offset, sizeof(pointer));
             if (!pointer) continue;
+            if (uint32_t(pointer >> 32) == packet_function_high_word) continue;
             bool found = std::any_of(bindings.begin(), bindings.end(), [&](auto binding) {
                 return pointer >= binding.address && (pointer - binding.address <= binding.native->size);
             });
@@ -223,7 +224,7 @@ struct shader_kernel : kernel {
             if(p.pointer) {
                 require(p.size==8,CUDA_ERROR_INVALID_IMAGE,"shader pointer ABI requires 64-bit CUDA pointers");
                 uint64_t pointer=0;std::memcpy(&pointer,src,8);
-                if(pointer) {
+                if(pointer && uint32_t(pointer >> 32) != packet_function_high_word) {
                     auto at=std::upper_bound(memory.records.begin(),memory.records.end(),pointer,
                         [](uint64_t address,const auto& record) { return address<join_packet_word64(record.address); });
                     bool found=at!=memory.records.begin() && pointer-join_packet_word64(std::prev(at)->address)<=std::prev(at)->size;

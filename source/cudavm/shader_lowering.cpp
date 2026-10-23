@@ -1,6 +1,7 @@
 #include "shader_lowering.hpp"
 #include "shader_collectives.hpp"
 #include "shader_local.hpp"
+#include "shader_calls.hpp"
 #include "device_conversions.hpp"
 #include "ptx_import.hpp"
 
@@ -13,6 +14,7 @@
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Analysis/CFG.h>
+#include <llvm/Analysis/CallGraph.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/Analysis/PostDominators.h>
@@ -27,6 +29,7 @@
 #include <llvm/Linker/Linker.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/CodeGen.h>
+#include <llvm/Support/KnownBits.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
 #include <llvm/Transforms/IPO/GlobalDCE.h>
@@ -240,21 +243,31 @@ bool lower_local_calls(llvm::Module& module) {
     return changed;
 }
 void optimize(llvm::Module& module) {
-    for (auto& f : module) if (!f.isDeclaration()) {
-        f.removeFnAttr(llvm::Attribute::OptimizeNone); f.removeFnAttr(llvm::Attribute::NoInline);
-        if(f.hasFnAttribute("cudavm.math") || f.getName().starts_with("_ZN13cudavm") || f.getName().starts_with("__cudavm_native_")) {
-            f.removeFnAttr(llvm::Attribute::AlwaysInline); f.addFnAttr(llvm::Attribute::NoInline);
-        } else if (!f.hasFnAttribute("cudavm.kernel") && !f.hasFnAttribute("hlsl.shader") && f.getCallingConv() != llvm::CallingConv::PTX_Kernel && f.getCallingConv() != llvm::CallingConv::SPIR_KERNEL)
-            f.addFnAttr(llvm::Attribute::AlwaysInline);
-    }
     llvm::LoopAnalysisManager loops; llvm::FunctionAnalysisManager functions;
     llvm::CGSCCAnalysisManager calls; llvm::ModuleAnalysisManager modules;
     llvm::PassBuilder pb;
     pb.registerModuleAnalyses(modules); pb.registerCGSCCAnalyses(calls);
     pb.registerFunctionAnalyses(functions); pb.registerLoopAnalyses(loops);
     pb.crossRegisterProxies(loops, functions, calls, modules);
+    for (auto& function : module) function.removeFnAttr(llvm::Attribute::OptimizeNone);
+    llvm::ModulePassManager tail_calls;
+    tail_calls.addPass(llvm::createModuleToFunctionPassAdaptor(llvm::TailCallElimPass()));
+    tail_calls.run(module, modules);
+    // Do not partially inline recursive SCCs. Inliner use-list order otherwise
+    // changes the residual call graph after an IR serialization round trip.
+    llvm::CallGraph graph(module);
+    std::set<llvm::Function*> recursive;
+    for (auto component = llvm::scc_begin(&graph); !component.isAtEnd(); ++component)
+        if (component.hasCycle()) for (auto* node : *component)
+            if (auto* function = node->getFunction()) recursive.insert(function);
+    for (auto& f : module) if (!f.isDeclaration()) {
+        f.removeFnAttr(llvm::Attribute::OptimizeNone); f.removeFnAttr(llvm::Attribute::NoInline);
+        if(shader_native_helper(f) || recursive.contains(&f)) {
+            f.removeFnAttr(llvm::Attribute::AlwaysInline); f.addFnAttr(llvm::Attribute::NoInline);
+        } else if (!f.hasFnAttribute("cudavm.kernel") && !f.hasFnAttribute("hlsl.shader") && f.getCallingConv() != llvm::CallingConv::PTX_Kernel && f.getCallingConv() != llvm::CallingConv::SPIR_KERNEL)
+            f.addFnAttr(llvm::Attribute::AlwaysInline);
+    }
     llvm::ModulePassManager passes;
-    passes.addPass(llvm::createModuleToFunctionPassAdaptor(llvm::TailCallElimPass()));
     passes.addPass(llvm::AlwaysInlinerPass());
     llvm::FunctionPassManager fp;
     fp.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG)); fp.addPass(llvm::PromotePass());
@@ -286,6 +299,7 @@ struct lowering {
     llvm::GlobalVariable* local_storage = nullptr;
     llvm::AllocaInst* opencl_local = nullptr;
     llvm::AllocaInst* stack_top = nullptr;
+    std::map<llvm::Function*, llvm::Value*> invocation_stack_bases;
     uint32_t local_bytes = 0;
     bool arena_local = false;
     bool partial_stores = false;
@@ -293,6 +307,7 @@ struct lowering {
     llvm::GlobalVariable* named_barrier_state = nullptr;
     llvm::GlobalVariable* collective_data = nullptr;
     llvm::GlobalVariable *collective_pc = nullptr, *collective_masks = nullptr, *collective_control = nullptr;
+    llvm::GlobalVariable* collective_frames = nullptr;
     std::map<unsigned,llvm::Function*> collective_helpers;
     std::map<std::tuple<unsigned,unsigned,unsigned,unsigned,unsigned>, llvm::Function*> atomic_helpers;
     uint32_t shared_bytes = 0;
@@ -337,6 +352,21 @@ struct lowering {
     }
     llvm::Value* call_helper(llvm::Function* function, std::initializer_list<llvm::Value*> base) {
         auto first = base.begin();
+        if (arena_local && (function == read || function == write)) {
+            auto known = llvm::computeKnownBits(*first, result->getDataLayout());
+            llvm::APInt mask(64, 0xffffffffc0000000ull), local(64, 0xffffffff80000000ull);
+            if ((known.One & mask) == local && (known.Zero & mask) == (mask ^ local)) {
+                // Proven private addresses need neither allocation lookup nor
+                // resource dispatch. Preserve the ordinary private word/mask
+                // semantics while binding the invocation's stack directly.
+                auto* offset = b.CreateAnd(b.CreateTrunc(*first, b.getInt32Ty()), b.getInt32(0x3fffffffu));
+                offset = b.CreateURem(b.CreateLShr(offset, b.getInt32(2)), b.getInt32(std::max(2u, (local_bytes + 3) / 4)));
+                auto* pointer = stack_word(nullptr, offset);
+                auto* previous = b.CreateAlignedLoad(b.getInt32Ty(), pointer, llvm::Align(4));
+                if (function == read) return previous;
+                return b.CreateAlignedStore(b.CreateOr(b.CreateAnd(previous, b.CreateNot(*(first + 2))), b.CreateAnd(*(first + 1), *(first + 2))), pointer, llvm::Align(4));
+            }
+        }
         std::vector<llvm::Value*> args{b.CreateTrunc(*first, b.getInt32Ty()), b.CreateTrunc(b.CreateLShr(*first, b.getInt64(32)), b.getInt32Ty())};
         args.insert(args.end(), first + 1, base.end());
         if (function->hasFnAttribute("cudavm.native.local")) {
@@ -433,12 +463,12 @@ struct lowering {
     llvm::Function* make_access(bool store) {
         auto base = store ? std::vector<llvm::Type*>{b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()}
             : std::vector<llvm::Type*>{b.getInt32Ty(),b.getInt32Ty()};
-        if (opencl && local_bytes) base.push_back(b.getPtrTy());
+        if (opencl && local_bytes && !arena_local) base.push_back(b.getPtrTy());
         if (opencl) for (unsigned i=0;i<packet_resource_count;++i) base.push_back(resource_pointer_type());
         auto* function = llvm::Function::Create(llvm::FunctionType::get(store ? b.getVoidTy() : b.getInt32Ty(),
             base, false),
             llvm::GlobalValue::InternalLinkage, store ? "cudavm.store.word" : "cudavm.load.word", *result);
-        if (opencl && local_bytes) function->addFnAttr("cudavm.native.local");
+        if (opencl && local_bytes && !arena_local) function->addFnAttr("cudavm.native.local");
         auto* first = llvm::BasicBlock::Create(b.getContext(), "entry", function);
         auto* private_space = llvm::BasicBlock::Create(b.getContext(), "private.space", function);
         auto* global_space = llvm::BasicBlock::Create(b.getContext(), "global", function);
@@ -483,17 +513,7 @@ struct lowering {
           auto* offset = b.CreateURem(b.CreateLShr(b.CreateAnd(lo,b.getInt32(0x3fffffffu)),b.getInt32(2)),b.getInt32(std::max(2u,(local_bytes+3)/4)));
           llvm::Value* ptr = nullptr;
           if (arena_local) {
-              auto index = [&](bool block, unsigned axis) {
-                  return b.CreateIntrinsic(b.getInt32Ty(), dxil
-                      ? (block ? llvm::Intrinsic::dx_group_id : llvm::Intrinsic::dx_thread_id_in_group)
-                      : (block ? llvm::Intrinsic::spv_group_id : llvm::Intrinsic::spv_thread_id_in_group), {b.getInt32(axis)});
-              };
-              auto* block = b.CreateAdd(index(true,0), b.CreateMul(packet(b.getInt32(0)), b.CreateAdd(index(true,1), b.CreateMul(packet(b.getInt32(1)), index(true,2)))));
-              auto* thread = b.CreateAdd(index(false,0), b.CreateMul(packet(b.getInt32(3)), b.CreateAdd(index(false,1), b.CreateMul(packet(b.getInt32(4)), index(false,2)))));
-              auto* count = b.CreateMul(packet(b.getInt32(3)), b.CreateMul(packet(b.getInt32(4)), packet(b.getInt32(5))));
-              auto* invocation = b.CreateAdd(b.CreateMul(block, count), thread);
-              auto* base = b.CreateLoad(b.getInt32Ty(), word_pointer(0, b.getInt32(packet_stack_base_word)));
-              ptr = word_pointer(0, b.CreateAdd(base, b.CreateAdd(b.CreateMul(invocation, b.getInt32(shader_local_capacity/4)), offset)));
+              ptr = stack_word(nullptr, offset);
           } else ptr = opencl ? b.CreateInBoundsGEP(b.getInt32Ty(),function->getArg(store ? 4 : 2),offset)
               : b.CreateInBoundsGEP(local_storage->getValueType(),local_storage,{b.getInt32(0),offset});
           if (store) {
@@ -529,6 +549,26 @@ struct lowering {
         b.CreateAtomicRMW(llvm::AtomicRMWInst::Or, word_pointer(0, b.getInt32(packet_stack_fault_word)), b.CreateZExt(b.CreateNot(fits), b.getInt32Ty()),
             llvm::Align(4), llvm::AtomicOrdering::Monotonic, scope);
         return b.CreateSelect(fits, b.CreateAdd(b.getInt64(0xffffffff80000000ull), aligned), b.getInt64(0xffffffff00000000ull));
+    }
+    llvm::Value* stack_word(llvm::Value* thread, llvm::Value* offset) {
+        auto* function = b.GetInsertBlock()->getParent();
+        if (!thread) if (auto found = invocation_stack_bases.find(function); found != invocation_stack_bases.end())
+            return word_pointer(0, b.CreateAdd(found->second, offset));
+        auto saved = b.saveIP();
+        bool invocation = !thread;
+        if (invocation) b.SetInsertPoint(&function->getEntryBlock(), function->getEntryBlock().getFirstInsertionPt());
+        auto index = [&](bool block, unsigned axis) {
+            auto intrinsic = dxil ? llvm::Intrinsic::ID(block ? llvm::Intrinsic::dx_group_id : llvm::Intrinsic::dx_thread_id_in_group)
+                : llvm::Intrinsic::ID(block ? llvm::Intrinsic::spv_group_id : llvm::Intrinsic::spv_thread_id_in_group);
+            return b.CreateZExtOrTrunc(b.CreateIntrinsic(opencl ? b.getInt64Ty() : b.getInt32Ty(), intrinsic, {b.getInt32(axis)}), b.getInt32Ty());
+        };
+        auto* block = b.CreateAdd(index(true,0), b.CreateMul(packet(b.getInt32(0)), b.CreateAdd(index(true,1), b.CreateMul(packet(b.getInt32(1)), index(true,2)))));
+        if (!thread) thread = linear_thread();
+        auto* linear = b.CreateAdd(b.CreateMul(block, thread_count()), thread);
+        auto* base = b.CreateLoad(b.getInt32Ty(), word_pointer(0, b.getInt32(packet_stack_base_word)));
+        auto* first = b.CreateAdd(base, b.CreateMul(linear, b.getInt32(shader_local_capacity/4)));
+        if (invocation) { invocation_stack_bases[function] = first; b.restoreIP(saved); }
+        return word_pointer(0, b.CreateAdd(first, offset));
     }
     llvm::Value* gep(const llvm::GEPOperator& pointer) {
         llvm::SmallMapVector<llvm::Value*, llvm::APInt, 4> variables; llvm::APInt constant(64, 0);
@@ -630,12 +670,12 @@ struct lowering {
         auto saved = b.saveIP();
         auto* integer = llvm::IntegerType::get(b.getContext(), bits);
         std::vector<llvm::Type*> signature{b.getInt32Ty(),b.getInt32Ty(),integer,integer};
-        if (opencl && local_bytes && bits==64) signature.push_back(b.getPtrTy());
+        if (opencl && local_bytes && !arena_local && bits==64) signature.push_back(b.getPtrTy());
         if (opencl) for (unsigned i=0;i<packet_resource_count;++i) signature.push_back(resource_pointer_type());
         auto* function = llvm::Function::Create(llvm::FunctionType::get(integer,
             signature,false), llvm::GlobalValue::InternalLinkage,
             "cudavm.atomic." + std::to_string(operation) + "." + std::to_string(bits), *result);
-        if (opencl && local_bytes && bits==64) function->addFnAttr("cudavm.native.local");
+        if (opencl && local_bytes && !arena_local && bits==64) function->addFnAttr("cudavm.native.local");
         atomic_helpers[key] = function;
         auto* first = llvm::BasicBlock::Create(b.getContext(), "entry", function); b.SetInsertPoint(first);
         auto* address = pair(function->getArg(0), function->getArg(1));
@@ -935,6 +975,12 @@ struct lowering {
         auto* high=operation==9 || operation==11?b.CreateTrunc(b.CreateLShr(data,b.getInt64(32)),b.getInt32Ty()):b.getInt32(0);
         if(data->getType()->isFloatTy()) data=b.CreateBitCast(data,b.getInt32Ty()); else data=b.CreateZExtOrTrunc(data,b.getInt32Ty());
         std::vector<llvm::Value*> args{mask,data,operation<4?value(call.getArgOperand(2)):high,operation<4?value(call.getArgOperand(3)):b.getInt32(0)};
+        if (collective_frames) {
+            auto context = call.getOperandBundle("cudavm.call.frame");
+            if (!context) fail(call, "collective is missing its device call frame");
+            collective_store(b.CreateAnd(b.CreateTrunc(value(context->Inputs[0].get()), b.getInt32Ty()), b.getInt32(0x3fffffffu)),
+                collective_pointer(collective_frames, linear_thread()));
+        }
         if(opencl) for (unsigned i=0;i<packet_resource_count;++i) args.push_back(entry->getArg(unsigned(entry->arg_size()-packet_resource_count+i)));
         auto* out=b.CreateCall(helper,args); out->setConvergent();
         if(call.getType()->isVoidTy()) return nullptr;
@@ -1060,6 +1106,8 @@ struct lowering {
         llvm::Value* image = nullptr; if (image_operation(instruction, image)) return image;
         auto* function = instruction.getCalledFunction();
         if (!function) fail(instruction, "indirect calls or CUDA inline assembly require fallback");
+        if (function->getName() == "cudavm.shader.stack.valid")
+            return stack_top ? b.CreateICmpULE(b.CreateLoad(b.getInt32Ty(), stack_top), b.getInt32(shader_local_capacity)) : b.getTrue();
         if(instruction.getType()->isHalfTy() || llvm::any_of(instruction.args(),[](const auto& argument){return argument->getType()->isHalfTy();}))
             fail(instruction,"remaining half operation requires explicit native shader lowering");
         auto name = function->hasFnAttribute("cudavm.cuda.origin") ? function->getFnAttribute("cudavm.cuda.origin").getValueAsString() : function->getName();
@@ -1353,7 +1401,7 @@ struct lowering {
         shader_local_layout local_layout(kernel);
         local_offsets = local_layout.allocations; byval_offsets = local_layout.arguments;
         local_bytes = local_layout.bytes();
-        arena_local = !opencl && local_bytes == shader_local_capacity;
+        arena_local = (!opencl || kernel.hasFnAttribute("cudavm.call.frames")) && local_bytes == shader_local_capacity;
         std::set<const llvm::Constant*> visited;
         std::function<void(const llvm::Value*)> collect = [&](const llvm::Value* value) {
             auto* constant = llvm::dyn_cast<llvm::Constant>(value); if (!constant || !visited.insert(constant).second) return;
@@ -1381,7 +1429,7 @@ struct lowering {
             dynamic_alignment=std::max(dynamic_alignment,global->getAlign().value_or(dl.getABITypeAlign(global->getValueType())).value());
         shared_bytes=uint32_t(llvm::alignTo(shared_bytes,dynamic_alignment));
         for(auto& [global,offset]:shared_offsets) if(!dl.getTypeAllocSize(global->getValueType()).getFixedValue()) offset=shared_bytes;
-        auto scratch=(collective_storage?native_collective_shared_bytes:0u)+(named_barriers?native_named_barrier_shared_bytes:0u);
+        auto scratch=(collective_storage?native_collective_shared_bytes+(kernel.hasFnAttribute("cudavm.call.frames")?4096u:0u):0u)+(named_barriers?native_named_barrier_shared_bytes:0u);
         if(shared_bytes+scratch>32768) fail(kernel,"native shared storage and collective scratch exceed 32 KiB");
         for (const auto& global : source.globals()) if ((global.getAddressSpace() == 1 || global.getAddressSpace() == 4) && global.hasInitializer()) globals[&global] = uint32_t(globals.size());
         result->setTargetTriple(llvm::Triple(dxil ? "dxil-pc-shadermodel6.0-compute" : opencl ? "spirv64v1.0-unknown-unknown-opencl" : "spirv1.5-unknown-vulkan1.2-compute"));
@@ -1396,6 +1444,7 @@ struct lowering {
             auto make_state=[&](unsigned words,const char* name){auto* t=llvm::ArrayType::get(b.getInt32Ty(),words);return new llvm::GlobalVariable(*result,t,false,llvm::GlobalValue::InternalLinkage,llvm::UndefValue::get(t),name,nullptr,llvm::GlobalVariable::NotThreadLocal,3);};
             collective_pc=make_state(1024,"cudavm.collective.pc");
             collective_masks=make_state(1024,"cudavm.collective.masks");
+            if(kernel.hasFnAttribute("cudavm.call.frames")) collective_frames=make_state(1024,"cudavm.collective.frames");
             collective_control=new llvm::GlobalVariable(*result,b.getInt32Ty(),false,llvm::GlobalValue::InternalLinkage,llvm::UndefValue::get(b.getInt32Ty()),"cudavm.collective.control",nullptr,llvm::GlobalVariable::NotThreadLocal,3);
             collective_control->setAlignment(llvm::Align(8));
             if(named_barriers) named_barrier_state=make_state(48,"cudavm.barrier.state");
@@ -1416,7 +1465,7 @@ struct lowering {
             {llvm::ConstantAsMetadata::get(b.getInt32(1)), llvm::ConstantAsMetadata::get(b.getInt32(8))}));
         for (const auto& block : kernel) blocks[&block] = llvm::BasicBlock::Create(b.getContext(), block.getName(), entry);
         b.SetInsertPoint(blocks.at(&kernel.getEntryBlock()));
-        if (local_bytes && opencl) opencl_local=b.CreateAlloca(llvm::ArrayType::get(b.getInt32Ty(),std::max(2u,(local_bytes+3)/4)),nullptr,"cudavm.local");
+        if (local_bytes && opencl && !arena_local) opencl_local=b.CreateAlloca(llvm::ArrayType::get(b.getInt32Ty(),std::max(2u,(local_bytes+3)/4)),nullptr,"cudavm.local");
         if (local_layout.dynamic) {
             stack_top = b.CreateAlloca(b.getInt32Ty(), nullptr, "cudavm.stack.top");
             b.CreateStore(b.getInt32(local_layout.static_bytes), stack_top);
@@ -1464,6 +1513,14 @@ struct lowering {
             }
         }
         if(collective_storage) make_continuations();
+        if (kernel.hasFnAttribute("cudavm.call.frames") && !collective_storage && !opencl && !dxil) {
+            // Residual calls already have explicit return continuations. Use
+            // the owned target's deterministic CFG dispatcher directly instead
+            // of speculatively restructuring the multi-entry call/return DAG.
+            // Collective kernels already have an acyclic step dispatcher;
+            // wrapping it in a second dispatcher makes driver compilation grow.
+            entry->addFnAttr("cudavm.spirv.force.dispatch");
+        }
         return std::move(result);
     }
 };
@@ -1505,6 +1562,7 @@ std::unique_ptr<llvm::Module> prepare_native_shader_module(const llvm::Module& i
     scalar_math(*module);
     optimize(*module);
     while (lower_local_calls(*module)) optimize(*module);
+    lower_shader_calls(*module);
     return module;
 }
 std::unique_ptr<llvm::Module> lower_native_shader(const llvm::Module& input, const std::string& symbol, shader_environment environment, const std::array<unsigned,3>& block) {

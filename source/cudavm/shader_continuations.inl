@@ -119,12 +119,41 @@ llvm::Function* make_named_warp_poll(const std::vector<unsigned>& states) {
     ready->addIncoming(b.CreateAnd(ready,agrees),next);index->addIncoming(b.CreateAdd(index,b.getInt32(1)),next);b.CreateBr(head);
     b.SetInsertPoint(done);b.CreateRet(ready);return function;
 }
+// Compare complete return-site chains, rather than hashes or private offsets.
+// Different lanes can have different dynamic-allocation sizes at the same call
+// depth. A recursive collective must not rendezvous with another invocation of
+// its static site until their actual call contexts agree.
+llvm::Function* make_call_context_equal() {
+    auto* function=llvm::Function::Create(llvm::FunctionType::get(b.getInt1Ty(),arguments({b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()}),false),llvm::GlobalValue::InternalLinkage,"cudavm.call.context.equal",*result);
+    auto* first=llvm::BasicBlock::Create(b.getContext(),"entry",function);
+    auto* loop=llvm::BasicBlock::Create(b.getContext(),"frames",function);
+    auto* check=llvm::BasicBlock::Create(b.getContext(),"check",function);
+    auto* parent=llvm::BasicBlock::Create(b.getContext(),"parent",function);
+    auto* yes=llvm::BasicBlock::Create(b.getContext(),"same",function);
+    auto* no=llvm::BasicBlock::Create(b.getContext(),"different",function);
+    b.SetInsertPoint(first);b.CreateBr(loop);b.SetInsertPoint(loop);
+    auto* left=b.CreatePHI(b.getInt32Ty(),2);left->addIncoming(function->getArg(2),first);
+    auto* right=b.CreatePHI(b.getInt32Ty(),2);right->addIncoming(function->getArg(3),first);
+    auto word=[&](unsigned lane,llvm::Value* offset,unsigned field) {
+        return b.CreateAlignedLoad(b.getInt32Ty(),stack_word(function->getArg(lane),b.CreateAdd(b.CreateLShr(offset,b.getInt32(2)),b.getInt32(field))),llvm::Align(4));
+    };
+    auto* left_id=word(0,left,6);auto* right_id=word(1,right,6);
+    b.CreateCondBr(b.CreateICmpEQ(left_id,right_id),check,no);b.SetInsertPoint(check);
+    b.CreateCondBr(b.CreateICmpEQ(left_id,b.getInt32(0)),yes,parent);b.SetInsertPoint(parent);
+    left->addIncoming(b.CreateAnd(word(0,left,0),b.getInt32(0x3fffffffu)),parent);
+    right->addIncoming(b.CreateAnd(word(1,right,0),b.getInt32(0x3fffffffu)),parent);
+    b.CreateBr(loop);b.SetInsertPoint(yes);b.CreateRet(b.getTrue());b.SetInsertPoint(no);b.CreateRet(b.getFalse());
+    return function;
+}
 llvm::Function* make_collective_poll() {
+    auto* contexts=collective_frames?make_call_context_equal():nullptr;
     auto* poll=llvm::Function::Create(llvm::FunctionType::get(b.getInt64Ty(),arguments({b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()}),false),llvm::GlobalValue::InternalLinkage,"cudavm.collective.poll",*result);
     auto* first=llvm::BasicBlock::Create(b.getContext(),"entry",poll);
     auto* loop=llvm::BasicBlock::Create(b.getContext(),"scan",poll);
     auto* body=llvm::BasicBlock::Create(b.getContext(),"peer",poll);
     auto* mask_test=llvm::BasicBlock::Create(b.getContext(),"mask",poll);
+    auto* context_test=contexts?llvm::BasicBlock::Create(b.getContext(),"context",poll):nullptr;
+    auto* context_done=contexts?llvm::BasicBlock::Create(b.getContext(),"context.done",poll):nullptr;
     auto* advance=llvm::BasicBlock::Create(b.getContext(),"advance",poll);
     auto* done=llvm::BasicBlock::Create(b.getContext(),"done",poll);
     b.SetInsertPoint(first);
@@ -141,7 +170,15 @@ llvm::Function* make_collective_poll() {
     b.CreateCondBr(b.CreateICmpULT(index,end),body,done); b.SetInsertPoint(body);
     auto* pc=collective_load(collective_pointer(collective_pc,index));
     auto* live=b.CreateICmpNE(pc,b.getInt32(0));
-    auto* same=b.CreateICmpEQ(pc,poll->getArg(1));
+    llvm::Value* same=b.CreateICmpEQ(pc,poll->getArg(1));
+    if(contexts) {
+        b.CreateCondBr(b.CreateAnd(same,b.CreateNot(block)),context_test,context_done);b.SetInsertPoint(context_test);
+        std::vector<llvm::Value*> args{id,index,collective_load(collective_pointer(collective_frames,id)),collective_load(collective_pointer(collective_frames,index))};
+        if(opencl) for(unsigned i=0;i<packet_resource_count;++i) args.push_back(poll->getArg(unsigned(poll->arg_size()-packet_resource_count+i)));
+        auto* equal=b.CreateCall(contexts,args);b.CreateBr(context_done);b.SetInsertPoint(context_done);
+        auto* agrees=b.CreatePHI(b.getInt1Ty(),2);agrees->addIncoming(same,body);agrees->addIncoming(equal,context_test);same=agrees;
+    }
+    auto* sampled=b.GetInsertBlock();
     auto* bit=b.CreateShl(b.getInt32(1),b.CreateAnd(index,b.getInt32(31)));
     auto* required=b.CreateAnd(live,b.CreateOr(block,b.CreateICmpNE(b.CreateAnd(poll->getArg(0),bit),b.getInt32(0))));
     // A peer outside this rendezvous may be publishing its next mask. Read its
@@ -150,7 +187,7 @@ llvm::Function* make_collective_poll() {
     b.SetInsertPoint(mask_test);
     auto* same_mask=b.CreateICmpEQ(collective_load(collective_pointer(collective_masks,index)),poll->getArg(0));
     b.CreateBr(advance); b.SetInsertPoint(advance);
-    auto* agrees=b.CreatePHI(b.getInt1Ty(),2); agrees->addIncoming(same,body);agrees->addIncoming(same_mask,mask_test);
+    auto* agrees=b.CreatePHI(b.getInt1Ty(),2); agrees->addIncoming(same,sampled);agrees->addIncoming(same_mask,mask_test);
     ready->addIncoming(b.CreateAnd(ready,b.CreateOr(b.CreateNot(required),agrees)),advance);
     auto* included=b.CreateSelect(active,same,required);
     members->addIncoming(b.CreateOr(members,b.CreateSelect(included,bit,b.getInt32(0))),advance);
