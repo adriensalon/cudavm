@@ -56,6 +56,10 @@ struct graph_node {
     CUgraphNode native_node = nullptr;
     CUgraphDeviceNode device_node = nullptr;
     std::shared_ptr<native_graph_definition> native_child;
+    std::shared_ptr<CUDA_HOST_NODE_PARAMS> native_host;
+    std::shared_ptr<native_graph_event> native_event;
+    std::shared_ptr<graph_parameter_storage> native_parameters;
+    std::vector<std::shared_ptr<external_semaphore>> native_semaphores;
     CUDA_CONDITIONAL_NODE_PARAMS conditional{};
     std::vector<CUgraph> conditional_graphs;
     std::vector<std::shared_ptr<const std::vector<graph_node>>> conditional_nodes;
@@ -96,10 +100,12 @@ struct graph_exec {
     completion tail;
     std::shared_ptr<graph_memory_instance> memory_instance;
     native_graph_cache native_regions;
-    std::shared_ptr<native_graph_executable> native;
     // Host changes are applied immediately before their queued native launch.
     // Earlier launches retain their own update list and parameter bytes.
     std::vector<graph_node> native_updates;
+    std::vector<graph_node> native_bindings;
     std::vector<std::pair<CUgraphNode, bool>> native_enables;
     std::vector<graph_state::condition> conditions;
+    // Destroy native descriptors before their callback/event/resource bindings.
+    std::shared_ptr<native_graph_executable> native;
 };

@@ -20,8 +20,8 @@ using native_graph_cache = std::map<size_t, std::shared_ptr<native_graph_region>
 
 // Contract contiguous, topologically ordered device regions. Host/event work,
 // foreign contexts, disabled nodes and memory transitions remain boundaries.
-// All incoming dependencies gate the region; every outgoing dependency waits
-// for its native join. Dependency ports inside the region remain native edges.
+// Cut at exported completions so an unrelated suffix cannot delay a boundary
+// consumer. Keep non-default internal edges together to preserve native ports.
 template<class Compile> void lower_graph_regions(std::vector<command_queue::submission>& replay,
         const std::vector<native_graph_command>& recorders, Compile compile, std::shared_ptr<native_queue> queue,
         native_graph_cache* cache = nullptr, std::span<const native_graph_key> keys = {},
@@ -31,6 +31,8 @@ template<class Compile> void lower_graph_regions(std::vector<command_queue::subm
     require(edges.empty() || edges.size() == replay.size(), CUDA_ERROR_INVALID_VALUE, "missing native graph edges");
     for (size_t i = 0; i < edges.size(); ++i)
         require(edges[i].size() == replay[i].dependencies.size(), CUDA_ERROR_INVALID_VALUE, "missing native graph dependency metadata");
+    std::map<command_completion*, size_t> positions;
+    for (size_t i = 0; i < replay.size(); ++i) positions.emplace(replay[i].done.get(), i);
     std::map<command_completion*, completion> replacements;
     std::vector<command_queue::submission> lowered;
     native_graph_cache next_cache;
@@ -40,6 +42,28 @@ template<class Compile> void lower_graph_regions(std::vector<command_queue::subm
         if (recorders[first]) while (end < replay.size() && recorders[end] &&
                 replay[end].domain == replay[first].domain &&
                 (command_regions ? replay[end].priority == replay[first].priority : replay[end].exclusive == replay[first].exclusive)) ++end;
+        std::vector<bool> exported(end - first + 1);
+        std::vector<int> port_spans(end - first + 1);
+        for (size_t i = first; i < replay.size(); ++i) {
+            size_t latest = first;
+            for (size_t j = 0; j < replay[i].dependencies.size(); ++j) {
+                auto found = positions.find(replay[i].dependencies[j].get());
+                if (found == positions.end() || found->second < first || found->second >= end) continue;
+                latest = std::max(latest, found->second + 1);
+                if (i < end && !edges.empty()) {
+                    auto& edge = edges[i][j];
+                    if (edge.from_port || edge.to_port || edge.type) {
+                        ++port_spans[found->second + 1 - first]; --port_spans[i + 1 - first];
+                    }
+                }
+            }
+            if (i >= end && latest > first) exported[latest - first] = true;
+        }
+        int ports = 0;
+        for (size_t cut = first + 1; cut < end; ++cut) {
+            ports += port_spans[cut - first];
+            if (exported[cut - first] && !ports) { end = cut; break; }
+        }
         if (end > first + 1) {
             bool exclusive = false;
             for (size_t i = first; i < end; ++i) exclusive |= replay[i].exclusive;

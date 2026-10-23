@@ -310,6 +310,19 @@ struct cuda_launch_event : device_launch_event {
         }
     }
 };
+struct cuda_graph_event : native_graph_event {
+    std::shared_ptr<cuda_event> event;
+    cuda_graph_event(std::shared_ptr<cuda_context> owner, unsigned flags)
+        : event(std::make_shared<cuda_event>(std::move(owner), flags)) { handle = event->value; }
+    std::shared_ptr<device_timer> timer() const override { return event; }
+    std::shared_ptr<native_signal> signal() const override { return event; }
+    bool query() override {
+        cuda_context_guard guard(*event->context);
+        auto status = event->context->api->driver.get<decltype(&cuEventQuery)>("cuEventQuery")(handle);
+        if (status == CUDA_ERROR_NOT_READY) return false;
+        check(status, "cuEventQuery graph record"); return true;
+    }
+};
 template<class F> device_work cuda_enqueue(std::shared_ptr<cuda_context> context, native_queue* queue, F action) {
     cuda_context_guard guard(*context);
     auto& lane = *static_cast<cuda_queue*>(queue);
@@ -395,6 +408,7 @@ struct cuda_host : host_allocation {
 struct cuda_semaphore : external_semaphore {
     std::shared_ptr<cuda_context> context;
     CUexternalSemaphore value = nullptr;
+    CUexternalSemaphore cuda_handle() const override { return value; }
     cuda_semaphore(std::shared_ptr<cuda_context> input, const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC& descriptor) : context(std::move(input)) {
         cuda_context_guard guard(*context);
         check(context->api->driver.get<decltype(&cuImportExternalSemaphore)>("cuImportExternalSemaphore")(&value, &descriptor), "cuImportExternalSemaphore");
@@ -705,6 +719,7 @@ struct cuda_session : session {
     cuda_session(std::shared_ptr<cuda_api> api, CUdevice device, unsigned flags = CU_CTX_MAP_HOST)
         : context(std::make_shared<cuda_context>(std::move(api), device, flags)) {}
     std::shared_ptr<device_launch_event> create_launch_event() override { return std::make_shared<cuda_launch_event>(context); }
+    std::shared_ptr<native_graph_event> create_graph_event(unsigned flags) override { return std::make_shared<cuda_graph_event>(context, flags); }
     std::pair<int, int> stream_priority_range() override {
         cuda_context_guard guard(*context); int least = 0, greatest = 0;
         check(context->api->driver.get<decltype(&cuCtxGetStreamPriorityRange)>("cuCtxGetStreamPriorityRange")(&least, &greatest), "cuCtxGetStreamPriorityRange");

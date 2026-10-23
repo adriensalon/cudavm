@@ -35,6 +35,10 @@ CUgraphNodeParams cuda_graph_parameters(CUgraphNodeParams params, CUcontext cont
     case CU_GRAPH_NODE_TYPE_MEMCPY: params.memcpy.copyCtx = context; break;
     case CU_GRAPH_NODE_TYPE_MEMSET: params.memset.ctx = context; break;
     case CU_GRAPH_NODE_TYPE_CONDITIONAL: params.conditional.ctx = context; break;
+    case CU_GRAPH_NODE_TYPE_HOST: params.host.ctx = context; break;
+    case CU_GRAPH_NODE_TYPE_BATCH_MEM_OP: params.memOp.ctx = context; break;
+    case CU_GRAPH_NODE_TYPE_EXT_SEMAS_SIGNAL: params.extSemSignal.ctx = context; break;
+    case CU_GRAPH_NODE_TYPE_EXT_SEMAS_WAIT: params.extSemWait.ctx = context; break;
     default: break;
     }
     return params;

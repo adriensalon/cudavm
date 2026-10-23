@@ -58,6 +58,7 @@ std::vector<std::shared_ptr<buffer>> graph_memory_prepare(const std::vector<grap
                 if (node.copy.dstMemoryType == CU_MEMORYTYPE_DEVICE || node.copy.dstMemoryType == CU_MEMORYTYPE_UNIFIED) use(node.copy.dstDevice);
             }
             if (node.child_nodes) visit(*node.child_nodes);
+            for (auto& body : node.conditional_nodes) visit(*body);
         }
     };
     visit(nodes);
@@ -132,6 +133,7 @@ bool graph_has_memory(const std::vector<graph_node>& nodes) {
     for (auto& node : nodes) {
         if (node.memory) return true;
         if (node.child_nodes ? graph_has_memory(*node.child_nodes) : node.child && graph_has_memory(graph_lookup(node.child).nodes)) return true;
+        for (auto& body : node.conditional_nodes) if (graph_has_memory(*body)) return true;
     }
     return false;
 }
@@ -216,6 +218,13 @@ graph_memory_plan graph_memory_validate(const std::vector<graph_node>& nodes, bo
             auto dependencies = node.dependencies.empty() ? roots : std::vector<size_t>{};
             for (auto dependency : node.dependencies) dependencies.push_back(indices.at(dependency));
             if (node.child_nodes) dependencies = expand(*node.child_nodes, dependencies, false);
+            if (!node.conditional_nodes.empty()) {
+                std::vector<size_t> branches;
+                for (auto& body : node.conditional_nodes) {
+                    auto leaves = expand(*body, dependencies, false); branches.insert(branches.end(), leaves.begin(), leaves.end());
+                }
+                dependencies = std::move(branches);
+            }
             auto index = items.size(); items.push_back({&node, std::move(dependencies), top && enabled ? (*enabled)[i] : !node.snapshot_disabled}); indices.emplace(node.handle, index); all.push_back(index);
         }
         return all.empty() ? roots : all;

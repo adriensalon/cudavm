@@ -1,4 +1,5 @@
 CUgraphNodeParams graph_node_parameters(graph_node&);
+graph_parameter_storage& graph_parameter_view(graph_node&, bool);
 bool graph_has_device_nodes(const std::vector<graph_node>& nodes) {
     for (auto& node : nodes) {
         if (node.device_node) return true;
@@ -33,6 +34,48 @@ CUgraphNodeParams graph_native_parameters(graph_node& node, const std::shared_pt
     case CU_GRAPH_NODE_TYPE_MEMSET:
     case CU_GRAPH_NODE_TYPE_EMPTY:
     case CU_GRAPH_NODE_TYPE_CONDITIONAL: break;
+    case CU_GRAPH_NODE_TYPE_HOST:
+        node.native_host = std::make_shared<CUDA_HOST_NODE_PARAMS>(node.host);
+        params.host.fn = [](void* data) {
+            auto p = *static_cast<CUDA_HOST_NODE_PARAMS*>(data);
+            struct guard { guard() { executing_host_function = true; } ~guard() { executing_host_function = false; } } scope;
+            p.fn(p.userData);
+        };
+        params.host.userData = node.native_host.get(); break;
+    case CU_GRAPH_NODE_TYPE_BATCH_MEM_OP: break;
+    case CU_GRAPH_NODE_TYPE_EVENT_RECORD:
+    case CU_GRAPH_NODE_TYPE_WAIT_EVENT:
+        if (!node.native_event) node.native_event = owner->native->create_graph_event(event_lookup(node.event).flags);
+        if (node.type == CU_GRAPH_NODE_TYPE_EVENT_RECORD) params.eventRecord.event = node.native_event->handle;
+        else params.eventWait.event = node.native_event->handle;
+        break;
+    case CU_GRAPH_NODE_TYPE_MEM_ALLOC:
+    case CU_GRAPH_NODE_TYPE_MEM_FREE: {
+        // The facade owns a stable reservation and restores its backing before
+        // submission. Native host nodes publish liveness at the DAG transitions.
+        // A second CUDA allocation would return a different device address.
+        bool allocate = node.type == CU_GRAPH_NODE_TYPE_MEM_ALLOC;
+        params = {}; params.type = CU_GRAPH_NODE_TYPE_HOST;
+        params.host.fn = allocate ? +[](void* data) { static_cast<graph_memory_region*>(data)->live = true; }
+                                  : +[](void* data) { static_cast<graph_memory_region*>(data)->live = false; };
+        params.host.userData = node.memory.get(); break;
+    }
+    case CU_GRAPH_NODE_TYPE_EXT_SEMAS_SIGNAL:
+    case CU_GRAPH_NODE_TYPE_EXT_SEMAS_WAIT: {
+        auto storage = std::make_shared<graph_parameter_storage>(graph_parameter_view(node, true));
+        std::vector<std::shared_ptr<external_semaphore>> retained;
+        for (auto& handle : storage->semaphores) {
+            auto found = global().semaphores.find(handle);
+            require(found != global().semaphores.end() && found->second.owner == owner, CUDA_ERROR_INVALID_HANDLE, "invalid graph semaphore or context");
+            auto resource = found->second.native;
+            handle = resource->cuda_handle();
+            require(handle, CUDA_ERROR_NOT_SUPPORTED, "graph semaphore has no native CUDA handle");
+            retained.push_back(std::move(resource));
+        }
+        if (node.type == CU_GRAPH_NODE_TYPE_EXT_SEMAS_SIGNAL) params.extSemSignal.extSemArray = storage->semaphores.data();
+        else params.extSemWait.extSemArray = storage->semaphores.data();
+        node.native_parameters = std::move(storage); node.native_semaphores = std::move(retained); break;
+    }
     case CU_GRAPH_NODE_TYPE_GRAPH:
         if (!node.native_child) node.native_child = graph_native_materialize(node.child, owner);
         params.graph.graph = node.native_child->handle();
@@ -103,6 +146,7 @@ std::shared_ptr<native_graph_definition> graph_native_materialize(CUgraph graph,
     }
     auto native = owner->native->create_graph();
     auto nodes = graph_order(state.nodes);
+    auto memory_resources = graph_memory_prepare(graph_snapshot(graph));
     std::unordered_map<CUgraphNode, CUgraphNode> handles;
     for (auto& node : nodes) {
         auto params = graph_native_parameters(node, owner);
@@ -110,6 +154,11 @@ std::shared_ptr<native_graph_definition> graph_native_materialize(CUgraph graph,
         for (auto dependency : node.dependencies) dependencies.push_back(handles.at(dependency));
         node.native_node = native->add(params, dependencies, node.dependency_edges);
         handles.emplace(node.handle, node.native_node); graph_native_attributes(native, node);
+        auto& stored = graph_node_lookup(node.handle);
+        stored.native_host = std::move(node.native_host);
+        stored.native_event = std::move(node.native_event);
+        stored.native_parameters = std::move(node.native_parameters);
+        stored.native_semaphores = std::move(node.native_semaphores);
     }
     for (auto& node : state.nodes) {
         node.native_node = handles.at(node.handle);
@@ -133,7 +182,7 @@ void graph_native_replace(const graph_node& existing, graph_node& replacement) {
 void graph_native_instantiate(graph_exec& value, CUgraph graph) {
     if (!graph_has_device_nodes(value.nodes) && !graph_has_conditionals(value.nodes)) return;
     auto native = graph_native_materialize(graph, value.owner.lock());
-    value.nodes = graph_snapshot(graph); value.native = native->instantiate(value.flags);
+    value.nodes = graph_snapshot(graph); value.native = native->instantiate(value.flags & ~CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
     std::function<void(CUgraph)> collect = [&](CUgraph g) {
         auto& state = graph_lookup(g); value.conditions.insert(value.conditions.end(), state.conditions.begin(), state.conditions.end());
         for (auto& node : state.nodes) { if (node.child) collect(node.child); for (auto body : node.conditional_graphs) collect(body); }
@@ -161,12 +210,35 @@ void graph_native_update(graph_exec& value, CUgraph graph, std::vector<graph_nod
     validate(value.nodes, nodes);
     // A new executable snapshot keeps already queued launches immutable. Device
     // updatable graphs are excluded by graph_update before reaching this path.
-    auto native = graph_native_materialize(graph, value.owner.lock())->instantiate(value.flags);
+    auto native = graph_native_materialize(graph, value.owner.lock())->instantiate(value.flags & ~CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
     for (size_t i = 0; i < nodes.size(); ++i) if (!value.enabled[i]) native->set_enabled(nodes[i].native_node, false);
-    value.native = std::move(native); value.conditions.swap(conditions); value.native_updates.clear(); value.native_enables.clear();
+    value.native = std::move(native); value.conditions.swap(conditions); value.native_updates.clear(); value.native_bindings.clear(); value.native_enables.clear();
 }
-bool graph_native_launch(graph_exec& value, const std::shared_ptr<context>& owner, const std::shared_ptr<stream_state>& target, CUstream stream, bool upload) {
+// Graph event records become visible independently of the graph's final join.
+// The gate prevents a never-submitted CUDA event from looking already complete.
+struct graph_event_signal : native_signal {
+    std::shared_ptr<std::atomic<bool>> submitted;
+    std::shared_ptr<native_signal> native;
+    bool can_wait(native_queue* queue) const override { return submitted->load(std::memory_order_acquire) && native && native->can_wait(queue); }
+    void enqueue_wait(native_queue* queue) const override { native->enqueue_wait(queue); }
+};
+struct graph_event_task : device_task {
+    std::shared_ptr<native_graph_event> event;
+    std::shared_ptr<graph_event_signal> dependency;
+    completion graph;
+    bool query() override {
+        if (!dependency->submitted->load(std::memory_order_acquire)) {
+            if (graph->ready.load(std::memory_order_acquire)) graph->query();
+            return false;
+        }
+        return event->query();
+    }
+    std::shared_ptr<native_signal> signal() const override { return dependency; }
+};
+bool graph_native_launch(graph_exec& value, const std::shared_ptr<context>& owner, const std::shared_ptr<stream_state>& target, CUstream, bool upload) {
     if (!value.native) return false;
+    auto memory_plan = graph_memory_validate(value.nodes, !upload, bool(value.flags & CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH), &value.enabled);
+    auto memory_resources = graph_memory_prepare(value.nodes);
     auto operations = std::make_shared<std::vector<graph_operation>>();
     std::vector<std::shared_ptr<host_entry>> hosts;
     std::function<void(const std::vector<graph_node>&)> retain = [&](const auto& nodes) {
@@ -185,16 +257,100 @@ bool graph_native_launch(graph_exec& value, const std::shared_ptr<context>& owne
         if (std::any_of(value.native_updates.begin() + i + 1, value.native_updates.end(), [&](auto& later) { return later.native_node == node.native_node; })) continue;
         changes->push_back({node, {}}); auto& update = changes->back(); update.params = graph_native_parameters(update.node, owner);
     }
+    auto done = std::make_shared<command_completion>();
+    auto submitted = std::make_shared<std::atomic<bool>>(false);
+    auto dependencies = stream_dependencies(owner, target);
+    if (value.tail) dependencies.push_back(value.tail);
+    if (owner->transport_tail) dependencies.push_back(owner->transport_tail);
+    struct record { CUevent handle; completion done; std::shared_ptr<device_timestamp> timestamp; std::shared_ptr<graph_event_task> task; };
+    std::vector<record> records;
+    std::unordered_map<CUevent, std::shared_ptr<native_graph_event>> local_events;
+    std::function<void(const std::vector<graph_node>&)> events = [&](const auto& nodes) {
+        for (auto node : nodes) {
+            if (node.child_nodes) events(*node.child_nodes);
+            if (node.type != CU_GRAPH_NODE_TYPE_EVENT_RECORD && node.type != CU_GRAPH_NODE_TYPE_WAIT_EVENT) continue;
+            auto& state = event_lookup(node.event);
+            if (node.type == CU_GRAPH_NODE_TYPE_EVENT_RECORD) {
+                node.native_event = owner->native->create_graph_event(state.flags);
+                local_events[node.event] = node.native_event;
+                auto task = std::make_shared<graph_event_task>(); task->event = node.native_event; task->graph = done;
+                task->dependency = std::make_shared<graph_event_signal>(); task->dependency->submitted = submitted;
+                task->dependency->native = node.native_event->signal();
+                std::shared_ptr<device_timestamp> timestamp;
+                if (!(state.flags & CU_EVENT_DISABLE_TIMING)) { timestamp = std::make_shared<device_timestamp>(); timestamp->timer = node.native_event->timer(); }
+                records.push_back({node.event, std::make_shared<command_completion>(), timestamp, task});
+            } else if (auto found = local_events.find(node.event); found != local_events.end()) node.native_event = found->second;
+            else {
+                // External records gate submission. A fresh unrecorded native
+                // event is a no-op wait, independent of the prior launch.
+                node.native_event = owner->native->create_graph_event(CU_EVENT_DISABLE_TIMING);
+                if (state.record) dependencies.push_back(state.record);
+            }
+            changes->push_back({std::move(node), {}}); auto& update = changes->back(); update.params = graph_native_parameters(update.node, owner);
+        }
+    };
+    if (!upload) events(value.nodes);
+    for (auto& dependency : dependencies) inherit_order(done->order, dependency);
+    auto record_order = done->order;
+    auto record_dependencies = dependencies;
+    done->order[target->id] = target->sequence + 1;
+    std::vector<std::shared_ptr<context>> managed_owners;
+    for (auto& [address, entry] : global().allocations) if (entry.native->is_managed() && entry.owner != owner) {
+        require(!entry.owner->retiring && (!entry.library || !global().libraries.at(entry.library)->retiring), CUDA_ERROR_INVALID_VALUE, "managed storage is retiring");
+        if (std::find(managed_owners.begin(), managed_owners.end(), entry.owner) == managed_owners.end()) managed_owners.push_back(entry.owner);
+    }
+    for (auto& context : managed_owners) context->foreign_work.reserve(context->foreign_work.size() + 1);
     for (auto& host : hosts) host->work.reserve(host->work.size() + 1);
     auto queue = stream_native(owner, target); auto native = value.native;
-    auto done = submit_stream(owner, stream, [] {}, value.tail ? std::vector<completion>{value.tail} : std::vector<completion>{}, 0,
-        [owner, queue, native, changes, operations, enables = value.native_enables, nodes = value.nodes, instance = value.memory_instance, objects = value.objects, upload] {
+    auto bindings = value.native_bindings;
+    for (auto& update : *changes) {
+        auto found = std::find_if(bindings.begin(), bindings.end(), [&](auto& binding) { return binding.native_node == update.node.native_node; });
+        if (found == bindings.end()) bindings.push_back(update.node);
+        else *found = update.node;
+    }
+    struct resources {
+        std::vector<graph_node> nodes, bindings;
+        std::shared_ptr<std::vector<graph_operation>> operations;
+        std::vector<std::shared_ptr<buffer>> memory;
+        std::shared_ptr<graph_memory_instance> instance;
+        user_references objects;
+        // Native descriptors retire before any of the resources they reference.
+        std::shared_ptr<native_graph_executable> native;
+    };
+    auto retained = std::make_shared<resources>(resources{value.nodes, bindings, operations, std::move(memory_resources), value.memory_instance, value.objects, native});
+    std::vector<CUdeviceptr> inserted;
+    inserted.reserve(memory_plan.regions.size());
+    std::vector<command_queue::submission> replay;
+    replay.push_back({done, std::move(dependencies), {}, 0,
+        [owner, target, queue, changes, submitted, retained, enables = value.native_enables, upload] {
             std::lock_guard lock(owner->execution);
+            auto& native = retained->native;
             for (auto& update : *changes) native->set_params(update.node.native_node, update.params);
             for (auto [node, enabled] : enables) native->set_enabled(node, enabled);
-            return upload ? native->upload(queue.get()) : native->enqueue(queue.get());
-        }, false, {}, queue);
-    value.tail = done; value.native_updates.clear(); value.native_enables.clear();
+            auto task = upload ? native->upload(queue.get()) : native->enqueue(queue.get());
+            submitted->store(true, std::memory_order_release); return task;
+        }, false, owner->command_domain, {}, queue});
+    for (auto& record : records) {
+        // A record does not certify completion of the graph's suffix. Keep
+        // incoming errors ordered without inheriting the final stream sequence.
+        record.done->order = record_order;
+        replay.push_back({record.done, record_dependencies, {}, 0, [task = record.task] { return task; }, false, owner->command_domain, {}, {}});
+    }
+    if (!owner->queue) owner->queue = std::make_unique<command_queue>(owner->command_domain);
+    try {
+        if (!upload) for (auto& memory : memory_plan.regions)
+            if (global().graph_live.emplace(memory->address, memory).second) inserted.push_back(memory->address);
+        owner->queue->submit_batch(std::move(replay));
+    } catch (...) { for (auto address : inserted) global().graph_live.erase(address); throw; }
+    if (!upload) for (auto& memory : memory_plan.regions) {
+        memory->planned_live = memory_plan.final_live.at(memory.get()); memory->transition = done;
+    }
+    // Keep the current native callback/descriptor bindings alive between
+    // launches too, after the update command has completed.
+    value.native_bindings.swap(bindings);
+    for (auto& context : managed_owners) context->foreign_work.push_back(done);
+    ++target->sequence; target->tail = done; value.tail = done; value.native_updates.clear(); value.native_enables.clear();
+    for (auto& record : records) { auto& state = event_lookup(record.handle); state.record = record.done; state.timestamp = record.timestamp; }
     for (auto& host : hosts) host->work.push_back(done);
     return true;
 }

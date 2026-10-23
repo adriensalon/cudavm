@@ -296,6 +296,9 @@ struct device_timer {
     virtual ~device_timer() = default;
     virtual float elapsed(const device_timer& end) const = 0;
 };
+struct native_graph_event : device_launch_event, device_task {
+    virtual std::shared_ptr<device_timer> timer() const = 0;
+};
 struct device_timestamp {
     std::shared_ptr<device_timer> timer;
     uint64_t ticks = 0;
@@ -326,6 +329,7 @@ struct external_memory {
 };
 struct external_semaphore {
     virtual ~external_semaphore() = default;
+    virtual CUexternalSemaphore cuda_handle() const { return nullptr; }
     virtual void signal(uint64_t value) = 0;
     virtual void wait(uint64_t value) = 0;
 };
@@ -476,6 +480,9 @@ struct session {
     }
     virtual std::shared_ptr<device_launch_event> create_launch_event() {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "native launch dependency events are unavailable");
+    }
+    virtual std::shared_ptr<native_graph_event> create_graph_event(unsigned) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "native graph events are unavailable");
     }
     virtual unsigned get_context_flags(unsigned requested) { return requested; }
     virtual unsigned set_context_flags(unsigned flags) { return flags; }
