@@ -796,7 +796,8 @@ class ptx_parser {
             } else if (parts[0] == "atom" || parts[0] == "red") {
                 bool reduction = parts[0] == "red";
                 auto type = ptx_scalar({parts.back(), opcode.line, opcode.column});
-                if ((type.bits != 32 && type.bits != 64) || (type.kind != 'b' && type.kind != 'u' && type.kind != 's'))
+                bool floating = type.kind == 'f' && type.bits == 32;
+                if (!floating && ((type.bits != 32 && type.bits != 64) || (type.kind != 'b' && type.kind != 'u' && type.kind != 's')))
                     ptx_fail(opcode, "unsupported atomic type", true);
                 std::string operation, scope, semantics, space;
                 for (unsigned i = 1; i + 1 < parts.size(); ++i) {
@@ -815,7 +816,7 @@ class ptx_parser {
                 if (operation.empty()) ptx_fail(opcode, "missing atomic operation");
                 bool bits = operation == "and" || operation == "or" || operation == "xor" || operation == "exch" || operation == "cas";
                 bool wrap = operation == "inc" || operation == "dec";
-                if ((bits && type.kind != 'b') || (!bits && type.kind == 'b') || (wrap && (type.kind != 'u' || type.bits != 32)) ||
+                if ((floating && operation != "add") || (bits && type.kind != 'b') || (!bits && type.kind == 'b') || (wrap && (type.kind != 'u' || type.bits != 32)) ||
                         (operation == "add" && type.bits == 64 && type.kind != 'u') ||
                         (reduction && (operation == "cas" || operation == "exch")))
                     ptx_fail(opcode, "invalid atomic operation/type combination");
@@ -835,7 +836,7 @@ class ptx_parser {
                     auto* exchange = builder.CreateAtomicCmpXchg(pointer, input, operand(address_index + 2, type), llvm::Align(type.bits / 8), order, failure, sync);
                     previous = builder.CreateExtractValue(exchange, 0);
                 } else {
-                    auto operation_id = operation == "add" ? llvm::AtomicRMWInst::Add : operation == "and" ? llvm::AtomicRMWInst::And :
+                    auto operation_id = operation == "add" ? (floating ? llvm::AtomicRMWInst::FAdd : llvm::AtomicRMWInst::Add) : operation == "and" ? llvm::AtomicRMWInst::And :
                         operation == "or" ? llvm::AtomicRMWInst::Or : operation == "xor" ? llvm::AtomicRMWInst::Xor :
                         operation == "inc" ? llvm::AtomicRMWInst::UIncWrap : operation == "dec" ? llvm::AtomicRMWInst::UDecWrap :
                         operation == "min" ? (type.signed_integer() ? llvm::AtomicRMWInst::Min : llvm::AtomicRMWInst::UMin) :
@@ -889,9 +890,16 @@ class ptx_parser {
             else if (parts.size() >= 2) {
                 const auto& op = parts[0];
                 auto type = ptx_scalar({parts.back(), opcode.line, opcode.column}, op == "ld" || op == "st");
-                if (type.kind == 'p') ptx_fail(opcode, "unsupported predicate instruction", true);
                 llvm::Value* value = nullptr;
-                if (numeric_instruction(parts,instruction,builder,scalar,write)) {}
+                if (type.kind == 'p') {
+                    if (parts.size() != 2 || (op != "and" && op != "or" && op != "xor" && op != "not"))
+                        ptx_fail(opcode, "unsupported predicate instruction", true);
+                    arity(op == "not" ? 2 : 3); auto* left = operand(1, type);
+                    value = op == "not" ? builder.CreateNot(left) : op == "and" ? builder.CreateAnd(left, operand(2, type)) :
+                        op == "or" ? builder.CreateOr(left, operand(2, type)) : builder.CreateXor(left, operand(2, type));
+                    write(instruction.operands[0], value, type);
+                }
+                else if (numeric_instruction(parts,instruction,builder,scalar,write)) {}
                 else if (op == "ld" || op == "st") {
                     arity(2);
                     bool load = op == "ld", parameter = parts.size() == 3 && parts[1] == "param";

@@ -494,7 +494,39 @@ CV_FN uint cvAtomicFloatAdd(uint a,uint b,uint flush) {
         if((a&0x7f800000u)==0u)a=a&0x80000000u;
         if((b&0x7f800000u)==0u)b=b&0x80000000u;
     }
-    uint result=cvDoubleBitsToFloatBitsMode(cvDoubleAdd(cvFloatBitsToDoubleBits(a),cvFloatBitsToDoubleBits(b)),0u);
+    // Three low bits carry guard, round and sticky information. Keep binary32
+    // addition in one word instead of expanding through binary64 arithmetic.
+    uint magnitude_a=a&0x7fffffffu,magnitude_b=b&0x7fffffffu;
+    if(magnitude_a>0x7f800000u || magnitude_b>0x7f800000u)return 0x7fffffffu;
+    if(magnitude_a==0x7f800000u || magnitude_b==0x7f800000u) {
+        if(magnitude_a==magnitude_b && ((a^b)&0x80000000u)!=0u)return 0x7fffffffu;
+        return magnitude_a==0x7f800000u?a:b;
+    }
+    if(magnitude_a<magnitude_b) {uint temporary=a;a=b;b=temporary;temporary=magnitude_a;magnitude_a=magnitude_b;magnitude_b=temporary;}
+    uint sign=a&0x80000000u;
+    if(magnitude_b==0u)return magnitude_a==0u?(a&b):a;
+    uint exponent=magnitude_a>>23u,other_exponent=magnitude_b>>23u;
+    uint left=((a&0x7fffffu)|(exponent!=0u?0x800000u:0u))<<3u;
+    uint right=((b&0x7fffffu)|(other_exponent!=0u?0x800000u:0u))<<3u;
+    exponent=exponent!=0u?exponent:1u;other_exponent=other_exponent!=0u?other_exponent:1u;
+    uint distance=exponent-other_exponent;
+    if(distance>=32u)right=1u;
+    else if(distance!=0u)right=(right>>distance)|((right<<(32u-distance))!=0u?1u:0u);
+    uint significand;
+    if(((a^b)&0x80000000u)==0u) {
+        significand=left+right;
+        if(significand>=0x8000000u) {significand=(significand>>1u)|(significand&1u);++exponent;}
+    } else {
+        significand=left-right;
+        if(significand==0u)return 0u;
+        while(significand<0x4000000u && exponent>1u) {significand<<=1u;--exponent;}
+    }
+    uint rounded=significand>>3u,tail=significand&7u;
+    if(tail>4u || (tail==4u && (rounded&1u)!=0u))++rounded;
+    if(rounded>=0x1000000u) {rounded>>=1u;++exponent;}
+    if(exponent>=255u)return sign|0x7f800000u;
+    if(exponent==1u && rounded<0x800000u)exponent=0u;
+    uint result=sign|(exponent<<23u)|(rounded&0x7fffffu);
     if(flush!=0u && (result&0x7f800000u)==0u)result=result&0x80000000u;
     return result;
 }

@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <llvm/ADT/PostOrderIterator.h>
+#include <llvm/ADT/FloatingPointMode.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Analysis/CFG.h>
 #include <llvm/Analysis/CallGraph.h>
@@ -818,12 +819,32 @@ struct lowering {
             b.SetInsertPoint(global_space); access_resolved(call_helper(resolve,{address}), [&](auto* block, const auto& pointer) { access(block,false,pointer); });
             access(shared_space,true,{});
         } else if (bits == 32) {
+            if(operation==llvm::AtomicRMWInst::FAdd || operation==llvm::AtomicRMWInst::FSub) {
+                // Share the arithmetic across resource bindings. Duplicating a
+                // numerical retry loop in every buffer-switch arm makes native
+                // shader compilation grow unnecessarily with the binding count.
+                auto* reader=atomic_helper(100,32,llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,requested_scope);
+                auto* exchange=atomic_helper(100,32,order,failure,requested_scope);
+                auto* initial=call_helper(reader,{address,b.getInt32(0),b.getInt32(0)});
+                auto* flush=b.CreateZExt(b.CreateICmpNE(function->getArg(1),b.getInt32(0xffffffffu)),b.getInt32Ty());
+                auto* operand=operation==llvm::AtomicRMWInst::FSub?b.CreateXor(function->getArg(2),b.getInt32(0x80000000u)):function->getArg(2);
+                auto* retry=llvm::BasicBlock::Create(b.getContext(),"add.retry",function);
+                auto* done=llvm::BasicBlock::Create(b.getContext(),"add.done",function);
+                b.CreateBr(retry);b.SetInsertPoint(retry);
+                auto* expected=b.CreatePHI(b.getInt32Ty(),2);expected->addIncoming(initial,first);
+                auto* next=numeric_call("__cudavm_native_word_f32_add",b.getInt32Ty(),{expected,operand,flush});
+                auto* observed=call_helper(exchange,{address,next,expected});
+                expected->addIncoming(observed,retry);
+                b.CreateCondBr(b.CreateICmpEQ(observed,expected),done,retry);
+                b.SetInsertPoint(done);b.CreateRet(expected);
+                b.restoreIP(saved);return function;
+            }
             auto* global_space = llvm::BasicBlock::Create(b.getContext(), "global", function);
             auto* shared_space = llvm::BasicBlock::Create(b.getContext(), "shared", function);
             b.CreateCondBr(b.CreateICmpEQ(function->getArg(1), b.getInt32(0xffffffffu)), shared_space, global_space);
             auto access = [&](llvm::BasicBlock* block, bool group_memory, const std::function<llvm::Value*()>& global_pointer) {
                 b.SetInsertPoint(block);
-                if((dxil && group_memory && operation!=100 && operation!=llvm::AtomicRMWInst::FAdd && operation!=llvm::AtomicRMWInst::FSub) ||
+                if((dxil && group_memory && operation!=100) ||
                         (!opencl && !dxil && (operation==llvm::AtomicRMWInst::Min || operation==llvm::AtomicRMWInst::Max)) ||
                         operation==llvm::AtomicRMWInst::UIncWrap || operation==llvm::AtomicRMWInst::UDecWrap) {
                     // Shader targets have no wrapping increment/decrement RMW;
@@ -855,18 +876,6 @@ struct lowering {
                     auto* exchange=b.CreateAtomicCmpXchg(pointer(),expected,next,llvm::Align(4),native_order,native_failure,scope);
                     expected->addIncoming(b.CreateExtractValue(exchange,0),retry);b.CreateCondBr(b.CreateExtractValue(exchange,1),done,retry);
                     b.SetInsertPoint(done);b.CreateRet(expected);return;
-                }
-                if(operation==llvm::AtomicRMWInst::FAdd || operation==llvm::AtomicRMWInst::FSub) {
-                    auto pointer=[&](){return group_memory?shared_pointer(b.CreateAnd(function->getArg(0),b.getInt32(0x3fffffffu))):global_pointer();};
-                    auto* retry=llvm::BasicBlock::Create(b.getContext(),"add.retry",function);
-                    auto* done=llvm::BasicBlock::Create(b.getContext(),"add.done",function);
-                    auto* initial=b.CreateExtractValue(b.CreateAtomicCmpXchg(pointer(),b.getInt32(0),b.getInt32(0),llvm::Align(4),llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,scope),0);
-                    b.CreateBr(retry);b.SetInsertPoint(retry);
-                    auto* expected=b.CreatePHI(b.getInt32Ty(),2);expected->addIncoming(initial,block);
-                    auto* operand=operation==llvm::AtomicRMWInst::FSub?b.CreateXor(function->getArg(2),b.getInt32(0x80000000u)):function->getArg(2);
-                    auto* next=numeric_call("__cudavm_native_word_f32_add",b.getInt32Ty(),{expected,operand,b.getInt32(group_memory?0:1)});
-                    auto* exchange=b.CreateAtomicCmpXchg(pointer(),expected,next,llvm::Align(4),native_order,native_failure,scope);
-                    expected->addIncoming(b.CreateExtractValue(exchange,0),retry);b.CreateCondBr(b.CreateExtractValue(exchange,1),done,retry);b.SetInsertPoint(done);b.CreateRet(expected);return;
                 }
                 auto* ptr = group_memory ? shared_pointer(b.CreateAnd(function->getArg(0),b.getInt32(0x3fffffffu)))
                     : global_pointer();
@@ -1275,6 +1284,37 @@ struct lowering {
             case llvm::Intrinsic::stackrestore:
                 if (stack_top) b.CreateStore(b.CreateAnd(b.CreateTrunc(value(instruction.getArgOperand(0)), b.getInt32Ty()), b.getInt32(0x3fffffffu)), stack_top);
                 return nullptr;
+            case llvm::Intrinsic::is_fpclass: {
+                // Optimized bit tests on atomic floating results can become
+                // classification intrinsics. Classify the transported bits so
+                // target FTZ modes cannot change zero/subnormal/NaN classes.
+                auto* input = instruction.getArgOperand(0);
+                unsigned width = input->getType()->getScalarSizeInBits();
+                if (!input->getType()->isHalfTy() && !input->getType()->isFloatTy() && !input->getType()->isDoubleTy())
+                    fail(instruction, "floating classification requires scalar IEEE storage");
+                unsigned fraction = width == 16 ? 10 : width == 32 ? 23 : 52;
+                auto* bits = value(input);
+                auto constant = [&](uint64_t x) { return llvm::ConstantInt::get(bits->getType(), x); };
+                uint64_t sign = uint64_t(1) << (width - 1), infinity = (sign - 1) & ~((uint64_t(1) << fraction) - 1);
+                auto* magnitude = b.CreateAnd(bits, constant(sign - 1));
+                auto* negative = b.CreateICmpNE(b.CreateAnd(bits, constant(sign)), constant(0));
+                auto* quiet = b.CreateICmpNE(b.CreateAnd(bits, constant(uint64_t(1) << (fraction - 1))), constant(0));
+                auto* nan = b.CreateICmpUGT(magnitude, constant(infinity));
+                auto* zero = b.CreateICmpEQ(magnitude, constant(0));
+                auto* subnormal = b.CreateAnd(b.CreateICmpULT(magnitude, constant(uint64_t(1) << fraction)), b.CreateNot(zero));
+                auto* normal = b.CreateAnd(b.CreateICmpUGE(magnitude, constant(uint64_t(1) << fraction)), b.CreateICmpULT(magnitude, constant(infinity)));
+                auto* infinite = b.CreateICmpEQ(magnitude, constant(infinity));
+                unsigned mask = llvm::cast<llvm::ConstantInt>(instruction.getArgOperand(1))->getZExtValue();
+                llvm::Value* result = b.getFalse();
+                auto include = [&](unsigned flag, llvm::Value* matches) { if (mask & flag) result = b.CreateOr(result, matches); };
+                include(llvm::fcSNan, b.CreateAnd(nan, b.CreateNot(quiet))); include(llvm::fcQNan, b.CreateAnd(nan, quiet));
+                auto signed_class = [&](unsigned positive, unsigned negative_class, llvm::Value* matches) {
+                    include(positive, b.CreateAnd(matches, b.CreateNot(negative))); include(negative_class, b.CreateAnd(matches, negative));
+                };
+                signed_class(llvm::fcPosInf, llvm::fcNegInf, infinite); signed_class(llvm::fcPosNormal, llvm::fcNegNormal, normal);
+                signed_class(llvm::fcPosSubnormal, llvm::fcNegSubnormal, subnormal); signed_class(llvm::fcPosZero, llvm::fcNegZero, zero);
+                return result;
+            }
             case llvm::Intrinsic::fabs: case llvm::Intrinsic::copysign: {
                 auto* magnitude=b.CreateBitCast(value(instruction.getArgOperand(0)),b.getInt32Ty());
                 auto* bits=b.CreateAnd(magnitude,b.getInt32(0x7fffffffu));
