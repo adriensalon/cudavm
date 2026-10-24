@@ -1,4 +1,5 @@
 #include "ptx_import.hpp"
+#include "compiler.hpp"
 #include "compiler_profiles.hpp"
 #include <algorithm>
 #include <cctype>
@@ -123,6 +124,7 @@ struct ptx_body {
     std::vector<ptx_parameter> parameters, results;
     std::map<std::string, ptx_register> registers;
     std::map<std::string, std::pair<ptx_parameter, llvm::Value*>> slots;
+    std::map<std::string, llvm::Value*> locals;
     std::vector<ptx_instruction> instructions;
 };
 struct ptx_global {
@@ -142,6 +144,7 @@ class ptx_parser {
     std::map<std::string, ptx_token> symbols;
     unsigned symbol_counter = 0;
     unsigned source_sm = 0;
+    unsigned source_version = 0;
     bool relocatable = false;
     const ptx_token& peek() const { return tokens.at(cursor); }
     ptx_token take() { auto token = peek(); if (cursor + 1 < tokens.size()) ++cursor; return token; }
@@ -285,7 +288,7 @@ class ptx_parser {
         if (!function->isDeclaration()) ptx_fail(name, "duplicate function definition");
         if (peek().text != "{") ptx_fail(peek(), "unsupported kernel directive or declaration", true);
         expect("{");
-        ptx_body body{name, function, parameters, results, {}, {}, {}};
+        ptx_body body{name, function, parameters, results, {}, {}, {}, {}};
         auto* entry = llvm::BasicBlock::Create(context, "entry", function); llvm::IRBuilder<> allocations(entry);
         std::vector<std::map<std::string, std::string>> scopes(1);
         auto add_slot = [&](const ptx_parameter& parameter, llvm::Value* input = nullptr, bool byval = false) {
@@ -323,6 +326,18 @@ class ptx_parser {
             bool external_storage = accept(".extern");
             if (peek().text == ".shared") { take(); storage(external_storage, ".shared", &body, &scopes.back()); continue; }
             if (external_storage) ptx_fail(peek(), "unsupported external body declaration", true);
+            if (accept(".local")) {
+                auto data = declaration(); auto original = data.name.text;
+                if (scopes.back().contains(original)) ptx_fail(data.name, "duplicate local storage declaration");
+                if (peek().text == "=") ptx_fail(peek(), "local storage cannot have an initializer");
+                expect(";");
+                auto unique = name.text + "$local$" + std::to_string(symbol_counter++);
+                auto* slot = allocations.CreateAlloca(data.storage(context), nullptr, unique);
+                slot->setAlignment(llvm::Align(data.alignment));
+                body.locals.emplace(unique, allocations.CreateAddrSpaceCast(slot, llvm::PointerType::get(context, 5)));
+                scopes.back()[original] = unique;
+                continue;
+            }
             if (accept(".reg")) {
                 auto type = ptx_scalar(take());
                 for (;;) {
@@ -596,9 +611,16 @@ class ptx_parser {
                             builtin->addFnAttr("cudavm.cuda.origin", "llvm.nvvm.read.ptx.sreg." + families[family] + "." + axis);
                             value = builder.CreateCall(callee);
                         }
+                    for (auto special : {"laneid", "warpsize", "lanemask.eq", "lanemask.lt", "lanemask.le", "lanemask.gt", "lanemask.ge"})
+                        if (token.text == std::string("%") + special)
+                            value = builder.CreateCall(module->getOrInsertFunction(std::string("llvm.nvvm.read.ptx.sreg.") + special,
+                                llvm::FunctionType::get(builder.getInt32Ty(), {}, false)));
                     if (!value) ptx_fail(token, token.text.find('.') == std::string::npos ? "undeclared register" : "unsupported special register",
                         token.text.find('.') != std::string::npos);
                 }
+            } else if (body.locals.contains(token.text)) {
+                if (negative || (type.bits != 32 && type.bits != 64) || type.kind == 'f') ptx_fail(token, "invalid local address operand");
+                value = builder.CreatePtrToInt(body.locals.at(token.text), type.storage(context));
             } else if (auto* global = module->getGlobalVariable(token.text, true)) {
                 if (negative || (type.bits != 32 && type.bits != 64) || type.kind == 'f') ptx_fail(token, "invalid symbol address operand");
                 value = builder.CreatePtrToInt(global, type.storage(context));
@@ -718,6 +740,44 @@ class ptx_parser {
                     llvm::FunctionType::get(builder.getVoidTy(), std::vector<llvm::Type*>(args.size(), builder.getInt32Ty()), false));
                 llvm::cast<llvm::Function>(callee.getCallee())->addFnAttr(llvm::Attribute::Convergent);
                 builder.CreateCall(callee, args)->setConvergent();
+            } else if (parts[0] == "vote" || parts[0] == "shfl" || parts[0] == "activemask" || opcode.text == "bar.warp.sync") {
+                auto collective = [&](const std::string& name, llvm::Type* result, std::vector<llvm::Value*> args) -> llvm::Value* {
+                    std::vector<llvm::Type*> types; for (auto* arg : args) types.push_back(arg->getType());
+                    auto callee = module->getOrInsertFunction("llvm.nvvm." + name, llvm::FunctionType::get(result, types, false));
+                    llvm::cast<llvm::Function>(callee.getCallee())->addFnAttr(llvm::Attribute::Convergent);
+                    auto* call = builder.CreateCall(callee, args); call->setConvergent(); return call;
+                };
+                if (opcode.text == "bar.warp.sync") {
+                    arity(1); collective("bar.warp.sync", builder.getVoidTy(), {operand(0, {32, 'u'})});
+                } else if (parts == std::vector<std::string>{"activemask", "b32"}) {
+                    arity(1);
+                    if (source_version < 62) ptx_fail(opcode, "activemask requires PTX 6.2", true);
+                    write(instruction.operands[0], collective("activemask", builder.getInt32Ty(), {}), {32, 'b'});
+                } else if (parts.size() == 4 && parts[0] == "vote" && parts[1] == "sync" &&
+                        ((parts[2] == "ballot" && parts[3] == "b32") ||
+                         ((parts[2] == "all" || parts[2] == "any" || parts[2] == "uni") && parts[3] == "pred"))) {
+                    arity(3); auto input = instruction.operands[1];
+                    bool negate = input.front().text == "!"; if (negate) input.erase(input.begin());
+                    auto* test = scalar(input, {1, 'p'}); if (negate) test = builder.CreateNot(test);
+                    auto* mask = operand(2, {32, 'u'}); bool ballot = parts[2] == "ballot";
+                    auto* result_type = ballot ? builder.getInt32Ty() : builder.getInt1Ty();
+                    auto* result = collective("vote." + (parts[2] == "uni" ? std::string("all") : parts[2]) + ".sync", result_type, {mask, test});
+                    if (parts[2] == "uni") result = builder.CreateOr(result,
+                        collective("vote.all.sync", result_type, {mask, builder.CreateNot(test)}));
+                    write(instruction.operands[0], result, ballot ? ptx_type{32, 'b'} : ptx_type{1, 'p'});
+                } else if (parts.size() == 4 && parts[0] == "shfl" && parts[1] == "sync" && parts[3] == "b32" &&
+                        (parts[2] == "idx" || parts[2] == "up" || parts[2] == "down" || parts[2] == "bfly")) {
+                    arity(5); const auto& destination = instruction.operands[0];
+                    if (destination.size() != 1 && (destination.size() != 3 || destination[1].text != "|"))
+                        ptx_fail(opcode, "invalid shuffle destination");
+                    auto* data = operand(1, {32, 'b'}); auto* offset = operand(2, {32, 'u'});
+                    auto* control = operand(3, {32, 'u'}); auto* mask = operand(4, {32, 'u'});
+                    bool predicate_result = destination.size() == 3 && destination[2].text != "_";
+                    llvm::Type* result_type = predicate_result ? static_cast<llvm::Type*>(llvm::StructType::get(context, {builder.getInt32Ty(), builder.getInt1Ty()})) : builder.getInt32Ty();
+                    auto* result = collective("shfl.sync." + parts[2] + (predicate_result ? ".i32p" : ".i32"), result_type, {mask, data, offset, control});
+                    if (destination[0].text != "_") write({destination[0]}, predicate_result ? builder.CreateExtractValue(result, 0) : result, {32, 'b'});
+                    if (predicate_result) write({destination[2]}, builder.CreateExtractValue(result, 1), {1, 'p'});
+                } else ptx_fail(opcode, "unsupported warp instruction or modifier", true);
             } else if (parts[0] == "membar" || parts[0] == "fence") {
                 arity(0);
                 bool legacy = parts[0] == "membar";
@@ -838,6 +898,7 @@ class ptx_parser {
                     bool global = (parts.size() == 3 && parts[1] == "global") ||
                         (load && parts.size() == 4 && parts[1] == "global" && parts[2] == "nc");
                     bool shared = parts.size() == 3 && parts[1] == "shared";
+                    bool local = parts.size() == 3 && parts[1] == "local";
                     bool constant = parts.size() == 3 && parts[1] == "const";
                     bool generic = parts.size() == 2;
                     llvm::AtomicOrdering order = llvm::AtomicOrdering::NotAtomic;
@@ -853,7 +914,7 @@ class ptx_parser {
                         global = parts.size() == 5 && parts[3] == "global";
                         shared = parts.size() == 5 && parts[3] == "shared";
                     }
-                    if ((!parameter && !global && !shared && !constant && !generic) || (!load && constant)) ptx_fail(opcode, "unsupported memory instruction", true);
+                    if ((!parameter && !global && !shared && !local && !constant && !generic) || (!load && constant)) ptx_fail(opcode, "unsupported memory instruction", true);
                     const auto& address = instruction.operands[load ? 1 : 0];
                     if (address.size() < 3 || address.front().text != "[" || address.back().text != "]" ||
                         (address.size() != 3 && address.size() != 5)) ptx_fail(opcode, "unsupported address expression", true);
@@ -877,11 +938,11 @@ class ptx_parser {
                         pointer = builder.CreateGEP(builder.getInt8Ty(), found->second.second, builder.getInt64(uint64_t(displacement)));
                     } else {
                         unsigned width = 64;
-                        if (shared && registers.contains(address[1].text)) width = registers.at(address[1].text).type.bits;
+                        if ((shared || local) && registers.contains(address[1].text)) width = registers.at(address[1].text).type.bits;
                         if (width != 32 && width != 64) ptx_fail(address[1], "invalid address register width");
                         auto* pointer_bits = scalar({address[1]}, {width, 'u'});
                         if (displacement) pointer_bits = builder.CreateAdd(pointer_bits, llvm::ConstantInt::get(pointer_bits->getType(), uint64_t(displacement)));
-                        pointer = builder.CreateIntToPtr(pointer_bits, llvm::PointerType::get(context, shared ? 3 : constant ? 4 : global ? 1 : 0));
+                        pointer = builder.CreateIntToPtr(pointer_bits, llvm::PointerType::get(context, shared ? 3 : local ? 5 : constant ? 4 : global ? 1 : 0));
                     }
                     if (load) {
                         auto* memory = builder.CreateAlignedLoad(type.storage(context), pointer, llvm::Align(type.bits / 8));
@@ -898,10 +959,18 @@ class ptx_parser {
                 } else if (op == "cvta" && (type.bits == 32 || type.bits == 64) && type.kind == 'u' &&
                         (parts.size() == 3 || (parts.size() == 4 && parts[1] == "to"))) {
                     arity(2); bool to = parts.size() == 4; auto space = parts[to ? 2 : 1];
-                    if (space != "global" && space != "shared" && space != "const") ptx_fail(opcode, "unsupported address space conversion", true);
-                    auto* specific = llvm::PointerType::get(context, space == "shared" ? 3 : space == "const" ? 4 : 1);
+                    if (space != "global" && space != "shared" && space != "const" && space != "local") ptx_fail(opcode, "unsupported address space conversion", true);
+                    auto* specific = llvm::PointerType::get(context, space == "shared" ? 3 : space == "const" ? 4 : space == "local" ? 5 : 1);
                     auto* generic = llvm::PointerType::get(context, 0);
-                    auto* pointer = builder.CreateIntToPtr(operand(1, type), to ? generic : specific);
+                    auto address = instruction.operands[1]; llvm::Value* bits = nullptr;
+                    if (!to && address.size() == 3 && (body.locals.contains(address[0].text) || module->getGlobalVariable(address[0].text, true)) &&
+                            (address[1].text == "+" || address[1].text == "-")) {
+                        auto displacement = ptx_unsigned(address[2]);
+                        if (displacement > INT32_MAX) ptx_fail(address[2], "address displacement exceeds supported range", true);
+                        bits = builder.CreateAdd(scalar({address[0]}, type), llvm::ConstantInt::get(type.storage(context),
+                            address[1].text == "-" ? uint64_t(0) - displacement : displacement));
+                    } else bits = operand(1, type);
+                    auto* pointer = builder.CreateIntToPtr(bits, to ? generic : specific);
                     value = builder.CreatePtrToInt(builder.CreateAddrSpaceCast(pointer, to ? specific : generic), type.storage(context));
                     write(instruction.operands[0], value, type);
                 } else if (op == "cvt" && parts.size() == 3 && type.kind != 'f' && type.kind != 'b' && type.bits >= 16) {
@@ -986,6 +1055,7 @@ public:
         // Later versions remain explicit obligations even for old opcodes.
         if (!supported_ptx_version(version.text))
             ptx_fail(version, "unsupported PTX version (expected 6.0-6.5, 7.0-7.8 or 8.0-8.4)", true, true);
+        source_version = unsigned((version.text[0] - '0') * 10 + version.text[2] - '0');
         expect(".target"); auto target = take();
         const std::map<std::string, unsigned> targets{{"sm_50", 60}, {"sm_52", 60}, {"sm_53", 60}, {"sm_60", 60},
             {"sm_61", 60}, {"sm_62", 60}, {"sm_70", 60}, {"sm_72", 61}, {"sm_75", 63},
@@ -1069,6 +1139,9 @@ public:
         for (auto& body : bodies) visit(body.function);
         for (auto& global : module->globals())
             if (!relocatable && global.isDeclaration() && global.getAddressSpace() != 3 && !global.use_empty()) ptx_fail(symbols.at(global.getName().str()), "unresolved device storage");
+        // PTX enters the same portable CUDA semantic identities as source IR.
+        // Keep native intrinsics out of persisted programs and native emission.
+        import_device_semantics(*module);
         std::string diagnostic; llvm::raw_string_ostream stream(diagnostic);
         if (llvm::verifyModule(*module, &stream)) throw ptx_import_error(false, "invalid imported PTX IR: " + diagnostic);
         return std::move(module);

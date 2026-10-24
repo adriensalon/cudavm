@@ -669,14 +669,14 @@ struct lowering {
             if (expression->getOpcode() == llvm::Instruction::AddrSpaceCast || expression->getOpcode() == llvm::Instruction::BitCast) return value(expression->getOperand(0));
             if (expression->getOpcode() == llvm::Instruction::PtrToInt) {
                 auto* address = value(expression->getOperand(0));
-                if (expression->getOperand(0)->getType()->getPointerAddressSpace() == 3)
+                if (expression->getOperand(0)->getType()->getPointerAddressSpace() == 3 || expression->getOperand(0)->getType()->getPointerAddressSpace() == 5)
                     address = b.CreateAnd(address, b.getInt64(0x3fffffffull));
                 return canonical(b.CreateZExtOrTrunc(address, type(expression->getType())), expression->getType());
             }
             if (expression->getOpcode() == llvm::Instruction::IntToPtr) {
                 auto* address = b.CreateZExtOrTrunc(value(expression->getOperand(0)), b.getInt64Ty());
-                if (expression->getType()->getPointerAddressSpace() == 3)
-                    address = b.CreateOr(address, b.getInt64(0xffffffff40000000ull));
+                if (auto space = expression->getType()->getPointerAddressSpace(); space == 3 || space == 5)
+                    address = b.CreateOr(address, b.getInt64(space == 3 ? 0xffffffff40000000ull : 0xffffffff80000000ull));
                 return address;
             }
             if (expression->getOpcode() == llvm::Instruction::Add || expression->getOpcode() == llvm::Instruction::Sub) {
@@ -977,11 +977,13 @@ struct lowering {
     llvm::Value* collective(const llvm::CallInst& call,unsigned operation) {
         if(operation>=32 && operation<35 && call.arg_size()>2) fail(call,"counted block reductions require separate lowering");
         if(operation>=32 && operation<36 && call.arg_size()>(operation==35?0u:1u)) if(auto* id=llvm::dyn_cast<llvm::ConstantInt>(call.getArgOperand(0));!id || !id->isZero()) fail(call,"named block reductions require separate lowering");
+        bool shuffle_predicate=operation<4 && call.getType()->isStructTy();
+        auto helper_key=operation+(shuffle_predicate?64:0);
         auto saved=b.saveIP(); llvm::Function* helper=nullptr;
-        if(auto found=collective_helpers.find(operation);found!=collective_helpers.end()) helper=found->second;
+        if(auto found=collective_helpers.find(helper_key);found!=collective_helpers.end()) helper=found->second;
         else {
-            helper=llvm::Function::Create(llvm::FunctionType::get(operation==10 || operation==11?b.getInt64Ty():b.getInt32Ty(),arguments({b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()}),false),llvm::GlobalValue::InternalLinkage,"cudavm.collective."+std::to_string(operation),*result);
-            helper->addFnAttr(llvm::Attribute::Convergent); collective_helpers[operation]=helper;
+            helper=llvm::Function::Create(llvm::FunctionType::get(shuffle_predicate || operation==10 || operation==11?b.getInt64Ty():b.getInt32Ty(),arguments({b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()}),false),llvm::GlobalValue::InternalLinkage,"cudavm.collective."+std::to_string(helper_key),*result);
+            helper->addFnAttr(llvm::Attribute::Convergent); collective_helpers[helper_key]=helper;
             helper->addFnAttr("cudavm.collective",std::to_string(operation));
             auto* first=llvm::BasicBlock::Create(b.getContext(),"entry",helper); b.SetInsertPoint(first);
             auto* id=linear_thread(); auto* lane=b.CreateAnd(id,b.getInt32(31)); auto* base=b.CreateAnd(id,b.getInt32(~31u));
@@ -995,9 +997,10 @@ struct lowering {
                 if(operation==1) peer=b.CreateSub(lane,offset);
                 if(operation==2) peer=b.CreateAdd(lane,offset);
                 if(operation==3) peer=b.CreateXor(lane,offset);
-                eligible=operation==1?b.CreateAnd(b.CreateICmpUGE(lane,offset),b.CreateICmpUGE(peer,minimum)):b.CreateICmpULE(peer,maximum);
+                eligible=operation==1?b.CreateAnd(b.CreateICmpUGE(lane,offset),b.CreateICmpUGE(peer,maximum)):b.CreateICmpULE(peer,maximum);
                 auto* selected=b.CreateSelect(eligible,b.CreateAdd(base,peer),id);
                 answer=b.CreateAlignedLoad(b.getInt32Ty(),pointer(selected),llvm::Align(4));
+                if(shuffle_predicate) answer=pair(answer,b.CreateZExt(eligible,b.getInt32Ty()));
             } else if(operation==7 || operation==35 || operation>=36) answer=b.getInt32(0);
             else if(operation==20) answer=helper->getArg(0);
             else {
@@ -1069,7 +1072,7 @@ struct lowering {
         if(opencl) for (unsigned i=0;i<packet_resource_count;++i) args.push_back(entry->getArg(unsigned(entry->arg_size()-packet_resource_count+i)));
         auto* out=b.CreateCall(helper,args); out->setConvergent();
         if(call.getType()->isVoidTy()) return nullptr;
-        if(operation==10 || operation==11) return b.CreateInsertValue(b.CreateInsertValue(llvm::UndefValue::get(type(call.getType())),b.CreateTrunc(out,b.getInt32Ty()),0),b.CreateICmpNE(b.CreateLShr(out,b.getInt64(32)),b.getInt64(0)),1);
+        if(shuffle_predicate || operation==10 || operation==11) return b.CreateInsertValue(b.CreateInsertValue(llvm::UndefValue::get(type(call.getType())),b.CreateTrunc(out,b.getInt32Ty()),0),b.CreateICmpNE(b.CreateLShr(out,b.getInt64(32)),b.getInt64(0)),1);
         return call.getType()->isIntegerTy(1)?b.CreateICmpNE(out,b.getInt32(0)):out;
     }
     #include "shader_texture_filter.inl"
@@ -1432,13 +1435,15 @@ struct lowering {
         if (auto* pointer = llvm::dyn_cast<llvm::GetElementPtrInst>(&input)) { values[&input] = gep(*llvm::cast<llvm::GEPOperator>(pointer)); return; }
         if (auto* cast = llvm::dyn_cast<llvm::CastInst>(&input); cast && (input.getType()->isPointerTy() || cast->getOperand(0)->getType()->isPointerTy())) {
             auto* address = value(cast->getOperand(0));
-            // PTX shared-space integers are byte offsets. Generic pointers keep
-            // the transport tag; explicit shared ptr/int conversions strip or
-            // restore it, including the common 32-bit shared-address form.
-            if (cast->getOpcode() == llvm::Instruction::PtrToInt && cast->getOperand(0)->getType()->getPointerAddressSpace() == 3)
+            // PTX shared/local integers are byte offsets. Generic pointers keep
+            // the transport tag; explicit space-specific ptr/int conversions
+            // strip or restore it for both 32-bit and 64-bit address operands.
+            auto source_space = cast->getOperand(0)->getType()->isPointerTy() ? cast->getOperand(0)->getType()->getPointerAddressSpace() : 0;
+            auto destination_space = input.getType()->isPointerTy() ? input.getType()->getPointerAddressSpace() : 0;
+            if (cast->getOpcode() == llvm::Instruction::PtrToInt && (source_space == 3 || source_space == 5))
                 address = b.CreateAnd(address, b.getInt64(0x3fffffffull));
-            if (cast->getOpcode() == llvm::Instruction::IntToPtr && input.getType()->getPointerAddressSpace() == 3)
-                address = b.CreateOr(b.CreateZExtOrTrunc(address, b.getInt64Ty()), b.getInt64(0xffffffff40000000ull));
+            if (cast->getOpcode() == llvm::Instruction::IntToPtr && (destination_space == 3 || destination_space == 5))
+                address = b.CreateOr(b.CreateZExtOrTrunc(address, b.getInt64Ty()), b.getInt64(destination_space == 3 ? 0xffffffff40000000ull : 0xffffffff80000000ull));
             values[&input] = canonical(b.CreateZExtOrTrunc(address, type(input.getType())), input.getType()); return;
         }
         if (auto* select = llvm::dyn_cast<llvm::SelectInst>(&input)) { values[&input] = b.CreateSelect(value(select->getCondition()), value(select->getTrueValue()), value(select->getFalseValue())); return; }

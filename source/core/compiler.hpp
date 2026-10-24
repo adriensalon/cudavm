@@ -75,6 +75,7 @@ void mark_translation_unit(llvm::Module&, const compiler_options&, const host_ex
 std::string program_input_identity(const llvm::Module&);
 std::unique_ptr<llvm::Module> link_device(llvm::LLVMContext&, const compiler_options&);
 void prepare_portable(llvm::Module&);
+void import_device_semantics(llvm::Module&);
 void lower_device_conversions(llvm::Module&);
 void lower_device_math(llvm::Module&);
 void lower_half_math_intrinsics(llvm::Module&);

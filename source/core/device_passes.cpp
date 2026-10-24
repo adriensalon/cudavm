@@ -614,7 +614,8 @@ std::string semantic_name(llvm::StringRef original) {
     // exact origin is preserved; shader backends must implement each explicitly.
     return "cudavm.cuda." + original.drop_front(10).str();
 }
-void import_semantics(llvm::Module& module) {
+}
+void import_device_semantics(llvm::Module& module) {
     std::vector<llvm::Function*> intrinsics;
     for (auto& function : module) {
         function.removeFnAttr("target-cpu"); function.removeFnAttr("target-features");
@@ -644,7 +645,6 @@ void import_semantics(llvm::Module& module) {
     module.setTargetTriple(llvm::Triple());
     // Keep the frontend data layout as the source object representation. CUDA
     // address spaces 0/1/3/4/5 remain generic/global/shared/constant/local domains.
-}
 }
 void mark_translation_unit(llvm::Module& module, const compiler_options& values, const host_extraction& host) {
     module.setModuleIdentifier(values.input);
@@ -1557,7 +1557,7 @@ void prepare_portable(llvm::Module& module) {
     lower_device_math(module);
     lower_device_integers(module);
     lower_device_synchronization(module);
-    import_semantics(module);
+    import_device_semantics(module);
     trace(module, "cuda-semantic-import");
     advance(module, "clang.cuda.linked", "cudavm.semantic");
     close_graph(module);
