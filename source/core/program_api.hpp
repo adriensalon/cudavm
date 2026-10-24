@@ -5,7 +5,7 @@
 // Requests borrow their storage. Import, link, and preparation return new
 // compiler-owned programs without mutating inputs. No LLVM types cross the ABI.
 namespace cudavm {
-enum class compiler_input_kind : uint32_t { ptx = 1, nvvm, cubin, nvltoir, source, cudavm_ir, program_image };
+enum class compiler_input_kind : uint32_t { ptx = 1, nvvm, cubin, nvltoir, source, cudavm_ir, program_image, automatic };
 struct compiler_source_header { const char* name; const char* contents; };
 struct compiler_source_request {
     uint32_t abi_version;
@@ -37,6 +37,12 @@ struct compiler_input_request {
 struct compiler_input_request_v2 {
     compiler_input_request base;
     const char* architecture = nullptr;
+};
+// V3 permits unresolved PTX declarations until device linking. For persisted
+// programs the requested architecture validates the existing source profile.
+struct compiler_input_request_v3 {
+    compiler_input_request_v2 base;
+    uint32_t relocatable = 0;
 };
 struct compiler_pipeline_request {
     uint32_t abi_version = 1;

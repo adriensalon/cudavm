@@ -435,7 +435,7 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
         auto program = import_compiler_program(request, diagnostics);
         if (stage(*program->module) == "cudavm.portable" && !program->module->getNamedMetadata(archive_key)) {
             compiler_options settings;
-            settings.input = settings.bitcode = program->module->getModuleIdentifier();
+            settings.input = program->module->getModuleIdentifier(); settings.bitcode = program_input_identity(*program->module);
             settings.standard = "c++17"; settings.architecture = program->architecture;
             mark_translation_unit(*program->module, settings, {});
         }
@@ -780,12 +780,15 @@ std::unique_ptr<llvm::Module> link_device(llvm::LLVMContext& context, const comp
                         || incoming_function->getMetadata("cudavm.selected.group.definition")))
                     || (existing_function && (existing_function->getMetadata("cudavm.discarded.group.definition")
                         || existing_function->getMetadata("cudavm.selected.group.definition")));
-                if (!incoming_alias && !existing_alias && !weak_helper && !external_library && !group_definition) continue;
                 auto* left = incoming_alias ? alias_target(*incoming_alias, true) : incoming_function;
                 auto* right = existing_alias ? alias_target(*existing_alias, true) : existing_function;
-                if (!left || !right || !same_alias_abi(*left, *right))
+                bool ptx_kind_mismatch = left && right && (module->getNamedMetadata("cudavm.import.architecture")
+                        || result->getNamedMetadata("cudavm.import.architecture"))
+                    && left->hasFnAttribute("cudavm.kernel") != right->hasFnAttribute("cudavm.kernel");
+                if (!left || !right || !same_alias_abi(*left, *right) || ptx_kind_mismatch)
                     throw std::runtime_error(std::string(incoming_alias || existing_alias
-                        ? "incompatible device function alias: " : "incompatible device helper override: ")
+                        ? "incompatible device function alias: " : weak_helper || external_library || group_definition
+                            ? "incompatible device helper override: " : "incompatible device function declaration: ")
                         + incoming.getName().str() + " in " + path);
             }
             // Opaque LLVM pointers can hide incompatible declarations when the

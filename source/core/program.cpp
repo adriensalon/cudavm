@@ -11,6 +11,8 @@
 #include "module_descriptor.hpp"
 #include <optional>
 #include <llvm/Config/llvm-config.h>
+#include <llvm/ADT/StringExtras.h>
+#include <llvm/Support/SHA256.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
@@ -24,6 +26,22 @@ namespace cudavm {
 static_assert(LLVM_VERSION_MAJOR == 22 && LLVM_VERSION_MINOR == 1 && LLVM_VERSION_PATCH == 4,
     "review the portable image IR profile when changing LLVM");
 namespace {
+bool has_ptx_header(std::string_view input) {
+    for (;;) {
+        auto first = input.find_first_not_of(" \t\r\n");
+        if (first == input.npos) return false;
+        input.remove_prefix(first);
+        if (input.starts_with("//")) {
+            auto end = input.find('\n');
+            if (end == input.npos) return false;
+            input.remove_prefix(end + 1);
+        } else if (input.starts_with("/*")) {
+            auto end = input.find("*/", 2);
+            if (end == input.npos) return false;
+            input.remove_prefix(end + 2);
+        } else return input.starts_with(".version");
+    }
+}
 std::string image_metadata(const llvm::Module& module) {
     return llvm::formatv("{0}", llvm::json::Value(describe(module))).str();
 }
@@ -60,14 +78,33 @@ std::unique_ptr<compiler_program> copy_program(const compiler_program& input) {
 }
 }
 
+std::string program_input_identity(const llvm::Module& module) {
+    auto bytes = bitcode(module);
+    auto hash = llvm::SHA256::hash(llvm::ArrayRef(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
+    return module.getModuleIdentifier() + "." + llvm::toHex(hash, true);
+}
+
 std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_request& request, compiler_result& result) {
-    require_compiler_request(request.abi_version == 1 || request.abi_version == 2, "compiler input requires abi_version 1 or 2");
-    const char* architecture = request.abi_version == 2 ? reinterpret_cast<const compiler_input_request_v2&>(request).architecture : nullptr;
-    require_compiler_request(!architecture || request.kind == compiler_input_kind::ptx, "compiler input target override requires PTX");
+    require_compiler_request(request.abi_version >= 1 && request.abi_version <= 3, "compiler input requires abi_version 1, 2 or 3");
+    const char* architecture = request.abi_version >= 2 ? reinterpret_cast<const compiler_input_request_v2&>(request).architecture : nullptr;
+    auto relocatable = request.abi_version == 3 ? reinterpret_cast<const compiler_input_request_v3&>(request).relocatable : 0;
+    require_compiler_request(relocatable <= 1, "invalid compiler input relocation mode");
+    require_compiler_request(!architecture || request.kind == compiler_input_kind::ptx || request.abi_version == 3,
+        "compiler input target override requires PTX or a V3 request");
     auto output = std::make_unique<compiler_program>();
     auto kind = request.kind;
+    if (kind == compiler_input_kind::automatic) {
+        require_compiler_request(request.data && request.size, "empty automatic compiler input");
+        auto bytes = std::string_view(request.data, request.size);
+        if (has_program_image(bytes)) kind = compiler_input_kind::program_image;
+        else if (has_ptx_header(bytes)) kind = compiler_input_kind::ptx;
+        else throw compiler_error(compiler_status::unsupported, "unrecognized compiler input (expected cudavm program image or PTX)");
+    }
     if ((kind == compiler_input_kind::cubin || kind == compiler_input_kind::nvltoir) && request.data
         && has_program_image(std::string_view(request.data, request.size))) kind = compiler_input_kind::program_image;
+    if (request.abi_version == 3 && request.data && request.size && ((kind == compiler_input_kind::ptx && has_program_image({request.data, request.size}))
+        || ((kind == compiler_input_kind::cubin || kind == compiler_input_kind::nvltoir) && has_ptx_header({request.data, request.size}))))
+        throw compiler_error(compiler_status::input_type_mismatch, "compiler input bytes do not match the declared input type");
     switch (kind) {
     case compiler_input_kind::source: {
         auto* source = request.source;
@@ -93,14 +130,14 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
         for (auto& [expression, name] : imported.lowered_names) output->lowered_names.emplace(expression, std::move(name));
         // Source programs remain relocatable until the caller requests closure.
         compiler_options options;
-        options.input = source->name; options.bitcode = source->name;
+        options.input = source->name; options.bitcode = program_input_identity(*output->module);
         options.standard = settings.standard; options.architecture = settings.architecture;
         mark_translation_unit(*output->module, options, {});
         break;
     }
     case compiler_input_kind::ptx:
         require_compiler_request(request.data && request.size, "empty PTX input");
-        output->module = import_ptx(output->context, {request.data, request.size}, architecture ? architecture : "");
+        output->module = import_ptx(output->context, {request.data, request.size}, architecture ? architecture : "", relocatable != 0);
         if (request.name) output->module->setModuleIdentifier(request.name);
         if (auto* target = output->module->getNamedMetadata("cudavm.import.architecture"))
             output->architecture = llvm::cast<llvm::MDString>(target->getOperand(0)->getOperand(0))->getString().str();
@@ -136,6 +173,8 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
     case compiler_input_kind::cubin: throw compiler_error(compiler_status::unsupported, "cubin import is not implemented");
     default: throw compiler_error(compiler_status::invalid, "unknown compiler input kind");
     }
+    if (architecture && output->architecture != architecture)
+        throw compiler_error(compiler_status::architecture_mismatch, "compiler target must match the retained program's source architecture");
     result.lowered_names = output->lowered_names;
     return output;
 }
@@ -158,7 +197,7 @@ std::unique_ptr<compiler_program> link_compiler_programs(size_t count, const com
         if (program_stage(*input.module) == "cudavm.portable" && !input.module->getNamedMetadata("cudavm.link.archive.v1")) {
             auto member = copy_program(input);
             compiler_options settings;
-            settings.input = settings.bitcode = input.module->getModuleIdentifier();
+            settings.input = input.module->getModuleIdentifier(); settings.bitcode = program_input_identity(*member->module);
             settings.standard = "c++17"; settings.architecture = input.architecture;
             mark_translation_unit(*member->module, settings, {});
             options.ir_inputs.push_back({bitcode(*member->module), settings.input});
@@ -175,7 +214,8 @@ std::unique_ptr<compiler_program> prepare_compiler_program(const compiler_progra
     require_compiler_request(request.abi_version == 1 && request.numerical_helpers <= 1 && request.lower_semantics <= 1
         && request.optimization_level <= 3, "invalid compiler pipeline request");
     auto output = copy_program(input);
-    if (request.numerical_helpers) link_device_numeric_ir(*output->module);
+    if (request.numerical_helpers || (request.lower_semantics && output->module->getNamedMetadata("cudavm.import.architecture")))
+        link_device_numeric_ir(*output->module);
     if (request.lower_semantics && program_stage(*output->module) != "cudavm.portable") {
         if (program_stage(*output->module) == "clang.cuda.tu") {
             const compiler_program* programs[] = {output.get()};

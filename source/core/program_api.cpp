@@ -16,6 +16,7 @@ template<class Function> compiler_status run_compiler_program_api(compiler_resul
         } catch (const compiler_error& error) { status = error.status; result->diagnostics += error.what(); }
         catch (const ptx_import_error& error) {
             status = error.unsupported_version ? compiler_status::unsupported_ptx_version
+                : error.architecture_mismatch ? compiler_status::architecture_mismatch
                 : error.unsupported ? compiler_status::unsupported : compiler_status::invalid;
             result->diagnostics += error.what();
         } catch (const std::bad_alloc&) { status = compiler_status::out_of_memory; }

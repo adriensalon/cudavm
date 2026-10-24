@@ -71,6 +71,8 @@ struct host_extraction {
 host_extraction extract_host(const compiler_options&);
 std::unique_ptr<llvm::Module> compile_device(llvm::LLVMContext&, const compiler_options&, const std::vector<std::string>& host_dependencies = {}, const llvm::json::Array* host_symbols = nullptr);
 void mark_translation_unit(llvm::Module&, const compiler_options&, const host_extraction&);
+// In-memory program names are diagnostic labels, not unique file identities.
+std::string program_input_identity(const llvm::Module&);
 std::unique_ptr<llvm::Module> link_device(llvm::LLVMContext&, const compiler_options&);
 void prepare_portable(llvm::Module&);
 void lower_device_conversions(llvm::Module&);

@@ -23,9 +23,9 @@
 namespace cudavm {
 namespace {
 struct ptx_token { std::string text; unsigned line, column; };
-[[noreturn]] void ptx_fail(const ptx_token& token, const std::string& reason, bool unsupported = false, bool version = false) {
+[[noreturn]] void ptx_fail(const ptx_token& token, const std::string& reason, bool unsupported = false, bool version = false, bool architecture = false) {
     throw ptx_import_error(unsupported, "PTX " + std::to_string(token.line) + ":" +
-        std::to_string(token.column) + ": " + reason + " (" + token.text + ")", version);
+        std::to_string(token.column) + ": " + reason + " (" + token.text + ")", version, architecture);
 }
 std::vector<ptx_token> ptx_tokens(std::string_view input) {
     std::vector<ptx_token> result;
@@ -138,6 +138,7 @@ class ptx_parser {
     std::vector<ptx_global> globals;
     std::map<std::string, ptx_token> symbols;
     unsigned symbol_counter = 0;
+    bool relocatable = false;
     const ptx_token& peek() const { return tokens.at(cursor); }
     ptx_token take() { auto token = peek(); if (cursor + 1 < tokens.size()) ++cursor; return token; }
     bool accept(const char* text) { if (peek().text != text) return false; take(); return true; }
@@ -696,7 +697,7 @@ class ptx_parser {
                 const auto& target = instruction.operands[target_index];
                 if (target.size() != 1 || !ptx_identifier(target[0].text)) ptx_fail(opcode, "indirect calls are unsupported", true);
                 auto* callee = module->getFunction(target[0].text);
-                if (!callee || callee->isDeclaration()) ptx_fail(target[0], "unresolved device function");
+                if (!callee || (!relocatable && callee->isDeclaration())) ptx_fail(target[0], "unresolved device function");
                 if (callee->hasFnAttribute("cudavm.kernel")) ptx_fail(target[0], "cannot call a kernel");
                 const auto& signature = signatures.at(target[0].text);
                 auto inputs = list(instruction.operands[target_index + 1]);
@@ -854,7 +855,8 @@ class ptx_parser {
     }
 public:
     ptx_parser(llvm::LLVMContext& owner, std::string_view input) : tokens(ptx_tokens(input)), context(owner), module(std::make_unique<llvm::Module>("imported.ptx", owner)) {}
-    std::unique_ptr<llvm::Module> parse(std::string_view architecture = {}) {
+    std::unique_ptr<llvm::Module> parse(std::string_view architecture = {}, bool retain_declarations = false) {
+        relocatable = retain_declarations;
         expect(".version"); auto version = take();
         // Bound accepted language versions independently of opcode support.
         // Later versions remain explicit obligations even for old opcodes.
@@ -870,7 +872,7 @@ public:
         auto selected = architecture.empty() ? target.text : std::string(architecture);
         if (!targets.contains(selected)) ptx_fail(target, "unsupported PTX compilation target", true);
         if (std::stoul(selected.substr(3)) < std::stoul(target.text.substr(3)))
-            ptx_fail(target, "PTX compilation target is older than the input target");
+            ptx_fail(target, "PTX compilation target is older than the input target", false, false, true);
         if (peek().text == ",") ptx_fail(peek(), "unsupported target option", true);
         expect(".address_size"); auto address = take();
         if (address.text != "64") ptx_fail(address, "PTX import requires 64-bit addresses", true);
@@ -891,7 +893,7 @@ public:
         }
         bool has_kernel = false;
         for (const auto& body : bodies) has_kernel |= body.function->hasFnAttribute("cudavm.kernel");
-        if (!has_kernel) ptx_fail(peek(), "PTX module contains no kernels");
+        if (!has_kernel && !relocatable) ptx_fail(peek(), "PTX module contains no kernels");
         for (auto& global : globals) if (!global.initializer.empty()) {
             const auto& data = global.declaration;
             std::vector<llvm::Constant*> elements(data.count, llvm::ConstantInt::get(data.type.storage(context), 0));
@@ -941,15 +943,15 @@ public:
         };
         for (auto& body : bodies) visit(body.function);
         for (auto& global : module->globals())
-            if (global.isDeclaration() && global.getAddressSpace() != 3 && !global.use_empty()) ptx_fail(symbols.at(global.getName().str()), "unresolved device storage");
+            if (!relocatable && global.isDeclaration() && global.getAddressSpace() != 3 && !global.use_empty()) ptx_fail(symbols.at(global.getName().str()), "unresolved device storage");
         std::string diagnostic; llvm::raw_string_ostream stream(diagnostic);
         if (llvm::verifyModule(*module, &stream)) throw ptx_import_error(false, "invalid imported PTX IR: " + diagnostic);
         return std::move(module);
     }
 };
 }
-std::unique_ptr<llvm::Module> import_ptx(llvm::LLVMContext& context, std::string_view input, std::string_view architecture) {
-    return ptx_parser(context, input).parse(architecture);
+std::unique_ptr<llvm::Module> import_ptx(llvm::LLVMContext& context, std::string_view input, std::string_view architecture, bool relocatable) {
+    return ptx_parser(context, input).parse(architecture, relocatable);
 }
 llvm::Value* import_numeric_inline_ptx(llvm::CallInst& call) {
     auto* assembly=llvm::cast<llvm::InlineAsm>(call.getCalledOperand());

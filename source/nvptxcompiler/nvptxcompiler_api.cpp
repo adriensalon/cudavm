@@ -145,11 +145,11 @@ extern "C" CUDAVM_NVPTXCOMPILER_API nvPTXCompileResult nvPTXCompilerCompile(nvPT
         program.compiled = false; program.binary.clear(); program.error.clear(); program.info.clear();
         auto settings = ptx_options(count, options, program.error);
         ptx_checkpoint(program);
-        compiler_input_request_v2 request;
-        request.base = {2, compiler_input_kind::ptx, program.source.data(), program.source.size(), "nvPTXCompiler.ptx", nullptr};
-        request.architecture = settings.architecture.c_str();
+        compiler_input_request_v3 request;
+        request.base.base = {3, compiler_input_kind::ptx, program.source.data(), program.source.size(), "nvPTXCompiler.ptx", nullptr};
+        request.base.architecture = settings.architecture.c_str(); request.relocatable = settings.relocatable;
         compiler_program* imported = nullptr; compiler_result* result = nullptr;
-        auto status = cudavm_core_program_import_v1(&request.base, &imported, &result);
+        auto status = cudavm_core_program_import_v1(&request.base.base, &imported, &result);
         compiler_program_ptr input(imported); compiler_result_ptr diagnostic(result);
         ptx_status(status, result, program); ptx_checkpoint(program);
         if (settings.parse_only) { program.compiled = true; return NVPTXCOMPILE_PARSE_ONLY_SUCCESS; }
