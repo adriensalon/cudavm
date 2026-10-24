@@ -31,6 +31,20 @@ CUmodule library_bind(CUlibrary handle, const std::shared_ptr<context>& owner) {
         ? entry->native->bind_registered(*owner->native, std::as_bytes(std::span(entry->registration->image.data(), entry->registration->image.size())), entry->registration->storage)
         : entry->native ? entry->native->bind(*owner->native) :
         owner->native->load_image(entry->image.c_str(), unsigned(entry->options.size()), entry->options.data(), entry->values.data()); }, true);
+    if (has_fatbin(std::string_view(entry->image))) native_call(owner, [&] {
+        auto names = native->kernel_names();
+        require(names.size() == entry->descriptors.size(), CUDA_ERROR_INVALID_IMAGE, "fatbinary variants have different kernel inventories");
+        for (const auto& descriptor : entry->descriptors) {
+            require(std::find(names.begin(), names.end(), descriptor.symbol) != names.end(), CUDA_ERROR_INVALID_IMAGE, "fatbinary variant is missing a kernel");
+            if (entry->unavailable_parameters.contains(descriptor.symbol)) continue;
+            auto parameters = native->find(descriptor.symbol.c_str())->parameter_layout();
+            require(parameters.size() == descriptor.parameters.size(), CUDA_ERROR_INVALID_IMAGE, "fatbinary variants have incompatible kernel parameters");
+            for (size_t i = 0; i < parameters.size(); ++i)
+                require(parameters[i].size == descriptor.parameters[i].size && parameters[i].offset == descriptor.parameters[i].offset,
+                    CUDA_ERROR_INVALID_IMAGE, "fatbinary variants have incompatible kernel layouts");
+        }
+        return 0;
+    }, true);
     library_lookup(handle);
     auto module = add_module(owner, std::move(native)); global().modules.at(module).library = handle;
     entry->modules.emplace(owner->id, module); return module;
@@ -251,7 +265,8 @@ CUlibrary registered_library_load(const void* image, size_t bytes) {
     auto entry = std::make_shared<library_entry>(); entry->registered = true;
     entry->image.assign(static_cast<const char*>(image), bytes - 1);
     std::string materialized;
-    if (has_program_image(entry->image)) materialized = materialize_program_image(entry->image, global().kind);
+    if (has_fatbin(std::string_view(entry->image))) materialized = materialize_fatbin(entry->image, global().kind);
+    else if (has_program_image(entry->image)) materialized = materialize_program_image(entry->image, global().kind);
     const auto& metadata_image = materialized.empty() ? entry->image : materialized;
     // Registration owns each context's native module independently. Runtime
     // reset can then retire one binding while preserving other contexts and
@@ -261,7 +276,7 @@ CUlibrary registered_library_load(const void* image, size_t bytes) {
         catch (const std::exception& e) { throw failure(CUDA_ERROR_INVALID_IMAGE, e.what()); }
     } else {
         require(global().kind == cudavmBackendCuda, CUDA_ERROR_NOT_SUPPORTED, "registered shader libraries require native module metadata");
-        auto metadata = nvidia_image_metadata(std::as_bytes(std::span(entry->image.data(), entry->image.size())));
+        auto metadata = nvidia_image_metadata(std::as_bytes(std::span(metadata_image.data(), metadata_image.size())));
         for (auto& [name, parameters] : metadata.kernels) {
             kernel_descriptor descriptor; descriptor.symbol = name;
             if (!metadata.unavailable.contains(name)) {
@@ -310,12 +325,13 @@ CUlibrary library_load(const void* image, const char* path, CUjit_option* option
     // adapters consume the same owned image and descriptor contract.
     std::string file_image;
     if (path) { std::ifstream file(path, std::ios::binary); require(bool(file), CUDA_ERROR_FILE_NOT_FOUND, "library file not found"); file_image.assign(std::istreambuf_iterator<char>(file), {}); }
-    bool portable_image = path ? has_program_image(file_image) : has_program_image(image);
+    bool portable_image = path ? has_program_image(file_image) || has_fatbin(std::string_view(file_image)) : has_program_image(image) || has_fatbin(image);
     if (portable_image) for (unsigned i = 0; i < library_count; ++i)
         require(library_options[i] != CU_LIBRARY_HOST_UNIVERSAL_FUNCTION_AND_DATA_TABLE, CUDA_ERROR_NOT_SUPPORTED, "portable images do not provide native host universal tables");
     if (!portable_image) entry->native = global().provider->load_library(image, path, options, values, count, library_options, library_values, library_count);
     if (!entry->native) {
         if (path) entry->image = std::move(file_image);
+        else if (has_fatbin(image)) { auto bytes = fatbin_memory_view(image); entry->image.assign(bytes.data(), bytes.size()); }
         else entry->image = static_cast<const char*>(image);
         for (unsigned i = 0; i < count; ++i) {
             require(options[i] == CU_JIT_OPTIMIZATION_LEVEL, CUDA_ERROR_NOT_SUPPORTED, "shader library JIT option is unavailable");
@@ -323,12 +339,25 @@ CUlibrary library_load(const void* image, const char* path, CUjit_option* option
             entry->options.push_back(options[i]); entry->values.push_back(values[i]);
         }
         std::string materialized;
-        if (portable_image) materialized = materialize_program_image(entry->image, global().kind);
+        if (has_fatbin(std::string_view(entry->image))) materialized = materialize_fatbin(entry->image, global().kind);
+        else if (portable_image) materialized = materialize_program_image(entry->image, global().kind);
         if (!portable_image && !has_module_descriptor(entry->image) && entry->image.find(".version") != std::string::npos)
             entry->image = compile_shader_ptx(entry->image, global().kind);
         const auto& metadata_image = portable_image ? materialized : entry->image;
-        require(has_module_descriptor(metadata_image), CUDA_ERROR_NOT_SUPPORTED, "shader library format is unsupported");
-        try { entry->descriptors = decode_module_descriptor(metadata_image).entries; }
+        try {
+            if (has_module_descriptor(metadata_image)) entry->descriptors = decode_module_descriptor(metadata_image).entries;
+            else {
+                require(global().kind == cudavmBackendCuda, CUDA_ERROR_NOT_SUPPORTED, "shader library format is unsupported");
+                auto metadata = nvidia_image_metadata(std::as_bytes(std::span(metadata_image.data(), metadata_image.size())));
+                for (auto& [name, parameters] : metadata.kernels) {
+                    kernel_descriptor descriptor; descriptor.symbol = name;
+                    for (auto parameter : parameters) descriptor.parameters.push_back({uint32_t(parameter.size), 1, uint32_t(parameter.offset), 0});
+                    if (metadata.unavailable.contains(name)) entry->unavailable_parameters.insert(name);
+                    entry->descriptors.push_back(std::move(descriptor));
+                }
+            }
+        }
+        catch (const failure&) { throw; }
         catch (const std::exception& e) { throw failure(CUDA_ERROR_INVALID_IMAGE, e.what()); }
     }
     return add_library(entry);

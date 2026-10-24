@@ -3,6 +3,7 @@
 #include <nvjitlink/export.h>
 #include "../core/program_api.hpp"
 #include "../core/compiler_profiles.hpp"
+#include "../nvfatbin/container_api.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -16,8 +17,8 @@
 
 namespace cudavm {
 namespace {
-// The hexadecimal envelope can be twice its 256 MiB decoded payload limit.
-constexpr size_t nvjitlink_input_limit = 512u * 1024u * 1024u + 64u;
+// Containers include multiple independently bounded program envelopes.
+constexpr size_t nvjitlink_input_limit = fatbin_limit;
 struct nvjitlink_options {
     std::string architecture;
     unsigned optimization = 3;
@@ -109,8 +110,17 @@ void nvjitlink_add(nvjitlink_program& program, nvJitLinkInputType type, const vo
         if (!program.options.lto) nvjitlink_fail(program, NVJITLINK_ERROR_LTO_NOT_ENABLED, "LTOIR inputs require -lto");
         kind = compiler_input_kind::nvltoir; break;
     case NVJITLINK_INPUT_ANY: kind = compiler_input_kind::automatic; break;
+    case NVJITLINK_INPUT_FATBIN: kind = compiler_input_kind::fatbinary; break;
     case NVJITLINK_INPUT_NONE: nvjitlink_fail(program, NVJITLINK_ERROR_INVALID_INPUT, "input type NONE is invalid");
     default: nvjitlink_fail(program, NVJITLINK_ERROR_UNRECOGNIZED_INPUT, "this container input type is not implemented");
+    }
+    if ((type == NVJITLINK_INPUT_ANY || type == NVJITLINK_INPUT_FATBIN) && has_fatbin(std::string_view(static_cast<const char*>(data), size))) {
+        std::vector<fatbin_record> records;
+        try { records = decode_fatbin({static_cast<const char*>(data), size}); }
+        catch (const std::exception& error) { nvjitlink_fail(program, NVJITLINK_ERROR_INVALID_INPUT, error.what()); }
+        auto* selected = select_fatbin(records, unsigned(std::stoul(program.options.architecture.substr(3))), true);
+        if (selected && selected->kind == fatbin_kind::ltoir && !program.options.lto)
+            nvjitlink_fail(program, NVJITLINK_ERROR_LTO_NOT_ENABLED, "fatbinary LTOIR inputs require -lto");
     }
     std::string label = name && *name ? name : "nvJitLink.input." + std::to_string(program.inputs.size());
     // The core owns a copy of the input IR before this call returns. Labels are

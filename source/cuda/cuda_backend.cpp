@@ -719,6 +719,12 @@ struct cuda_session : session {
     std::shared_ptr<cuda_context> context;
     cuda_session(std::shared_ptr<cuda_api> api, CUdevice device, unsigned flags = CU_CTX_MAP_HOST)
         : context(std::make_shared<cuda_context>(std::move(api), device, flags)) {}
+    unsigned image_architecture() const {
+        int major = 0, minor = 0;
+        check(context->api->attribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, context->device), "cuDeviceGetAttribute");
+        check(context->api->attribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, context->device), "cuDeviceGetAttribute");
+        return unsigned(major * 10 + minor);
+    }
     std::shared_ptr<device_launch_event> create_launch_event() override { return std::make_shared<cuda_launch_event>(context); }
     std::shared_ptr<native_graph_event> create_graph_event(unsigned flags) override { return std::make_shared<cuda_graph_event>(context, flags); }
     std::pair<int, int> stream_priority_range() override {
@@ -1035,7 +1041,8 @@ struct cuda_session : session {
     void synchronize() override { cuda_context_guard guard(*context); check(context->api->sync(), "cuCtxSynchronize"); }
     std::shared_ptr<executable> load_image(const void* image, unsigned count, CUjit_option* options, void** values) override {
         std::string materialized;
-        if (has_program_image(image)) { materialized = materialize_program_image(static_cast<const char*>(image), cudavmBackendCuda); image = materialized.c_str(); }
+        if (has_fatbin(image)) { materialized = materialize_fatbin(fatbin_memory_view(image), cudavmBackendCuda, image_architecture()); image = materialized.c_str(); }
+        else if (has_program_image(image)) { materialized = materialize_program_image(static_cast<const char*>(image), cudavmBackendCuda); image = materialized.c_str(); }
         auto result = std::make_shared<cuda_module>(context);
         cuda_context_guard guard(*context);
         check(context->api->load_image(&result->value, image, count, options, values), "cuModuleLoadDataEx");
@@ -1052,9 +1059,10 @@ struct cuda_session : session {
     }
     std::shared_ptr<executable> load_file(const char* path) override {
         { std::ifstream file(path, std::ios::binary); std::string prefix(program_image_magic.size(), '\0');
-          if (file.read(prefix.data(), prefix.size()) && has_program_image(prefix)) {
+          if (file.read(prefix.data(), prefix.size()) && (has_program_image(prefix) || has_fatbin(std::string_view(prefix)))) {
               file.seekg(0); std::string image((std::istreambuf_iterator<char>(file)), {});
-              image = materialize_program_image(image, cudavmBackendCuda);
+              image = has_fatbin(std::string_view(image)) ? materialize_fatbin(image, cudavmBackendCuda, image_architecture())
+                  : materialize_program_image(image, cudavmBackendCuda);
               return load_image(image.c_str(), 0, nullptr, nullptr);
           } }
         auto result = std::make_shared<cuda_module>(context);

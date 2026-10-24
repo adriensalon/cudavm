@@ -1,6 +1,7 @@
 #include "shader_ptx.hpp"
 #include "dynamic_library.hpp"
 #include "../core/image_api.hpp"
+#include "../core/module_descriptor.hpp"
 namespace cudavm {
 namespace {
 std::string compile_image(std::string_view input, cudavmBackend backend, compiler_input_kind kind) {
@@ -37,5 +38,21 @@ std::string materialize_program_image(std::string_view input, cudavmBackend back
     } catch (const std::bad_alloc&) { throw failure(CUDA_ERROR_OUT_OF_MEMORY, "program image allocation failed"); }
     catch (const std::exception& error) { throw failure(CUDA_ERROR_INVALID_IMAGE, error.what()); }
     return compile_image(input, backend, compiler_input_kind::program_image);
+}
+std::string materialize_fatbin(std::string_view input, cudavmBackend backend, unsigned architecture) {
+    std::vector<fatbin_record> records;
+    try { records = decode_fatbin(input); }
+    catch (const std::bad_alloc&) { throw failure(CUDA_ERROR_OUT_OF_MEMORY, "fatbinary allocation failed"); }
+    catch (const std::exception& error) { throw failure(CUDA_ERROR_INVALID_IMAGE, error.what()); }
+    auto* selected = select_fatbin(records, architecture, false, backend == cudavmBackendCuda);
+    require(selected, CUDA_ERROR_NO_BINARY_FOR_GPU, "fatbinary has no compatible executable image");
+    if (has_program_image(std::string_view(selected->code))) return materialize_program_image(selected->code, backend);
+    if (selected->kind == fatbin_kind::ptx && backend != cudavmBackendCuda && !has_module_descriptor(selected->code))
+        return compile_shader_ptx(selected->code, backend);
+    return selected->code;
+}
+std::string_view fatbin_memory_view(const void* image) {
+    try { return fatbin_memory(image); }
+    catch (const std::exception& error) { throw failure(CUDA_ERROR_INVALID_IMAGE, error.what()); }
 }
 }

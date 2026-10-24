@@ -1,6 +1,7 @@
 #include "compiler.hpp"
 #include "program.hpp"
 #include "program_image.hpp"
+#include "../nvfatbin/container_api.hpp"
 #include "device_conversions.hpp"
 #include "device_integers.hpp"
 #include "device_simd.hpp"
@@ -429,10 +430,13 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
     };
     auto image_bitcode = [&](llvm::MemoryBufferRef buffer) -> std::string {
         auto bytes = buffer.getBuffer();
-        if (!has_program_image(std::string_view(bytes.data(), bytes.size()))) return bytes.str();
-        compiler_input_request request{1, compiler_input_kind::program_image, bytes.data(), bytes.size(), nullptr, nullptr};
+        auto view = std::string_view(bytes.data(), bytes.size());
+        if (!has_program_image(view) && !has_fatbin(view)) return bytes.str();
+        compiler_input_request_v3 request;
+        request.base.base = {3, has_fatbin(view) ? compiler_input_kind::fatbinary : compiler_input_kind::program_image, bytes.data(), bytes.size(), nullptr, nullptr};
+        request.base.architecture = values.architecture.c_str(); request.relocatable = 1;
         compiler_result diagnostics;
-        auto program = import_compiler_program(request, diagnostics);
+        auto program = import_compiler_program(request.base.base, diagnostics);
         if (stage(*program->module) == "cudavm.portable" && !program->module->getNamedMetadata(archive_key)) {
             compiler_options settings;
             settings.input = program->module->getModuleIdentifier(); settings.bitcode = program_input_identity(*program->module);
@@ -477,7 +481,7 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
         auto file = llvm::MemoryBuffer::getFile(path);
         if (!file) throw std::runtime_error("cannot read " + path + ": " + file.getError().message());
         auto bytes = (*file)->getBuffer();
-        if (has_program_image(std::string_view(bytes.data(), bytes.size()))) {
+        if (has_program_image(std::string_view(bytes.data(), bytes.size())) || has_fatbin(std::string_view(bytes.data(), bytes.size()))) {
             auto normalized = image_bitcode((*file)->getMemBufferRef());
             buffers.emplace_back(llvm::MemoryBuffer::getMemBufferCopy(normalized, path), path);
         } else buffers.emplace_back(std::move(*file), path);

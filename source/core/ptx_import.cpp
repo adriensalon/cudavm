@@ -28,6 +28,9 @@ struct ptx_token { std::string text; unsigned line, column; };
         std::to_string(token.column) + ": " + reason + " (" + token.text + ")", version, architecture);
 }
 std::vector<ptx_token> ptx_tokens(std::string_view input) {
+    // Public binary/container APIs include the PTX text terminator in their
+    // byte extent. Embedded NULs still reach the lexer and fail validation.
+    if (!input.empty() && input.back() == '\0') input.remove_suffix(1);
     std::vector<ptx_token> result;
     size_t at = 0; unsigned line = 1, column = 1;
     auto advance = [&] { if (input[at++] == '\n') { ++line; column = 1; } else ++column; };

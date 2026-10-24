@@ -35,7 +35,7 @@ extern "C" CUDAVM_CORE_API cudavm::compiler_status cudavm_core_compile_image_v1(
         // Envelopes retain their complete helper IR. Source programs already
         // carry their source ABI; do not link a second frontend's helper module.
         pipeline.numerical_helpers = request->kind == compiler_input_kind::ptx;
-        pipeline.lower_semantics = request->kind == compiler_input_kind::program_image;
+        pipeline.lower_semantics = request->kind == compiler_input_kind::program_image || request->kind == compiler_input_kind::fatbinary;
         status = cudavm_core_program_prepare_v1(program, &pipeline, &program, &result);
         compiler_program_ptr prepared(program);
         compiler_result_ptr prepare_result(result);

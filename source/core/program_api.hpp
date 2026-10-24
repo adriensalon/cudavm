@@ -5,7 +5,7 @@
 // Requests borrow their storage. Import, link, and preparation return new
 // compiler-owned programs without mutating inputs. No LLVM types cross the ABI.
 namespace cudavm {
-enum class compiler_input_kind : uint32_t { ptx = 1, nvvm, cubin, nvltoir, source, cudavm_ir, program_image, automatic };
+enum class compiler_input_kind : uint32_t { ptx = 1, nvvm, cubin, nvltoir, source, cudavm_ir, program_image, automatic, fatbinary };
 struct compiler_source_header { const char* name; const char* contents; };
 struct compiler_source_request {
     uint32_t abi_version;

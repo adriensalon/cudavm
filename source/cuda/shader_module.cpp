@@ -406,9 +406,10 @@ std::shared_ptr<executable> session::load_image(const void* image,unsigned count
         require(options[i]==CU_JIT_OPTIMIZATION_LEVEL,CUDA_ERROR_NOT_SUPPORTED,"shader JIT option is unavailable");
         require(reinterpret_cast<uintptr_t>(values[i])<=4,CUDA_ERROR_INVALID_VALUE,"invalid JIT optimization hint");
     }
-    auto text=std::string_view(static_cast<const char*>(image));
+    auto text=has_fatbin(image) ? fatbin_memory_view(image) : std::string_view(static_cast<const char*>(image));
     std::string compiled;
-    if (has_program_image(text)) { compiled = materialize_program_image(text, kind()); text = compiled; }
+    if (has_fatbin(text)) { compiled = materialize_fatbin(text, kind()); text = compiled; }
+    else if (has_program_image(text)) { compiled = materialize_program_image(text, kind()); text = compiled; }
     if (!cudavm::has_module_descriptor(text) && text.find(".version") != text.npos) {
         compiled = compile_shader_ptx(text, kind()); text = compiled;
     }
@@ -438,7 +439,8 @@ std::shared_ptr<executable> session::load_file(const char* path) {
     require(path,CUDA_ERROR_INVALID_VALUE,"null module filename");
     std::ifstream file(path,std::ios::binary);require(bool(file),CUDA_ERROR_FILE_NOT_FOUND,"module file cannot be opened");
     std::string image((std::istreambuf_iterator<char>(file)),{});
-    if (has_program_image(image)) image = materialize_program_image(image, kind());
+    if (has_fatbin(std::string_view(image))) image = materialize_fatbin(image, kind());
+    else if (has_program_image(image)) image = materialize_program_image(image, kind());
     return load_image(image.c_str(),0,nullptr,nullptr);
 }
 }
