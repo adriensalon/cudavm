@@ -1,5 +1,6 @@
 #pragma once
 #include "ptx_parameters.hpp"
+#include "../nvfatbin/nvidia_container_api.hpp"
 #include <cstring>
 #include <set>
 
@@ -22,18 +23,12 @@ struct nvidia_image_reader {
         return std::string(reinterpret_cast<const char*>(data.data()), size_t(end - data.begin()));
     }
 };
-inline constexpr uint32_t nvidia_fatbin_magic = 0xba55ed50;
-inline constexpr size_t nvidia_image_limit = size_t(1) << 30;
 inline size_t nvidia_image_length(const void* image) {
     require(image, CUDA_ERROR_INVALID_IMAGE, "null NVIDIA image");
     uint32_t magic = 0; std::memcpy(&magic, image, sizeof(magic));
     if (magic == nvidia_fatbin_magic) {
-        uint16_t version = 0, header = 0; uint64_t payload = 0;
-        auto data = static_cast<const char*>(image);
-        std::memcpy(&version, data + 4, 2); std::memcpy(&header, data + 6, 2); std::memcpy(&payload, data + 8, 8);
-        require(version == 1 && header >= 16 && header <= 4096 && payload <= nvidia_image_limit - header,
-            CUDA_ERROR_INVALID_IMAGE, "invalid or oversized CUDA fatbinary header");
-        return header + size_t(payload);
+        try { return nvidia_fatbin_memory(image).size(); }
+        catch (const nvidia_container_error& error) { throw failure(CUDA_ERROR_INVALID_IMAGE, error.what()); }
     }
     if (magic == 0x464c457f) {
         auto data = static_cast<const std::byte*>(image);
@@ -65,22 +60,11 @@ inline size_t nvidia_image_length(const void* image) {
     return 0;
 }
 inline std::vector<std::byte> nvidia_decompress(std::span<const std::byte> input, size_t size) {
-    require(size <= nvidia_image_limit, CUDA_ERROR_INVALID_IMAGE, "oversized compressed NVIDIA image");
-    std::vector<std::byte> output; output.reserve(size); size_t position = 0;
-    auto byte = [&] { require(position < input.size(), CUDA_ERROR_INVALID_IMAGE, "truncated NVIDIA compression token"); return std::to_integer<unsigned>(input[position++]); };
-    auto length = [&](size_t value) { if (value == 15) { unsigned next; do { next = byte(); require(next <= size - std::min(value, size), CUDA_ERROR_INVALID_IMAGE, "NVIDIA compression length overflow"); value += next; } while (next == 255); } return value; };
-    while (position < input.size()) {
-        auto token = byte(); auto literals = length(token >> 4);
-        require(literals <= input.size() - position && literals <= size - output.size(), CUDA_ERROR_INVALID_IMAGE, "invalid NVIDIA compression literals");
-        output.insert(output.end(), input.begin() + position, input.begin() + position + literals); position += literals;
-        if (position == input.size()) break;
-        auto offset = byte(); offset |= byte() << 8;
-        require(offset && offset <= output.size(), CUDA_ERROR_INVALID_IMAGE, "invalid NVIDIA compression back reference");
-        auto count = length(token & 15);
-        require(count <= size - output.size() && 4 <= size - output.size() - count, CUDA_ERROR_INVALID_IMAGE, "NVIDIA compression output overflow");
-        for (size_t i = 0; i < count + 4; ++i) output.push_back(output[output.size() - offset]);
-    }
-    require(output.size() == size, CUDA_ERROR_INVALID_IMAGE, "NVIDIA decompression size mismatch"); return output;
+    try {
+        auto decoded = decompress_nvidia_fatbin({reinterpret_cast<const char*>(input.data()), input.size()}, size);
+        auto bytes = std::as_bytes(std::span(decoded.data(), decoded.size()));
+        return {bytes.begin(), bytes.end()};
+    } catch (const nvidia_container_error& error) { throw failure(CUDA_ERROR_INVALID_IMAGE, error.what()); }
 }
 struct nvidia_module_metadata {
     std::map<std::string, std::vector<kernel_parameter>> kernels;
@@ -164,27 +148,17 @@ inline nvidia_module_metadata nvidia_image_metadata(std::span<const std::byte> i
         }
         return result;
     }
-    require(in.read<uint16_t>(4) == 1, CUDA_ERROR_INVALID_IMAGE, "unsupported CUDA fatbinary version");
-    size_t position = in.read<uint16_t>(6); auto payload = in.read<uint64_t>(8);
-    require(position >= 16 && position <= image.size() && payload <= image.size() - position, CUDA_ERROR_INVALID_IMAGE, "invalid CUDA fatbinary extent");
-    auto end = position + size_t(payload); nvidia_module_metadata result;
-    while (position < end) {
-        require(end - position >= 64, CUDA_ERROR_INVALID_IMAGE, "truncated CUDA fatbinary entry");
-        auto kind = in.read<uint16_t>(position); auto version = in.read<uint16_t>(position + 2);
-        size_t header = in.read<uint32_t>(position + 4); auto bytes = in.read<uint64_t>(position + 8);
-        require(version == 0x101 && header >= 64 && header <= end - position && bytes <= end - position - header,
-            CUDA_ERROR_INVALID_IMAGE, "invalid CUDA fatbinary entry");
-        if (kind == 1 || kind == 2) {
-            auto data = in.slice(position + header, size_t(bytes)); std::vector<std::byte> decoded;
-            if (in.read<uint64_t>(position + 40) & 0x2000) {
-                auto compressed = in.read<uint32_t>(position + 16); auto unpacked = in.read<uint64_t>(position + 56);
-                require(compressed <= data.size(), CUDA_ERROR_INVALID_IMAGE, "invalid compressed CUDA fatbinary extent");
-                decoded = nvidia_decompress(data.first(compressed), size_t(unpacked)); data = decoded;
-            }
+    nvidia_module_metadata result;
+    std::vector<nvidia_fatbin_entry> entries;
+    try { entries = decode_nvidia_container({reinterpret_cast<const char*>(image.data()), image.size()}); }
+    catch (const nvidia_container_error& error) { throw failure(CUDA_ERROR_INVALID_IMAGE, error.what()); }
+    for (const auto& record : entries) {
+        if (record.kind == 1 || record.kind == 2) {
+            auto data = std::as_bytes(std::span(record.code.data(), record.code.size()));
             // Sections contain PTX or cubin, never another fatbinary. Avoid
             // recursive parsing of untrusted container records.
             nvidia_module_metadata entry;
-            if (kind == 2) entry = nvidia_elf_metadata(data);
+            if (record.kind == 2) entry = nvidia_elf_metadata(data);
             else {
                 nvidia_image_reader text{data};
                 auto entry_magic = text.read<uint32_t>(0);
@@ -193,7 +167,6 @@ inline nvidia_module_metadata nvidia_image_metadata(std::span<const std::byte> i
             }
             result.merge(entry);
         }
-        position += header + size_t(bytes);
     }
     return result;
 }

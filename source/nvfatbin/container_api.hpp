@@ -1,5 +1,6 @@
 #pragma once
 #include "../core/program_image.hpp"
+#include "nvidia_container_api.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cctype>
@@ -35,13 +36,15 @@ inline std::vector<std::string_view> fatbin_ptx_header(std::string_view text) {
     return tokens;
 }
 inline unsigned fatbin_elf_architecture(std::string_view);
-inline bool has_fatbin(std::string_view bytes) { return bytes.starts_with(fatbin_magic); }
-inline bool has_fatbin(const void* bytes) {
+inline bool has_portable_fatbin(std::string_view bytes) { return bytes.starts_with(fatbin_magic); }
+inline bool has_portable_fatbin(const void* bytes) {
     if (!bytes) return false;
     auto* text = static_cast<const char*>(bytes);
     for (size_t i = 0; i < fatbin_magic.size(); ++i) if (text[i] != fatbin_magic[i]) return false;
     return true;
 }
+inline bool has_fatbin(std::string_view bytes) { return has_portable_fatbin(bytes) || has_nvidia_fatbin(bytes); }
+inline bool has_fatbin(const void* bytes) { return has_nvidia_fatbin(bytes) || has_portable_fatbin(bytes); }
 struct fatbin_reader {
     std::string_view bytes;
     uint64_t number(size_t offset, unsigned width = 4) const {
@@ -52,6 +55,7 @@ struct fatbin_reader {
     }
 };
 inline std::string_view fatbin_memory(const void* image) {
+    if (has_nvidia_fatbin(image)) return nvidia_fatbin_memory(image);
     if (!has_fatbin(image)) throw std::runtime_error("invalid fatbinary magic");
     fatbin_reader header{{static_cast<const char*>(image), 24}};
     auto size = header.number(16, 8);
@@ -127,7 +131,55 @@ inline std::string encode_fatbin(const std::vector<fatbin_record>& records, fatb
     append_fatbin_number(bytes, program_image_hash(bytes), 8); bytes += '\0';
     return bytes;
 }
+inline std::vector<fatbin_record> decode_nvidia_fatbin(std::string_view bytes) {
+    std::vector<fatbin_record> records;
+    for (auto& entry : decode_nvidia_container(bytes)) {
+        if (entry.kind != 1 && entry.kind != 2 && entry.kind != 4)
+            throw nvidia_container_error("unsupported NVIDIA fatbinary member kind", true);
+        if (!(entry.flags & 1)) throw nvidia_container_error("only 64-bit NVIDIA fatbinary members are supported", true);
+        if (entry.kind == 1) {
+            // NVIDIA pads PTX members with NULs, including compressed images.
+            auto end = entry.code.find('\0');
+            if (end != entry.code.npos) {
+                if (entry.code.find_first_not_of('\0', end) != entry.code.npos)
+                    throw nvidia_container_error("embedded NUL in NVIDIA fatbinary PTX");
+                entry.code.resize(end);
+            }
+            auto major = entry.ptx_version >> 16, minor = entry.ptx_version & 0xffff;
+            if (!major || major > 9999 || minor > 9) throw nvidia_container_error("invalid NVIDIA fatbinary PTX version metadata");
+            auto version = std::to_string(major) + "." + std::to_string(minor);
+            auto header = fatbin_ptx_header(entry.code);
+            // NVIDIA's producer removes the .version directive from member
+            // text and retains its major/minor in the entry header instead.
+            if (!header.empty() && header[0] == ".target") {
+                entry.code.insert(0, ".version " + version + "\n");
+                header = fatbin_ptx_header(entry.code);
+            }
+            if (header.size() != 6 || header[0] != ".version" || header[2] != ".target"
+                || header[1] != version
+                || header[3] != "sm_" + std::to_string(entry.architecture) || header[4] != ".address_size" || header[5] != "64")
+                throw nvidia_container_error("NVIDIA fatbinary PTX metadata mismatch");
+            entry.code += '\0';
+        } else if (entry.kind == 2) {
+            // Container payload extents include alignment padding after ELF.
+            bool valid = false;
+            for (unsigned padding = 0; padding < 8 && padding < entry.code.size(); ++padding) {
+                if (padding && entry.code[entry.code.size() - padding] != 0) break;
+                try {
+                    if (fatbin_elf_architecture(std::string_view(entry.code).substr(0, entry.code.size() - padding)) == entry.architecture) {
+                        entry.code.resize(entry.code.size() - padding); valid = true; break;
+                    }
+                } catch (const std::runtime_error&) {}
+            }
+            if (!valid) throw nvidia_container_error("invalid NVIDIA fatbinary cubin payload");
+        }
+        records.push_back({entry.kind == 1 ? fatbin_kind::ptx : entry.kind == 2 ? fatbin_kind::cubin : fatbin_kind::ltoir,
+            entry.architecture, {}, std::move(entry.code)});
+    }
+    return records;
+}
 inline std::vector<fatbin_record> decode_fatbin(std::string_view bytes) {
+    if (has_nvidia_fatbin(bytes)) return decode_nvidia_fatbin(bytes);
     if (!has_fatbin(bytes) || bytes.size() < 40 || bytes.size() > fatbin_limit) throw std::runtime_error("invalid fatbinary header");
     fatbin_reader reader{bytes};
     auto size = reader.number(16, 8);

@@ -43,16 +43,26 @@ std::string materialize_fatbin(std::string_view input, cudavmBackend backend, un
     std::vector<fatbin_record> records;
     try { records = decode_fatbin(input); }
     catch (const std::bad_alloc&) { throw failure(CUDA_ERROR_OUT_OF_MEMORY, "fatbinary allocation failed"); }
+    catch (const nvidia_container_error& error) { throw failure(error.unsupported ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_IMAGE, error.what()); }
     catch (const std::exception& error) { throw failure(CUDA_ERROR_INVALID_IMAGE, error.what()); }
     auto* selected = select_fatbin(records, architecture, false, backend == cudavmBackendCuda);
+    if (!selected && has_nvidia_fatbin(input)
+        && std::none_of(records.begin(), records.end(), [](const auto& entry) { return entry.kind == fatbin_kind::ptx; }))
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "NVIDIA fatbinary has no PTX member; cubin/SASS and NVIDIA LTO-IR import are not implemented");
     require(selected, CUDA_ERROR_NO_BINARY_FOR_GPU, "fatbinary has no compatible executable image");
     if (has_program_image(std::string_view(selected->code))) return materialize_program_image(selected->code, backend);
-    if (selected->kind == fatbin_kind::ptx && backend != cudavmBackendCuda && !has_module_descriptor(selected->code))
-        return compile_shader_ptx(selected->code, backend);
+    if (selected->kind == fatbin_kind::ptx && backend != cudavmBackendCuda && !has_module_descriptor(selected->code)) {
+        // Member framing must not hide appended descriptors when the result
+        // crosses a NUL-terminated module/file loader boundary.
+        auto ptx = std::string_view(selected->code);
+        if (!ptx.empty() && ptx.back() == 0) ptx.remove_suffix(1);
+        return compile_shader_ptx(ptx, backend);
+    }
     return selected->code;
 }
 std::string_view fatbin_memory_view(const void* image) {
     try { return fatbin_memory(image); }
+    catch (const nvidia_container_error& error) { throw failure(error.unsupported ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_IMAGE, error.what()); }
     catch (const std::exception& error) { throw failure(CUDA_ERROR_INVALID_IMAGE, error.what()); }
 }
 }

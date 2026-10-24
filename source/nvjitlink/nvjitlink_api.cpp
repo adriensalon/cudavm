@@ -117,6 +117,9 @@ void nvjitlink_add(nvjitlink_program& program, nvJitLinkInputType type, const vo
     if ((type == NVJITLINK_INPUT_ANY || type == NVJITLINK_INPUT_FATBIN) && has_fatbin(std::string_view(static_cast<const char*>(data), size))) {
         std::vector<fatbin_record> records;
         try { records = decode_fatbin({static_cast<const char*>(data), size}); }
+        catch (const nvidia_container_error& error) {
+            nvjitlink_fail(program, error.unsupported ? NVJITLINK_ERROR_UNRECOGNIZED_INPUT : NVJITLINK_ERROR_INVALID_INPUT, error.what());
+        }
         catch (const std::exception& error) { nvjitlink_fail(program, NVJITLINK_ERROR_INVALID_INPUT, error.what()); }
         auto* selected = select_fatbin(records, unsigned(std::stoul(program.options.architecture.substr(3))), true);
         if (selected && selected->kind == fatbin_kind::ltoir && !program.options.lto)

@@ -31,7 +31,8 @@ CUmodule library_bind(CUlibrary handle, const std::shared_ptr<context>& owner) {
         ? entry->native->bind_registered(*owner->native, std::as_bytes(std::span(entry->registration->image.data(), entry->registration->image.size())), entry->registration->storage)
         : entry->native ? entry->native->bind(*owner->native) :
         owner->native->load_image(entry->image.c_str(), unsigned(entry->options.size()), entry->options.data(), entry->values.data()); }, true);
-    if (has_fatbin(std::string_view(entry->image))) native_call(owner, [&] {
+    if (has_portable_fatbin(std::string_view(entry->image))
+        || (global().kind != cudavmBackendCuda && has_nvidia_fatbin(std::string_view(entry->image)))) native_call(owner, [&] {
         auto names = native->kernel_names();
         require(names.size() == entry->descriptors.size(), CUDA_ERROR_INVALID_IMAGE, "fatbinary variants have different kernel inventories");
         for (const auto& descriptor : entry->descriptors) {
@@ -265,7 +266,7 @@ CUlibrary registered_library_load(const void* image, size_t bytes) {
     auto entry = std::make_shared<library_entry>(); entry->registered = true;
     entry->image.assign(static_cast<const char*>(image), bytes - 1);
     std::string materialized;
-    if (has_fatbin(std::string_view(entry->image))) materialized = materialize_fatbin(entry->image, global().kind);
+    if (has_portable_fatbin(std::string_view(entry->image))) materialized = materialize_fatbin(entry->image, global().kind);
     else if (has_program_image(entry->image)) materialized = materialize_program_image(entry->image, global().kind);
     const auto& metadata_image = materialized.empty() ? entry->image : materialized;
     // Registration owns each context's native module independently. Runtime
@@ -325,7 +326,12 @@ CUlibrary library_load(const void* image, const char* path, CUjit_option* option
     // adapters consume the same owned image and descriptor contract.
     std::string file_image;
     if (path) { std::ifstream file(path, std::ios::binary); require(bool(file), CUDA_ERROR_FILE_NOT_FOUND, "library file not found"); file_image.assign(std::istreambuf_iterator<char>(file), {}); }
-    bool portable_image = path ? has_program_image(file_image) || has_fatbin(std::string_view(file_image)) : has_program_image(image) || has_fatbin(image);
+    bool portable_image = path ? has_program_image(file_image) || has_portable_fatbin(std::string_view(file_image))
+        : has_program_image(image) || has_portable_fatbin(image);
+    // Genuine NVIDIA images retain native CUDA passthrough. Shader adapters
+    // own the complete binary extent before selecting a PTX alternative.
+    if (global().kind != cudavmBackendCuda)
+        portable_image |= path ? has_nvidia_fatbin(std::string_view(file_image)) : has_nvidia_fatbin(image);
     if (portable_image) for (unsigned i = 0; i < library_count; ++i)
         require(library_options[i] != CU_LIBRARY_HOST_UNIVERSAL_FUNCTION_AND_DATA_TABLE, CUDA_ERROR_NOT_SUPPORTED, "portable images do not provide native host universal tables");
     if (!portable_image) entry->native = global().provider->load_library(image, path, options, values, count, library_options, library_values, library_count);

@@ -1041,7 +1041,7 @@ struct cuda_session : session {
     void synchronize() override { cuda_context_guard guard(*context); check(context->api->sync(), "cuCtxSynchronize"); }
     std::shared_ptr<executable> load_image(const void* image, unsigned count, CUjit_option* options, void** values) override {
         std::string materialized;
-        if (has_fatbin(image)) { materialized = materialize_fatbin(fatbin_memory_view(image), cudavmBackendCuda, image_architecture()); image = materialized.c_str(); }
+        if (has_portable_fatbin(image)) { materialized = materialize_fatbin(fatbin_memory_view(image), cudavmBackendCuda, image_architecture()); image = materialized.c_str(); }
         else if (has_program_image(image)) { materialized = materialize_program_image(static_cast<const char*>(image), cudavmBackendCuda); image = materialized.c_str(); }
         auto result = std::make_shared<cuda_module>(context);
         cuda_context_guard guard(*context);
@@ -1059,9 +1059,9 @@ struct cuda_session : session {
     }
     std::shared_ptr<executable> load_file(const char* path) override {
         { std::ifstream file(path, std::ios::binary); std::string prefix(program_image_magic.size(), '\0');
-          if (file.read(prefix.data(), prefix.size()) && (has_program_image(prefix) || has_fatbin(std::string_view(prefix)))) {
+          if (file.read(prefix.data(), prefix.size()) && (has_program_image(prefix) || has_portable_fatbin(std::string_view(prefix)))) {
               file.seekg(0); std::string image((std::istreambuf_iterator<char>(file)), {});
-              image = has_fatbin(std::string_view(image)) ? materialize_fatbin(image, cudavmBackendCuda, image_architecture())
+              image = has_portable_fatbin(std::string_view(image)) ? materialize_fatbin(image, cudavmBackendCuda, image_architecture())
                   : materialize_program_image(image, cudavmBackendCuda);
               return load_image(image.c_str(), 0, nullptr, nullptr);
           } }

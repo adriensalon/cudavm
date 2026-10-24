@@ -112,7 +112,11 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
     switch (kind) {
     case compiler_input_kind::fatbinary: {
         require_compiler_request(request.data && request.size, "empty fatbinary input");
-        auto records = decode_fatbin({request.data, request.size});
+        std::vector<fatbin_record> records;
+        try { records = decode_fatbin({request.data, request.size}); }
+        catch (const nvidia_container_error& error) {
+            throw compiler_error(error.unsupported ? compiler_status::unsupported : compiler_status::invalid, error.what());
+        }
         unsigned target = 0;
         if (architecture) {
             auto name = std::string(architecture);
@@ -121,7 +125,12 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
             target = unsigned(std::stoul(name.substr(3)));
         }
         auto* selected = select_fatbin(records, target, true);
-        if (!selected) throw compiler_error(compiler_status::architecture_mismatch, "fatbinary has no compatible IR/PTX input for this target");
+        if (!selected) {
+            if (has_nvidia_fatbin(std::string_view(request.data, request.size))
+                && std::none_of(records.begin(), records.end(), [](const auto& entry) { return entry.kind == fatbin_kind::ptx; }))
+                throw compiler_error(compiler_status::unsupported, "NVIDIA fatbinary has no PTX member; cubin/SASS and NVIDIA LTO-IR import are not implemented");
+            throw compiler_error(compiler_status::architecture_mismatch, "fatbinary has no compatible IR/PTX input for this target");
+        }
         auto selected_kind = selected->kind == fatbin_kind::ptx ? compiler_input_kind::ptx
             : selected->kind == fatbin_kind::cubin ? compiler_input_kind::cubin : compiler_input_kind::nvltoir;
         compiler_input_request_v3 input;
