@@ -1,11 +1,11 @@
 // CLI and build artifact paths only. Libraries own compilation and linking.
-#include <nvrtc/cudavm_nvrtc.h>
-#include <nvjitlink/cudavm_nvjitlink.h>
+#include "../core/compiler_client.hpp"
 #include <cstdio>
 #include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
+using namespace cudavm;
 int main(int argc, char** argv) {
     try {
         if (argc < 2) throw std::runtime_error(
@@ -37,32 +37,32 @@ int main(int argc, char** argv) {
         if (command == "compile-tu" || command == "--print-resources") {
             if (value("--library-bitcode") || value("--host-input"))
                 throw std::runtime_error("--library-bitcode and --host-input require link-device");
-            cudavmCompileResult* result = nullptr;
+            compiler_result* result = nullptr;
             int status;
-            if (command == "--print-resources") status = cudavmCompileGetResources(value("--resources-root"), &result);
+            if (command == "--print-resources") status = cudavm_core_describe_resources_v1(value("--resources-root"), &result);
             else {
                 if (inputs.size() > 1) throw std::runtime_error("compile-tu produces one bitcode output");
                 if (value("--module")) throw std::runtime_error("--module is a link-device output");
                 auto& includes = fields["--include"]; auto& defines = fields["--define"];
-                cudavmCompileOptions options {1, value("--input"), value("--host"), value("--bitcode"),
+                compiler_translation_unit_request options {1, value("--input"), value("--host"), value("--bitcode"),
                     value("--manifest"), value("--depfile"), value("--standard"), value("--arch"), value("--resources-root"),
                     includes.size(), includes.data(), defines.size(), defines.data()};
-                status = cudavmCompileTranslationUnit(&options, &result);
+                status = cudavm_core_compile_translation_unit_v1(&options, &result);
             }
-            std::fputs(cudavmCompileOutput(result), stdout);
-            std::fputs(cudavmCompileDiagnostics(result), stderr);
-            cudavmCompileRelease(result);
+            compiler_result_ptr owned(result);
+            std::fputs(cudavm_core_result_output_v1(result), stdout);
+            std::fputs(cudavm_core_result_diagnostics_v1(result), stderr);
             return status;
         }
         if (command == "link-device") {
             auto& libraries = fields["--library-bitcode"]; auto& hosts = fields["--host-input"];
-            cudavmLinkOptionsV2 options {{2, inputs.size(), inputs.data(), value("--portable"), value("--ir"),
-                value("--manifest"), value("--binary"), value("--target"), value("--module"), value("--arch")},
-                libraries.size(), libraries.data(), hosts.size(), hosts.data()};
-            cudavmLinkResult* result = nullptr;
-            auto status = cudavmLinkDevice(&options.base, &result);
-            std::fputs(cudavmLinkDiagnostics(result), stderr);
-            cudavmLinkRelease(result);
+            compiler_link_request options {1, inputs.size(), inputs.data(), libraries.size(), libraries.data(),
+                hosts.size(), hosts.data(), value("--portable"), value("--ir"), value("--manifest"),
+                value("--binary"), value("--target"), value("--module"), value("--arch")};
+            compiler_result* result = nullptr;
+            auto status = cudavm_core_link_files_v1(&options, &result);
+            compiler_result_ptr owned(result);
+            std::fputs(cudavm_core_result_diagnostics_v1(result), stderr);
             return status;
         }
         throw std::runtime_error("unknown command: " + command);

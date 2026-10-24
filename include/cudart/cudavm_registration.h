@@ -1,11 +1,13 @@
 #pragma once
+#include <cudart/export.h>
 #include <cuda/cudavm_cuda.h>
 #include <cuda_runtime_api.h>
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* Private compiler/facade ABI. These are not CUDA public declarations.
+/* Registration extension used by generated application host code.
+   These are not NVIDIA CUDA declarations.
    Binding copies metadata and image bytes; it never initializes a GPU. */
 typedef struct cudavmKernelParameter {
     size_t size, alignment, offset;

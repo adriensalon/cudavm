@@ -1,4 +1,4 @@
-#include "../cudavm/compiler_client.hpp"
+#include "../core/compiler_client.hpp"
 #include <nvjitlink/cudavm_nvjitlink.h>
 struct cudavmLinkResult { std::string output, diagnostics; };
 using namespace cudavm;
@@ -29,7 +29,7 @@ extern "C" CUDAVM_NVJITLINK_API int cudavmLinkDevice(const cudavmLinkOptions* re
         normalized.binary = request->binary; normalized.target = request->target; normalized.module = request->module;
         normalized.architecture = request->architecture ? request->architecture : "sm_75";
         compiler_result* linked = nullptr;
-        auto status = cudavm_compiler_link_device_v1(&normalized, &linked);
+        auto status = cudavm_core_link_files_v1(&normalized, &linked);
         return copy_compiler_result(result, status, linked);
     });
 }

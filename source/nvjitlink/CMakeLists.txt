@@ -3,7 +3,7 @@ set(cudavm_install_targets ${cudavm_install_targets} PARENT_SCOPE)
 foreach(linkage shared static)
     if(TARGET cudavm_nvjitlink_${linkage})
         # Keep compiler linkage consistent with the facade and its consumers.
-        target_link_libraries(cudavm_nvjitlink_${linkage} PUBLIC cudavm::compiler_${linkage})
+        target_link_libraries(cudavm_nvjitlink_${linkage} PUBLIC cudavm::core_${linkage})
         if(APPLE)
             set_property(TARGET cudavm_nvjitlink_${linkage} PROPERTY INSTALL_RPATH "@loader_path")
         elseif(UNIX)

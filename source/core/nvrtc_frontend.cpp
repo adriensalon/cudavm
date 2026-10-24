@@ -143,12 +143,9 @@ struct nvrtc_action : clang::EmitLLVMOnlyAction {
     }
 };
 }
-nvrtc_output compile_nvrtc_source(const std::string& source, const std::string& name,
+nvrtc_output import_cuda_source(llvm::LLVMContext& context, const std::string& source, const std::string& name,
     const std::vector<std::pair<std::string, std::string>>& headers,
     const std::vector<std::string>& expressions, const nvrtc_options& settings, std::string& log) {
-    // The current in-process LLVM pipeline has shared target state. Keep
-    // concurrent public programs isolated while their compiler requests run.
-    std::lock_guard compilation_lock(compiler_mutex());
     // Each request has its own virtual files, diagnostics, frontend and IR context.
     // Neither source nor virtual headers are materialized on disk.
     auto root = (std::filesystem::current_path() / "__cudavm_nvrtc_virtual__").generic_string();
@@ -258,7 +255,6 @@ nvrtc_output compile_nvrtc_source(const std::string& source, const std::string& 
     for (const auto& argument : args) pointers.push_back(argument.c_str());
     // Frontend consumers and diagnostic printers can retain these references
     // until CompilerInstance destruction, so their owners must outlive it.
-    llvm::LLVMContext context;
     llvm::raw_string_ostream stream(log);
     auto invocation = std::make_shared<clang::CompilerInvocation>();
     // CompilerInstance otherwise prints its summary directly to stderr. NVRTC
@@ -441,10 +437,7 @@ nvrtc_output compile_nvrtc_source(const std::string& source, const std::string& 
     // NVRTC is a source compiler, not the final device linker. NVIDIA also
     // permits external device declarations in default-mode PTX. Neither mode
     // may invoke the AOT graph closure or discard named device definitions.
-    output.ptx = emit_cuda_ir(*module, settings.architecture);
-    output.ptx += emit_native_spirv_payload(*module);
-    output.ptx += emit_native_dxil_payload(*module);
-    output.ptx += emit_native_module(*module);
+    output.module = std::move(module);
     return output;
 }
 }

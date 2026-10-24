@@ -1,4 +1,4 @@
-#include "../cudavm/compiler_client.hpp"
+#include "../core/compiler_client.hpp"
 #include <nvrtc/cudavm_nvrtc.h>
 struct cudavmCompileResult { std::string output, diagnostics; };
 using namespace cudavm;
@@ -16,14 +16,14 @@ extern "C" CUDAVM_NVRTC_API int cudavmCompileTranslationUnit(const cudavmCompile
             standard, request->architecture ? request->architecture : "sm_75", request->resources_root,
             request->include_count, request->includes, request->define_count, request->defines};
         compiler_result* compiled = nullptr;
-        auto status = cudavm_compiler_compile_translation_unit_v1(&normalized, &compiled);
+        auto status = cudavm_core_compile_translation_unit_v1(&normalized, &compiled);
         return copy_compiler_result(result, status, compiled);
     });
 }
 extern "C" CUDAVM_NVRTC_API int cudavmCompileGetResources(const char* root, cudavmCompileResult** output) {
     return run_compiler_facade(output, [&](cudavmCompileResult& result) {
         compiler_result* resources = nullptr;
-        auto status = cudavm_compiler_compile_get_resources_v1(root, &resources);
+        auto status = cudavm_core_describe_resources_v1(root, &resources);
         return copy_compiler_result(result, status, resources);
     });
 }

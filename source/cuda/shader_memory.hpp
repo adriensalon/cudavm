@@ -1,6 +1,6 @@
 #pragma once
 #include "backend.hpp"
-#include "../cudavm/shader_packet.hpp"
+#include "../core/shader_packet.hpp"
 #include <unordered_map>
 
 namespace cudavm {

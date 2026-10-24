@@ -452,11 +452,17 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
                 value.definitions.insert(definition.getName().str());
         libraries.push_back(std::move(value));
     };
+    std::vector<std::pair<std::unique_ptr<llvm::MemoryBuffer>, std::string>> buffers;
     for (const auto& path : values.inputs) {
         auto file = llvm::MemoryBuffer::getFile(path);
         if (!file) throw std::runtime_error("cannot read " + path + ": " + file.getError().message());
-        if ((*file)->getBuffer().starts_with("!<arch>\n") || (*file)->getBuffer().starts_with("!<thin>\n")) {
-            auto archive = llvm::object::Archive::create((*file)->getMemBufferRef());
+        buffers.emplace_back(std::move(*file), path);
+    }
+    for (const auto& input : values.ir_inputs)
+        buffers.emplace_back(llvm::MemoryBuffer::getMemBufferCopy(input.bytes, input.name), input.name);
+    for (const auto& [file, path] : buffers) {
+        if (file->getBuffer().starts_with("!<arch>\n") || file->getBuffer().starts_with("!<thin>\n")) {
+            auto archive = llvm::object::Archive::create(file->getMemBufferRef());
             if (!archive) throw std::runtime_error("invalid device library " + path + ": " + llvm::toString(archive.takeError()));
             if ((*archive)->isThin()) throw std::runtime_error("thin device libraries are unsupported: " + path);
             llvm::Error error = llvm::Error::success();
@@ -474,14 +480,14 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
         // Discovery must not pollute the final context's named record types.
         // Replay the canonical TU order in that context after collecting bytes.
         llvm::LLVMContext discovery;
-        auto parsed = llvm::parseBitcodeFile((*file)->getMemBufferRef(), discovery);
+        auto parsed = llvm::parseBitcodeFile(file->getMemBufferRef(), discovery);
         if (!parsed) throw std::runtime_error("invalid device bitcode " + path + ": " + llvm::toString(parsed.takeError()));
         auto& module = **parsed;
         check_ir(module);
         auto input_stage = stage(module);
         if (input_stage == "clang.cuda.tu") {
             if (module.getNamedMetadata(archive_key)) throw std::runtime_error("raw TU cannot contain a device link archive: " + path);
-            add(unit_identity(module), (*file)->getBuffer(), path, false);
+            add(unit_identity(module), file->getBuffer(), path, false);
             continue;
         }
         auto* archive = module.getNamedMetadata(archive_key);

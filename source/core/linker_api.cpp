@@ -1,13 +1,14 @@
 #include "compiler_service.hpp"
 #include "compiler_api.hpp"
 #include "native_emission.hpp"
+#include "program.hpp"
 #include <algorithm>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
 using namespace cudavm;
-extern "C" CUDAVM_COMPILER_API int cudavm_compiler_link_device_v1(const compiler_link_request* request, compiler_result** output) noexcept {
+extern "C" CUDAVM_CORE_API int cudavm_core_link_files_v1(const compiler_link_request* request, compiler_result** output) noexcept {
     return run_compiler_api(output, [&](compiler_options& values, compiler_result&) {
         std::lock_guard lock(compiler_mutex());
         if (!request || request->abi_version != 1) throw std::runtime_error("invalid compiler link request");
@@ -18,9 +19,20 @@ extern "C" CUDAVM_COMPILER_API int cudavm_compiler_link_device_v1(const compiler
         values.manifest = compiler_option_text(request->manifest); values.binary = compiler_option_text(request->binary);
         values.target = compiler_option_text(request->target); values.module = compiler_option_text(request->module);
         if (request->architecture) values.architecture = request->architecture;
-        llvm::LLVMContext context;
-        auto module = link_device(context, values);
-        prepare_portable(*module);
+        if ((values.inputs.empty() && values.library_inputs.empty()) || values.portable.empty())
+            throw std::runtime_error("link-device requires input --bitcode arguments and --portable output");
+        if (!values.target.empty() && values.target != "cuda" && values.target != "all" && values.target != "opencl"
+            && values.target != "opengl" && values.target != "vulkan" && values.target != "directx")
+            throw std::runtime_error("unknown emission target: " + values.target);
+        if (values.binary.empty() != values.target.empty()) throw std::runtime_error("--target and --binary must be supplied together");
+        if (!values.module.empty() && values.target.empty()) throw std::runtime_error("--module requires an emission target and binary output");
+        compiler_program linked;
+        linked.architecture = values.architecture;
+        linked.module = link_device(linked.context, values);
+        compiler_pipeline_request pipeline;
+        pipeline.lower_semantics = 1;
+        auto prepared = prepare_compiler_program(linked, pipeline);
+        auto* module = prepared->module.get();
         auto metadata = describe(*module);
         std::string code, embedded;
         if (!values.target.empty()) {

@@ -4,7 +4,7 @@
 #include "command_queue.hpp"
 #include "graph_regions.hpp"
 #include "command_domain.hpp"
-#include "../cudavm/module_descriptor.hpp"
+#include "../core/module_descriptor.hpp"
 #include "shader_ptx.hpp"
 #include "ptx_parameters.hpp"
 #include "nvidia_image.hpp"
@@ -1033,9 +1033,10 @@ extern "C" CUDAVM_CUDA_API int cudavmDriverIsManagedPointer(CUdeviceptr pointer)
     std::lock_guard lock(global().mutex); auto it = containing(pointer);
     return it != global().allocations.end() && it->second.native->is_managed();
 }
-extern "C" CUDAVM_CUDA_API cudavmBackend cudavmDriverBackend() {
-    std::lock_guard lock(global().mutex); return global().kind;
+extern "C" CUDAVM_CUDA_API driver_backend cudavmDriverBackend() {
+    std::lock_guard lock(global().mutex); return driver_backend(global().kind);
 }
+extern "C" CUDAVM_CUDA_API const char* cudavmDriverDiagnostic() { return diagnostic_text().c_str(); }
 extern "C" CUDAVM_CUDA_API void cudavmDriverSetDiagnostic(const char* message) {
     diagnostic_text() = message;
 }

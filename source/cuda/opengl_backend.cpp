@@ -1,6 +1,6 @@
 #include "dynamic_library.hpp"
 #include "device_resources.hpp"
-#include "../cudavm/spirv_artifact.hpp"
+#include "../core/spirv_artifact.hpp"
 #include "opengl_shader.hpp"
 #include <condition_variable>
 #include <deque>

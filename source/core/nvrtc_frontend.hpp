@@ -9,10 +9,10 @@ struct nvrtc_options {
     std::vector<std::string> includes, defines, undefines;
 };
 struct nvrtc_output {
-    std::string ptx;
+    std::unique_ptr<llvm::Module> module;
     std::map<std::string, std::string> lowered_names;
 };
-nvrtc_output compile_nvrtc_source(const std::string& source, const std::string& name,
+nvrtc_output import_cuda_source(llvm::LLVMContext&, const std::string& source, const std::string& name,
     const std::vector<std::pair<std::string, std::string>>& headers,
     const std::vector<std::string>& expressions, const nvrtc_options&, std::string& log);
 }

@@ -871,6 +871,8 @@ public:
         expect(".address_size"); auto address = take();
         if (address.text != "64") ptx_fail(address, "PTX import requires 64-bit addresses", true);
         module->setTargetTriple(llvm::Triple("nvptx64-nvidia-cuda"));
+        module->getOrInsertNamedMetadata("cudavm.import.architecture")->addOperand(
+            llvm::MDNode::get(context, llvm::MDString::get(context, target.text)));
         module->setDataLayout("e-p:64:64-p1:64:64-p3:32:32-p4:64:64-p5:32:32-p6:32:32-i64:64-i128:128-v16:16-v32:32-n16:32:64");
         module->getOrInsertNamedMetadata("cudavm.ir.stage")->addOperand(llvm::MDNode::get(context, llvm::MDString::get(context, "cudavm.portable")));
         while (peek().text != "<eof>") {

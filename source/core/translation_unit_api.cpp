@@ -5,7 +5,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Support/FormatVariadic.h>
 using namespace cudavm;
-extern "C" CUDAVM_COMPILER_API int cudavm_compiler_compile_translation_unit_v1(const compiler_translation_unit_request* request, compiler_result** output) noexcept {
+extern "C" CUDAVM_CORE_API int cudavm_core_compile_translation_unit_v1(const compiler_translation_unit_request* request, compiler_result** output) noexcept {
     return run_compiler_api(output, [&](compiler_options& values, compiler_result&) {
         // Frontend serialization is independent of GPU contexts/registry locks.
         std::lock_guard lock(compiler_mutex());
@@ -15,6 +15,10 @@ extern "C" CUDAVM_COMPILER_API int cudavm_compiler_compile_translation_unit_v1(c
         values.depfile = compiler_option_text(request->depfile);
         if (request->standard) values.standard = request->standard;
         if (request->architecture) values.architecture = request->architecture;
+        if (values.input.empty() || values.host.empty() || values.bitcode.empty())
+            throw std::runtime_error("compile-tu requires --input, --host and --bitcode");
+        if (values.standard != "c++17" && values.standard != "c++20" && values.standard != "c++23")
+            throw std::runtime_error("--standard must be c++17, c++20 or c++23");
         append_compiler_option_strings(request->include_count, request->includes, values.includes);
         append_compiler_option_strings(request->define_count, request->defines, values.defines);
         values.resources = resolve_resources(compiler_option_text(request->resources_root));
@@ -37,7 +41,7 @@ extern "C" CUDAVM_COMPILER_API int cudavm_compiler_compile_translation_unit_v1(c
         write_file(values.manifest, llvm::formatv("{0:2}\n", llvm::json::Value(std::move(metadata))).str());
     });
 }
-extern "C" CUDAVM_COMPILER_API int cudavm_compiler_compile_get_resources_v1(const char* root, compiler_result** output) noexcept {
+extern "C" CUDAVM_CORE_API int cudavm_core_describe_resources_v1(const char* root, compiler_result** output) noexcept {
     return run_compiler_api(output, [&](compiler_options&, compiler_result& result) {
         result.output = llvm::formatv("{0:2}\n", llvm::json::Value(describe_resources(resolve_resources(compiler_option_text(root))))).str();
     });

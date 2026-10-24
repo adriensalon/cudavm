@@ -1,7 +1,7 @@
-#include "../cudavm/compiler_client.hpp"
+#include "../core/compiler_client.hpp"
 #include <map>
 #include <vector>
-#include <cudavm/export.h>
+#include <nvrtc/export.h>
 #include <nvrtc.h>
 #include <algorithm>
 #include <cstring>
@@ -185,19 +185,31 @@ extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcCompileProgram(nvrtcProgram handle,
                 settings.standard.c_str(), settings.architecture.c_str(), unsigned(settings.relocatable),
                 headers.size(), headers.data(), expressions.size(), expressions.data(),
                 includes.size(), includes.data(), defines.size(), defines.data(), undefines.size(), undefines.data()};
+            compiler_input_request input;
+            input.kind = compiler_input_kind::source; input.source = &request;
+            compiler_program* program = nullptr;
             compiler_result* result = nullptr;
-            auto status = cudavm_compiler_compile_source_v1(&request, &result);
+            auto status = cudavm_core_program_import_v1(&input, &program, &result);
+            compiler_program_ptr imported(program);
+            compiler_result_ptr import_result(result);
+            value.log = cudavm_core_result_diagnostics_v1(result);
+            if (status == compiler_status::out_of_memory) throw std::bad_alloc();
+            require(status == compiler_status::success && program, NVRTC_ERROR_COMPILATION);
+            compiler_emit_request emission;
+            emission.kind = compiler_output_kind::program_image;
+            emission.environment = compiler_environment::all;
+            status = cudavm_core_program_emit_v1(program, &emission, &result);
             compiler_result_ptr owned(result);
-            value.log = cudavm_compiler_result_diagnostics_v1(result);
+            value.log += cudavm_core_result_diagnostics_v1(result);
             if (status == compiler_status::out_of_memory) throw std::bad_alloc();
             require(status == compiler_status::success && result, NVRTC_ERROR_COMPILATION);
             std::map<std::string, std::string> lowered_names;
             for (const auto& expression : value.expressions) {
-                auto* name = cudavm_compiler_result_lowered_name_v1(result, expression.c_str());
+                auto* name = cudavm_core_result_lowered_name_v1(result, expression.c_str());
                 require(name, NVRTC_ERROR_INTERNAL_ERROR);
                 lowered_names.emplace(expression, name);
             }
-            std::string ptx = cudavm_compiler_result_output_v1(result);
+            std::string ptx = cudavm_core_result_output_v1(result);
             value.lowered_names.push_back(std::move(lowered_names));
             value.ptx = std::move(ptx);
             value.compiled = true;

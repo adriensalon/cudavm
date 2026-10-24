@@ -13,10 +13,12 @@ struct frontend_resources {
 };
 frontend_resources resolve_resources(const std::string& root = {});
 llvm::json::Object describe_resources(const frontend_resources&);
+struct compiler_ir_input { std::string bytes, name; };
 struct compiler_options {
     std::string input, host, bitcode, portable, ir, manifest, binary, target, depfile, module;
     std::string standard = "c++20", architecture = "sm_75";
     std::vector<std::string> inputs, includes, defines, library_inputs, host_inputs;
+    std::vector<compiler_ir_input> ir_inputs;
     frontend_resources resources;
     mutable std::string diagnostics;
 };

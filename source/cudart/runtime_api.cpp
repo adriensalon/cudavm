@@ -25,7 +25,7 @@ struct symbol_failure : std::runtime_error {
 };
 void symbol_require(bool condition, cudaError_t code, const char* text) { if (!condition) throw symbol_failure(code, text); }
 void require(bool condition, CUresult code, const char* text) { if (!condition) throw failure(code, text); }
-void check(CUresult code) { if (code != CUDA_SUCCESS) throw failure(code, cudavmGetDiagnostic()); }
+void check(CUresult code) { if (code != CUDA_SUCCESS) throw failure(code, cudavmDriverDiagnostic()); }
 struct nvidia_managed_binding { void** host; std::string symbol; size_t bytes; const void* alias = nullptr; };
 struct program_image {
     cudavmBackend kind;

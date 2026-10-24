@@ -1,7 +1,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
-#include <cudavm/export.h>
+#include <cuda/export.h>
 #define CUDAVM_API CUDAVM_CUDA_API
 #ifdef __cplusplus
 extern "C" {

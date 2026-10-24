@@ -20,8 +20,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include "../cudavm/data_view_descriptor.hpp"
-#include "../cudavm/shader_packet.hpp"
+#include "../core/data_view_descriptor.hpp"
+#include "../core/shader_packet.hpp"
 
 namespace cudavm {
 struct session;

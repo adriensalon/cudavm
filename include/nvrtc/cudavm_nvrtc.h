@@ -1,5 +1,5 @@
 #pragma once
-#include <cudavm/export.h>
+#include <nvrtc/export.h>
 #include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus

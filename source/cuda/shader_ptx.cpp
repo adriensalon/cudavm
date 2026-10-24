@@ -1,18 +1,18 @@
 #include "shader_ptx.hpp"
 #include "dynamic_library.hpp"
-#include "../cudavm/compiler_service.hpp"
+#include "../core/compiler_service.hpp"
 namespace cudavm {
 std::string compile_shader_ptx(std::string_view input, cudavmBackend backend) {
     // Retry discovery after an unavailable service; a failed first load must
     // not prevent a later application from deploying the optional compiler.
 #if defined(_WIN32)
-    static dynamic_library compiler({"cudavm_compiler.dll"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
+    static dynamic_library compiler({"cudavm_core.dll"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
 #elif defined(__APPLE__)
-    static dynamic_library compiler({"libcudavm_compiler.dylib"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
+    static dynamic_library compiler({"libcudavm_core.dylib"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
 #else
-    static dynamic_library compiler({"libcudavm_compiler.so"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
+    static dynamic_library compiler({"libcudavm_core.so"}, true, CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
 #endif
-    auto compile = compiler.get<compiler_compile_image>("cudavm_compiler_compile_image_v1");
+    auto compile = compiler.get<compiler_compile_image>("cudavm_core_compile_image_v1");
     std::array<char, 8192> diagnostic{};
     std::string image;
     auto output = [](const char* bytes, size_t size, void* user) noexcept {

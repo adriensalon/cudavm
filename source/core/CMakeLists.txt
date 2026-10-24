@@ -1,6 +1,6 @@
 # Shared compiler implementation and sole module owning static Clang/LLVM.
 # Facades link the matching variant; the Driver discovers the shared service lazily.
-cudavm_add_component(compiler compiler_api.cpp translation_unit_api.cpp linker_api.cpp source_api.cpp
+cudavm_add_component(core compiler_api.cpp program_api.cpp translation_unit_api.cpp linker_api.cpp
     compiler_resources.cpp device_sources.cpp cuda_frontend.cpp nvrtc_frontend.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/embedded_headers.cpp"
     ptx_import.cpp image_api.cpp device_numeric_ir.cpp device_services.cpp nvptx_emitter.cpp native_emission.cpp
@@ -8,7 +8,7 @@ cudavm_add_component(compiler compiler_api.cpp translation_unit_api.cpp linker_a
     device_passes.cpp host_embedding.cpp compiler_io.cpp)
 set(cudavm_install_targets ${cudavm_install_targets} PARENT_SCOPE)
 foreach(linkage shared static)
-    set(target cudavm_compiler_${linkage})
+    set(target cudavm_core_${linkage})
     if(NOT TARGET ${target})
         continue()
     endif()
@@ -24,10 +24,10 @@ foreach(linkage shared static)
         CUDAVM_CUDA_INCLUDE_DIR="${CUDAVM_CUDA_INCLUDE_DIR}"
         CUDAVM_CUDA_CRT_INCLUDE_DIR="${CUDAVM_CUDA_CRT_INCLUDE_DIR}"
         CUDAVM_PUBLIC_INCLUDE_DIR="${PROJECT_SOURCE_DIR}/include")
-    cudavm_compiler_dependencies(${target} clangCodeGen ${source_libraries} ${link_libraries})
+    cudavm_core_dependencies(${target} clangCodeGen ${source_libraries} ${link_libraries})
 endforeach()
-if(TARGET cudavm_compiler_shared)
-    list(APPEND CUDAVM_SHADER_COMPILER_FILES "$<TARGET_FILE:cudavm_compiler_shared>")
+if(TARGET cudavm_core_shared)
+    list(APPEND CUDAVM_SHADER_COMPILER_FILES "$<TARGET_FILE:cudavm_core_shared>")
     set(CUDAVM_SHADER_COMPILER_FILES ${CUDAVM_SHADER_COMPILER_FILES} PARENT_SCOPE)
 endif()
 # Runtime compilation uses embedded compiler headers, the common public CUDA

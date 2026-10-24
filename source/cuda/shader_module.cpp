@@ -2,11 +2,11 @@
 #include "command_regions.hpp"
 #include "shader_ptx.hpp"
 #include "shader_memory.hpp"
-#include "../cudavm/module_descriptor.hpp"
-#include "../cudavm/shader_packet.hpp"
-#include "../cudavm/device_services.hpp"
-#include "../cudavm/spirv_artifact.hpp"
-#include "../cudavm/dxil_artifact.hpp"
+#include "../core/module_descriptor.hpp"
+#include "../core/shader_packet.hpp"
+#include "../core/device_services.hpp"
+#include "../core/spirv_artifact.hpp"
+#include "../core/dxil_artifact.hpp"
 #include <cstdlib>
 #include <array>
 #include <bit>

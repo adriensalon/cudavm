@@ -1,9 +1,12 @@
 #pragma once
 #include <cuda.h>
-#include <cuda/cudavm_cuda.h>
+#include <cuda/export.h>
 #include <stdint.h>
 // Private Driver contract, declared and implemented by Driver. Never a facade
 // dispatch table. Runtime composes public cu* calls with these registry probes.
+namespace cudavm {
+enum class driver_backend : int { cuda, opencl, opengl, vulkan, directx };
+}
 extern "C" {
 CUDAVM_CUDA_API uint64_t cudavmDriverEpoch();
 CUDAVM_CUDA_API int cudavmDriverContextIsPrimary(CUcontext);
@@ -22,7 +25,8 @@ CUDAVM_CUDA_API uint64_t cudavmDriverContextGeneration(CUcontext);
 CUDAVM_CUDA_API int cudavmDriverIsDevicePointer(CUdeviceptr);
 CUDAVM_CUDA_API int cudavmDriverIsManagedPointer(CUdeviceptr);
 CUDAVM_CUDA_API int cudavmDriverIsHostPointer(CUdeviceptr);
-CUDAVM_CUDA_API cudavmBackend cudavmDriverBackend();
+CUDAVM_CUDA_API cudavm::driver_backend cudavmDriverBackend();
+CUDAVM_CUDA_API const char* cudavmDriverDiagnostic();
 CUDAVM_CUDA_API void cudavmDriverSetDiagnostic(const char*);
 CUDAVM_CUDA_API int cudavmDriverInHostFunction();
 CUDAVM_CUDA_API CUresult cudavmDriverMemset3DAsync(CUdeviceptr, size_t pitch, size_t slice_height,

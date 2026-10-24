@@ -1,5 +1,5 @@
 #include "backend.hpp"
-#include "../cudavm/device_services.hpp"
+#include "../core/device_services.hpp"
 #include <bit>
 #include <cstdio>
 namespace cudavm {

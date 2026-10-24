@@ -1,7 +1,7 @@
 #include "dynamic_library.hpp"
 #include "command_regions.hpp"
 #include "device_resources.hpp"
-#include "../cudavm/dxil_artifact.hpp"
+#include "../core/dxil_artifact.hpp"
 #if defined(_WIN32)
 #include <d3d12.h>
 #include <d3dcompiler.h>

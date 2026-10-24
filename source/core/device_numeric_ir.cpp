@@ -14,6 +14,7 @@
 
 namespace cudavm {
 void link_device_numeric_ir(llvm::Module& module) {
+    if (module.getNamedMetadata("cudavm.numeric.helpers")) return;
     auto files=llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
     add_embedded_files(*files, "/cudavm_resources");
     auto source=std::string(device_source("device_numeric_entry.cu"));
@@ -33,5 +34,6 @@ void link_device_numeric_ir(llvm::Module& module) {
     if(!numeric)throw std::runtime_error("numeric frontend produced no IR");
     numeric->setDataLayout(module.getDataLayout());
     if(llvm::Linker::linkModules(module,std::move(numeric)))throw std::runtime_error("numeric source linking failed");
+    module.getOrInsertNamedMetadata("cudavm.numeric.helpers");
 }
 }
