@@ -196,7 +196,7 @@ extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcCompileProgram(nvrtcProgram handle,
             if (status == compiler_status::out_of_memory) throw std::bad_alloc();
             require(status == compiler_status::success && program, NVRTC_ERROR_COMPILATION);
             compiler_emit_request emission;
-            emission.kind = compiler_output_kind::program_image;
+            emission.kind = compiler_output_kind::native_image;
             emission.environment = compiler_environment::all;
             status = cudavm_core_program_emit_v1(program, &emission, &result);
             compiler_result_ptr owned(result);

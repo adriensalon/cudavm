@@ -1,4 +1,6 @@
 #include "compiler.hpp"
+#include "program.hpp"
+#include "program_image.hpp"
 #include "device_conversions.hpp"
 #include "device_integers.hpp"
 #include "device_simd.hpp"
@@ -10,6 +12,7 @@
 #include <set>
 #include <stdexcept>
 #include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/DiagnosticPrinter.h>
@@ -424,8 +427,25 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
             found->second.raw_seen |= !composed;
         } else units.emplace(identity, archived_unit{bytes.str(), std::move(digest), origin, !composed});
     };
+    auto image_bitcode = [&](llvm::MemoryBufferRef buffer) -> std::string {
+        auto bytes = buffer.getBuffer();
+        if (!has_program_image(std::string_view(bytes.data(), bytes.size()))) return bytes.str();
+        compiler_input_request request{1, compiler_input_kind::program_image, bytes.data(), bytes.size(), nullptr, nullptr};
+        compiler_result diagnostics;
+        auto program = import_compiler_program(request, diagnostics);
+        if (stage(*program->module) == "cudavm.portable" && !program->module->getNamedMetadata(archive_key)) {
+            compiler_options settings;
+            settings.input = settings.bitcode = program->module->getModuleIdentifier();
+            settings.standard = "c++17"; settings.architecture = program->architecture;
+            mark_translation_unit(*program->module, settings, {});
+        }
+        std::string result;
+        llvm::raw_string_ostream stream(result);
+        llvm::WriteBitcodeToFile(*program->module, stream);
+        return result;
+    };
     auto candidate = [&](llvm::MemoryBufferRef buffer, const std::string& origin) {
-        candidates.emplace_back(buffer.getBuffer().str(), origin);
+        candidates.emplace_back(image_bitcode(buffer), origin);
     };
     auto parse_candidate = [&](llvm::MemoryBufferRef buffer, const std::string& origin) {
         llvm::LLVMContext discovery;
@@ -456,7 +476,11 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
     for (const auto& path : values.inputs) {
         auto file = llvm::MemoryBuffer::getFile(path);
         if (!file) throw std::runtime_error("cannot read " + path + ": " + file.getError().message());
-        buffers.emplace_back(std::move(*file), path);
+        auto bytes = (*file)->getBuffer();
+        if (has_program_image(std::string_view(bytes.data(), bytes.size()))) {
+            auto normalized = image_bitcode((*file)->getMemBufferRef());
+            buffers.emplace_back(llvm::MemoryBuffer::getMemBufferCopy(normalized, path), path);
+        } else buffers.emplace_back(std::move(*file), path);
     }
     for (const auto& input : values.ir_inputs)
         buffers.emplace_back(llvm::MemoryBuffer::getMemBufferCopy(input.bytes, input.name), input.name);
@@ -491,7 +515,7 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
             continue;
         }
         auto* archive = module.getNamedMetadata(archive_key);
-        if (input_stage != "cudavm.portable" || !archive || !archive->getNumOperands())
+        if ((input_stage != "cudavm.portable" && input_stage != "clang.cuda.linked") || !archive || !archive->getNumOperands())
             throw std::runtime_error("device link accepts compile-tu artifacts or portable artifacts with a raw-TU archive: " + path);
         std::set<std::string> archived, declared;
         for (auto* row : archive->operands()) {

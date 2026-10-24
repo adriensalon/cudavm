@@ -1,6 +1,7 @@
 #include "dynamic_library.hpp"
 #include "cuda_graph_capture.hpp"
 #include "ptx_parameters.hpp"
+#include "shader_ptx.hpp"
 #include "nvidia_image.hpp"
 #include "nvidia_managed_image.hpp"
 #include <cctype>
@@ -1033,6 +1034,8 @@ struct cuda_session : session {
     }
     void synchronize() override { cuda_context_guard guard(*context); check(context->api->sync(), "cuCtxSynchronize"); }
     std::shared_ptr<executable> load_image(const void* image, unsigned count, CUjit_option* options, void** values) override {
+        std::string materialized;
+        if (has_program_image(image)) { materialized = materialize_program_image(static_cast<const char*>(image), cudavmBackendCuda); image = materialized.c_str(); }
         auto result = std::make_shared<cuda_module>(context);
         cuda_context_guard guard(*context);
         check(context->api->load_image(&result->value, image, count, options, values), "cuModuleLoadDataEx");
@@ -1048,6 +1051,12 @@ struct cuda_session : session {
         return result;
     }
     std::shared_ptr<executable> load_file(const char* path) override {
+        { std::ifstream file(path, std::ios::binary); std::string prefix(program_image_magic.size(), '\0');
+          if (file.read(prefix.data(), prefix.size()) && has_program_image(prefix)) {
+              file.seekg(0); std::string image((std::istreambuf_iterator<char>(file)), {});
+              image = materialize_program_image(image, cudavmBackendCuda);
+              return load_image(image.c_str(), 0, nullptr, nullptr);
+          } }
         auto result = std::make_shared<cuda_module>(context);
         cuda_context_guard guard(*context);
         check(context->api->load_file(&result->value, path), "cuModuleLoad");

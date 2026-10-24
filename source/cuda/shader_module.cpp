@@ -408,6 +408,7 @@ std::shared_ptr<executable> session::load_image(const void* image,unsigned count
     }
     auto text=std::string_view(static_cast<const char*>(image));
     std::string compiled;
+    if (has_program_image(text)) { compiled = materialize_program_image(text, kind()); text = compiled; }
     if (!cudavm::has_module_descriptor(text) && text.find(".version") != text.npos) {
         compiled = compile_shader_ptx(text, kind()); text = compiled;
     }
@@ -436,6 +437,8 @@ std::shared_ptr<executable> session::load_image(const void* image,unsigned count
 std::shared_ptr<executable> session::load_file(const char* path) {
     require(path,CUDA_ERROR_INVALID_VALUE,"null module filename");
     std::ifstream file(path,std::ios::binary);require(bool(file),CUDA_ERROR_FILE_NOT_FOUND,"module file cannot be opened");
-    std::string image((std::istreambuf_iterator<char>(file)),{});return load_image(image.c_str(),0,nullptr,nullptr);
+    std::string image((std::istreambuf_iterator<char>(file)),{});
+    if (has_program_image(image)) image = materialize_program_image(image, kind());
+    return load_image(image.c_str(),0,nullptr,nullptr);
 }
 }

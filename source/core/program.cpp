@@ -7,6 +7,11 @@
 #include "dxil_emitter.hpp"
 #include "spirv_artifact.hpp"
 #include "dxil_artifact.hpp"
+#include "program_image.hpp"
+#include "module_descriptor.hpp"
+#include <optional>
+#include <llvm/Config/llvm-config.h>
+#include <llvm/Support/FormatVariadic.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Verifier.h>
@@ -16,7 +21,12 @@
 #include <llvm/Support/raw_ostream.h>
 
 namespace cudavm {
+static_assert(LLVM_VERSION_MAJOR == 22 && LLVM_VERSION_MINOR == 1 && LLVM_VERSION_PATCH == 4,
+    "review the portable image IR profile when changing LLVM");
 namespace {
+std::string image_metadata(const llvm::Module& module) {
+    return llvm::formatv("{0}", llvm::json::Value(describe(module))).str();
+}
 std::string program_stage(const llvm::Module& module) {
     auto* stage = module.getNamedMetadata("cudavm.ir.stage");
     if (!stage || stage->getNumOperands() != 1 || stage->getOperand(0)->getNumOperands() != 1) return {};
@@ -53,7 +63,10 @@ std::unique_ptr<compiler_program> copy_program(const compiler_program& input) {
 std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_request& request, compiler_result& result) {
     require_compiler_request(request.abi_version == 1, "compiler input requires abi_version 1");
     auto output = std::make_unique<compiler_program>();
-    switch (request.kind) {
+    auto kind = request.kind;
+    if ((kind == compiler_input_kind::cubin || kind == compiler_input_kind::nvltoir) && request.data
+        && has_program_image(std::string_view(request.data, request.size))) kind = compiler_input_kind::program_image;
+    switch (kind) {
     case compiler_input_kind::source: {
         auto* source = request.source;
         require_compiler_request(source && source->abi_version == 1 && source->source && source->name && source->relocatable <= 1
@@ -90,16 +103,30 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
         if (auto* target = output->module->getNamedMetadata("cudavm.import.architecture"))
             output->architecture = llvm::cast<llvm::MDString>(target->getOperand(0)->getOperand(0))->getString().str();
         break;
+    case compiler_input_kind::program_image:
     case compiler_input_kind::cudavm_ir: {
         require_compiler_request(request.data && request.size, "empty cudavm IR input");
-        output->module = read_bitcode(output->context, {request.data, request.size}, request.name ? request.name : "input.bc");
+        std::string_view bytes(request.data, request.size);
+        std::optional<program_image> image;
+        if (has_program_image(bytes)) {
+            image = decode_program_image(bytes);
+            require_compiler_request(image->producer == program_image_ir_profile, "unsupported program image IR profile");
+            bytes = image->ir;
+            output->architecture = image->architecture;
+            output->lowered_names = image->lowered_names;
+        } else require_compiler_request(kind != compiler_input_kind::program_image, "invalid program image magic");
+        output->module = read_bitcode(output->context, {bytes.data(), bytes.size()},
+            image ? image->module_name.c_str() : request.name ? request.name : "input.bc");
         auto stage = program_stage(*output->module);
         require_compiler_request(stage == "clang.cuda.tu" || stage == "clang.cuda.linked" || stage == "cudavm.portable", "unsupported cudavm IR stage");
         if (auto* abi = output->module->getNamedMetadata("cudavm.source.abi"); abi && abi->getNumOperands()) {
             auto* row = abi->getOperand(0);
             require_compiler_request(row->getNumOperands() == 6 && llvm::isa<llvm::MDString>(row->getOperand(2)), "invalid source ABI metadata");
-            output->architecture = llvm::cast<llvm::MDString>(row->getOperand(2))->getString().str();
+            auto architecture = llvm::cast<llvm::MDString>(row->getOperand(2))->getString().str();
+            require_compiler_request(!image || architecture == image->architecture, "program image architecture mismatch");
+            output->architecture = architecture;
         }
+        if (image) require_compiler_request(image_metadata(*output->module) == image->metadata, "program image ABI/linkage metadata mismatch");
         break;
     }
     case compiler_input_kind::nvvm: throw compiler_error(compiler_status::unsupported, "NVVM import is not implemented");
@@ -175,7 +202,7 @@ std::unique_ptr<compiler_program> prepare_compiler_program(const compiler_progra
 
 void emit_compiler_program(const compiler_program& program, const compiler_emit_request& request, compiler_result& result) {
     require_compiler_request(request.abi_version == 1, "compiler emission requires abi_version 1");
-    require_compiler_request(uint32_t(request.environment) <= uint32_t(compiler_environment::all), "invalid compiler environment");
+    require_compiler_request(uint32_t(request.environment) <= uint32_t(compiler_environment::none), "invalid compiler environment");
     const auto& module = *program.module;
     auto architecture = request.architecture ? request.architecture : program.architecture.c_str();
     auto portable = program_stage(module) == "cudavm.portable";
@@ -209,9 +236,54 @@ void emit_compiler_program(const compiler_program& program, const compiler_emit_
         }
         return;
     }
-    case compiler_output_kind::program_image: break;
+    case compiler_output_kind::program_image: {
+        if (module.getNamedMetadata("cudavm.import.architecture") && !module.getNamedMetadata("cudavm.numeric.helpers")) {
+            auto complete = prepare_compiler_program(program, {1, 1, 0, 0});
+            emit_compiler_program(*complete, request, result);
+            return;
+        }
+        require_compiler_request(architecture == program.architecture, "program image architecture must match its portable program");
+        program_image image;
+        image.architecture = program.architecture; image.module_name = module.getModuleIdentifier();
+        image.ir = bitcode(module); image.metadata = image_metadata(module); image.lowered_names = program.lowered_names;
+        if (request.environment != compiler_environment::none) {
+            compiler_emit_request native = request; native.kind = compiler_output_kind::native_image;
+            compiler_result artifact;
+            emit_compiler_program(program, native, artifact);
+            auto hash = program_image_hash(program_image_identity(image));
+            unsigned first = request.environment == compiler_environment::all ? 0 : unsigned(request.environment);
+            unsigned last = request.environment == compiler_environment::all ? 4 : first;
+            auto spirv = decode_spirv_artifacts(artifact.output);
+            auto dxil = decode_dxil_artifacts(artifact.output);
+            auto entries = decode_module_descriptor(artifact.output).entries.size();
+            for (unsigned backend = first; backend <= last; ++backend) {
+                bool available = backend == 0 || (backend == 4
+                    ? dxil.size() == entries && std::all_of(dxil.begin(), dxil.end(), [](const auto& item) { return !item.code.empty(); })
+                    : spirv.size() == entries && std::all_of(spirv.begin(), spirv.end(), [&](const auto& item) { return !(backend == 1 ? item.opencl_code : item.code).empty(); }));
+                if (!available) continue;
+                auto code = artifact.output;
+                if (backend != 0) {
+                    code = emit_native_module(module) + emit_data_views(module);
+                    if (backend == 4) code += encode_dxil_artifacts(dxil);
+                    else {
+                        auto selected = spirv;
+                        for (auto& entry : selected) {
+                            if (backend == 1) { entry.code.clear(); entry.diagnostic.clear(); }
+                            else { entry.opencl_code.clear(); entry.opencl_diagnostic.clear(); }
+                        }
+                        code += encode_spirv_artifacts(selected);
+                    }
+                }
+                image.artifacts.push_back({backend, program_image_native_profile, packet_memory_abi, hash, std::move(code)});
+            }
+        }
+        result.output = encode_program_image(image);
+        return;
+    }
+    case compiler_output_kind::native_image: break;
     default: throw compiler_error(compiler_status::invalid, "unknown compiler output kind");
     }
+    require_compiler_request(request.environment != compiler_environment::none, "native image requires an emission environment");
     if (request.environment == compiler_environment::all || request.environment == compiler_environment::cuda) {
         if (portable) result.output = emit_native(module, {native_target::nvptx, architecture, true, {}}).bytes;
         else {
@@ -222,7 +294,7 @@ void emit_compiler_program(const compiler_program& program, const compiler_emit_
         }
         return;
     }
-    result.output = emit_native_module(module);
+    result.output = emit_native_module(module) + emit_data_views(module);
     std::vector<shader_artifact> artifacts;
     for (const auto& function : module) if (!function.isDeclaration() && (function.hasFnAttribute("cudavm.kernel") || function.getCallingConv() == llvm::CallingConv::PTX_Kernel)) {
         shader_artifact artifact; artifact.symbol = function.getName().str();

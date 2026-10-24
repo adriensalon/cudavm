@@ -5,7 +5,7 @@
 // Requests borrow their storage. Import, link, and preparation return new
 // compiler-owned programs without mutating inputs. No LLVM types cross the ABI.
 namespace cudavm {
-enum class compiler_input_kind : uint32_t { ptx = 1, nvvm, cubin, nvltoir, source, cudavm_ir };
+enum class compiler_input_kind : uint32_t { ptx = 1, nvvm, cubin, nvltoir, source, cudavm_ir, program_image };
 struct compiler_source_header { const char* name; const char* contents; };
 struct compiler_source_request {
     uint32_t abi_version;
@@ -38,9 +38,11 @@ struct compiler_pipeline_request {
     uint32_t lower_semantics = 0;
     uint32_t optimization_level = 0; // 0 preserves IR; 1 through 3 select LLVM O1/O2/O3.
 };
-enum class compiler_output_kind : uint32_t { ptx, spirv, dxil, program_image, bitcode, llvm_ir };
+enum class compiler_output_kind : uint32_t { ptx, spirv, dxil, program_image, bitcode, llvm_ir, native_image };
+// program_image retains IR and metadata. none omits optional native artifacts;
+// native_image retains the existing PTX/descriptor transport for text consumers.
 // Values intentionally match cudavmBackend without depending on the Driver.
-enum class compiler_environment : uint32_t { cuda, opencl, opengl, vulkan, directx, all };
+enum class compiler_environment : uint32_t { cuda, opencl, opengl, vulkan, directx, all, none };
 struct compiler_emit_request {
     uint32_t abi_version = 1;
     compiler_output_kind kind = compiler_output_kind::ptx;

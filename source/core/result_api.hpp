@@ -7,7 +7,8 @@
 #include <string>
 
 // Shared compiler status, owned result bytes, diagnostics, and name mappings.
-// Result storage stays in core until release. Sizes exclude the convenience NUL.
+// Result storage stays in core until release. Sizes exclude the convenience NUL;
+// a program image's own framing NUL is part of its binary output extent.
 namespace cudavm {
 enum class compiler_status : int { success, invalid, unsupported, out_of_memory };
 struct compiler_result;
