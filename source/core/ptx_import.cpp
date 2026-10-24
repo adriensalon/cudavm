@@ -1,4 +1,5 @@
 #include "ptx_import.hpp"
+#include "compiler_profiles.hpp"
 #include <algorithm>
 #include <cctype>
 #include <functional>
@@ -22,9 +23,9 @@
 namespace cudavm {
 namespace {
 struct ptx_token { std::string text; unsigned line, column; };
-[[noreturn]] void ptx_fail(const ptx_token& token, const std::string& reason, bool unsupported = false) {
+[[noreturn]] void ptx_fail(const ptx_token& token, const std::string& reason, bool unsupported = false, bool version = false) {
     throw ptx_import_error(unsupported, "PTX " + std::to_string(token.line) + ":" +
-        std::to_string(token.column) + ": " + reason + " (" + token.text + ")");
+        std::to_string(token.column) + ": " + reason + " (" + token.text + ")", version);
 }
 std::vector<ptx_token> ptx_tokens(std::string_view input) {
     std::vector<ptx_token> result;
@@ -853,13 +854,12 @@ class ptx_parser {
     }
 public:
     ptx_parser(llvm::LLVMContext& owner, std::string_view input) : tokens(ptx_tokens(input)), context(owner), module(std::make_unique<llvm::Module>("imported.ptx", owner)) {}
-    std::unique_ptr<llvm::Module> parse() {
+    std::unique_ptr<llvm::Module> parse(std::string_view architecture = {}) {
         expect(".version"); auto version = take();
         // Bound accepted language versions independently of opcode support.
         // Later versions remain explicit obligations even for old opcodes.
-        const std::set<std::string> versions{"6.0", "6.1", "6.2", "6.3", "6.4", "6.5", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "8.0", "8.1", "8.2", "8.3", "8.4"};
-        if (!versions.contains(version.text))
-            ptx_fail(version, "unsupported PTX version (expected 6.0-6.5, 7.0-7.8 or 8.0-8.4)", true);
+        if (!supported_ptx_version(version.text))
+            ptx_fail(version, "unsupported PTX version (expected 6.0-6.5, 7.0-7.8 or 8.0-8.4)", true, true);
         expect(".target"); auto target = take();
         const std::map<std::string, unsigned> targets{{"sm_50", 60}, {"sm_52", 60}, {"sm_53", 60}, {"sm_60", 60},
             {"sm_61", 60}, {"sm_62", 60}, {"sm_70", 60}, {"sm_72", 61}, {"sm_75", 63},
@@ -867,11 +867,17 @@ public:
         if (!targets.contains(target.text)) ptx_fail(target, "unsupported PTX target", true);
         if (unsigned((version.text[0] - '0') * 10 + version.text[2] - '0') < targets.at(target.text))
             ptx_fail(target, "target is unavailable in this PTX version");
+        auto selected = architecture.empty() ? target.text : std::string(architecture);
+        if (!targets.contains(selected)) ptx_fail(target, "unsupported PTX compilation target", true);
+        if (std::stoul(selected.substr(3)) < std::stoul(target.text.substr(3)))
+            ptx_fail(target, "PTX compilation target is older than the input target");
         if (peek().text == ",") ptx_fail(peek(), "unsupported target option", true);
         expect(".address_size"); auto address = take();
         if (address.text != "64") ptx_fail(address, "PTX import requires 64-bit addresses", true);
         module->setTargetTriple(llvm::Triple("nvptx64-nvidia-cuda"));
         module->getOrInsertNamedMetadata("cudavm.import.architecture")->addOperand(
+            llvm::MDNode::get(context, llvm::MDString::get(context, selected)));
+        module->getOrInsertNamedMetadata("cudavm.import.source.architecture")->addOperand(
             llvm::MDNode::get(context, llvm::MDString::get(context, target.text)));
         module->setDataLayout("e-p:64:64-p1:64:64-p3:32:32-p4:64:64-p5:32:32-p6:32:32-i64:64-i128:128-v16:16-v32:32-n16:32:64");
         module->getOrInsertNamedMetadata("cudavm.ir.stage")->addOperand(llvm::MDNode::get(context, llvm::MDString::get(context, "cudavm.portable")));
@@ -942,8 +948,8 @@ public:
     }
 };
 }
-std::unique_ptr<llvm::Module> import_ptx(llvm::LLVMContext& context, std::string_view input) {
-    return ptx_parser(context, input).parse();
+std::unique_ptr<llvm::Module> import_ptx(llvm::LLVMContext& context, std::string_view input, std::string_view architecture) {
+    return ptx_parser(context, input).parse(architecture);
 }
 llvm::Value* import_numeric_inline_ptx(llvm::CallInst& call) {
     auto* assembly=llvm::cast<llvm::InlineAsm>(call.getCalledOperand());

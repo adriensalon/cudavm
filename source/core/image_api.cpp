@@ -27,7 +27,10 @@ extern "C" CUDAVM_CORE_API cudavm::compiler_status cudavm_core_compile_image_v1(
         auto status = cudavm_core_program_import_v1(&input, &program, &result);
         compiler_program_ptr imported(program);
         compiler_result_ptr import_result(result);
-        if (status != compiler_status::success) { report(cudavm_core_result_diagnostics_v1(result)); return status; }
+        if (status != compiler_status::success) {
+            report(cudavm_core_result_diagnostics_v1(result));
+            return status == compiler_status::unsupported_ptx_version ? compiler_status::unsupported : status;
+        }
         compiler_pipeline_request pipeline;
         // Envelopes retain their complete helper IR. Source programs already
         // carry their source ABI; do not link a second frontend's helper module.

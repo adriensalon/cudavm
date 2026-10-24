@@ -336,7 +336,11 @@ struct lowering {
         if(input->isFloatTy()) return b.getInt32Ty();
         if(input->isDoubleTy()) return b.getInt64Ty();
         if(input->isHalfTy()) return b.getInt32Ty();
-        if (input->isIntegerTy(8) || input->isIntegerTy(16)) return b.getInt32Ty();
+        if (auto* integer = llvm::dyn_cast<llvm::IntegerType>(input)) {
+            auto bits = integer->getBitWidth();
+            if (bits > 1 && bits < 32) return b.getInt32Ty();
+            if (bits > 32 && bits < 64) return b.getInt64Ty();
+        }
         if (auto* structure = llvm::dyn_cast<llvm::StructType>(input)) {
             std::vector<llvm::Type*> elements; for (auto* element : structure->elements()) elements.push_back(type(element));
             return llvm::StructType::get(b.getContext(), elements, structure->isPacked());
@@ -344,13 +348,21 @@ struct lowering {
         return input;
     }
     llvm::Value* canonical(llvm::Value* output, llvm::Type* source_type) {
-        if (source_type->isIntegerTy(8) || source_type->isIntegerTy(16))
-            return b.CreateAnd(output, b.getInt32((1u << source_type->getIntegerBitWidth()) - 1));
+        if (auto* integer = llvm::dyn_cast<llvm::IntegerType>(source_type)) {
+            auto bits = integer->getBitWidth(), storage = output->getType()->getIntegerBitWidth();
+            if (bits > 1 && bits < storage)
+                return b.CreateAnd(output, llvm::ConstantInt::get(output->getType(), llvm::APInt::getLowBitsSet(storage, bits)));
+        }
         return output;
     }
     llvm::Value* signed_value(const llvm::Value* input) {
         auto* output = value(input); auto bits = input->getType()->isPointerTy() ? 64u : input->getType()->getIntegerBitWidth();
-        return bits > 1 && bits < 32 ? b.CreateAShr(b.CreateShl(output, b.getInt32(32 - bits)), b.getInt32(32 - bits)) : output;
+        auto storage = output->getType()->getIntegerBitWidth();
+        if (bits > 1 && bits < storage) {
+            auto* shift = llvm::ConstantInt::get(output->getType(), storage - bits);
+            return b.CreateAShr(b.CreateShl(output, shift), shift);
+        }
+        return output;
     }
     llvm::Type* resource_pointer_type() { return llvm::PointerType::get(b.getContext(), 1); }
     std::vector<llvm::Type*> arguments(std::initializer_list<llvm::Type*> base) {
@@ -639,7 +651,7 @@ struct lowering {
         if (!pointer.collectOffset(dl, 64, variables, constant)) fail(pointer, "nonlinear pointer offset");
         auto* offset = static_cast<llvm::Value*>(llvm::ConstantInt::get(b.getInt64Ty(), constant));
         for (auto& [index, scale] : variables)
-            offset = b.CreateAdd(offset, b.CreateMul(b.CreateSExtOrTrunc(value(index), b.getInt64Ty()), llvm::ConstantInt::get(b.getInt64Ty(), scale)));
+            offset = b.CreateAdd(offset, b.CreateMul(b.CreateSExtOrTrunc(signed_value(index), b.getInt64Ty()), llvm::ConstantInt::get(b.getInt64Ty(), scale)));
         return b.CreateAdd(value(pointer.getPointerOperand()), offset);
     }
     llvm::Value* value(const llvm::Value* input) {
@@ -659,7 +671,7 @@ struct lowering {
                 auto* address = value(expression->getOperand(0));
                 if (expression->getOperand(0)->getType()->getPointerAddressSpace() == 3)
                     address = b.CreateAnd(address, b.getInt64(0x3fffffffull));
-                return b.CreateZExtOrTrunc(address, expression->getType());
+                return canonical(b.CreateZExtOrTrunc(address, type(expression->getType())), expression->getType());
             }
             if (expression->getOpcode() == llvm::Instruction::IntToPtr) {
                 auto* address = b.CreateZExtOrTrunc(value(expression->getOperand(0)), b.getInt64Ty());
@@ -679,7 +691,7 @@ struct lowering {
         if (auto* integer = llvm::dyn_cast<llvm::ConstantInt>(input)) return llvm::ConstantInt::get(type(integer->getType()), integer->getValue().zextOrTrunc(type(integer->getType())->getIntegerBitWidth()));
         if(auto* floating=llvm::dyn_cast<llvm::ConstantFP>(input);floating && (floating->getType()->isDoubleTy() || floating->getType()->isFloatTy() || floating->getType()->isHalfTy()))
             return llvm::ConstantInt::get(type(floating->getType()),floating->getValueAPF().bitcastToAPInt().zextOrTrunc(type(floating->getType())->getIntegerBitWidth()));
-        if (llvm::isa<llvm::UndefValue>(input) || llvm::isa<llvm::PoisonValue>(input)) return llvm::UndefValue::get(type(input->getType()));
+        if (llvm::isa<llvm::UndefValue>(input) || llvm::isa<llvm::PoisonValue>(input)) return canonical(llvm::UndefValue::get(type(input->getType())), input->getType());
         if (auto* constant = llvm::dyn_cast<llvm::Constant>(input); constant && !constant->getType()->isPointerTy()) return const_cast<llvm::Constant*>(constant);
         fail(*input, "unsupported or non-dominating value");
     }
@@ -1308,20 +1320,33 @@ struct lowering {
                     };
                     auto* low=b.CreateZExtOrTrunc(args[0],b.getInt32Ty());
                     llvm::Value* count=scan(low);
-                    if(bits==64) {
+                    if(bits>32) {
                         auto* high=b.CreateTrunc(b.CreateLShr(args[0],b.getInt64(32)),b.getInt32Ty());
                         auto* high_count=scan(high);
                         auto* primary=leading?high:low;
                         auto* first=leading?high_count:count;
                         auto* second=leading?count:high_count;
                         count=b.CreateSelect(b.CreateICmpEQ(primary,b.getInt32(0)),b.CreateAdd(second,b.getInt32(32)),first);
-                    } else if(leading && bits<32) count=b.CreateSub(count,b.getInt32(32-bits));
+                    }
+                    if (leading && bits != 32 && bits != 64) count = b.CreateSub(count, b.getInt32((bits > 32 ? 64 : 32) - bits));
                     count=b.CreateZExtOrTrunc(count,type(instruction.getType()));
                     auto* zero=llvm::cast<llvm::ConstantInt>(instruction.getArgOperand(1))->isOne()
                         ?llvm::PoisonValue::get(count->getType()):llvm::ConstantInt::get(count->getType(),bits);
                     return canonical(b.CreateSelect(b.CreateICmpEQ(args[0],llvm::Constant::getNullValue(args[0]->getType())),zero,count),instruction.getType());
                 }
-                if (!opencl && !dxil && instruction.getType()->isIntegerTy(64)
+                auto* integer_type = llvm::dyn_cast<llvm::IntegerType>(instruction.getType());
+                unsigned bits = integer_type ? integer_type->getBitWidth() : 0;
+                auto storage = integer_type ? type(integer_type)->getIntegerBitWidth() : 0;
+                if (integer_type && bits > 1 && bits < storage && (id == llvm::Intrinsic::fshl || id == llvm::Intrinsic::fshr)) {
+                    auto* width = llvm::ConstantInt::get(type(integer_type), bits);
+                    auto* shift = b.CreateURem(args[2], width);
+                    auto* complement = b.CreateSub(width, shift);
+                    return canonical(id == llvm::Intrinsic::fshl
+                        ? b.CreateOr(b.CreateShl(args[0], shift), b.CreateLShr(args[1], complement))
+                        : b.CreateOr(b.CreateShl(args[0], complement), b.CreateLShr(args[1], shift)), integer_type);
+                }
+                if (integer_type && id == llvm::Intrinsic::abs) args[0] = signed_value(instruction.getArgOperand(0));
+                if (!opencl && !dxil && storage == 64
                     && (id==llvm::Intrinsic::ctpop || id==llvm::Intrinsic::bitreverse)) {
                     // The SPIR-V is also consumed by OpenGL, whose integer64
                     // extension does not supply 64-bit count/reverse overloads.
@@ -1331,15 +1356,16 @@ struct lowering {
                     auto* low_result=b.CreateIntrinsic(b.getInt32Ty(),id,{low});
                     auto* high_result=b.CreateIntrinsic(b.getInt32Ty(),id,{high});
                     if(id==llvm::Intrinsic::ctpop) return b.CreateZExt(b.CreateAdd(low_result,high_result),b.getInt64Ty());
-                    return b.CreateOr(b.CreateShl(b.CreateZExt(low_result,b.getInt64Ty()),b.getInt64(32)),b.CreateZExt(high_result,b.getInt64Ty()));
+                    auto* reversed = b.CreateOr(b.CreateShl(b.CreateZExt(low_result,b.getInt64Ty()),b.getInt64(32)),b.CreateZExt(high_result,b.getInt64Ty()));
+                    return bits < 64 ? b.CreateLShr(reversed, b.getInt64(64 - bits)) : reversed;
                 }
                 auto* out = b.CreateIntrinsic(instruction.getType()->isFloatTy()?b.getFloatTy():type(instruction.getType()),id,args);
                 if(instruction.getType()->isFloatTy()) return b.CreateBitCast(out,b.getInt32Ty());
-                if (instruction.getType()->isIntegerTy(8) || instruction.getType()->isIntegerTy(16)) {
-                    auto bits=instruction.getType()->getIntegerBitWidth();
-                    if (id==llvm::Intrinsic::ctlz) return b.CreateSub(out,b.getInt32(32-bits));
-                    if (id==llvm::Intrinsic::cttz) return b.CreateSelect(b.CreateICmpEQ(args[0],b.getInt32(0)),b.getInt32(bits),out);
-                    if (id==llvm::Intrinsic::bitreverse) return b.CreateLShr(out,b.getInt32(32-bits));
+                if (integer_type && bits > 1 && bits < storage) {
+                    auto* padding = llvm::ConstantInt::get(out->getType(), storage - bits);
+                    if (id==llvm::Intrinsic::ctlz) return b.CreateSub(out,padding);
+                    if (id==llvm::Intrinsic::cttz) return b.CreateSelect(b.CreateICmpEQ(args[0],llvm::ConstantInt::get(args[0]->getType(),0)),llvm::ConstantInt::get(out->getType(),bits),out);
+                    if (id==llvm::Intrinsic::bitreverse || id==llvm::Intrinsic::bswap) return b.CreateLShr(out,padding);
                 }
                 return canonical(out,instruction.getType());
             }
@@ -1355,8 +1381,7 @@ struct lowering {
     }
     void instruction(const llvm::Instruction& input) {
         if (input.getType()->isVectorTy()) fail(input, "vector values require fallback in this native profile");
-        if (auto* integer = llvm::dyn_cast<llvm::IntegerType>(input.getType()); integer && integer->getBitWidth() != 1 && integer->getBitWidth() != 8
-            && integer->getBitWidth() != 16 && integer->getBitWidth() != 32 && integer->getBitWidth() != 64)
+        if (auto* integer = llvm::dyn_cast<llvm::IntegerType>(input.getType()); integer && integer->getBitWidth() > 64)
             fail(input, "unsupported native integer width");
         if (llvm::isa<llvm::PHINode>(input)) return;
         if (auto* frozen = llvm::dyn_cast<llvm::FreezeInst>(&input)) { values[&input] = value(frozen->getOperand(0)); return; }
@@ -1409,7 +1434,7 @@ struct lowering {
                 address = b.CreateAnd(address, b.getInt64(0x3fffffffull));
             if (cast->getOpcode() == llvm::Instruction::IntToPtr && input.getType()->getPointerAddressSpace() == 3)
                 address = b.CreateOr(b.CreateZExtOrTrunc(address, b.getInt64Ty()), b.getInt64(0xffffffff40000000ull));
-            values[&input] = b.CreateZExtOrTrunc(address, type(input.getType())); return;
+            values[&input] = canonical(b.CreateZExtOrTrunc(address, type(input.getType())), input.getType()); return;
         }
         if (auto* select = llvm::dyn_cast<llvm::SelectInst>(&input)) { values[&input] = b.CreateSelect(value(select->getCondition()), value(select->getTrueValue()), value(select->getFalseValue())); return; }
         if(auto* cast=llvm::dyn_cast<llvm::BitCastInst>(&input)) {

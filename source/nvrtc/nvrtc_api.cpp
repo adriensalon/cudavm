@@ -1,4 +1,5 @@
 #include "../core/program_api.hpp"
+#include "../core/compiler_profiles.hpp"
 #include <map>
 #include <vector>
 #include <nvrtc/export.h>
@@ -17,12 +18,12 @@ namespace cudavm {
 namespace {
 struct nvrtc_options {
     std::string standard = "c++17", architecture = "sm_75";
-    bool relocatable = false;
+    bool relocatable = false, physical = false, lto = false;
     std::vector<std::string> includes, defines, undefines;
 };
 struct program {
     std::mutex mutex;
-    std::string source, name, ptx, log;
+    std::string source, name, ptx, cubin, lto, log;
     std::vector<std::pair<std::string, std::string>> headers;
     std::vector<std::string> expressions;
     // NVIDIA keeps returned name pointers valid until program destruction,
@@ -80,9 +81,9 @@ cudavm::nvrtc_options parse_options(int count, const char* const* input, std::st
             return std::nullopt;
         };
         if (auto architecture = value("--gpu-architecture", "-arch")) {
-            // Physical SM targets also require CUBIN, which is not implemented.
-            if (*architecture != "compute_75" && *architecture != "compute_80") invalid(option);
-            result.architecture = *architecture == "compute_80" ? "sm_80" : "sm_75";
+            if (*architecture != "compute_75" && *architecture != "compute_80" && *architecture != "sm_75" && *architecture != "sm_80") invalid(option);
+            result.physical = architecture->starts_with("sm_");
+            result.architecture = architecture->ends_with("80") ? "sm_80" : "sm_75";
         } else if (auto standard = value("--std", "-std")) {
             if (*standard != "c++11" && *standard != "c++14" && *standard != "c++17"
                 && *standard != "c++20" && *standard != "c++23") invalid(option);
@@ -101,8 +102,10 @@ cudavm::nvrtc_options parse_options(int count, const char* const* input, std::st
             result.relocatable = *relocatable == "true";
         } else if (option == "--device-c" || option == "-dc") result.relocatable = true;
         else if (option == "--device-w" || option == "-dw") result.relocatable = false;
+        else if (option == "--dlink-time-opt" || option == "-dlto") result.lto = true;
         else invalid(option);
     }
+    if (result.lto) result.relocatable = true;
     return result;
 }
 }
@@ -130,10 +133,10 @@ extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcVersion(int* major, int* minor) {
     return api([&] { require(major && minor, NVRTC_ERROR_INVALID_INPUT); *major = 13; *minor = 4; });
 }
 extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcGetNumSupportedArchs(int* count) {
-    return api([&] { require(count, NVRTC_ERROR_INVALID_INPUT); *count = 2; });
+    return api([&] { require(count, NVRTC_ERROR_INVALID_INPUT); *count = int(source_architectures.size()); });
 }
 extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcGetSupportedArchs(int* architectures) {
-    return api([&] { require(architectures, NVRTC_ERROR_INVALID_INPUT); architectures[0] = 75; architectures[1] = 80; });
+    return api([&] { require(architectures, NVRTC_ERROR_INVALID_INPUT); std::copy(source_architectures.begin(), source_architectures.end(), architectures); });
 }
 extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcCreateProgram(nvrtcProgram* output, const char* source,
     const char* name, int count, const char* const* headers, const char* const* names) {
@@ -168,7 +171,7 @@ extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcCompileProgram(nvrtcProgram handle,
         require(count >= 0 && (!count || options), NVRTC_ERROR_INVALID_INPUT);
         for (int i = 0; i < count; ++i) require(options[i], NVRTC_ERROR_INVALID_INPUT);
         value.compilation_attempted = true; value.compiled = false;
-        value.ptx.clear(); value.log.clear();
+        value.ptx.clear(); value.cubin.clear(); value.lto.clear(); value.log.clear();
         auto settings = parse_options(count, options, value.log);
         try {
             auto pointers = [](const std::vector<std::string>& strings) {
@@ -195,23 +198,45 @@ extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcCompileProgram(nvrtcProgram handle,
             value.log = cudavm_core_result_diagnostics_v1(result);
             if (status == compiler_status::out_of_memory) throw std::bad_alloc();
             require(status == compiler_status::success && program, NVRTC_ERROR_COMPILATION);
-            compiler_emit_request emission;
-            emission.kind = compiler_output_kind::native_image;
-            emission.environment = compiler_environment::all;
-            status = cudavm_core_program_emit_v1(program, &emission, &result);
-            compiler_result_ptr owned(result);
-            value.log += cudavm_core_result_diagnostics_v1(result);
-            if (status == compiler_status::out_of_memory) throw std::bad_alloc();
-            require(status == compiler_status::success && result, NVRTC_ERROR_COMPILATION);
+            auto emit = [&](const compiler_program* input, compiler_output_kind kind, compiler_environment environment) {
+                compiler_emit_request emission;
+                emission.kind = kind; emission.environment = environment;
+                compiler_result* output = nullptr;
+                auto status = cudavm_core_program_emit_v1(input, &emission, &output);
+                compiler_result_ptr owned(output);
+                value.log += cudavm_core_result_diagnostics_v1(output);
+                if (status == compiler_status::out_of_memory) throw std::bad_alloc();
+                require(status == compiler_status::success && output, NVRTC_ERROR_COMPILATION);
+                return std::string(cudavm_core_result_output_v1(output), cudavm_core_result_size_v1(output));
+            };
+            std::string ptx, cubin, lto;
+            if (settings.lto) lto = emit(program, compiler_output_kind::program_image, compiler_environment::none);
+            else {
+                ptx = emit(program, compiler_output_kind::native_image, compiler_environment::all);
+                if (settings.physical) {
+                    compiler_program_ptr prepared;
+                    if (!settings.relocatable) {
+                        compiler_pipeline_request pipeline{1, 0, 1, 0};
+                        compiler_program* closed = nullptr; compiler_result* diagnostics = nullptr;
+                        status = cudavm_core_program_prepare_v1(program, &pipeline, &closed, &diagnostics);
+                        prepared.reset(closed); compiler_result_ptr owned(diagnostics);
+                        value.log += cudavm_core_result_diagnostics_v1(diagnostics);
+                        if (status == compiler_status::out_of_memory) throw std::bad_alloc();
+                        require(status == compiler_status::success && closed, NVRTC_ERROR_COMPILATION);
+                    }
+                    cubin = emit(prepared ? prepared.get() : program, compiler_output_kind::program_image,
+                        settings.relocatable ? compiler_environment::none : compiler_environment::all);
+                }
+            }
             std::map<std::string, std::string> lowered_names;
             for (const auto& expression : value.expressions) {
-                auto* name = cudavm_core_result_lowered_name_v1(result, expression.c_str());
+                auto* name = cudavm_core_result_lowered_name_v1(import_result.get(), expression.c_str());
                 require(name, NVRTC_ERROR_INTERNAL_ERROR);
                 lowered_names.emplace(expression, name);
             }
-            std::string ptx = cudavm_core_result_output_v1(result);
             value.lowered_names.push_back(std::move(lowered_names));
             value.ptx = std::move(ptx);
+            value.cubin = std::move(cubin); value.lto = std::move(lto);
             value.compiled = true;
         } catch (const std::bad_alloc&) { throw; }
         catch (const std::exception& error) {
@@ -230,6 +255,22 @@ extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcGetPTX(nvrtcProgram handle, char* o
 }
 extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcGetProgramLogSize(nvrtcProgram handle, size_t* size) {
     return with_program(handle, [&](program& value) { require(size, NVRTC_ERROR_INVALID_INPUT); *size = value.log.size() + 1; });
+}
+extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcGetCUBINSize(nvrtcProgram handle, size_t* size) {
+    return with_program(handle, [&](program& value) { require(size, NVRTC_ERROR_INVALID_INPUT); *size = value.cubin.size(); });
+}
+extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcGetCUBIN(nvrtcProgram handle, char* output) {
+    return with_program(handle, [&](program& value) {
+        require(output, NVRTC_ERROR_INVALID_INPUT); if (!value.cubin.empty()) std::memcpy(output, value.cubin.data(), value.cubin.size());
+    });
+}
+extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcGetLTOIRSize(nvrtcProgram handle, size_t* size) {
+    return with_program(handle, [&](program& value) { require(size, NVRTC_ERROR_INVALID_INPUT); *size = value.lto.size(); });
+}
+extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcGetLTOIR(nvrtcProgram handle, char* output) {
+    return with_program(handle, [&](program& value) {
+        require(output, NVRTC_ERROR_INVALID_INPUT); if (!value.lto.empty()) std::memcpy(output, value.lto.data(), value.lto.size());
+    });
 }
 extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcGetProgramLog(nvrtcProgram handle, char* output) {
     return with_program(handle, [&](program& value) {

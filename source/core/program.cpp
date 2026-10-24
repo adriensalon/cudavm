@@ -61,7 +61,9 @@ std::unique_ptr<compiler_program> copy_program(const compiler_program& input) {
 }
 
 std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_request& request, compiler_result& result) {
-    require_compiler_request(request.abi_version == 1, "compiler input requires abi_version 1");
+    require_compiler_request(request.abi_version == 1 || request.abi_version == 2, "compiler input requires abi_version 1 or 2");
+    const char* architecture = request.abi_version == 2 ? reinterpret_cast<const compiler_input_request_v2&>(request).architecture : nullptr;
+    require_compiler_request(!architecture || request.kind == compiler_input_kind::ptx, "compiler input target override requires PTX");
     auto output = std::make_unique<compiler_program>();
     auto kind = request.kind;
     if ((kind == compiler_input_kind::cubin || kind == compiler_input_kind::nvltoir) && request.data
@@ -98,7 +100,7 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
     }
     case compiler_input_kind::ptx:
         require_compiler_request(request.data && request.size, "empty PTX input");
-        output->module = import_ptx(output->context, {request.data, request.size});
+        output->module = import_ptx(output->context, {request.data, request.size}, architecture ? architecture : "");
         if (request.name) output->module->setModuleIdentifier(request.name);
         if (auto* target = output->module->getNamedMetadata("cudavm.import.architecture"))
             output->architecture = llvm::cast<llvm::MDString>(target->getOperand(0)->getOperand(0))->getString().str();

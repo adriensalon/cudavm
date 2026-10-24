@@ -32,6 +32,12 @@ struct compiler_input_request {
     // Source inputs use the normalized source options, headers and expressions.
     const compiler_source_request* source = nullptr;
 };
+// V2 adds a PTX compilation target. The original .target remains the input's
+// minimum architecture; the selected target must satisfy that requirement.
+struct compiler_input_request_v2 {
+    compiler_input_request base;
+    const char* architecture = nullptr;
+};
 struct compiler_pipeline_request {
     uint32_t abi_version = 1;
     uint32_t numerical_helpers = 0;

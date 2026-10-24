@@ -10,7 +10,7 @@
 // Result storage stays in core until release. Sizes exclude the convenience NUL;
 // a program image's own framing NUL is part of its binary output extent.
 namespace cudavm {
-enum class compiler_status : int { success, invalid, unsupported, out_of_memory };
+enum class compiler_status : int { success, invalid, unsupported, out_of_memory, unsupported_ptx_version };
 struct compiler_result;
 }
 extern "C" {
