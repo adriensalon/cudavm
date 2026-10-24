@@ -823,12 +823,15 @@ struct lowering {
             b.CreateCondBr(b.CreateICmpEQ(function->getArg(1), b.getInt32(0xffffffffu)), shared_space, global_space);
             auto access = [&](llvm::BasicBlock* block, bool group_memory, const std::function<llvm::Value*()>& global_pointer) {
                 b.SetInsertPoint(block);
-                if(dxil && group_memory && operation!=100 && operation!=llvm::AtomicRMWInst::FAdd && operation!=llvm::AtomicRMWInst::FSub) {
-                    // DXIL's legacy bitcode reader rejects LLVM's remaining
-                    // TGSM atomicrmw encoding. A native CAS loop keeps the full
-                    // operation atomic and returns the successful old value.
-                    auto* pointer=shared_pointer(b.CreateAnd(function->getArg(0),b.getInt32(0x3fffffffu)));
-                    auto* initial=b.CreateExtractValue(b.CreateAtomicCmpXchg(pointer,b.getInt32(0),b.getInt32(0),llvm::Align(4),llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,scope),0);
+                if((dxil && group_memory && operation!=100 && operation!=llvm::AtomicRMWInst::FAdd && operation!=llvm::AtomicRMWInst::FSub) ||
+                        (!opencl && !dxil && (operation==llvm::AtomicRMWInst::Min || operation==llvm::AtomicRMWInst::Max)) ||
+                        operation==llvm::AtomicRMWInst::UIncWrap || operation==llvm::AtomicRMWInst::UDecWrap) {
+                    // Shader targets have no wrapping increment/decrement RMW;
+                    // DXIL also needs CAS for its legacy shared RMW encoding.
+                    // GLSL's uint transport lvalues select unsigned min/max,
+                    // so preserve signed comparisons explicitly in a CAS loop.
+                    auto pointer=[&](){return group_memory?shared_pointer(b.CreateAnd(function->getArg(0),b.getInt32(0x3fffffffu))):global_pointer();};
+                    auto* initial=b.CreateExtractValue(b.CreateAtomicCmpXchg(pointer(),b.getInt32(0),b.getInt32(0),llvm::Align(4),llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,scope),0);
                     auto* retry=llvm::BasicBlock::Create(b.getContext(),"shared.retry",function);
                     auto* done=llvm::BasicBlock::Create(b.getContext(),"shared.done",function);
                     b.CreateBr(retry);b.SetInsertPoint(retry);
@@ -845,9 +848,11 @@ struct lowering {
                     case llvm::AtomicRMWInst::Max:next=b.CreateSelect(b.CreateICmpSGT(expected,operand),expected,operand);break;
                     case llvm::AtomicRMWInst::UMin:next=b.CreateSelect(b.CreateICmpULT(expected,operand),expected,operand);break;
                     case llvm::AtomicRMWInst::UMax:next=b.CreateSelect(b.CreateICmpUGT(expected,operand),expected,operand);break;
+                    case llvm::AtomicRMWInst::UIncWrap:next=b.CreateSelect(b.CreateICmpUGE(expected,operand),b.getInt32(0),b.CreateAdd(expected,b.getInt32(1)));break;
+                    case llvm::AtomicRMWInst::UDecWrap:next=b.CreateSelect(b.CreateOr(b.CreateICmpEQ(expected,b.getInt32(0)),b.CreateICmpUGT(expected,operand)),operand,b.CreateSub(expected,b.getInt32(1)));break;
                     default:fail(kernel,"unsupported native 32-bit atomic operation");
                     }
-                    auto* exchange=b.CreateAtomicCmpXchg(pointer,expected,next,llvm::Align(4),native_order,native_failure,scope);
+                    auto* exchange=b.CreateAtomicCmpXchg(pointer(),expected,next,llvm::Align(4),native_order,native_failure,scope);
                     expected->addIncoming(b.CreateExtractValue(exchange,0),retry);b.CreateCondBr(b.CreateExtractValue(exchange,1),done,retry);
                     b.SetInsertPoint(done);b.CreateRet(expected);return;
                 }

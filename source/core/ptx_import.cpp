@@ -141,6 +141,7 @@ class ptx_parser {
     std::vector<ptx_global> globals;
     std::map<std::string, ptx_token> symbols;
     unsigned symbol_counter = 0;
+    unsigned source_sm = 0;
     bool relocatable = false;
     const ptx_token& peek() const { return tokens.at(cursor); }
     ptx_token take() { auto token = peek(); if (cursor + 1 < tokens.size()) ++cursor; return token; }
@@ -624,6 +625,30 @@ class ptx_parser {
             value = result_type.signed_integer() ? builder.CreateSExtOrTrunc(value, output.type.storage(context)) : builder.CreateZExtOrTrunc(value, output.type.storage(context));
             builder.CreateStore(value, output.slot);
         };
+        auto memory_address = [&](const std::vector<ptx_token>& address, unsigned space, unsigned atomic_alignment = 0) {
+            if ((address.size() != 3 && address.size() != 5) || address.front().text != "[" || address.back().text != "]")
+                ptx_fail(address.front(), "unsupported address expression", true);
+            int64_t displacement = 0;
+            if (address.size() == 5) {
+                if (address[2].text != "+" && address[2].text != "-") ptx_fail(address[2], "invalid address displacement");
+                auto amount = ptx_unsigned(address[3]);
+                if (amount > INT32_MAX) ptx_fail(address[3], "address displacement exceeds supported range", true);
+                displacement = int64_t(amount) * (address[2].text == "-" ? -1 : 1);
+            }
+            if (atomic_alignment) if (auto* symbol = module->getGlobalVariable(address[1].text, true)) {
+                if ((space && symbol->getAddressSpace() != space) ||
+                        (symbol->getAddressSpace() != 1 && symbol->getAddressSpace() != 3))
+                    ptx_fail(address[1], "atomic address space disagrees with storage");
+                if (symbol->getAlign().valueOrOne().value() < atomic_alignment || displacement % atomic_alignment)
+                    ptx_fail(address[1], "atomic storage is misaligned");
+            }
+            unsigned width = 64;
+            if (space == 3 && registers.contains(address[1].text)) width = registers.at(address[1].text).type.bits;
+            if (width != 32 && width != 64) ptx_fail(address[1], "invalid address register width");
+            auto* bits = scalar({address[1]}, {width, 'u'});
+            if (displacement) bits = builder.CreateAdd(bits, llvm::ConstantInt::get(bits->getType(), uint64_t(displacement)));
+            return builder.CreateIntToPtr(bits, llvm::PointerType::get(context, space));
+        };
         std::map<std::string, llvm::BasicBlock*> labels;
         for (const auto& instruction : instructions) if (instruction.label) {
             if (labels.contains(instruction.opcode.text)) ptx_fail(instruction.opcode, "duplicate label");
@@ -693,6 +718,74 @@ class ptx_parser {
                     llvm::FunctionType::get(builder.getVoidTy(), std::vector<llvm::Type*>(args.size(), builder.getInt32Ty()), false));
                 llvm::cast<llvm::Function>(callee.getCallee())->addFnAttr(llvm::Attribute::Convergent);
                 builder.CreateCall(callee, args)->setConvergent();
+            } else if (parts[0] == "membar" || parts[0] == "fence") {
+                arity(0);
+                bool legacy = parts[0] == "membar";
+                auto order = legacy ? llvm::AtomicOrdering::SequentiallyConsistent : llvm::AtomicOrdering::AcquireRelease;
+                unsigned index = 1;
+                if (!legacy && parts.size() > 2) {
+                    if (parts[index] == "sc") order = llvm::AtomicOrdering::SequentiallyConsistent;
+                    else if (parts[index] != "acq_rel") ptx_fail(opcode, "unsupported fence semantics", true);
+                    ++index;
+                }
+                if (parts.size() != index + 1) ptx_fail(opcode, "unsupported fence modifier", true);
+                auto scope = parts[index];
+                if (scope != "cta" && scope != (legacy ? "gl" : "gpu")) ptx_fail(opcode, "unsupported fence scope", true);
+                if (!legacy && source_sm < 70) ptx_fail(opcode, "fence requires sm_70", true);
+                builder.CreateFence(order, context.getOrInsertSyncScopeID(scope == "cta" ? "block" : "device"));
+            } else if (parts[0] == "atom" || parts[0] == "red") {
+                bool reduction = parts[0] == "red";
+                auto type = ptx_scalar({parts.back(), opcode.line, opcode.column});
+                if ((type.bits != 32 && type.bits != 64) || (type.kind != 'b' && type.kind != 'u' && type.kind != 's'))
+                    ptx_fail(opcode, "unsupported atomic type", true);
+                std::string operation, scope, semantics, space;
+                for (unsigned i = 1; i + 1 < parts.size(); ++i) {
+                    const auto& part = parts[i];
+                    auto assign = [&](std::string& field) {
+                        if (!field.empty()) ptx_fail(opcode, "duplicate atomic qualifier");
+                        field = part;
+                    };
+                    if (part == "relaxed" || part == "acquire" || part == "release" || part == "acq_rel") assign(semantics);
+                    else if (part == "cta" || part == "gpu") assign(scope);
+                    else if (part == "global" || part == "shared") assign(space);
+                    else if (part == "add" || part == "min" || part == "max" || part == "and" || part == "or" || part == "xor" ||
+                            part == "exch" || part == "cas" || part == "inc" || part == "dec") assign(operation);
+                    else ptx_fail(opcode, "unsupported atomic qualifier", true);
+                }
+                if (operation.empty()) ptx_fail(opcode, "missing atomic operation");
+                bool bits = operation == "and" || operation == "or" || operation == "xor" || operation == "exch" || operation == "cas";
+                bool wrap = operation == "inc" || operation == "dec";
+                if ((bits && type.kind != 'b') || (!bits && type.kind == 'b') || (wrap && (type.kind != 'u' || type.bits != 32)) ||
+                        (operation == "add" && type.bits == 64 && type.kind != 'u') ||
+                        (reduction && (operation == "cas" || operation == "exch")))
+                    ptx_fail(opcode, "invalid atomic operation/type combination");
+                if (reduction && (semantics == "acquire" || semantics == "acq_rel")) ptx_fail(opcode, "reduction cannot acquire");
+                if ((!semantics.empty() && source_sm < 70) || (!scope.empty() && source_sm < 60))
+                    ptx_fail(opcode, "atomic qualifier is unavailable for the source target", true);
+                auto order = semantics == "acquire" ? llvm::AtomicOrdering::Acquire : semantics == "release" ? llvm::AtomicOrdering::Release :
+                    semantics == "acq_rel" ? llvm::AtomicOrdering::AcquireRelease : llvm::AtomicOrdering::Monotonic;
+                auto failure = llvm::isAcquireOrStronger(order) ? llvm::AtomicOrdering::Acquire : llvm::AtomicOrdering::Monotonic;
+                auto sync = context.getOrInsertSyncScopeID(scope == "cta" ? "block" : "device");
+                unsigned address_index = reduction ? 0 : 1;
+                arity(address_index + (operation == "cas" ? 3 : 2));
+                auto* pointer = memory_address(instruction.operands[address_index], space == "shared" ? 3 : space == "global" ? 1 : 0, type.bits / 8);
+                auto* input = operand(address_index + 1, type);
+                llvm::Value* previous = nullptr;
+                if (operation == "cas") {
+                    auto* exchange = builder.CreateAtomicCmpXchg(pointer, input, operand(address_index + 2, type), llvm::Align(type.bits / 8), order, failure, sync);
+                    previous = builder.CreateExtractValue(exchange, 0);
+                } else {
+                    auto operation_id = operation == "add" ? llvm::AtomicRMWInst::Add : operation == "and" ? llvm::AtomicRMWInst::And :
+                        operation == "or" ? llvm::AtomicRMWInst::Or : operation == "xor" ? llvm::AtomicRMWInst::Xor :
+                        operation == "inc" ? llvm::AtomicRMWInst::UIncWrap : operation == "dec" ? llvm::AtomicRMWInst::UDecWrap :
+                        operation == "min" ? (type.signed_integer() ? llvm::AtomicRMWInst::Min : llvm::AtomicRMWInst::UMin) :
+                        operation == "max" ? (type.signed_integer() ? llvm::AtomicRMWInst::Max : llvm::AtomicRMWInst::UMax) : llvm::AtomicRMWInst::Xchg;
+                    previous = builder.CreateAtomicRMW(operation_id, pointer, input, llvm::Align(type.bits / 8), order, sync);
+                }
+                if (!reduction) {
+                    const auto& destination = instruction.operands[0];
+                    if (destination.size() != 1 || destination[0].text != "_") write(destination, previous, type);
+                }
             } else if (opcode.text == "call" || opcode.text == "call.uni") {
                 auto list = [&](const std::vector<ptx_token>& tokens) {
                     std::vector<ptx_token> names;
@@ -747,6 +840,19 @@ class ptx_parser {
                     bool shared = parts.size() == 3 && parts[1] == "shared";
                     bool constant = parts.size() == 3 && parts[1] == "const";
                     bool generic = parts.size() == 2;
+                    llvm::AtomicOrdering order = llvm::AtomicOrdering::NotAtomic;
+                    llvm::SyncScope::ID sync = llvm::SyncScope::System;
+                    if (parts.size() >= 4 && (parts[1] == "relaxed" || parts[1] == "acquire" || parts[1] == "release")) {
+                        if ((load && parts[1] == "release") || (!load && parts[1] == "acquire")) ptx_fail(opcode, "invalid load/store memory ordering");
+                        if (parts[2] != "cta" && parts[2] != "gpu") ptx_fail(opcode, "unsupported memory scope", true);
+                        if (source_sm < 70) ptx_fail(opcode, "ordered memory access requires sm_70", true);
+                        if ((type.bits != 32 && type.bits != 64) || type.kind == 'f') ptx_fail(opcode, "unsupported ordered memory type", true);
+                        order = parts[1] == "acquire" ? llvm::AtomicOrdering::Acquire : parts[1] == "release" ? llvm::AtomicOrdering::Release : llvm::AtomicOrdering::Monotonic;
+                        sync = context.getOrInsertSyncScopeID(parts[2] == "cta" ? "block" : "device");
+                        generic = parts.size() == 4;
+                        global = parts.size() == 5 && parts[3] == "global";
+                        shared = parts.size() == 5 && parts[3] == "shared";
+                    }
                     if ((!parameter && !global && !shared && !constant && !generic) || (!load && constant)) ptx_fail(opcode, "unsupported memory instruction", true);
                     const auto& address = instruction.operands[load ? 1 : 0];
                     if (address.size() < 3 || address.front().text != "[" || address.back().text != "]" ||
@@ -777,11 +883,16 @@ class ptx_parser {
                         if (displacement) pointer_bits = builder.CreateAdd(pointer_bits, llvm::ConstantInt::get(pointer_bits->getType(), uint64_t(displacement)));
                         pointer = builder.CreateIntToPtr(pointer_bits, llvm::PointerType::get(context, shared ? 3 : constant ? 4 : global ? 1 : 0));
                     }
-                    if (load) value = builder.CreateAlignedLoad(type.storage(context), pointer, llvm::Align(type.bits / 8));
+                    if (load) {
+                        auto* memory = builder.CreateAlignedLoad(type.storage(context), pointer, llvm::Align(type.bits / 8));
+                        if (order != llvm::AtomicOrdering::NotAtomic) memory->setAtomic(order, sync);
+                        value = memory;
+                    }
                     else {
                         auto* data = scalar(instruction.operands[1], type, true);
                         if (type.kind == 'f') data = builder.CreateBitCast(data, type.storage(context));
-                        builder.CreateAlignedStore(data, pointer, llvm::Align(type.bits / 8));
+                        auto* memory = builder.CreateAlignedStore(data, pointer, llvm::Align(type.bits / 8));
+                        if (order != llvm::AtomicOrdering::NotAtomic) memory->setAtomic(order, sync);
                     }
                     if (load) write(instruction.operands[0], value, type, true);
                 } else if (op == "cvta" && (type.bits == 32 || type.bits == 64) && type.kind == 'u' &&
@@ -880,6 +991,7 @@ public:
             {"sm_61", 60}, {"sm_62", 60}, {"sm_70", 60}, {"sm_72", 61}, {"sm_75", 63},
             {"sm_80", 70}, {"sm_86", 71}, {"sm_87", 74}, {"sm_89", 78}, {"sm_90", 78}};
         if (!targets.contains(target.text)) ptx_fail(target, "unsupported PTX target", true);
+        source_sm = unsigned(std::stoul(target.text.substr(3)));
         if (unsigned((version.text[0] - '0') * 10 + version.text[2] - '0') < targets.at(target.text))
             ptx_fail(target, "target is unavailable in this PTX version");
         auto selected = architecture.empty() ? target.text : std::string(architecture);
