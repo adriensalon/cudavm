@@ -1,5 +1,6 @@
 // CLI and build artifact paths only. Libraries own compilation and linking.
-#include "../core/compiler_client.hpp"
+#include "../core/frontend_api.hpp"
+#include "../core/linker_api.hpp"
 #include <cstdio>
 #include <map>
 #include <stdexcept>

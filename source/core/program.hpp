@@ -1,5 +1,6 @@
 #pragma once
-#include "compiler_api.hpp"
+#include "compiler.hpp"
+#include "program_api.hpp"
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 

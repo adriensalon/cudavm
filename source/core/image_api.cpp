@@ -1,8 +1,8 @@
-#include "compiler_client.hpp"
+#include "image_api.hpp"
 #include <algorithm>
 #include <cstring>
 
-// Compatibility adapter for the Driver's lazily discovered callback ABI.
+using namespace cudavm;
 extern "C" CUDAVM_CORE_API cudavm::compiler_status cudavm_core_compile_image_v1(
         const cudavm::compiler_image_request* request, cudavm::compiler_output output,
         void* user, char* diagnostic, size_t capacity) noexcept {

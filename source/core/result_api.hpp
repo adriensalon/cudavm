@@ -1,13 +1,27 @@
 #pragma once
-#include "compiler_service.hpp"
+#include "export.h"
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
+
+// Shared compiler status, owned result bytes, diagnostics, and name mappings.
+// Result storage stays in core until release. Sizes exclude the convenience NUL.
 namespace cudavm {
-struct compiler_program_deleter {
-    void operator()(compiler_program* value) const noexcept { cudavm_core_program_release_v1(value); }
-};
-using compiler_program_ptr = std::unique_ptr<compiler_program, compiler_program_deleter>;
+enum class compiler_status : int { success, invalid, unsupported, out_of_memory };
+struct compiler_result;
+}
+extern "C" {
+CUDAVM_CORE_API size_t cudavm_core_result_size_v1(const cudavm::compiler_result*) noexcept;
+CUDAVM_CORE_API const char* cudavm_core_result_output_v1(const cudavm::compiler_result*) noexcept;
+CUDAVM_CORE_API const char* cudavm_core_result_diagnostics_v1(const cudavm::compiler_result*) noexcept;
+CUDAVM_CORE_API const char* cudavm_core_result_lowered_name_v1(const cudavm::compiler_result*, const char*) noexcept;
+CUDAVM_CORE_API void cudavm_core_result_release_v1(cudavm::compiler_result*) noexcept;
+}
+
+// Local ownership and convenience helpers for this boundary.
+namespace cudavm {
 struct compiler_result_deleter {
     void operator()(compiler_result* value) const noexcept { cudavm_core_result_release_v1(value); }
 };

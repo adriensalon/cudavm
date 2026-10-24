@@ -1,4 +1,4 @@
-#include "../core/compiler_client.hpp"
+#include "../core/program_api.hpp"
 #include <map>
 #include <vector>
 #include <nvrtc/export.h>

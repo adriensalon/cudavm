@@ -1,6 +1,6 @@
 #include "shader_ptx.hpp"
 #include "dynamic_library.hpp"
-#include "../core/compiler_service.hpp"
+#include "../core/image_api.hpp"
 namespace cudavm {
 std::string compile_shader_ptx(std::string_view input, cudavmBackend backend) {
     // Retry discovery after an unavailable service; a failed first load must

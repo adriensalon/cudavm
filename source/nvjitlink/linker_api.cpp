@@ -1,4 +1,4 @@
-#include "../core/compiler_client.hpp"
+#include "../core/linker_api.hpp"
 #include <nvjitlink/cudavm_nvjitlink.h>
 struct cudavmLinkResult { std::string output, diagnostics; };
 using namespace cudavm;

@@ -1,4 +1,4 @@
-#include "../core/compiler_client.hpp"
+#include "../core/frontend_api.hpp"
 #include <nvrtc/cudavm_nvrtc.h>
 struct cudavmCompileResult { std::string output, diagnostics; };
 using namespace cudavm;

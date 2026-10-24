@@ -1,4 +1,6 @@
 #pragma once
+#include "result_api.hpp"
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -6,6 +8,25 @@
 #include <llvm/Support/JSON.h>
 namespace llvm { class LLVMContext; class Module; }
 namespace cudavm {
+struct compiler_error : std::runtime_error {
+    compiler_status status;
+    compiler_error(compiler_status value, const char* text) : std::runtime_error(text), status(value) {}
+};
+inline void require_compiler_request(bool condition, const char* text) {
+    if (!condition) throw compiler_error(compiler_status::invalid, text);
+}
+struct compiler_result {
+    std::string output, diagnostics;
+    std::map<std::string, std::string, std::less<>> lowered_names;
+};
+inline std::string compiler_option_text(const char* value) { return value ? value : ""; }
+inline void append_compiler_option_strings(size_t count, const char* const* input, std::vector<std::string>& output) {
+    if (count && !input) throw std::runtime_error("null compiler option array");
+    for (size_t i = 0; i < count; ++i) {
+        if (!input[i]) throw std::runtime_error("null compiler option string");
+        output.emplace_back(input[i]);
+    }
+}
 // Source, link and import entry points share LLVM target state in one library.
 std::mutex& compiler_mutex();
 struct frontend_resources {
@@ -22,6 +43,24 @@ struct compiler_options {
     frontend_resources resources;
     mutable std::string diagnostics;
 };
+template<class Result, class F> int run_compiler_file_api(Result** output, F function) noexcept {
+    if (!output) return 1;
+    *output = nullptr;
+    try {
+        auto result = std::make_unique<Result>();
+        compiler_options values;
+        int status = 0;
+        try { function(values, *result); }
+        catch (const std::exception& error) {
+            status = 1;
+            values.diagnostics += std::string("cudavm compiler: ") + error.what() + '\n';
+        }
+        catch (...) { status = 1; values.diagnostics += "cudavm compiler: unknown failure\n"; }
+        result->diagnostics = std::move(values.diagnostics);
+        *output = result.release();
+        return status;
+    } catch (...) { return 1; }
+}
 struct extracted_host_header { std::string source, output; };
 struct host_extraction {
     std::string host;

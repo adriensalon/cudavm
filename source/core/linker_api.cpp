@@ -1,15 +1,14 @@
-#include "compiler_service.hpp"
-#include "compiler_api.hpp"
-#include "native_emission.hpp"
+#include "linker_api.hpp"
+#include "compiler.hpp"
 #include "program.hpp"
+#include "native_emission.hpp"
 #include <algorithm>
-#include <llvm/IR/LLVMContext.h>
-#include <llvm/IR/Module.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_ostream.h>
+
 using namespace cudavm;
 extern "C" CUDAVM_CORE_API int cudavm_core_link_files_v1(const compiler_link_request* request, compiler_result** output) noexcept {
-    return run_compiler_api(output, [&](compiler_options& values, compiler_result&) {
+    return run_compiler_file_api(output, [&](compiler_options& values, compiler_result&) {
         std::lock_guard lock(compiler_mutex());
         if (!request || request->abi_version != 1) throw std::runtime_error("invalid compiler link request");
         append_compiler_option_strings(request->input_count, request->inputs, values.inputs);

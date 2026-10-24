@@ -1,11 +1,12 @@
 # Shared compiler implementation and sole module owning static Clang/LLVM.
 # Facades link the matching variant; the Driver discovers the shared service lazily.
-cudavm_add_component(core compiler_api.cpp program_api.cpp translation_unit_api.cpp linker_api.cpp
-    compiler_resources.cpp device_sources.cpp cuda_frontend.cpp nvrtc_frontend.cpp
+cudavm_add_component(core result_api.cpp program_api.cpp frontend_api.cpp linker_api.cpp image_api.cpp
+    compiler.cpp program.cpp
+    device_sources.cpp cuda_frontend.cpp nvrtc_frontend.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/embedded_headers.cpp"
-    ptx_import.cpp image_api.cpp device_numeric_ir.cpp device_services.cpp nvptx_emitter.cpp native_emission.cpp
+    ptx_import.cpp device_numeric_ir.cpp device_services.cpp nvptx_emitter.cpp native_emission.cpp
     spirv_emitter.cpp shader_lowering.cpp dxil_emitter.cpp module_descriptor.cpp
-    device_passes.cpp host_embedding.cpp compiler_io.cpp)
+    device_passes.cpp host_embedding.cpp)
 set(cudavm_install_targets ${cudavm_install_targets} PARENT_SCOPE)
 foreach(linkage shared static)
     set(target cudavm_core_${linkage})

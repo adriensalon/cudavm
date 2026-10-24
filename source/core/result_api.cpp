@@ -1,4 +1,6 @@
-#include "compiler_api.hpp"
+#include "result_api.hpp"
+#include "compiler.hpp"
+
 using namespace cudavm;
 extern "C" CUDAVM_CORE_API size_t cudavm_core_result_size_v1(const compiler_result* result) noexcept {
     return result ? result->output.size() : 0;

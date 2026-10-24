@@ -1,12 +1,12 @@
-#include "compiler_service.hpp"
-#include "compiler_api.hpp"
-#include <mutex>
+#include "frontend_api.hpp"
+#include "compiler.hpp"
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/FormatVariadic.h>
+
 using namespace cudavm;
 extern "C" CUDAVM_CORE_API int cudavm_core_compile_translation_unit_v1(const compiler_translation_unit_request* request, compiler_result** output) noexcept {
-    return run_compiler_api(output, [&](compiler_options& values, compiler_result&) {
+    return run_compiler_file_api(output, [&](compiler_options& values, compiler_result&) {
         // Frontend serialization is independent of GPU contexts/registry locks.
         std::lock_guard lock(compiler_mutex());
         if (!request || request->abi_version != 1) throw std::runtime_error("compile options require abi_version 1");
@@ -42,7 +42,7 @@ extern "C" CUDAVM_CORE_API int cudavm_core_compile_translation_unit_v1(const com
     });
 }
 extern "C" CUDAVM_CORE_API int cudavm_core_describe_resources_v1(const char* root, compiler_result** output) noexcept {
-    return run_compiler_api(output, [&](compiler_options&, compiler_result& result) {
+    return run_compiler_file_api(output, [&](compiler_options&, compiler_result& result) {
         result.output = llvm::formatv("{0:2}\n", llvm::json::Value(describe_resources(resolve_resources(compiler_option_text(root))))).str();
     });
 }
