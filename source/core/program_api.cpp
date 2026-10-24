@@ -1,6 +1,7 @@
 #include "program_api.hpp"
 #include "program.hpp"
 #include "ptx_import.hpp"
+#include "nvvm_import.hpp"
 
 namespace cudavm {
 namespace {
@@ -32,6 +33,13 @@ template<class Function> compiler_status run_compiler_program_api(compiler_resul
 }
 
 using namespace cudavm;
+extern "C" CUDAVM_CORE_API compiler_status cudavm_core_nvvm_compile_v1(
+        const compiler_nvvm_request* request, compiler_result** result) noexcept {
+    return run_compiler_program_api(result, [&](compiler_result& output) {
+        require_compiler_request(request, "null NVVM compilation request");
+        compile_nvvm(*request, output);
+    });
+}
 extern "C" CUDAVM_CORE_API compiler_status cudavm_core_program_import_v1(
         const compiler_input_request* request, compiler_program** program, compiler_result** result) noexcept {
     if (program) *program = nullptr;

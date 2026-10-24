@@ -1,6 +1,7 @@
 #include "program.hpp"
 #include "nvrtc_frontend.hpp"
 #include "ptx_import.hpp"
+#include "nvvm_import.hpp"
 #include "native_emission.hpp"
 #include "device_numeric_ir.hpp"
 #include "spirv_emitter.hpp"
@@ -190,7 +191,11 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
         if (image) require_compiler_request(image_metadata(*output->module) == image->metadata, "program image ABI/linkage metadata mismatch");
         break;
     }
-    case compiler_input_kind::nvvm: throw compiler_error(compiler_status::unsupported, "NVVM import is not implemented");
+    case compiler_input_kind::nvvm:
+        require_compiler_request(request.data && request.size, "empty NVVM input");
+        output->architecture = architecture ? architecture : "sm_75";
+        output->module = import_nvvm(output->context, {request.data, request.size}, request.name, output->architecture.c_str());
+        break;
     case compiler_input_kind::nvltoir: throw compiler_error(compiler_status::unsupported, "NVIDIA LTO-IR import is not implemented");
     case compiler_input_kind::cubin: throw compiler_error(compiler_status::unsupported, "cubin import is not implemented");
     default: throw compiler_error(compiler_status::invalid, "unknown compiler input kind");

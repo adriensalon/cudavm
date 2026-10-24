@@ -154,13 +154,22 @@ class ptx_parser {
         if (!value || value > 256 || (value & (value - 1))) ptx_fail(token, "invalid storage alignment");
         return unsigned(value);
     }
-    ptx_parameter declaration(bool unsized = false) {
+    ptx_parameter declaration(bool unsized = false, bool parameter = false) {
         unsigned align = accept(".align") ? alignment() : 0;
         auto type = ptx_scalar(take(), true);
-        if (peek().text == ".ptr") ptx_fail(peek(), "pointer parameter annotations are unsupported", true);
+        bool pointer = accept(".ptr");
+        if (pointer) {
+            if (!parameter || type.bits != 64 || (type.kind != 'u' && type.kind != 'b'))
+                ptx_fail(peek(), "pointer annotations require a scalar 64-bit parameter");
+            // These constrain the pointee, not the parameter slot. Keep the
+            // ordinary 64-bit ABI and do not invent stronger LLVM assumptions.
+            if (peek().text == ".global" || peek().text == ".const" || peek().text == ".shared" || peek().text == ".local") take();
+            if (accept(".align")) alignment();
+        }
         auto name = identifier();
         ptx_parameter result{name, type, 1, align ? align : type.bits / 8, false};
         if (accept("[")) {
+            if (pointer) ptx_fail(name, "pointer parameter cannot be an array");
             result.array = true;
             result.count = peek().text == "]" ? 0 : ptx_unsigned(take());
             expect("]");
@@ -174,7 +183,7 @@ class ptx_parser {
         expect("("); std::vector<ptx_parameter> result; std::set<std::string> names;
         uint64_t extent = 0;
         if (!accept(")")) for (;;) {
-            expect(".param"); auto parameter = declaration();
+            expect(".param"); auto parameter = declaration(false, true);
             if (!names.insert(parameter.name.text).second) ptx_fail(parameter.name, "duplicate parameter");
             extent = llvm::alignTo(extent, parameter.alignment) + parameter.bytes();
             if (extent > 65536) ptx_fail(parameter.name, "function parameters exceed 64 KiB", true);
@@ -790,7 +799,8 @@ class ptx_parser {
                     auto* input = scalar(instruction.operands[1], type, true);
                     value = type.signed_integer() ? builder.CreateSExtOrTrunc(input, destination.storage(context)) : builder.CreateZExtOrTrunc(input, destination.storage(context));
                     write(instruction.operands[0], value, destination, true);
-                } else if (op == "setp" && parts.size() == 3 && (type.kind == 's' || type.kind == 'u') && type.bits >= 16) {
+                } else if (op == "setp" && parts.size() == 3 && (type.kind == 's' || type.kind == 'u'
+                        || (type.kind == 'b' && (parts[1] == "eq" || parts[1] == "ne"))) && type.bits >= 16) {
                     arity(3); auto* left = operand(1, type); auto* right = operand(2, type);
                     const std::map<std::string, llvm::CmpInst::Predicate> comparisons{
                         {"eq", llvm::CmpInst::ICMP_EQ}, {"ne", llvm::CmpInst::ICMP_NE},
