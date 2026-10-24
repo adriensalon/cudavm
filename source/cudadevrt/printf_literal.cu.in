@@ -1,0 +1,5 @@
+    at = @end@;
+    if (owned) {
+        out[10] = 576; out[3] = count;
+@words@
+    }

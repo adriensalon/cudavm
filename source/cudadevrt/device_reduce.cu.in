@@ -1,0 +1,4 @@
+extern "C" __device__ __attribute__((convergent)) @type@ __cudavm_rtc_reduce_@suffix@(@type@,unsigned);
+__device__ inline @type@ __reduce_@name@_sync(unsigned mask,@type@ value) {
+    return __cudavm_rtc_reduce_@suffix@(value,mask);
+}

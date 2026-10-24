@@ -40,6 +40,12 @@ std::vector<std::string> frontend_arguments(const compiler_options& values, bool
         // core launch protocol explicitly; public declarations remain 13.4.1.
         "-Xclang", "-target-sdk-version=12.8",
         "-include", values.resources.wrapper,
+        "-isystem", values.resources.resource_dir + "/public/cudart",
+        "-isystem", values.resources.resource_dir + "/public/nvcc",
+        "-isystem", values.resources.resource_dir + "/public/cuda",
+        "-isystem", values.resources.resource_dir + "/public/cudadevrt",
+        "-isystem", values.resources.resource_dir + "/public",
+        "-isystem", values.resources.resource_dir + "/device",
         "-isystem", values.resources.cuda_include, "-isystem", values.resources.cuda_crt_include,
         "-I", values.resources.public_include,
         "-isystem", values.resources.public_include + "/cuda",

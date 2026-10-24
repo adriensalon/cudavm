@@ -1,0 +1,2 @@
+extern "C" __device__ @result@ @symbol@(@arguments@);
+@linkage@__device__ inline @result@ @name@(@arguments@) {return @symbol@(@call@);}

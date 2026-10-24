@@ -1,7 +1,3 @@
-#pragma once
-#include <string>
-namespace cudavm {
-inline std::string device_half_header() { return R"cudavm_half(
 namespace cudavm {
 __device__ static inline unsigned long long half_shift_jam(unsigned long long a,unsigned shift) {
     return shift==0?a:shift<64?(a>>shift)|((a<<(64-shift))!=0):a!=0;
@@ -158,6 +154,4 @@ extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word
     if(exponent<-126)return sign|unsigned(q);
     if(q>=0x1000000ull){q>>=1;++exponent;}
     return exponent>127?sign|0x7f800000u:sign|unsigned(exponent+127)<<23|(unsigned(q)&0x7fffffu);
-}
-)cudavm_half"; }
 }

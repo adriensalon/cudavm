@@ -1,0 +1,1 @@
+__device__ __attribute__((used)) auto __cudavm_nvrtc_name_@index@ = (@expression@);

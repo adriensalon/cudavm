@@ -1,0 +1,16 @@
+// Generated from compiler resources and device sources. Do not edit.
+#include "embedded_headers.hpp"
+#include <algorithm>
+#include <stdexcept>
+namespace cudavm {
+@embedded_includes@
+static constexpr embedded_file files[] = {
+@embedded_entries@};
+std::span<const embedded_file> embedded_files() { return files; }
+std::string_view embedded_source(std::string_view path) {
+    auto found = std::find_if(std::begin(files), std::end(files),
+        [path](const auto& file) { return path == file.path; });
+    if (found == std::end(files)) throw std::runtime_error("missing embedded compiler source: " + std::string(path));
+    return {found->contents, found->size};
+}
+}

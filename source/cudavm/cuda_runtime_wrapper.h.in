@@ -1,0 +1,3 @@
+// Patched LLVM wrapper; original license notices retained.
+#pragma clang system_header
+@wrapper@

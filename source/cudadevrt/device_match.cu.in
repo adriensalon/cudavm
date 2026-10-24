@@ -1,0 +1,5 @@
+__device__ inline unsigned __match_@mode@_sync(unsigned mask,@type@ value@predicate_argument@) {
+    union {@type@ value;unsigned word;unsigned long long wide;} bits;bits.value=value;
+    if(sizeof(value)==4)return __cudavm_rtc_match_@mode@32(mask,bits.word@predicate_call@);
+    else return __cudavm_rtc_match_@mode@64(mask,bits.wide@predicate_call@);
+}

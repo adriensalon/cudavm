@@ -1,5 +1,5 @@
 #include "device_services.hpp"
-#include "device_services_source.hpp"
+#include "device_sources.hpp"
 #include <stdexcept>
 #include <set>
 #include <map>
@@ -79,33 +79,34 @@ std::optional<shader_output_plan> plan_output(const llvm::CallInst& call, const 
     return plan;
 }
 std::string output_plan_source(const shader_output_plan& plan) {
-    std::string source = "\nnamespace cudavm { extern \"C\" DEV int " + plan.symbol + "(const char* format, const char* arguments) {\n"
-        "if (!format) return -1; u64 parsed = ";
-    source += plan.format ? std::to_string(*plan.format) + "ull;\n" : "__cudavm_service_scan(format);\n";
-    source += "unsigned count = unsigned(parsed), strings = unsigned(parsed >> 32);\n"
-        "bool valid = count <= " + std::to_string(plan.fields.size()) + ";\n"
-        "unsigned* claimed = record(1); bool owned = claimed != nullptr; unsigned* out = output_pointer(claimed); unsigned at = 576;\n";
+    std::string format;
     if (plan.literal) {
         auto bytes = *plan.literal + '\0';
-        source += "at = " + std::to_string(576 + bytes.size()) + "; if (owned) { out[10] = 576; out[3] = count;\n";
+        std::string words;
         for (size_t at = 0; at < bytes.size(); at += 4) {
-            uint32_t word = 0; for (unsigned byte = 0; byte < 4 && at + byte < bytes.size(); ++byte) word |= uint32_t(uint8_t(bytes[at + byte])) << (byte * 8);
-            source += "out[" + std::to_string(144 + at / 4) + "] = " + std::to_string(word) + "u;\n";
+            uint32_t word = 0;
+            for (unsigned byte = 0; byte < 4 && at + byte < bytes.size(); ++byte)
+                word |= uint32_t(uint8_t(bytes[at + byte])) << (byte * 8);
+            words += render_device_source("printf_word.cu.in", {
+                {"index", std::to_string(144 + at / 4)}, {"value", std::to_string(word)}});
         }
-        source += "}\n";
-    } else source += "if (owned) { out[10] = text(out, at, format); valid = valid && out[10] != 0; out[3] = count; }\n";
+        format = render_device_source("printf_literal.cu.in", {
+            {"end", std::to_string(576 + bytes.size())}, {"words", words}});
+    } else format = device_source("printf_text.cu");
+    std::string fields;
     for (size_t index = 0; index < plan.fields.size(); ++index) {
         auto [code, offset] = plan.fields[index];
-        source += "if (count > " + std::to_string(index) + ") {\nunsigned code = " +
-            (code == 7 ? "(strings & " + std::to_string(1u << index) + "u) ? 6 : 7" : std::to_string(code)) + ";\n";
-        source += "u64 bits = *reinterpret_cast<const " + std::string(code >= 3 ? "u64" : "unsigned") + "*>(arguments + " + std::to_string(offset) + ");\n";
-        source += "if (owned && valid) { unsigned* arg = out + " + std::to_string(16 + index * 4) + ";\n"
-            "arg[0] = code; arg[1] = 0; arg[2] = unsigned(bits); arg[3] = unsigned(bits >> 32);\n";
-        if (code == 7) source += "if (code == 6) { arg[1] = text(out, at, reinterpret_cast<const char*>(bits)); valid = arg[1] != 0; }\n";
-        source += "}\n}\n";
+        auto expression = code == 7 ? render_device_source("printf_pointer_code.cu.in",
+            {{"mask", std::to_string(1u << index)}}) : std::to_string(code);
+        fields += render_device_source("printf_field.cu.in", {
+            {"index", std::to_string(index)}, {"code", expression},
+            {"load_type", code >= 3 ? "u64" : "unsigned"}, {"offset", std::to_string(offset)},
+            {"slot", std::to_string(16 + index * 4)},
+            {"string", code == 7 ? device_source("printf_string.cu") : std::string_view{}}});
     }
-    source += "if (owned) publish(out, at, valid ? 1 : 0); return valid ? int(count) : -2;\n} }\n";
-    return source;
+    return render_device_source("printf_plan.cu.in", {
+        {"symbol", plan.symbol}, {"parsed", plan.format ? std::to_string(*plan.format) + "ull" : "__cudavm_service_scan(format)"},
+        {"field_count", std::to_string(plan.fields.size())}, {"format", format}, {"fields", fields}});
 }
 }
 uint32_t shader_service_requirements(const llvm::Function& entry) {
@@ -154,7 +155,7 @@ void link_shader_services(llvm::Module& module) {
         if (auto* call = llvm::dyn_cast<llvm::CallInst>(user)) if (auto plan = plan_output(*call, module.getDataLayout())) {
             planned_calls.emplace_back(call, plan->symbol); plans.emplace(plan->symbol, std::move(*plan));
         }
-    std::string source = device_services_source;
+    std::string source(device_source("device_services.cu"));
     for (const auto& [name, plan] : plans) source += output_plan_source(plan);
     auto files = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
     files->addFile("/cudavm_services.cu", 0, llvm::MemoryBuffer::getMemBufferCopy(source));

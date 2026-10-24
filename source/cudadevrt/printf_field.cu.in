@@ -1,0 +1,9 @@
+    if (count > @index@) {
+        unsigned code = @code@;
+        u64 bits = *reinterpret_cast<const @load_type@*>(arguments + @offset@);
+        if (owned && valid) {
+            unsigned* arg = out + @slot@;
+            arg[0] = code; arg[1] = 0; arg[2] = unsigned(bits); arg[3] = unsigned(bits >> 32);
+@string@
+        }
+    }

@@ -1,0 +1,2 @@
+// Embedded source bytes; original license notices are retained below.
+static constexpr char @embedded_symbol@[] = R"cudavm_resource(@embedded_contents@)cudavm_resource";

@@ -1,0 +1,3 @@
+__device__ inline @word@ __@name@(@vector_a@ x,@vector_b@ y,@word@ c) {
+    return @symbol@(__builtin_bit_cast(@word@,x),__builtin_bit_cast(@word@,y),c);
+}

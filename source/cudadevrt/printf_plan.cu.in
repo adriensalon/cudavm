@@ -1,0 +1,14 @@
+namespace cudavm {
+extern "C" DEV int @symbol@(const char* format, const char* arguments) {
+    if (!format) return -1;
+    u64 parsed = @parsed@;
+    unsigned count = unsigned(parsed), strings = unsigned(parsed >> 32);
+    bool valid = count <= @field_count@;
+    unsigned* claimed = record(1); bool owned = claimed != nullptr;
+    unsigned* out = output_pointer(claimed); unsigned at = 576;
+@format@
+@fields@
+    if (owned) publish(out, at, valid ? 1 : 0);
+    return valid ? int(count) : -2;
+}
+}

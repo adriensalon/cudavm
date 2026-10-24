@@ -1,0 +1,6 @@
+__device__ inline @type@ @name@(unsigned mask,@type@ value,@offset_type@ offset,int width=32) {
+    union {@type@ value;unsigned words[sizeof(@type@)/4];} bits;bits.value=value;
+    for(unsigned i=0;i<sizeof(value)/4;++i)
+        bits.words[i]=__cudavm_rtc_shfl_@mode@(mask,bits.words[i],unsigned(offset),((32-unsigned(width))<<8)|@clamp@);
+    return bits.value;
+}

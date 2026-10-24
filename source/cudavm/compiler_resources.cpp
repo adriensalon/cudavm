@@ -1,6 +1,5 @@
 #include "compiler.hpp"
 #include "embedded_headers.hpp"
-#include "device_math_source.hpp"
 #include <filesystem>
 #include <stdexcept>
 #include <utility>
@@ -63,19 +62,22 @@ frontend_resources resolve_resources(const std::string& root) {
     return {"build-tree", builtin, builtin + "/cuda_runtime_wrapper.h",
         CUDAVM_CUDA_INCLUDE_DIR, CUDAVM_CUDA_CRT_INCLUDE_DIR, CUDAVM_PUBLIC_INCLUDE_DIR};
 }
-llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> frontend_files(const frontend_resources& value) {
-    auto files = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
-    for (const auto& file : embedded_headers()) {
-        auto path = value.resource_dir + "/" + file.path;
+void add_embedded_files(llvm::vfs::InMemoryFileSystem& files, const std::string& root) {
+    for (const auto& file : embedded_files()) {
+        auto path = root + "/" + file.path;
         // The data has static storage and its original trailing NUL. Keep it
         // in the library instead of duplicating all headers for each request.
-        if (!files->addFile(path, 0, llvm::MemoryBuffer::getMemBuffer(
+        if (!files.addFile(path, 0, llvm::MemoryBuffer::getMemBuffer(
                 llvm::StringRef(file.contents, file.size), path)))
             throw std::runtime_error("conflicting embedded compiler resource: " + path);
     }
-    static const auto math_header=device_math_header();
+}
+llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> frontend_files(const frontend_resources& value) {
+    auto files = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
+    add_embedded_files(*files, value.resource_dir);
+    const auto math_header = embedded_source("device/device_math.cu");
     auto math_path=value.resource_dir+"/cudavm_device_math.h";
-    if(!files->addFile(math_path,0,llvm::MemoryBuffer::getMemBuffer(math_header,math_path)))
+    if(!files->addFile(math_path,0,llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(math_header),math_path)))
         throw std::runtime_error("conflicting embedded device math header");
     auto overlay = llvm::makeIntrusiveRefCnt<llvm::vfs::OverlayFileSystem>(llvm::vfs::getRealFileSystem());
     overlay->pushOverlay(files);
@@ -83,7 +85,7 @@ llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> frontend_files(const frontend_re
 }
 llvm::json::Object describe_resources(const frontend_resources& value) {
     return llvm::json::Object{{"origin", value.origin}, {"frontend", "in-process-static-Clang"}, {"builtin_headers", "embedded"},
-        {"public_headers", "module-include-directories"},
+        {"public_headers", "embedded-common-and-module-include-directories"},
         {"cuda_include", value.cuda_include},
         {"cuda_crt_include", value.cuda_crt_include}, {"public_include", value.public_include}};
 }

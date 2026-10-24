@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include "device_sources.hpp"
 namespace cudavm {
 // CUDA DPX public functions also have fallbacks on pre-SM90 architectures.
 // Keep the checked wrapper signatures and semantics shared by AOT and NVRTC.
@@ -43,8 +44,9 @@ inline std::string device_dpx_header() {
             if(operation.bits==16){arguments+=",bool* lo";call+=",lo";}
         }
         auto symbol=std::string("__cudavm_rtc_dpx_")+operation.name;
-        result+="extern \"C\" __device__ "+word+" "+symbol+"("+arguments+");\n";
-        result+="__device__ inline "+word+" __"+operation.name+"("+arguments+"){return "+symbol+"("+call+");}\n";
+        result += render_device_source("device_wrapper.cu.in", {
+            {"result", word}, {"symbol", symbol}, {"arguments", arguments},
+            {"name", "__" + std::string(operation.name)}, {"linkage", ""}, {"call", call}});
     }
     return result;
 }

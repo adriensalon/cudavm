@@ -1,6 +1,3 @@
-#pragma once
-namespace cudavm {
-inline constexpr const char device_services_source[] = R"cudavm(
 #define DEV __attribute__((device))
 using size_t = __SIZE_TYPE__;
 using u64 = unsigned long long;
@@ -176,6 +173,4 @@ extern "C" DEV void __assertfail(const char* message, const char* file, unsigned
     __cudavm_service_assert();
     __builtin_unreachable();
 }
-}
-)cudavm";
 }

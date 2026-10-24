@@ -1,9 +1,3 @@
-#pragma once
-#include <string>
-namespace cudavm {
-// Exact word arithmetic compiled by the existing CUDA frontend. Native
-// lowering selects these helpers without requiring hardware FP64 arithmetic.
-inline std::string native_numeric_header() { return R"cudavm_numeric(
 #define CV_FN __device__ static inline
 namespace cudavm {
 typedef unsigned uint;
@@ -524,5 +518,3 @@ extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_n
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_u64_to_f64(unsigned long long bits,unsigned mode){using namespace cudavm;return join(cvU64ToDoubleBitsMode(split(bits),mode));}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_i64_to_f64(unsigned long long bits,unsigned mode){using namespace cudavm;return join(cvI64ToDoubleBitsMode(split(bits),mode));}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_to_i64(unsigned long long bits,unsigned mode){using namespace cudavm;return join(cvDoubleBitsTo64Mode(split(bits),mode));}
-)cudavm_numeric"; }
-}

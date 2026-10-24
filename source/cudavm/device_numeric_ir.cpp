@@ -1,5 +1,6 @@
 #include "device_numeric_ir.hpp"
-#include "device_math_source.hpp"
+#include "device_sources.hpp"
+#include "embedded_headers.hpp"
 #include <stdexcept>
 #include <clang/CodeGen/CodeGenAction.h>
 #include <clang/Frontend/CompilerInstance.h>
@@ -14,10 +15,12 @@
 namespace cudavm {
 void link_device_numeric_ir(llvm::Module& module) {
     auto files=llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
-    auto source=std::string("#define __device__ __attribute__((device))\n")+device_math_header();
+    add_embedded_files(*files, "/cudavm_resources");
+    auto source=std::string(device_source("device_numeric_entry.cu"));
     files->addFile("/cudavm_numeric.cu",0,llvm::MemoryBuffer::getMemBufferCopy(source));
     const char* args[]={"-triple","nvptx64-nvidia-cuda","-fcuda-is-device","-x","cuda","-std=c++17",
-        "-target-cpu","sm_75","-emit-llvm","-disable-llvm-passes","-O1","-nostdsysteminc","-nobuiltininc","/cudavm_numeric.cu"};
+        "-target-cpu","sm_75","-emit-llvm","-disable-llvm-passes","-O1","-nostdsysteminc","-nobuiltininc",
+        "-I", "/cudavm_resources/device", "/cudavm_numeric.cu"};
     std::string log;llvm::raw_string_ostream stream(log);
     auto invocation=std::make_shared<clang::CompilerInvocation>();
     clang::CompilerInstance compiler(invocation);
