@@ -265,6 +265,11 @@ CUlibrary registered_library_load(const void* image, size_t bytes) {
     require(image && bytes && static_cast<const char*>(image)[bytes - 1] == 0, CUDA_ERROR_INVALID_IMAGE, "invalid registered library image");
     auto entry = std::make_shared<library_entry>(); entry->registered = true;
     entry->image.assign(static_cast<const char*>(image), bytes - 1);
+    // Constructors retain the original image without choosing a backend. On
+    // first library use, import its PTX once and keep the resulting descriptors
+    // and native artifacts together for every independently owned context bind.
+    if (global().kind != cudavmBackendCuda && has_nvidia_fatbin(std::string_view(entry->image)))
+        entry->image = materialize_fatbin(entry->image, global().kind);
     std::string materialized;
     if (has_portable_fatbin(std::string_view(entry->image))) materialized = materialize_fatbin(entry->image, global().kind);
     else if (has_program_image(entry->image)) materialized = materialize_program_image(entry->image, global().kind);
