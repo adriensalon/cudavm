@@ -725,8 +725,10 @@ class ptx_parser {
                     result = value;
                 }
                 if (result) builder.CreateRet(result); else builder.CreateRetVoid();
-            } else if (opcode.text == "bar.sync") {
-                if (instruction.operands.empty() || instruction.operands.size() > 2) ptx_fail(opcode, "wrong operand count");
+            } else if (opcode.text == "bar.sync" || opcode.text == "bar.arrive") {
+                bool arrive = opcode.text == "bar.arrive";
+                if (instruction.operands.empty() || instruction.operands.size() > 2 || (arrive && instruction.operands.size() != 2))
+                    ptx_fail(opcode, "wrong operand count");
                 std::vector<llvm::Value*> args;
                 for (unsigned i = 0; i < instruction.operands.size(); ++i) {
                     auto* value = operand(i, {32, 'u'});
@@ -736,11 +738,14 @@ class ptx_parser {
                     }
                     args.push_back(value);
                 }
-                auto callee = module->getOrInsertFunction(args.size() == 1 ? "llvm.nvvm.barrier.cta.sync.aligned.all" : "llvm.nvvm.barrier.cta.sync.aligned.count",
+                auto name = arrive ? "llvm.nvvm.barrier.cta.arrive.aligned.count" :
+                    args.size() == 1 ? "llvm.nvvm.barrier.cta.sync.aligned.all" : "llvm.nvvm.barrier.cta.sync.aligned.count";
+                auto callee = module->getOrInsertFunction(name,
                     llvm::FunctionType::get(builder.getVoidTy(), std::vector<llvm::Type*>(args.size(), builder.getInt32Ty()), false));
                 llvm::cast<llvm::Function>(callee.getCallee())->addFnAttr(llvm::Attribute::Convergent);
                 builder.CreateCall(callee, args)->setConvergent();
-            } else if (parts[0] == "vote" || parts[0] == "shfl" || parts[0] == "activemask" || opcode.text == "bar.warp.sync") {
+            } else if (parts[0] == "vote" || parts[0] == "shfl" || parts[0] == "match" || parts[0] == "redux" ||
+                    parts[0] == "activemask" || opcode.text == "bar.warp.sync") {
                 auto collective = [&](const std::string& name, llvm::Type* result, std::vector<llvm::Value*> args) -> llvm::Value* {
                     std::vector<llvm::Type*> types; for (auto* arg : args) types.push_back(arg->getType());
                     auto callee = module->getOrInsertFunction("llvm.nvvm." + name, llvm::FunctionType::get(result, types, false));
@@ -777,6 +782,32 @@ class ptx_parser {
                     auto* result = collective("shfl.sync." + parts[2] + (predicate_result ? ".i32p" : ".i32"), result_type, {mask, data, offset, control});
                     if (destination[0].text != "_") write({destination[0]}, predicate_result ? builder.CreateExtractValue(result, 0) : result, {32, 'b'});
                     if (predicate_result) write({destination[2]}, builder.CreateExtractValue(result, 1), {1, 'p'});
+                } else if (parts.size() == 4 && parts[0] == "match" && parts[2] == "sync" &&
+                        (parts[1] == "any" || parts[1] == "all") && (parts[3] == "b32" || parts[3] == "b64")) {
+                    arity(3);
+                    if (source_version < 60 || source_sm < 70) ptx_fail(opcode, "match.sync requires PTX 6.0 and sm_70", true);
+                    bool all = parts[1] == "all";
+                    const auto& destination = instruction.operands[0];
+                    if (destination.size() != 1 && (!all || destination.size() != 3 || destination[1].text != "|"))
+                        ptx_fail(opcode, "invalid match destination");
+                    unsigned width = parts[3] == "b64" ? 64 : 32;
+                    auto* data = operand(1, {width, 'b'}); auto* mask = operand(2, {32, 'u'});
+                    llvm::Type* result_type = all ? static_cast<llvm::Type*>(llvm::StructType::get(context, {builder.getInt32Ty(), builder.getInt1Ty()})) : builder.getInt32Ty();
+                    auto* result = collective("match." + parts[1] + ".sync.i" + std::to_string(width) + (all ? "p" : ""), result_type, {mask, data});
+                    if (destination[0].text != "_") write({destination[0]}, all ? builder.CreateExtractValue(result, 0) : result, {32, 'b'});
+                    if (destination.size() == 3 && destination[2].text != "_") write({destination[2]}, builder.CreateExtractValue(result, 1), {1, 'p'});
+                } else if (parts.size() == 4 && parts[0] == "redux" && parts[1] == "sync") {
+                    arity(3);
+                    if (source_version < 70 || source_sm < 80) ptx_fail(opcode, "redux.sync requires PTX 7.0 and sm_80", true);
+                    bool arithmetic = parts[2] == "add" || parts[2] == "min" || parts[2] == "max";
+                    bool bitwise = parts[2] == "and" || parts[2] == "or" || parts[2] == "xor";
+                    if ((!arithmetic || (parts[3] != "u32" && parts[3] != "s32")) && (!bitwise || parts[3] != "b32"))
+                        ptx_fail(opcode, "unsupported warp reduction operation/type", true);
+                    auto type = ptx_scalar({parts[3], opcode.line, opcode.column});
+                    auto name = (parts[2] == "min" || parts[2] == "max") && parts[3] == "u32" ? "u" + parts[2] : parts[2];
+                    auto* result = collective("redux.sync." + name, builder.getInt32Ty(), {operand(1, type), operand(2, {32, 'u'})});
+                    if (instruction.operands[0].size() != 1 || instruction.operands[0][0].text != "_")
+                        write(instruction.operands[0], result, type);
                 } else ptx_fail(opcode, "unsupported warp instruction or modifier", true);
             } else if (parts[0] == "membar" || parts[0] == "fence") {
                 arity(0);
