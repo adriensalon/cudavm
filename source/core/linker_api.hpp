@@ -1,7 +1,7 @@
 #pragma once
 #include "result_api.hpp"
 
-// File/archive device linking, used by nvJitLink build extensions and nvcc. Request storage is borrowed.
+// File/archive device linking, used by nvcc. Request storage is borrowed.
 namespace cudavm {
 struct compiler_link_request {
     uint32_t abi_version;

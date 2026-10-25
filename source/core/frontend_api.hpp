@@ -1,7 +1,7 @@
 #pragma once
 #include "result_api.hpp"
 
-// AOT CUDA translation units and SDK resource discovery, used by NVRTC build extensions and nvcc. Request storage is borrowed.
+// AOT CUDA translation units and SDK resource discovery, used by nvcc. Request storage is borrowed.
 namespace cudavm {
 struct compiler_translation_unit_request {
     uint32_t abi_version;

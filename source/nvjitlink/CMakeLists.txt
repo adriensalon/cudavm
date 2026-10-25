@@ -1,4 +1,4 @@
-cudavm_add_component(nvjitlink linker_api.cpp nvjitlink_api.cpp)
+cudavm_add_component(nvjitlink nvjitlink_api.cpp)
 set(cudavm_install_targets ${cudavm_install_targets} PARENT_SCOPE)
 foreach(linkage shared static)
     if(TARGET cudavm_nvjitlink_${linkage})

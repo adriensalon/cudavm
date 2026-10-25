@@ -38,7 +38,7 @@ std::filesystem::path module_directory() {
 #endif
 }
 frontend_resources installed(const std::filesystem::path& include) {
-    for (const char* required : {"cudart/cuda_runtime.h", "nvcc/crt/host_defines.h", "cuda/cuda.h", "nvrtc/cudavm_nvrtc.h"}) {
+    for (const char* required : {"cudart/cuda_runtime.h", "nvcc/crt/host_defines.h", "cuda/cuda.h"}) {
         if (!std::filesystem::is_regular_file(include / required))
             throw std::runtime_error("installed SDK public header is unavailable: " + (include / required).string());
     }
@@ -56,7 +56,7 @@ frontend_resources resolve_resources(const std::string& root) {
         // The existing CMake package distinguishes an SDK from a nearby source
         // checkout's include tree. No compiler resource manifest is needed.
         if (std::filesystem::is_regular_file(module / package)
-                && std::filesystem::is_regular_file(candidate / "nvrtc/cudavm_nvrtc.h")) return installed(candidate);
+                && std::filesystem::is_regular_file(candidate / "cudart/cuda_runtime.h")) return installed(candidate);
     }
     std::error_code error;
     if (!std::filesystem::equivalent(module, std::filesystem::path(CUDAVM_BUILD_MODULE_DIR), error)
