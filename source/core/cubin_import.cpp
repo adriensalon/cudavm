@@ -132,6 +132,7 @@ std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
                     cubin_check(format == 4 && size == 4, "invalid producer information");
                     cubin_check(record.number(0) == (attr == 0x36 ? 1u : 124u), "unsupported producer information", true);
                 } else if (attr == 0x1b) cubin_check(format == 3, "invalid register limit");
+                else if (attr == 0x4) cubin_check(format == 1 && size == 0, "invalid CTAID.Z usage record");
                 else if (attr == 0x1c) {
                     cubin_check(format == 4 && size % 4 == 0, "invalid exit offsets");
                     for (unsigned offset = 0; offset < size; offset += 4)
@@ -187,7 +188,14 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
     output += "){ .reg .b32 %r<255>,%scratch; .reg .b64 %a,%b; .reg .pred %p0;\n";
     std::array<std::optional<uint32_t>, 256> known{}; known[255] = 0;
     auto reg = [&](unsigned id) { cubin_check(id != 1, "stack-register use is unsupported", true); return id == 255 ? std::string("0") : "%r" + std::to_string(id); };
-    auto parameter_load = [&](unsigned dest, unsigned offset, unsigned size, const std::string& guard) {
+    auto constant_load = [&](unsigned dest, unsigned offset, unsigned size, const std::string& guard) {
+        // CUDA 12.4's SM75 launch ABI stores block and grid dimensions before
+        // the parameter area. Never treat other runtime-owned bank bytes as
+        // ordinary constants from the (zero-filled) ELF section.
+        if (size == 4 && offset < 24 && offset % 4 == 0) {
+            const char* dimensions[]{"%ntid.x", "%ntid.y", "%ntid.z", "%nctaid.x", "%nctaid.y", "%nctaid.z"};
+            return guard + "mov.u32 " + reg(dest) + "," + dimensions[offset / 4] + ";\n";
+        }
         cubin_check(offset >= kernel.base, "unsupported constant-bank read", true); offset -= kernel.base;
         for (unsigned i = 0; i < kernel.parameters.size(); ++i) {
             auto parameter = kernel.parameters[i];
@@ -218,44 +226,66 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         } else if (op == 0xa02 && hi == 0xf00 && (lo & 0xffc000ffff000000ull) == 0) {
             unsigned offset = unsigned(lo >> 40) * 4;
             if (pc == 0 && predicate == 7 && dest == 1 && offset == 0x28) { /* dead stack-pointer prologue; all reads of R1 reject */ }
-            else output += parameter_load(dest, offset, 4, guard);
+            else output += constant_load(dest, offset, 4, guard);
         } else if (op == 0xb82 && (hi == 0x800 || hi == 0xa00) && (lo & 0xffc000ff00000000ull) == 0) {
             if (!known[left]) fail("dynamic constant-bank indexing is unsupported");
             unsigned width = hi == 0xa00 ? 8 : 4;
-            output += parameter_load(dest, unsigned(lo >> 40) * 4 + *known[left], width, guard);
+            auto offset = uint64_t(unsigned(lo >> 40)) * 4 + *known[left];
+            if (offset > UINT32_MAX) fail("constant-bank offset overflow");
+            output += constant_load(dest, unsigned(offset), width, guard);
             if (width == 8) known[dest + 1].reset();
+        } else if (op == 0x919 && (lo >> 24) == 0 && (hi & ~uint64_t(0xff00)) == 0) {
+            unsigned special = unsigned(hi >> 8);
+            const char* component = special >= 0x21 && special <= 0x23 ? "%tid." :
+                special >= 0x25 && special <= 0x27 ? "%ctaid." : nullptr;
+            if (!component) fail("unsupported special register " + std::to_string(special));
+            unsigned axis = special >= 0x25 ? special - 0x25 : special - 0x21;
+            instruction = "mov.u32 " + reg(dest) + "," + component + "xyz"[axis] + ";";
         } else if ((op == 0x381 && hi == 0x1ee900) || (op == 0x386 && hi == 0x10e900)) {
             if (left >= 254) fail("unsupported extended address register");
+            if (op == 0x386 && dest != 0) fail("unsupported global store modifier");
             output += guard + "cvt.u64.u32 %a," + reg(left) + ";\n" + guard + "cvt.u64.u32 %b," + reg(left + 1) + ";\n" +
                 guard + "shl.b64 %b,%b,32;\n" + guard + "or.b64 %a,%a,%b;\n";
-            auto displacement = int32_t(lo >> 32);
+            // STG puts the source in bits 32..39 and its signed displacement
+            // in bits 40..63; LDG uses the full high word for displacement.
+            auto displacement = op == 0x381 ? int32_t(lo >> 32) : int32_t(lo >> 32) >> 8;
             auto address = "[%a" + std::string(displacement < 0 ? "-" : "+") + std::to_string(displacement < 0 ? -int64_t(displacement) : displacement) + "]";
-            instruction = op == 0x381 ? "ld.global.u32 " + reg(dest) + "," + address + ";" : "st.global.u32 " + address + "," + reg(dest) + ";";
-        } else if (op == 0x810 && hi == 0x7f1e0ff && predicate == 7) {
-            // IADD3 Rd, P0, Ra, imm32, RZ: retain the carry used by the
+            instruction = op == 0x381 ? "ld.global.u32 " + reg(dest) + "," + address + ";" : "st.global.u32 " + address + "," + reg(right) + ";";
+        } else if ((op == 0x210 || op == 0x810) && hi == 0x7f1e0ff && predicate == 7 && (op == 0x810 || !(lo >> 40))) {
+            // IADD3 Rd, P0, Ra, Rb/imm32, RZ: retain the carry used by the
             // following IADD3.X when ptxas forms a 64-bit address.
-            output += "cvt.u64.u32 %a," + reg(left) + ";\nadd.u64 %a,%a," + std::to_string(uint32_t(lo >> 32)) + ";\n"
+            output += "cvt.u64.u32 %a," + reg(left) + ";\ncvt.u64.u32 %b," +
+                (op == 0x210 ? reg(right) : std::to_string(uint32_t(lo >> 32))) + ";\nadd.u64 %a,%a,%b;\n"
                 "setp.gt.u64 %p0,%a,4294967295;\n";
             instruction = "cvt.u32.u64 " + reg(dest) + ",%a;";
-        } else if (op == 0x210 && hi == 0x7fe4ff && right == 255 && !(lo >> 40)) {
-            // IADD3.X Rd, Ra, RZ, RZ, P0, !PT.
-            output += guard + "selp.u32 %scratch,1,0,%p0;\n";
-            instruction = "add.u32 " + reg(dest) + "," + reg(left) + ",%scratch;";
+        } else if (op == 0x210 && hi == 0x7fe4ff && !(lo >> 40)) {
+            // IADD3.X Rd, Ra, Rb, RZ, P0, !PT.
+            output += guard + "selp.u32 %scratch,1,0,%p0;\n" + guard + "add.u32 %scratch,%scratch," + reg(left) + ";\n";
+            instruction = "add.u32 " + reg(dest) + ",%scratch," + reg(right) + ";";
         } else if ((op == 0x210 || op == 0x810) && (hi & ~uint64_t(255)) == 0x7ffe000) {
             if (op == 0x210 && (lo >> 40)) fail("unsupported IADD3 register modifier");
             output += guard + "add.u32 %scratch," + reg(left) + "," + (op == 0x210 ? reg(right) : std::to_string(uint32_t(lo >> 32))) + ";\n";
             instruction = "add.u32 " + reg(dest) + ",%scratch," + reg(unsigned(hi) & 255) + ";";
-        } else if (op == 0x824 && (hi & ~uint64_t(255)) == 0x78e0000) {
-            instruction = "mad.lo.u32 " + reg(dest) + "," + reg(left) + "," + std::to_string(uint32_t(lo >> 32)) + "," + reg(unsigned(hi) & 255) + ";";
+        } else if ((op == 0x224 || op == 0x824 || op == 0x227 || op == 0x827) && (hi & ~uint64_t(255)) == 0x78e0000) {
+            bool immediate = (op & 0x800) != 0;
+            if (!immediate && (lo >> 40)) fail("unsupported IMAD register modifier");
+            bool high_product = op == 0x227 || op == 0x827;
+            if (high_product && (hi & 255) != 255) fail("unsupported IMAD high-product addend");
+            instruction = std::string(high_product ? "mad.hi.u32 " : "mad.lo.u32 ") + reg(dest) + "," + reg(left) + "," +
+                (immediate ? std::to_string(uint32_t(lo >> 32)) : reg(right)) + "," + reg(unsigned(hi) & 255) + ";";
         } else if (op == 0x20c && hi == 0x3f01070 && dest == 0 && !(lo >> 40)) {
             instruction = "setp.lt.u32 %p0," + reg(left) + "," + reg(right) + ";";
+        } else if (op == 0x81c && hi == 0x70e170 && !(lo >> 16)) {
+            // The checked PLOP3.LUT P0, PT, P0, PT, PT, 0x8, 0x0 form
+            // inverts P0 before a conditional EXIT. Other truth tables reject.
+            instruction = "not.pred %p0,%p0;";
         } else if (op == 0x947 && (hi & ~uint64_t(0x3ffff)) == 0x3800000 && (lo & 0xffff0000) == 0) {
             instruction = "bra L" + std::to_string(branch_target(pc, lo, hi)) + ";";
         } else if (op == 0x94d && hi == 0x3800000 && !(lo >> 16)) instruction = "ret;";
         else if (op == 0x918 && hi == 0 && !(lo >> 16)) { }
         else fail("unsupported SM75 instruction encoding " + std::to_string(lo) + "/" + std::to_string(hi));
         if (!instruction.empty()) output += guard + instruction + "\n";
-        if (op != 0x386 && op != 0x947 && op != 0x94d && op != 0x918 && op != 0x20c)
+        if (op != 0x386 && op != 0x947 && op != 0x94d && op != 0x918 && op != 0x20c && op != 0x81c)
             known[dest] = predicate == 7 ? constant : std::nullopt;
     }
     // ptxas pads the section with unreachable NOPs after its exit/stop loop.
