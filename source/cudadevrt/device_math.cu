@@ -1,5 +1,15 @@
 #include "device_numeric.cu"
 #include "device_half.cu"
+extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_umulhi32(unsigned a,unsigned b) {return cudavm::cvMulHi(a,b);}
+extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_smulhi32(unsigned a,unsigned b) {return cudavm::cvSMulHi32(a,b);}
+extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_umulhi64(unsigned long long a,unsigned long long b) {
+    auto result=cudavm::cvMulHi64(cudavm::cvMake(unsigned(a),unsigned(a>>32)),cudavm::cvMake(unsigned(b),unsigned(b>>32)));
+    return (static_cast<unsigned long long>(result.hi)<<32)|result.lo;
+}
+extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_smulhi64(unsigned long long a,unsigned long long b) {
+    auto result=cudavm::cvSMulHi64(cudavm::cvMake(unsigned(a),unsigned(a>>32)),cudavm::cvMake(unsigned(b),unsigned(b>>32)));
+    return (static_cast<unsigned long long>(result.hi)<<32)|result.lo;
+}
 #pragma clang system_header
 #define CV_MATH_FN __device__ inline
 #define CV_MATH_PRECISE

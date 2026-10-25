@@ -49,7 +49,8 @@ bool supported_nvvm_intrinsic(const llvm::Function& function) {
         if (name.starts_with(prefix)) return true;
     for (auto exact : {"llvm.nvvm.read.ptx.sreg.warpsize", "llvm.nvvm.read.ptx.sreg.laneid", "llvm.nvvm.barrier0",
             "llvm.nvvm.barrier0.popc", "llvm.nvvm.barrier0.and", "llvm.nvvm.barrier0.or", "llvm.nvvm.activemask",
-            "llvm.nvvm.bar.warp.sync", "llvm.nvvm.membar.cta", "llvm.nvvm.membar.gl", "llvm.nvvm.membar.sys"})
+            "llvm.nvvm.bar.warp.sync", "llvm.nvvm.membar.cta", "llvm.nvvm.membar.gl", "llvm.nvvm.membar.sys",
+            "llvm.nvvm.isspacep.global", "llvm.nvvm.isspacep.const", "llvm.nvvm.isspacep.shared", "llvm.nvvm.isspacep.local"})
         if (name == exact) return true;
     for (const auto& conversion : device_conversions) if (name == conversion.intrinsic) return true;
     for (const auto& conversion : double_conversions) if (name == conversion.intrinsic) return true;

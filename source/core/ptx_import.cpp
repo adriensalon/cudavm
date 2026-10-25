@@ -918,6 +918,22 @@ class ptx_parser {
                     builder.CreateAlignedStore(call, slot(outputs[i], signature.second[i], true), llvm::Align(signature.second[i].alignment));
                 }
             }
+            else if (parts[0] == "isspacep") {
+                arity(2);
+                if (parts.size() != 2 || (parts[1] != "global" && parts[1] != "const" && parts[1] != "shared" && parts[1] != "local"))
+                    ptx_fail(opcode, "unsupported address space query", true);
+                unsigned width = 64;
+                const auto& address = instruction.operands[1];
+                if (address.size() == 1 && registers.contains(address[0].text)) width = reg(address[0]).type.bits;
+                if (width != 32 && width != 64) ptx_fail(opcode, "address space query requires a 32- or 64-bit address");
+                auto* source_address = operand(1, {width, 'u'});
+                if (width == 32) ptx_fail(opcode, "32-bit generic address queries require separate lowering", true);
+                auto* bits = builder.CreateZExtOrTrunc(source_address, builder.getInt64Ty());
+                auto* pointer = builder.CreateIntToPtr(bits, llvm::PointerType::get(context, 0));
+                auto callee = module->getOrInsertFunction("llvm.nvvm.isspacep." + parts[1],
+                    llvm::FunctionType::get(builder.getInt1Ty(), {pointer->getType()}, false));
+                write(instruction.operands[0], builder.CreateCall(callee, {pointer}), {1, 'p'});
+            }
             else if (parts.size() >= 2) {
                 const auto& op = parts[0];
                 auto type = ptx_scalar({parts.back(), opcode.line, opcode.column}, op == "ld" || op == "st");
@@ -1033,16 +1049,46 @@ class ptx_parser {
                     arity(2); write(instruction.operands[0], operand(1, type), type);
                 } else if (op == "selp" && parts.size() == 2) {
                     arity(4); write(instruction.operands[0], builder.CreateSelect(operand(3, {1, 'p'}), operand(1, type), operand(2, type)), type);
+                } else if ((op == "min" || op == "max" || op == "div" || op == "rem") && parts.size() == 2 &&
+                        (type.kind == 's' || type.kind == 'u') && type.bits >= 16) {
+                    arity(3); auto* left = operand(1, type); auto* right = operand(2, type);
+                    if (op == "min" || op == "max") {
+                        auto predicate = type.signed_integer() ? (op == "min" ? llvm::CmpInst::ICMP_SLT : llvm::CmpInst::ICMP_SGT) :
+                            (op == "min" ? llvm::CmpInst::ICMP_ULT : llvm::CmpInst::ICMP_UGT);
+                        value = builder.CreateSelect(builder.CreateICmp(predicate, left, right), left, right);
+                    } else {
+                        // PTX zero-divisor results are unspecified. Keep those
+                        // values local instead of introducing LLVM poison; also
+                        // guard the signed minimum/-1 overflow case.
+                        auto* zero = llvm::ConstantInt::get(type.storage(context), 0);
+                        auto* invalid = builder.CreateICmpEQ(right, zero);
+                        if (type.signed_integer()) invalid = builder.CreateOr(invalid, builder.CreateAnd(
+                            builder.CreateICmpEQ(left, llvm::ConstantInt::get(context, llvm::APInt::getSignedMinValue(type.bits))),
+                            builder.CreateICmpEQ(right, llvm::ConstantInt::getSigned(type.storage(context), -1))));
+                        auto* safe = builder.CreateSelect(invalid, llvm::ConstantInt::get(type.storage(context), 1), right);
+                        value = type.signed_integer() ? (op == "div" ? builder.CreateSDiv(left, safe) : builder.CreateSRem(left, safe)) :
+                            (op == "div" ? builder.CreateUDiv(left, safe) : builder.CreateURem(left, safe));
+                    }
+                    write(instruction.operands[0], value, type);
                 } else if ((op == "mul" || op == "mad") && parts.size() == 3 && (type.kind == 's' || type.kind == 'u') &&
-                        (parts[1] == "lo" || (parts[1] == "wide" && type.bits == 32))) {
+                        (parts[1] == "lo" || (parts[1] == "hi" && type.bits >= 16) || (parts[1] == "wide" && (type.bits == 16 || type.bits == 32)))) {
                     arity(op == "mad" ? 4 : 3); auto* left = operand(1, type); auto* right = operand(2, type);
                     auto result_type = type;
-                    if (parts[1] == "wide") {
-                        result_type.bits *= 2;
-                        left = type.signed_integer() ? builder.CreateSExt(left, result_type.storage(context)) : builder.CreateZExt(left, result_type.storage(context));
-                        right = type.signed_integer() ? builder.CreateSExt(right, result_type.storage(context)) : builder.CreateZExt(right, result_type.storage(context));
+                    if (parts[1] == "hi" && type.bits >= 32) {
+                        auto name = std::string("llvm.nvvm.mulhi.") + (type.bits == 64 ? (type.signed_integer() ? "ll" : "ull") : (type.signed_integer() ? "i" : "ui"));
+                        value = builder.CreateCall(module->getOrInsertFunction(name,
+                            llvm::FunctionType::get(type.storage(context), {left->getType(), right->getType()}, false)), {left, right});
+                    } else if (parts[1] == "hi") {
+                        auto extend = [&](llvm::Value* input) { return type.signed_integer() ? builder.CreateSExt(input, builder.getInt32Ty()) : builder.CreateZExt(input, builder.getInt32Ty()); };
+                        value = builder.CreateTrunc(builder.CreateLShr(builder.CreateMul(extend(left), extend(right)), 16), type.storage(context));
+                    } else {
+                        if (parts[1] == "wide") {
+                            result_type.bits *= 2;
+                            left = type.signed_integer() ? builder.CreateSExt(left, result_type.storage(context)) : builder.CreateZExt(left, result_type.storage(context));
+                            right = type.signed_integer() ? builder.CreateSExt(right, result_type.storage(context)) : builder.CreateZExt(right, result_type.storage(context));
+                        }
+                        value = builder.CreateMul(left, right);
                     }
-                    value = builder.CreateMul(left, right);
                     if (op == "mad") value = builder.CreateAdd(value, operand(3, result_type));
                     write(instruction.operands[0], value, result_type);
                 } else if ((op == "add" || op == "sub" || op == "mul") && type.kind == 'f' &&

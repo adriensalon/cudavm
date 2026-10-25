@@ -170,6 +170,15 @@ void scalar_math(llvm::Module& module) {
             for(const auto& conversion:double_conversions) if(name==conversion.intrinsic)
                 if(auto* helper=numeric("f64_to_f32")) replacement=builder.CreateBitCast(builder.CreateCall(helper,{bits(call->getArgOperand(0)),builder.getInt32(conversion.mode)}),builder.getFloatTy());
         }
+        if (auto* call = llvm::dyn_cast<llvm::CallInst>(instruction)) if (auto* function = call->getCalledFunction()) {
+            auto name = function->hasFnAttribute("cudavm.cuda.origin") ? function->getFnAttribute("cudavm.cuda.origin").getValueAsString() : function->getName();
+            for (auto suffix : {"i", "ui", "ll", "ull"}) if (name == std::string("llvm.nvvm.mulhi.") + suffix) {
+                bool wide = std::string_view(suffix).ends_with("ll"), unsign = std::string_view(suffix).starts_with('u');
+                auto* helper = numeric(std::string(unsign ? "umulhi" : "smulhi") + (wide ? "64" : "32"));
+                if (!helper || helper->isDeclaration()) throw std::runtime_error("missing high multiplication helper");
+                replacement = builder.CreateCall(helper, {call->getArgOperand(0), call->getArgOperand(1)});
+            }
+        }
         if (replacement) { instruction->replaceAllUsesWith(replacement); instruction->eraseFromParent(); }
     }
 }
@@ -531,6 +540,31 @@ struct lowering {
         auto* binding = b.CreateZExt(packet(b.CreateAdd(row, b.getInt32(6))), b.getInt64Ty());
         b.CreateRet(b.CreateOr(offset, b.CreateShl(binding, b.getInt64(packet_binding_shift))));
         b.SetInsertPoint(absent); b.CreateRet(b.getInt64(0));
+    }
+    llvm::Value* constant_pointer(llvm::Value* address) {
+        auto* query = result->getFunction("cudavm.pointer.constant");
+        if (!query) {
+            auto saved = b.saveIP();
+            query = llvm::Function::Create(llvm::FunctionType::get(b.getInt32Ty(), arguments({b.getInt32Ty(), b.getInt32Ty()}), false),
+                llvm::GlobalValue::InternalLinkage, "cudavm.pointer.constant", *result);
+            auto* first = llvm::BasicBlock::Create(b.getContext(), "entry", query);
+            b.SetInsertPoint(first);
+            auto* query_address = pair(query->getArg(0), query->getArg(1));
+            llvm::Value* matches = b.getFalse();
+            // Constant windows belong to the executing module. An exported
+            // generic pointer from another module can be a global alias even
+            // when that module initialized it through cvta.const.
+            for (const auto& [global, index] : globals) if (global->getAddressSpace() == 4) {
+                auto* base = value(global);
+                auto bytes = dl.getTypeAllocSize(global->getValueType()).getFixedValue();
+                auto* within = b.CreateAnd(b.CreateICmpUGE(query_address, base),
+                    b.CreateICmpULE(b.CreateSub(query_address, base), b.getInt64(bytes)));
+                matches = b.CreateOr(matches, within);
+            }
+            b.CreateRet(b.CreateZExt(matches, b.getInt32Ty()));
+            b.restoreIP(saved);
+        }
+        return b.CreateICmpNE(call_helper(query, {address}), b.getInt32(0));
     }
     llvm::Function* make_access(bool store) {
         auto base = store ? std::vector<llvm::Type*>{b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()}
@@ -1230,6 +1264,20 @@ struct lowering {
             fail(instruction,"remaining half operation requires explicit native shader lowering");
         auto name = function->hasFnAttribute("cudavm.cuda.origin") ? function->getFnAttribute("cudavm.cuda.origin").getValueAsString() : function->getName();
         if(auto operation=native_collective(name);operation>=0) return collective(instruction,unsigned(operation));
+        if (name.starts_with("llvm.nvvm.isspacep.")) {
+            if (instruction.arg_size() != 1 || !instruction.getArgOperand(0)->getType()->isPointerTy() || !instruction.getType()->isIntegerTy(1))
+                fail(instruction, "invalid CUDA address space query");
+            auto* address = value(instruction.getArgOperand(0));
+            auto* tag = b.CreateAnd(address, b.getInt64(0xffffffffc0000000ull));
+            auto* shared = b.CreateICmpEQ(tag, b.getInt64(0xffffffff40000000ull));
+            auto* local = b.CreateICmpEQ(tag, b.getInt64(0xffffffff80000000ull));
+            if (name == "llvm.nvvm.isspacep.shared") return shared;
+            if (name == "llvm.nvvm.isspacep.local") return local;
+            auto* constant = constant_pointer(address);
+            if (name == "llvm.nvvm.isspacep.const") return constant;
+            if (name == "llvm.nvvm.isspacep.global") return b.CreateNot(b.CreateOr(b.CreateOr(shared, local), constant));
+            fail(instruction, "unsupported CUDA address space query");
+        }
         if(name=="llvm.nvvm.membar.cta" || name=="llvm.nvvm.membar.gl") {
             auto scope=b.getContext().getOrInsertSyncScopeID(name.ends_with("cta")?"workgroup":"device");
             if(opencl) memory_fence(llvm::AtomicOrdering::SequentiallyConsistent,scope);
@@ -1762,6 +1810,13 @@ std::unique_ptr<llvm::Module> prepare_native_shader_module(const llvm::Module& i
         replacement->copyAttributesFrom(global); replacement->takeName(global);
         global->replaceAllUsesWith(llvm::ConstantExpr::getAddrSpaceCast(replacement, global->getType())); global->eraseFromParent();
     }
+    lower_shader_half(*module);
+    lower_half_math_intrinsics(*module);
+    scalar_math(*module);
+    // Scalarize helper aggregates while their copies are still intrinsics.
+    // Expanding those copies first leaves byte loops over private storage in
+    // otherwise register-only integer arithmetic.
+    optimize(*module);
     std::vector<llvm::MemIntrinsic*> memory_operations;
     for (auto& function : *module) for (auto& block : function) for (auto& instruction : block)
         if (auto* memory = llvm::dyn_cast<llvm::MemIntrinsic>(&instruction)) memory_operations.push_back(memory);
@@ -1774,9 +1829,6 @@ std::unique_ptr<llvm::Module> prepare_native_shader_module(const llvm::Module& i
         else throw std::runtime_error("unsupported device memory intrinsic");
         memory->eraseFromParent();
     }
-    lower_shader_half(*module);
-    lower_half_math_intrinsics(*module);
-    scalar_math(*module);
     optimize(*module);
     while (lower_local_calls(*module)) optimize(*module);
     lower_shader_calls(*module);
