@@ -240,6 +240,8 @@ bool same_alias_attributes(llvm::AttributeList a, llvm::AttributeList b, unsigne
     return true;
 }
 bool same_alias_abi(const llvm::Function& a, const llvm::Function& b) {
+    auto a_ptx = a.getFnAttribute("cudavm.ptx.signature"), b_ptx = b.getFnAttribute("cudavm.ptx.signature");
+    if (a_ptx.isValid() && b_ptx.isValid() && a_ptx.getValueAsString() != b_ptx.getValueAsString()) return false;
     // Clang represents an unimplemented __global__ prototype with C convention
     // and assigns PTX_Kernel only to its definition. It is still a launch ABI.
     auto kernel = [](const llvm::Function& f) {

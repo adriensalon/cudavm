@@ -196,7 +196,7 @@ bool lower_local_calls(llvm::Module& module) {
         std::function<bool(llvm::Value*)> collect = [&](llvm::Value* value) {
             if (!visited.insert(value).second) return true;
             if (auto* target = llvm::dyn_cast<llvm::Function>(value)) {
-                if (target->isDeclaration() || target->getFunctionType() != call->getFunctionType() || !llvm::isLegalToPromote(*call, target)) return false;
+                if (target->isDeclaration() || target->getFunctionType() != call->getFunctionType() || !shader_call_signature_matches(*call, *target) || !llvm::isLegalToPromote(*call, target)) return false;
                 if (std::find(targets.begin(), targets.end(), target) == targets.end()) targets.push_back(target);
                 return true;
             }

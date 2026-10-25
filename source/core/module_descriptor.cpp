@@ -69,6 +69,12 @@ struct global_initializer {
             auto* address=expression->getOperand(0);
             if(!type->isIntegerTy(64) || dl.getPointerTypeSizeInBits(address->getType())!=64
                 || dl.isNonIntegralPointerType(address->getType()))fail(*c);
+            // PTX function tables store integer addresses. Token replacement
+            // can leave the inverse casts explicit in constant initializers.
+            if (auto* cast=llvm::dyn_cast<llvm::ConstantExpr>(address); cast && cast->getOpcode()==llvm::Instruction::IntToPtr)
+                if (auto* bits=llvm::dyn_cast<llvm::ConstantInt>(cast->getOperand(0)); bits && bits->getBitWidth()==64) {
+                    scalar(bits->getZExtValue(),8,offset);return;
+                }
             relocate(address,offset);return;
         }
         if (auto* expression=llvm::dyn_cast<llvm::ConstantExpr>(c); expression && expression->getOpcode()==llvm::Instruction::IntToPtr) {

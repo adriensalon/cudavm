@@ -16,6 +16,17 @@
 
 namespace cudavm {
 inline constexpr uint64_t shader_function_address_base = uint64_t(packet_function_high_word) << 32;
+inline bool shader_call_signature_matches(const llvm::CallInst& call, const llvm::Function& function) {
+    auto signature = call.getFnAttr("cudavm.ptx.signature");
+    auto target_signature = function.getFnAttribute("cudavm.ptx.signature");
+    if (signature.isValid() && (!target_signature.isValid() || signature.getValueAsString() != target_signature.getValueAsString())) return false;
+    if (auto* targets = call.getMetadata("callees"))
+        return llvm::any_of(targets->operands(), [&](const auto& operand) {
+            auto* value = llvm::dyn_cast_or_null<llvm::ValueAsMetadata>(operand.get());
+            return value && value->getValue() == &function;
+        });
+    return true;
+}
 inline bool shader_native_helper(const llvm::Function& function) {
     return function.hasFnAttribute("cudavm.math") || function.hasFnAttribute("cudavm.service.helper") || function.getName().starts_with("_ZN13cudavm")
         || function.getName().starts_with("__cudavm_native_");
@@ -90,12 +101,13 @@ struct shader_call_lowering {
     std::vector<llvm::Function*> targets(llvm::CallInst& call) {
         if (call.isInlineAsm()) return {};
         if (auto* function = call.getCalledFunction()) {
+            if (!shader_call_signature_matches(call, *function)) throw std::runtime_error("PTX call target signature mismatch");
             if (function->isDeclaration() || shader_native_helper(*function)) return {};
             return {function};
         }
         std::vector<llvm::Function*> result;
         for (auto& function : module) if (address_taken.contains(&function) && !function.isVarArg()
-            && function.getFunctionType() == call.getFunctionType() && llvm::isLegalToPromote(call, &function))
+            && function.getFunctionType() == call.getFunctionType() && shader_call_signature_matches(call, function) && llvm::isLegalToPromote(call, &function))
             result.push_back(&function);
         return result;
     }
@@ -303,6 +315,10 @@ inline void lower_shader_calls(llvm::Module& module) {
             if (function.hasAddressTaken(nullptr, false, true, true)) address_taken.insert(&function);
         }
     }
+    for (auto& function : module) for (auto& instruction : llvm::instructions(function))
+        if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction)) if (auto* targets = call->getMetadata("callees"))
+            for (auto& operand : targets->operands()) if (auto* value = llvm::dyn_cast_or_null<llvm::ValueAsMetadata>(operand.get()))
+                if (auto* target = llvm::dyn_cast<llvm::Function>(value->getValue()); target && !target->isDeclaration()) address_taken.insert(target);
     for (auto* kernel : kernels) {
         bool needed = false;
         for (auto& instruction : llvm::instructions(kernel)) if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction); call && !call->isInlineAsm()) {
