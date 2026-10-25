@@ -5,6 +5,7 @@
 #include "device_services.hpp"
 #include "device_conversions.hpp"
 #include "ptx_import.hpp"
+#include "integer_ir.hpp"
 
 #include <map>
 #include <tuple>
@@ -1264,6 +1265,15 @@ struct lowering {
             fail(instruction,"remaining half operation requires explicit native shader lowering");
         auto name = function->hasFnAttribute("cudavm.cuda.origin") ? function->getFnAttribute("cudavm.cuda.origin").getValueAsString() : function->getName();
         if(auto operation=native_collective(name);operation>=0) return collective(instruction,unsigned(operation));
+        if (name == "llvm.nvvm.prmt" || name.starts_with("llvm.nvvm.prmt.")) {
+            auto mode = name == "llvm.nvvm.prmt" ? std::string{} : name.drop_front(15).str();
+            bool pair = mode.empty() || mode == "f4e" || mode == "b4e";
+            if (!byte_permutation_mode(mode) || instruction.arg_size() != (pair ? 3u : 2u) || !instruction.getType()->isIntegerTy(32) ||
+                    llvm::any_of(instruction.args(), [](const auto& argument) { return !argument->getType()->isIntegerTy(32); }))
+                fail(instruction, "invalid CUDA byte permutation");
+            return byte_permutation_ir(b, value(instruction.getArgOperand(0)), pair ? value(instruction.getArgOperand(1)) : b.getInt32(0),
+                value(instruction.getArgOperand(pair ? 2 : 1)), mode);
+        }
         if (name.starts_with("llvm.nvvm.isspacep.")) {
             if (instruction.arg_size() != 1 || !instruction.getArgOperand(0)->getType()->isPointerTy() || !instruction.getType()->isIntegerTy(1))
                 fail(instruction, "invalid CUDA address space query");
@@ -1433,13 +1443,18 @@ struct lowering {
                 auto* integer_type = llvm::dyn_cast<llvm::IntegerType>(instruction.getType());
                 unsigned bits = integer_type ? integer_type->getBitWidth() : 0;
                 auto storage = integer_type ? type(integer_type)->getIntegerBitWidth() : 0;
-                if (integer_type && bits > 1 && bits < storage && (id == llvm::Intrinsic::fshl || id == llvm::Intrinsic::fshr)) {
+                if (integer_type && bits > 1 && (id == llvm::Intrinsic::fshl || id == llvm::Intrinsic::fshr)) {
                     auto* width = llvm::ConstantInt::get(type(integer_type), bits);
                     auto* shift = b.CreateURem(args[2], width);
-                    auto* complement = b.CreateSub(width, shift);
-                    return canonical(id == llvm::Intrinsic::fshl
+                    auto* complement = b.CreateURem(b.CreateSub(width, shift), width);
+                    auto* value = id == llvm::Intrinsic::fshl
                         ? b.CreateOr(b.CreateShl(args[0], shift), b.CreateLShr(args[1], complement))
-                        : b.CreateOr(b.CreateShl(args[0], complement), b.CreateLShr(args[1], shift)), integer_type);
+                        : b.CreateOr(b.CreateShl(args[0], complement), b.CreateLShr(args[1], shift));
+                    // Target funnel expansion must not shift a word by its own
+                    // width. In particular SPIR-V's masked shift can otherwise
+                    // OR both source words together for a zero/wrapped count.
+                    return canonical(b.CreateSelect(b.CreateICmpEQ(shift, llvm::ConstantInt::get(shift->getType(), 0)),
+                        id == llvm::Intrinsic::fshl ? args[0] : args[1], value), integer_type);
                 }
                 if (integer_type && id == llvm::Intrinsic::abs) args[0] = signed_value(instruction.getArgOperand(0));
                 if (!opencl && !dxil && storage == 64

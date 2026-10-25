@@ -1,6 +1,7 @@
 #include "ptx_import.hpp"
 #include "compiler.hpp"
 #include "compiler_profiles.hpp"
+#include "integer_ir.hpp"
 #include <algorithm>
 #include <cctype>
 #include <functional>
@@ -539,6 +540,142 @@ class ptx_parser {
         }
         return false;
     }
+    llvm::Value* high_product(llvm::IRBuilder<>& b, llvm::Value* left, llvm::Value* right, ptx_type type) {
+        if (type.bits == 16) {
+            auto extend = [&](llvm::Value* value) { return type.signed_integer() ? b.CreateSExt(value, b.getInt32Ty()) : b.CreateZExt(value, b.getInt32Ty()); };
+            return b.CreateTrunc(b.CreateLShr(b.CreateMul(extend(left), extend(right)), 16), type.storage(context));
+        }
+        auto name = std::string("llvm.nvvm.mulhi.") + (type.bits == 64 ? (type.signed_integer() ? "ll" : "ull") : (type.signed_integer() ? "i" : "ui"));
+        return b.CreateCall(module->getOrInsertFunction(name,
+            llvm::FunctionType::get(type.storage(context), {left->getType(), right->getType()}, false)), {left, right});
+    }
+    template<class Read, class Write> bool integer_instruction(const std::vector<std::string>& parts,
+            const ptx_instruction& instruction, llvm::IRBuilder<>& b, Read read, Write write, llvm::AllocaInst* carry) {
+        const auto& op = parts[0]; const auto& operands = instruction.operands; const auto& opcode = instruction.opcode;
+        auto arity = [&](unsigned count) { if (operands.size() != count) ptx_fail(opcode, "wrong operand count"); };
+        auto operand = [&](unsigned index, ptx_type type) { return read(operands.at(index), type); };
+        auto unsupported = [&] { ptx_fail(opcode, "unsupported integer instruction or modifier", true); };
+        bool cc = std::find(parts.begin(), parts.end(), "cc") != parts.end();
+        if (op == "addc" || op == "subc" || op == "madc" || (cc && (op == "add" || op == "sub" || op == "mad"))) {
+            bool multiply = op == "mad" || op == "madc", input_carry = op == "addc" || op == "subc" || op == "madc";
+            if (parts.size() != 2u + unsigned(multiply) + unsigned(cc) ||
+                    (cc && parts[parts.size() - 2] != "cc") ||
+                    (multiply && parts[1] != "lo" && parts[1] != "hi")) unsupported();
+            auto type = ptx_scalar({parts.back(), opcode.line, opcode.column});
+            if ((type.kind != 'u' && type.kind != 's') || (type.bits != 32 && type.bits != 64)) unsupported();
+            arity(multiply ? 4 : 3);
+            auto* left = operand(1, type); auto* right = operand(2, type);
+            if (multiply) {
+                left = parts[1] == "hi" ? high_product(b, left, right, type) : b.CreateMul(left, right);
+                right = operand(3, type);
+            }
+            bool subtract = op == "sub" || op == "subc";
+            auto* value = subtract ? b.CreateSub(left, right) : b.CreateAdd(left, right);
+            llvm::Value* overflow = subtract ? b.CreateICmpULT(left, right) : b.CreateICmpULT(value, left);
+            if (input_carry) {
+                auto* flag = b.CreateLoad(b.getInt1Ty(), carry);
+                // NVIDIA uses a carry/no-borrow encoding for CC.CF. Subc
+                // consumes its complement; mixed add/sub chains observe the
+                // same flag, rather than two independently named states.
+                auto* incoming = b.CreateZExt(subtract ? b.CreateNot(flag) : flag, type.storage(context));
+                auto* final = subtract ? b.CreateSub(value, incoming) : b.CreateAdd(value, incoming);
+                overflow = b.CreateOr(overflow, subtract ? b.CreateICmpULT(value, incoming) : b.CreateICmpULT(final, value));
+                value = final;
+            }
+            if (cc) b.CreateStore(subtract ? b.CreateNot(overflow) : overflow, carry);
+            write(operands[0], value, type);
+            return true;
+        }
+        if (op == "prmt") {
+            if (parts.size() < 2 || parts[1] != "b32" || parts.size() > 3) unsupported();
+            auto mode = parts.size() == 3 ? parts[2] : "";
+            if (!byte_permutation_mode(mode)) unsupported();
+            arity(4);
+            auto* low = operand(1, {32, 'b'}); auto* high = operand(2, {32, 'b'}); auto* control = operand(3, {32, 'b'});
+            write(operands[0], byte_permutation_ir(b, low, high, control, mode), {32, 'b'}); return true;
+        }
+        if (op == "lop3") {
+            bool predicate = parts.size() == 3 && (parts[1] == "or" || parts[1] == "and");
+            if (parts != std::vector<std::string>{"lop3", "b32"} && !(predicate && parts[2] == "b32")) unsupported();
+            if (predicate && (source_version < 82 || source_sm < 70)) ptx_fail(opcode, "predicate lop3 requires PTX 8.2 and SM 70", true);
+            arity(predicate ? 6 : 5);
+            const auto& literal = operands[4];
+            if (literal.size() != 1 || !std::isdigit(static_cast<unsigned char>(literal[0].text[0]))) ptx_fail(opcode, "lop3 requires an immediate lookup table");
+            auto table = ptx_unsigned(literal[0]); if (table > 255) ptx_fail(literal[0], "lop3 lookup table exceeds 8 bits");
+            llvm::Value* nodes[8];
+            for (unsigned i = 0; i < 8; ++i) nodes[i] = b.getInt32(table & (1u << i) ? UINT32_MAX : 0);
+            for (unsigned level = 0; level < 3; ++level) {
+                auto* mask = operand(3 - level, {32, 'b'});
+                for (unsigned i = 0; i < (4u >> level); ++i) nodes[i] = nodes[i * 2] == nodes[i * 2 + 1] ? nodes[i * 2] :
+                    b.CreateOr(b.CreateAnd(b.CreateNot(mask), nodes[i * 2]), b.CreateAnd(mask, nodes[i * 2 + 1]));
+            }
+            if (!predicate) write(operands[0], nodes[0], {32, 'b'});
+            else {
+                const auto& destination = operands[0];
+                if (destination.size() != 3 || destination[1].text != "|") ptx_fail(opcode, "predicate lop3 requires paired destinations");
+                if (destination[2].text == "_") ptx_fail(opcode, "predicate lop3 requires a predicate destination");
+                auto* test = b.CreateICmpNE(nodes[0], b.getInt32(0)); auto* q = operand(5, {1, 'p'});
+                auto* result = parts[1] == "or" ? b.CreateOr(test, q) : b.CreateAnd(test, q);
+                if (destination[0].text != "_") write({destination[0]}, nodes[0], {32, 'b'});
+                write({destination[2]}, result, {1, 'p'});
+            }
+            return true;
+        }
+        if (op == "shf") {
+            if (parts.size() != 4 || (parts[1] != "l" && parts[1] != "r") ||
+                    (parts[2] != "wrap" && parts[2] != "clamp") || parts[3] != "b32") unsupported();
+            arity(4);
+            auto* low = operand(1, {32, 'b'}); auto* high = operand(2, {32, 'b'}); auto* shift = operand(3, {32, 'u'});
+            auto intrinsic = parts[1] == "l" ? llvm::Intrinsic::fshl : llvm::Intrinsic::fshr;
+            auto* native = llvm::Intrinsic::getOrInsertDeclaration(module.get(), intrinsic, {b.getInt32Ty()});
+            llvm::Value* value = b.CreateCall(native, {high, low, shift});
+            if (parts[2] == "clamp") value = b.CreateSelect(b.CreateICmpULT(shift, b.getInt32(32)), value, parts[1] == "l" ? low : high);
+            write(operands[0], value, {32, 'b'}); return true;
+        }
+        if (op != "bfe" && op != "bfi" && op != "brev" && op != "popc" && op != "clz" && op != "bfind" && op != "cnot") return false;
+        bool shift_amount = op == "bfind" && parts.size() == 3 && parts[1] == "shiftamt";
+        if (parts.size() != 2u + unsigned(shift_amount)) unsupported();
+        auto type = ptx_scalar({parts.back(), opcode.line, opcode.column});
+        bool integer = op == "bfe" || op == "bfind";
+        if ((integer ? (type.kind != 's' && type.kind != 'u') : type.kind != 'b') ||
+                (type.bits != 32 && type.bits != 64 && !(op == "cnot" && type.bits == 16))) unsupported();
+        arity(op == "bfe" ? 4 : op == "bfi" ? 5 : 2);
+        auto* input = operand(1, type); llvm::Value* value = nullptr;
+        if (op == "bfe" || op == "bfi") {
+            auto* position = b.CreateAnd(operand(op == "bfe" ? 2 : 3, {32, 'u'}), b.getInt32(255));
+            auto* length = b.CreateAnd(operand(op == "bfe" ? 3 : 4, {32, 'u'}), b.getInt32(255));
+            auto* bound = b.getInt32(type.bits); auto* zero = llvm::ConstantInt::get(type.storage(context), 0);
+            auto* position_valid = b.CreateICmpULT(position, bound);
+            auto* safe = b.CreateZExtOrTrunc(b.CreateSelect(position_valid, position, b.getInt32(type.bits - 1)), type.storage(context));
+            auto* bounded_length = b.CreateSelect(b.CreateICmpULT(length, bound), length, bound);
+            auto* padding = b.CreateZExtOrTrunc(b.CreateAnd(b.CreateSub(bound, bounded_length), b.getInt32(type.bits - 1)), type.storage(context));
+            auto* mask = b.CreateSelect(b.CreateICmpEQ(length, b.getInt32(0)), zero,
+                b.CreateLShr(llvm::ConstantInt::getAllOnesValue(type.storage(context)), padding));
+            if (op == "bfe") {
+                auto* shifted = type.signed_integer() ? b.CreateAShr(input, safe) : b.CreateLShr(input, safe);
+                if (type.signed_integer()) value = b.CreateSelect(b.CreateICmpEQ(length, b.getInt32(0)), zero,
+                    b.CreateAShr(b.CreateShl(shifted, padding), padding));
+                else value = b.CreateSelect(position_valid, b.CreateAnd(shifted, mask), zero);
+            } else {
+                auto* target = operand(2, type);
+                mask = b.CreateSelect(position_valid, b.CreateShl(mask, safe), zero);
+                value = b.CreateOr(b.CreateAnd(target, b.CreateNot(mask)), b.CreateAnd(b.CreateShl(input, safe), mask));
+            }
+        } else if (op == "cnot") value = b.CreateZExt(b.CreateICmpEQ(input, llvm::ConstantInt::get(type.storage(context), 0)), type.storage(context));
+        else {
+            if (op == "bfind" && type.signed_integer()) input = b.CreateSelect(b.CreateICmpSLT(input, llvm::ConstantInt::get(type.storage(context), 0)), b.CreateNot(input), input);
+            auto intrinsic = op == "brev" ? llvm::Intrinsic::bitreverse : op == "popc" ? llvm::Intrinsic::ctpop : llvm::Intrinsic::ctlz;
+            auto* native = llvm::Intrinsic::getOrInsertDeclaration(module.get(), intrinsic, {type.storage(context)});
+            value = intrinsic == llvm::Intrinsic::ctlz ? b.CreateCall(native, {input, b.getFalse()}) : b.CreateCall(native, {input});
+            if (op != "brev") {
+                value = b.CreateZExtOrTrunc(value, b.getInt32Ty());
+                if (op == "bfind") value = b.CreateSelect(b.CreateICmpEQ(input, llvm::ConstantInt::get(type.storage(context), 0)), b.getInt32(UINT32_MAX),
+                    shift_amount ? value : b.CreateSub(b.getInt32(type.bits - 1), value));
+                type = {32, 'u'};
+            }
+        }
+        write(operands[0], value, type); return true;
+    }
     void lower(ptx_body& body) {
         auto& function = *body.function; auto* entry = &function.getEntryBlock();
         const auto& registers = body.registers;
@@ -579,6 +716,9 @@ class ptx_parser {
             }
         }
         llvm::IRBuilder<> builder(entry);
+        // The implicit carry flag is local to this PTX function, shared by its
+        // lexical scopes and promoted with the ordinary registers into SSA.
+        auto* carry = builder.CreateAlloca(builder.getInt1Ty(), nullptr, "ptx.cc.cf");
         auto reg = [&](const ptx_token& token) -> const ptx_register& {
             auto found = registers.find(token.text);
             if (found == registers.end()) ptx_fail(token, "undeclared register");
@@ -914,6 +1054,7 @@ class ptx_parser {
                 std::vector<llvm::Value*> arguments;
                 for (unsigned i = 0; i < inputs.size(); ++i) arguments.push_back(builder.CreateAlignedLoad(signature.first[i].storage(context), slot(inputs[i], signature.first[i], false), llvm::Align(signature.first[i].alignment)));
                 auto* call = builder.CreateCall(callee, arguments); call->setConvergent();
+                builder.CreateStore(llvm::UndefValue::get(builder.getInt1Ty()), carry);
                 for (unsigned i = 0; i < outputs.size(); ++i) {
                     builder.CreateAlignedStore(call, slot(outputs[i], signature.second[i], true), llvm::Align(signature.second[i].alignment));
                 }
@@ -934,6 +1075,7 @@ class ptx_parser {
                     llvm::FunctionType::get(builder.getInt1Ty(), {pointer->getType()}, false));
                 write(instruction.operands[0], builder.CreateCall(callee, {pointer}), {1, 'p'});
             }
+            else if (integer_instruction(parts, instruction, builder, scalar, write, carry)) {}
             else if (parts.size() >= 2) {
                 const auto& op = parts[0];
                 auto type = ptx_scalar({parts.back(), opcode.line, opcode.column}, op == "ld" || op == "st");
@@ -1074,14 +1216,8 @@ class ptx_parser {
                         (parts[1] == "lo" || (parts[1] == "hi" && type.bits >= 16) || (parts[1] == "wide" && (type.bits == 16 || type.bits == 32)))) {
                     arity(op == "mad" ? 4 : 3); auto* left = operand(1, type); auto* right = operand(2, type);
                     auto result_type = type;
-                    if (parts[1] == "hi" && type.bits >= 32) {
-                        auto name = std::string("llvm.nvvm.mulhi.") + (type.bits == 64 ? (type.signed_integer() ? "ll" : "ull") : (type.signed_integer() ? "i" : "ui"));
-                        value = builder.CreateCall(module->getOrInsertFunction(name,
-                            llvm::FunctionType::get(type.storage(context), {left->getType(), right->getType()}, false)), {left, right});
-                    } else if (parts[1] == "hi") {
-                        auto extend = [&](llvm::Value* input) { return type.signed_integer() ? builder.CreateSExt(input, builder.getInt32Ty()) : builder.CreateZExt(input, builder.getInt32Ty()); };
-                        value = builder.CreateTrunc(builder.CreateLShr(builder.CreateMul(extend(left), extend(right)), 16), type.storage(context));
-                    } else {
+                    if (parts[1] == "hi") value = high_product(builder, left, right, type);
+                    else {
                         if (parts[1] == "wide") {
                             result_type.bits *= 2;
                             left = type.signed_integer() ? builder.CreateSExt(left, result_type.storage(context)) : builder.CreateZExt(left, result_type.storage(context));
