@@ -35,10 +35,13 @@ std::string compile_image(std::string_view input, cudavmBackend backend, compile
 std::string compile_shader_ptx(std::string_view input, cudavmBackend backend) {
     return compile_image(input, backend, compiler_input_kind::ptx);
 }
+std::string compile_shader_cubin(std::string_view input, cudavmBackend backend) {
+    return compile_image(input, backend, compiler_input_kind::cubin);
+}
 std::string link_shader_images(std::span<const std::string_view> inputs, cudavmBackend backend) {
     std::vector<std::string> ptx; unsigned target = 0; size_t bytes = 0;
     for (auto input : inputs) {
-        require(!input.starts_with("\x7f" "ELF"), CUDA_ERROR_NOT_SUPPORTED, "unfinished shader device links require PTX in every input; cubin/SASS import is unavailable");
+        require(!has_nvidia_cubin(input), CUDA_ERROR_NOT_SUPPORTED, "unfinished shader device links require relocatable PTX in every input");
         std::vector<fatbin_record> records;
         try { records = decode_fatbin(input); }
         catch (const std::bad_alloc&) { throw failure(CUDA_ERROR_OUT_OF_MEMORY, "NVIDIA device link input allocation failed"); }
@@ -109,9 +112,11 @@ std::string materialize_fatbin(std::string_view input, cudavmBackend backend, un
     auto* selected = select_fatbin(records, architecture, false, backend == cudavmBackendCuda);
     if (!selected && has_nvidia_fatbin(input)
         && std::none_of(records.begin(), records.end(), [](const auto& entry) { return entry.kind == fatbin_kind::ptx; }))
-        throw failure(CUDA_ERROR_NOT_SUPPORTED, "NVIDIA fatbinary has no PTX member; cubin/SASS and NVIDIA LTO-IR import are not implemented");
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "NVIDIA fatbinary has no supported PTX, SM75 cubin or program image member");
     require(selected, CUDA_ERROR_NO_BINARY_FOR_GPU, "fatbinary has no compatible executable image");
     if (has_program_image(std::string_view(selected->code))) return materialize_program_image(selected->code, backend);
+    if (selected->kind == fatbin_kind::cubin && backend != cudavmBackendCuda)
+        return compile_shader_cubin(selected->code, backend);
     if (selected->kind == fatbin_kind::ptx && backend != cudavmBackendCuda && !has_module_descriptor(selected->code)) {
         // Member framing must not hide appended descriptors when the result
         // crosses a NUL-terminated module/file loader boundary.

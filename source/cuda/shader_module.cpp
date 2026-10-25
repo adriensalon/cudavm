@@ -1,6 +1,7 @@
 #include "backend.hpp"
 #include "command_regions.hpp"
 #include "shader_ptx.hpp"
+#include "nvidia_image.hpp"
 #include "shader_memory.hpp"
 #include "../core/module_descriptor.hpp"
 #include "../core/shader_packet.hpp"
@@ -406,10 +407,12 @@ std::shared_ptr<executable> session::load_image(const void* image,unsigned count
         require(options[i]==CU_JIT_OPTIMIZATION_LEVEL,CUDA_ERROR_NOT_SUPPORTED,"shader JIT option is unavailable");
         require(reinterpret_cast<uintptr_t>(values[i])<=4,CUDA_ERROR_INVALID_VALUE,"invalid JIT optimization hint");
     }
-    auto text=has_fatbin(image) ? fatbin_memory_view(image) : std::string_view(static_cast<const char*>(image));
+    auto text=has_fatbin(image) ? fatbin_memory_view(image) : has_nvidia_cubin(image)
+        ? std::string_view(static_cast<const char*>(image), nvidia_image_length(image)) : std::string_view(static_cast<const char*>(image));
     std::string compiled;
     if (has_fatbin(text)) { compiled = materialize_fatbin(text, kind()); text = compiled; }
     else if (has_program_image(text)) { compiled = materialize_program_image(text, kind()); text = compiled; }
+    else if (has_nvidia_cubin(text)) { compiled = compile_shader_cubin(text, kind()); text = compiled; }
     if (!cudavm::has_module_descriptor(text) && text.find(".version") != text.npos) {
         compiled = compile_shader_ptx(text, kind()); text = compiled;
     }
@@ -441,6 +444,7 @@ std::shared_ptr<executable> session::load_file(const char* path) {
     std::string image((std::istreambuf_iterator<char>(file)),{});
     if (has_fatbin(std::string_view(image))) image = materialize_fatbin(image, kind());
     else if (has_program_image(image)) image = materialize_program_image(image, kind());
+    else if (has_nvidia_cubin(std::string_view(image))) image = compile_shader_cubin(image, kind());
     return load_image(image.c_str(),0,nullptr,nullptr);
 }
 }

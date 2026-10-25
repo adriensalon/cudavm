@@ -333,16 +333,18 @@ CUlibrary library_load(const void* image, const char* path, CUjit_option* option
     if (path) { std::ifstream file(path, std::ios::binary); require(bool(file), CUDA_ERROR_FILE_NOT_FOUND, "library file not found"); file_image.assign(std::istreambuf_iterator<char>(file), {}); }
     bool portable_image = path ? has_program_image(file_image) || has_portable_fatbin(std::string_view(file_image))
         : has_program_image(image) || has_portable_fatbin(image);
+    bool cubin_image = global().kind != cudavmBackendCuda && (path ? has_nvidia_cubin(std::string_view(file_image)) : has_nvidia_cubin(image));
     // Genuine NVIDIA images retain native CUDA passthrough. Shader adapters
     // own the complete binary extent before selecting a PTX alternative.
     if (global().kind != cudavmBackendCuda)
         portable_image |= path ? has_nvidia_fatbin(std::string_view(file_image)) : has_nvidia_fatbin(image);
-    if (portable_image) for (unsigned i = 0; i < library_count; ++i)
+    if (portable_image || cubin_image) for (unsigned i = 0; i < library_count; ++i)
         require(library_options[i] != CU_LIBRARY_HOST_UNIVERSAL_FUNCTION_AND_DATA_TABLE, CUDA_ERROR_NOT_SUPPORTED, "portable images do not provide native host universal tables");
-    if (!portable_image) entry->native = global().provider->load_library(image, path, options, values, count, library_options, library_values, library_count);
+    if (!portable_image && !cubin_image) entry->native = global().provider->load_library(image, path, options, values, count, library_options, library_values, library_count);
     if (!entry->native) {
         if (path) entry->image = std::move(file_image);
         else if (has_fatbin(image)) { auto bytes = fatbin_memory_view(image); entry->image.assign(bytes.data(), bytes.size()); }
+        else if (cubin_image) entry->image.assign(static_cast<const char*>(image), nvidia_image_length(image));
         else entry->image = static_cast<const char*>(image);
         for (unsigned i = 0; i < count; ++i) {
             require(options[i] == CU_JIT_OPTIMIZATION_LEVEL, CUDA_ERROR_NOT_SUPPORTED, "shader library JIT option is unavailable");
@@ -350,6 +352,7 @@ CUlibrary library_load(const void* image, const char* path, CUjit_option* option
             entry->options.push_back(options[i]); entry->values.push_back(values[i]);
         }
         std::string materialized;
+        if (cubin_image) entry->image = compile_shader_cubin(entry->image, global().kind);
         if (has_fatbin(std::string_view(entry->image))) materialized = materialize_fatbin(entry->image, global().kind);
         else if (portable_image) materialized = materialize_program_image(entry->image, global().kind);
         if (!portable_image && !has_module_descriptor(entry->image) && entry->image.find(".version") != std::string::npos)

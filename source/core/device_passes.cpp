@@ -433,9 +433,9 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
     auto image_bitcode = [&](llvm::MemoryBufferRef buffer) -> std::string {
         auto bytes = buffer.getBuffer();
         auto view = std::string_view(bytes.data(), bytes.size());
-        if (!has_program_image(view) && !has_fatbin(view)) return bytes.str();
+        if (!has_program_image(view) && !has_fatbin(view) && !has_nvidia_cubin(view)) return bytes.str();
         compiler_input_request_v3 request;
-        request.base.base = {3, has_fatbin(view) ? compiler_input_kind::fatbinary : compiler_input_kind::program_image, bytes.data(), bytes.size(), nullptr, nullptr};
+        request.base.base = {3, compiler_input_kind::automatic, bytes.data(), bytes.size(), nullptr, nullptr};
         request.base.architecture = values.architecture.c_str(); request.relocatable = 1;
         compiler_result diagnostics;
         auto program = import_compiler_program(request.base.base, diagnostics);
@@ -483,7 +483,8 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
         auto file = llvm::MemoryBuffer::getFile(path);
         if (!file) throw std::runtime_error("cannot read " + path + ": " + file.getError().message());
         auto bytes = (*file)->getBuffer();
-        if (has_program_image(std::string_view(bytes.data(), bytes.size())) || has_fatbin(std::string_view(bytes.data(), bytes.size()))) {
+        auto view = std::string_view(bytes.data(), bytes.size());
+        if (has_program_image(view) || has_fatbin(view) || has_nvidia_cubin(view)) {
             auto normalized = image_bitcode((*file)->getMemBufferRef());
             buffers.emplace_back(llvm::MemoryBuffer::getMemBufferCopy(normalized, path), path);
         } else buffers.emplace_back(std::move(*file), path);

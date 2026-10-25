@@ -1,6 +1,7 @@
 #include "program.hpp"
 #include "nvrtc_frontend.hpp"
 #include "ptx_import.hpp"
+#include "cubin_import.hpp"
 #include "nvvm_import.hpp"
 #include "native_emission.hpp"
 #include "device_numeric_ir.hpp"
@@ -101,7 +102,8 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
         if (has_fatbin(bytes)) kind = compiler_input_kind::fatbinary;
         else if (has_program_image(bytes)) kind = compiler_input_kind::program_image;
         else if (has_ptx_header(bytes)) kind = compiler_input_kind::ptx;
-        else throw compiler_error(compiler_status::unsupported, "unrecognized compiler input (expected cudavm program image, fatbinary or PTX)");
+        else if (bytes.starts_with("\x7f" "ELF")) kind = compiler_input_kind::cubin;
+        else throw compiler_error(compiler_status::unsupported, "unrecognized compiler input (expected cudavm program image, fatbinary, cubin or PTX)");
     }
     if ((kind == compiler_input_kind::cubin || kind == compiler_input_kind::nvltoir) && request.data
         && has_program_image(std::string_view(request.data, request.size))) kind = compiler_input_kind::program_image;
@@ -128,7 +130,7 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
         if (!selected) {
             if (has_nvidia_fatbin(std::string_view(request.data, request.size))
                 && std::none_of(records.begin(), records.end(), [](const auto& entry) { return entry.kind == fatbin_kind::ptx; }))
-                throw compiler_error(compiler_status::unsupported, "NVIDIA fatbinary has no PTX member; cubin/SASS and NVIDIA LTO-IR import are not implemented");
+                throw compiler_error(compiler_status::unsupported, "NVIDIA fatbinary has no supported PTX, SM75 cubin or program image member");
             throw compiler_error(compiler_status::architecture_mismatch, "fatbinary has no compatible IR/PTX input for this target");
         }
         auto selected_kind = selected->kind == fatbin_kind::ptx ? compiler_input_kind::ptx
@@ -206,7 +208,13 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
         output->module = import_nvvm(output->context, {request.data, request.size}, request.name, output->architecture.c_str());
         break;
     case compiler_input_kind::nvltoir: throw compiler_error(compiler_status::unsupported, "NVIDIA LTO-IR import is not implemented");
-    case compiler_input_kind::cubin: throw compiler_error(compiler_status::unsupported, "cubin import is not implemented");
+    case compiler_input_kind::cubin:
+        require_compiler_request(request.data && request.size, "empty cubin input");
+        output->module = import_cubin(output->context, {request.data, request.size}, architecture ? architecture : "");
+        if (auto* target = output->module->getNamedMetadata("cudavm.import.architecture"))
+            output->architecture = llvm::cast<llvm::MDString>(target->getOperand(0)->getOperand(0))->getString().str();
+        if (request.name) output->module->setModuleIdentifier(request.name);
+        break;
     default: throw compiler_error(compiler_status::invalid, "unknown compiler input kind");
     }
     if (architecture && output->architecture != architecture)

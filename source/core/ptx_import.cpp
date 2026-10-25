@@ -1,6 +1,7 @@
 #include "ptx_import.hpp"
 #include "compiler.hpp"
 #include "compiler_profiles.hpp"
+#include "device_conversions.hpp"
 #include "integer_ir.hpp"
 #include <algorithm>
 #include <cctype>
@@ -534,6 +535,143 @@ class ptx_parser {
         auto word=[&](llvm::Value* v)->llvm::Value* {return v->getType()->isFloatingPointTy()?b.CreateBitCast(v,llvm::Type::getIntNTy(context,v->getType()->getPrimitiveSizeInBits())):v;};
         auto real=[&](llvm::Value* v)->llvm::Value* {return b.CreateBitCast(helper("word_f16_to_f32",{b.CreateZExtOrTrunc(word(v),b.getInt32Ty())},b.getInt32Ty()),b.getFloatTy());};
         auto done=[&](llvm::Value* v,ptx_type t){write(operands[0],v,t,false);return true;};
+        auto flush_float = [&](llvm::Value* value) -> llvm::Value* {
+            auto* bits = word(value);
+            return b.CreateBitCast(b.CreateSelect(b.CreateICmpULT(b.CreateAnd(bits, b.getInt32(0x7fffffff)), b.getInt32(0x800000)),
+                b.CreateAnd(bits, b.getInt32(0x80000000)), bits), b.getFloatTy());
+        };
+        if (op == "cvt" && parts.size() >= 3) {
+            auto destination = ptx_scalar({parts[parts.size() - 2], instruction.opcode.line, instruction.opcode.column});
+            bool from_float = type.kind == 'f' && type.bits == 32;
+            bool to_float = destination.kind == 'f' && destination.bits == 32;
+            bool from_integer = (type.kind == 's' || type.kind == 'u') && type.bits >= 16;
+            bool to_integer = (destination.kind == 's' || destination.kind == 'u') && destination.bits >= 16;
+            if ((from_float && (to_float || to_integer)) || (to_float && from_integer)) {
+                unsigned at = 1, mode = from_float && to_integer ? 1 : 0;
+                bool rounded = false, integral = false;
+                const std::vector<std::string> float_modes{"rn", "rz", "rm", "rp"};
+                const std::vector<std::string> integer_modes{"rni", "rzi", "rmi", "rpi"};
+                for (unsigned i = 0; i < 4; ++i) {
+                    if (parts[at] == float_modes[i]) { mode = i; rounded = true; ++at; break; }
+                    if (parts[at] == integer_modes[i]) { mode = i; rounded = integral = true; ++at; break; }
+                }
+                bool flush = parts[at] == "ftz"; if (flush) ++at;
+                bool saturate = parts[at] == "sat"; if (saturate) ++at;
+                if (at != parts.size() - 2 || ((from_integer || to_integer) && !rounded) || (rounded && integral != from_float) ||
+                        (from_float && to_float && rounded && !integral))
+                    ptx_fail(instruction.opcode, "unsupported FP32 conversion modifier", true);
+                arity(2);
+                auto* input = read(operands[1], type, from_integer);
+                if (from_float && flush) input = flush_float(input);
+                llvm::Value* result = input;
+                if (from_float && to_float && rounded) {
+                    // NVPTX uses native rounding instructions; shader lowering
+                    // maps these intrinsics to the shared exact helpers.
+                    constexpr llvm::Intrinsic::ID modes[]{llvm::Intrinsic::roundeven, llvm::Intrinsic::trunc,
+                        llvm::Intrinsic::floor, llvm::Intrinsic::ceil};
+                    result = b.CreateIntrinsic(b.getFloatTy(), modes[mode], {input});
+                } else if (from_integer) {
+                    auto width = std::max(32u, type.bits);
+                    input = type.signed_integer() ? b.CreateSExtOrTrunc(input, b.getIntNTy(width)) : b.CreateZExtOrTrunc(input, b.getIntNTy(width));
+                    for (const auto& conversion : device_conversions)
+                        if (conversion.to_real && conversion.real_bits == 32 && conversion.integer_bits == width &&
+                                conversion.signed_value == type.signed_integer() && conversion.mode == mode) {
+                            result = b.CreateCall(module->getOrInsertFunction(conversion.intrinsic,
+                                llvm::FunctionType::get(b.getFloatTy(), {input->getType()}, false)), {input});
+                            break;
+                        }
+                } else if (to_integer) {
+                    auto* bits = word(input);
+                    auto* magnitude = b.CreateAnd(bits, b.getInt32(0x7fffffff));
+                    auto* negative = b.CreateICmpSLT(bits, b.getInt32(0));
+                    auto* nan = b.CreateICmpUGT(magnitude, b.getInt32(0x7f800000));
+                    auto limit = (127 + destination.bits - unsigned(destination.signed_integer())) << 23;
+                    auto* overflow = b.CreateICmpUGE(magnitude, b.getInt32(limit));
+                    auto* invalid = b.CreateOr(nan, overflow);
+                    if (!destination.signed_integer()) invalid = b.CreateOr(invalid, negative);
+                    auto* safe = b.CreateSelect(invalid, llvm::ConstantFP::get(b.getFloatTy(), 0), input);
+                    // PTX cvt clamps and maps NaN to zero. CUDA's conversion
+                    // intrinsics have a narrower valid range, so guard their
+                    // input before reusing the shared rounding implementation.
+                    auto width = std::max(32u, destination.bits);
+                    for (const auto& conversion : device_conversions)
+                        if (!conversion.to_real && conversion.real_bits == 32 && conversion.integer_bits == width &&
+                                conversion.signed_value == destination.signed_integer() && conversion.mode == mode) {
+                            result = b.CreateCall(module->getOrInsertFunction(conversion.intrinsic,
+                                llvm::FunctionType::get(b.getIntNTy(width), {safe->getType()}, false)), {safe});
+                            break;
+                        }
+                    auto minimum = destination.signed_integer() ? llvm::APInt::getSignedMinValue(destination.bits).sext(width) : llvm::APInt(width, 0);
+                    auto maximum = destination.signed_integer() ? llvm::APInt::getSignedMaxValue(destination.bits).zext(width) : llvm::APInt::getMaxValue(destination.bits).zext(width);
+                    auto* low = llvm::ConstantInt::get(context, minimum);
+                    auto* high = llvm::ConstantInt::get(context, maximum);
+                    if (destination.bits < width) {
+                        result = b.CreateSelect(destination.signed_integer() ? b.CreateICmpSLT(result, low) : b.CreateICmpULT(result, low), low, result);
+                        result = b.CreateSelect(destination.signed_integer() ? b.CreateICmpSGT(result, high) : b.CreateICmpUGT(result, high), high, result);
+                    }
+                    result = b.CreateSelect(overflow, b.CreateSelect(negative, low, high), result);
+                    if (!destination.signed_integer()) result = b.CreateSelect(negative, low, result);
+                    result = b.CreateSelect(nan, llvm::ConstantInt::get(b.getIntNTy(width), 0), result);
+                    result = b.CreateTruncOrBitCast(result, destination.storage(context));
+                }
+                if (to_float && saturate) {
+                    auto* bits = word(result);
+                    auto* zero = b.CreateOr(b.CreateICmpSLT(bits, b.getInt32(0)),
+                        b.CreateICmpUGT(b.CreateAnd(bits, b.getInt32(0x7fffffff)), b.getInt32(0x7f800000)));
+                    bits = b.CreateSelect(zero, b.getInt32(0), b.CreateSelect(b.CreateICmpUGT(bits, b.getInt32(0x3f800000)), b.getInt32(0x3f800000), bits));
+                    result = b.CreateBitCast(bits, b.getFloatTy());
+                }
+                if (to_float && flush) result = flush_float(result);
+                write(operands[0], result, destination, to_integer);
+                return true;
+            }
+        }
+        if ((op == "setp" || op == "set") && type.kind == 'f' && type.bits == 32) {
+            if (parts.size() < (op == "setp" ? 3u : 4u)) ptx_fail(instruction.opcode, "unsupported FP32 comparison modifier", true);
+            unsigned at = 2;
+            auto boolean = parts[at] == "and" || parts[at] == "or" || parts[at] == "xor" ? parts[at++] : std::string{};
+            bool flush = parts[at] == "ftz"; if (flush) ++at;
+            if (at != parts.size() - (op == "setp" ? 1 : 2)) ptx_fail(instruction.opcode, "unsupported FP32 comparison modifier", true);
+            arity(boolean.empty() ? 3 : 4);
+            auto* left = read(operands[1], type); auto* right = read(operands[2], type);
+            if (flush) {
+                left = flush_float(left); right = flush_float(right);
+            }
+            const std::map<std::string, llvm::CmpInst::Predicate> comparisons{
+                {"eq", llvm::CmpInst::FCMP_OEQ}, {"ne", llvm::CmpInst::FCMP_ONE}, {"lt", llvm::CmpInst::FCMP_OLT},
+                {"le", llvm::CmpInst::FCMP_OLE}, {"gt", llvm::CmpInst::FCMP_OGT}, {"ge", llvm::CmpInst::FCMP_OGE},
+                {"equ", llvm::CmpInst::FCMP_UEQ}, {"neu", llvm::CmpInst::FCMP_UNE}, {"ltu", llvm::CmpInst::FCMP_ULT},
+                {"leu", llvm::CmpInst::FCMP_ULE}, {"gtu", llvm::CmpInst::FCMP_UGT}, {"geu", llvm::CmpInst::FCMP_UGE},
+                {"nan", llvm::CmpInst::FCMP_UNO}, {"num", llvm::CmpInst::FCMP_ORD}};
+            if (!comparisons.contains(parts[1])) ptx_fail(instruction.opcode, "unsupported FP32 comparison", true);
+            // The common shader pass preserves subnormals with the same exact
+            // comparison helper used by CUDA source and imported NVVM.
+            auto* comparison = b.CreateFCmp(comparisons.at(parts[1]), left, right);
+            llvm::Value* predicate = nullptr;
+            if (!boolean.empty()) {
+                auto tokens = operands[3]; bool negate = tokens.front().text == "!";
+                if (negate) tokens.erase(tokens.begin());
+                predicate = read(tokens, {1, 'p'}); if (negate) predicate = b.CreateNot(predicate);
+            }
+            auto combine = [&](llvm::Value* value) -> llvm::Value* {
+                return boolean == "and" ? b.CreateAnd(value, predicate) : boolean == "or" ? b.CreateOr(value, predicate) :
+                    boolean == "xor" ? b.CreateXor(value, predicate) : value;
+            };
+            if (op == "setp") {
+                const auto& outputs = operands[0];
+                if (outputs.size() != 1 && (outputs.size() != 3 || outputs[1].text != "|")) ptx_fail(instruction.opcode, "invalid comparison predicate destinations");
+                // Both results use the incoming c, even when c aliases p or q.
+                auto* positive = combine(comparison); auto* negative = combine(b.CreateNot(comparison));
+                if (outputs[0].text != "_") write({outputs[0]}, positive, {1, 'p'}, false);
+                if (outputs.size() == 3 && outputs[2].text != "_") write({outputs[2]}, negative, {1, 'p'}, false);
+                return true;
+            }
+            auto destination = ptx_scalar({parts[parts.size() - 2], instruction.opcode.line, instruction.opcode.column});
+            if (destination.bits != 32 || (destination.kind != 'f' && destination.kind != 's' && destination.kind != 'u'))
+                ptx_fail(instruction.opcode, "unsupported FP32 comparison result type", true);
+            auto* result = b.CreateSelect(combine(comparison), b.getInt32(destination.kind == 'f' ? 0x3f800000 : 0xffffffff), b.getInt32(0));
+            return done(destination.kind == 'f' ? b.CreateBitCast(result, b.getFloatTy()) : result, destination);
+        }
         if(op=="mov" && parts.size()==2 && (operands.size()==2) && (operands[0].size()>1 || operands[1].size()>1)) {
             // mov.b32 packs/unpacks two independent 16-bit lanes.
             if(type.bits!=32 || type.kind!='b')return false;

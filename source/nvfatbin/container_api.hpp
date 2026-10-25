@@ -222,7 +222,8 @@ inline std::vector<fatbin_record> decode_fatbin(std::string_view bytes) {
     return records;
 }
 // A source-image cubin retains IR/PTX and can target later CUDA SMs. A genuine
-// ELF cubin is usable only within its SM family, and never by shader/core paths.
+// ELF cubin is native only within its SM family. Shader/core import prefers PTX
+// and retained IR, with bounded SM75 SASS import as the last alternative.
 inline const fatbin_record* select_fatbin(const std::vector<fatbin_record>& records, unsigned architecture = 0,
                                         bool require_ir = false, bool cuda = false) {
     const fatbin_record* selected = nullptr; unsigned rank = 0;
@@ -230,10 +231,12 @@ inline const fatbin_record* select_fatbin(const std::vector<fatbin_record>& reco
         bool program = has_program_image(std::string_view(record.code));
         bool elf = record.code.starts_with("\x7f" "ELF");
         if (architecture && record.architecture > architecture) continue;
-        if (record.kind == fatbin_kind::cubin && !program && (!cuda || !elf || (architecture && record.architecture / 10 != architecture / 10))) continue;
+        if (record.kind == fatbin_kind::cubin && !program && (!elf || (cuda
+            ? (architecture && record.architecture / 10 != architecture / 10) : record.architecture != 75))) continue;
         if (record.kind == fatbin_kind::ltoir && !program) continue;
         if (require_ir && program && architecture && record.architecture != architecture) continue;
         unsigned candidate = record.kind == fatbin_kind::cubin ? 3 : record.kind == fatbin_kind::ptx ? 2 : 1;
+        if (elf && !cuda) candidate = 0;
         if (!selected || candidate > rank || (candidate == rank && record.architecture > selected->architecture)) { selected = &record; rank = candidate; }
     }
     return selected;

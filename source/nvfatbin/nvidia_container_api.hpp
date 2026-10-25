@@ -34,6 +34,10 @@ inline bool has_nvidia_fatbin(const void* image) {
     if (!image) return false;
     uint32_t magic; std::memcpy(&magic, image, sizeof(magic)); return magic == nvidia_fatbin_magic;
 }
+inline bool has_nvidia_cubin(std::string_view bytes) { return bytes.starts_with("\x7f" "ELF"); }
+inline bool has_nvidia_cubin(const void* image) {
+    return image && std::memcmp(image, "\x7f" "ELF", 4) == 0;
+}
 inline size_t nvidia_fatbin_extent(std::string_view bytes) {
     nvidia_container_reader reader{bytes};
     if (!has_nvidia_fatbin(bytes)) throw nvidia_container_error("invalid NVIDIA fatbinary magic");
