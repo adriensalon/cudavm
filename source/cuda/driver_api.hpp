@@ -13,6 +13,7 @@ CUDAVM_CUDA_API int cudavmDriverContextIsPrimary(CUcontext);
 CUDAVM_CUDA_API int cudavmDriverContextExists(CUcontext);
 CUDAVM_CUDA_API int cudavmDriverIsLibraryKernel(const void*);
 CUDAVM_CUDA_API CUresult cudavmDriverLoadRegisteredLibrary(CUlibrary*, const void*, size_t);
+CUDAVM_CUDA_API CUresult cudavmDriverLoadRegisteredRdcLibrary(CUlibrary*, const void* const*, const size_t*, size_t, int);
 CUDAVM_CUDA_API CUresult cudavmDriverCreateManagedRegistration(void**, const void*, size_t, const char* const*, const void* const*, const size_t*, size_t);
 CUDAVM_CUDA_API CUresult cudavmDriverLoadManagedRegistration(CUlibrary*, void*);
 CUDAVM_CUDA_API CUresult cudavmDriverRetireManagedRegistration(void*);

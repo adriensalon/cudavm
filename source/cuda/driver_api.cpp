@@ -816,6 +816,22 @@ using namespace cudavm;
 extern "C" CUDAVM_CUDA_API CUresult cudavmDriverLoadRegisteredLibrary(CUlibrary* output, const void* image, size_t bytes) {
     return driver_call([&] { driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null registered library output"); *output = registered_library_load(image, bytes); });
 }
+extern "C" CUDAVM_CUDA_API CUresult cudavmDriverLoadRegisteredRdcLibrary(CUlibrary* output, const void* const* images, const size_t* sizes, size_t count, int device) {
+    return driver_call([&] {
+        driver_ready(); valid_device(device);
+        require(output && images && sizes && count, CUDA_ERROR_INVALID_VALUE, "invalid NVIDIA device link request");
+        std::vector<std::string_view> inputs;
+        for (size_t i = 0; i < count; ++i) {
+            require(images[i] && sizes[i], CUDA_ERROR_INVALID_IMAGE, "empty NVIDIA device link input");
+            inputs.emplace_back(static_cast<const char*>(images[i]), sizes[i]);
+        }
+        auto image = global().kind == cudavmBackendCuda ? global().provider->link_registered_images(inputs, device)
+            : link_shader_images(inputs, global().kind);
+        // All linking and metadata validation finish before add_library can
+        // expose a handle. Neither failure nor retries mutate the input group.
+        image.push_back(0); *output = registered_library_load(image.data(), image.size());
+    });
+}
 extern "C" CUDAVM_CUDA_API CUresult cudavmDriverCreateManagedRegistration(void** output, const void* image, size_t bytes, const char* const* names, const void* const* slots, const size_t* sizes, size_t count) {
     return driver_call([&] {
         require(output && image && bytes && static_cast<const char*>(image)[bytes - 1] == 0 && names && slots && sizes && count,

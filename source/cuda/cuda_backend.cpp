@@ -1168,6 +1168,42 @@ struct cuda_device_library : device_library, std::enable_shared_from_this<cuda_d
 };
 struct cuda_backend : backend {
     std::shared_ptr<cuda_api> api = std::make_shared<cuda_api>();
+    std::string link_registered_images(std::span<const std::string_view> inputs, int device) override {
+        auto owner = open(device); auto& target = static_cast<cuda_session&>(*owner);
+        cuda_context_guard guard(*target.context);
+        CUdevice native_device = 0; int major = 0, minor = 0;
+        check(api->device(&native_device, device), "cuDeviceGet");
+        check(api->attribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, native_device), "cuDeviceGetAttribute");
+        check(api->attribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, native_device), "cuDeviceGetAttribute");
+        std::array<char, 8192> diagnostic{};
+        CUjit_option options[]{CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+        void* values[]{diagnostic.data(), reinterpret_cast<void*>(diagnostic.size())};
+        CUlinkState link = nullptr;
+        check(api->driver.get<decltype(&cuLinkCreate)>("cuLinkCreate_v2")(2, options, values, &link), "cuLinkCreate");
+        auto link_check = [&](CUresult status, const char* operation) {
+            if (status != CUDA_SUCCESS) throw failure(status, std::string(operation) + ": "
+                + (diagnostic[0] ? diagnostic.data() : "NVIDIA runtime device link failed (" + std::to_string(status) + ")"));
+        };
+        std::string result;
+        try {
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                auto input = inputs[i]; auto name = "nvcc-rdc:" + std::to_string(i);
+                // The shared reader restores version directives stripped from
+                // NVIDIA PTX members and validates/decompresses alternatives.
+                auto selected = has_nvidia_fatbin(input) ? materialize_fatbin(input, cudavmBackendCuda, unsigned(major * 10 + minor))
+                    : std::string(input);
+                auto kind = selected.starts_with("\x7f" "ELF") ? CU_JIT_INPUT_CUBIN : CU_JIT_INPUT_PTX;
+                if (kind == CU_JIT_INPUT_PTX) selected.push_back(0);
+                link_check(api->driver.get<decltype(&cuLinkAddData)>("cuLinkAddData_v2")(link, kind,
+                    selected.data(), selected.size(), name.c_str(), 0, nullptr, nullptr), "cuLinkAddData");
+            }
+            void* binary = nullptr; size_t bytes = 0;
+            link_check(api->driver.get<decltype(&cuLinkComplete)>("cuLinkComplete")(link, &binary, &bytes), "cuLinkComplete");
+            result.assign(static_cast<const char*>(binary), bytes);
+        } catch (...) { api->driver.get<decltype(&cuLinkDestroy)>("cuLinkDestroy")(link); throw; }
+        check(api->driver.get<decltype(&cuLinkDestroy)>("cuLinkDestroy")(link), "cuLinkDestroy");
+        return result;
+    }
     CUmoduleLoadingMode loading_mode() override {
         CUmoduleLoadingMode mode{}; check(api->driver.get<decltype(&cuModuleGetLoadingMode)>("cuModuleGetLoadingMode")(&mode), "cuModuleGetLoadingMode"); return mode;
     }

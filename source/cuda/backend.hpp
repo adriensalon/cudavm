@@ -735,6 +735,9 @@ struct device_library {
 };
 struct backend {
     virtual ~backend() = default;
+    virtual std::string link_registered_images(std::span<const std::string_view>, int) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "native NVIDIA device linking is unavailable");
+    }
     virtual std::vector<device_info> discover() = 0;
     virtual std::unique_ptr<session> open(int device) = 0;
     virtual std::array<char, 16> device_uuid(int, bool) {

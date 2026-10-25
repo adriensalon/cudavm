@@ -2,16 +2,30 @@ void** register_nvidia_image(void* input) {
     require(input, CUDA_ERROR_INVALID_VALUE, "null NVIDIA fatbinary wrapper");
     struct wrapper { uint32_t magic, version; const void* image; const void* auxiliary; } value;
     std::memcpy(&value, input, sizeof(value));
-    require(value.magic == 0x466243b1 && value.image, CUDA_ERROR_INVALID_IMAGE, "invalid NVIDIA fatbinary wrapper");
+    require(value.magic == 0x466243b1, CUDA_ERROR_INVALID_IMAGE, "invalid NVIDIA fatbinary wrapper");
     require(value.version == 1 || value.version == 2, CUDA_ERROR_NOT_SUPPORTED, "unsupported NVIDIA fatbinary wrapper version");
-    // NVCC's device-link object has already combined the relocatable inputs.
-    // Version 2 names that final image; auxiliary points to the prelink inputs
-    // used by NVIDIA's optional runtime-link path, not additional host bindings.
     require(value.version != 2 || value.auxiliary, CUDA_ERROR_INVALID_IMAGE, "linked NVIDIA wrapper has no prelink table");
-    size_t size = 0; check(cudavmDriverNvidiaImageSize(value.image, &size));
     program_image image{cudavmBackendCuda, {}, {}};
-    image.bytes.resize(size + 1); std::memcpy(image.bytes.data(), value.image, size);
-    check(cudavmDriverValidateNvidiaImage(image.bytes.data(), size));
+    auto copy_image = [](const void* input, size_t capacity = size_t(1) << 30) {
+        size_t size = 0; check(cudavmDriverNvidiaImageSize(input, &size));
+        require(size <= capacity, CUDA_ERROR_INVALID_IMAGE, "oversized NVIDIA prelink inputs");
+        std::vector<std::byte> bytes(size + 1); std::memcpy(bytes.data(), input, size);
+        check(cudavmDriverValidateNvidiaImage(bytes.data(), size)); return bytes;
+    };
+    if (value.image) image.bytes = copy_image(value.image);
+    else require(value.version == 2, CUDA_ERROR_INVALID_IMAGE, "NVIDIA wrapper has no image");
+    if (value.version == 2) {
+        auto inputs = static_cast<const void* const*>(value.auxiliary);
+        // The private ABI has a NUL-terminated table, not a byte extent. Bound
+        // traversal and aggregate ownership before publishing a registration.
+        constexpr size_t max_inputs = 4096, max_bytes = size_t(1) << 30;
+        size_t bytes = 0, count = 0;
+        for (; count < max_inputs && inputs[count]; ++count) {
+            auto input = copy_image(inputs[count], max_bytes - bytes);
+            bytes += input.size() - 1; image.link_inputs.push_back(std::move(input));
+        }
+        require(count < max_inputs && (count || value.image), CUDA_ERROR_INVALID_IMAGE, "empty or unterminated NVIDIA prelink table");
+    }
     void** handle = nullptr; std::string identity;
     do {
         handle = reinterpret_cast<void**>(global().next_nvidia_registration); global().next_nvidia_registration += 0x100;

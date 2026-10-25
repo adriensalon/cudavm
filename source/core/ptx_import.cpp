@@ -231,7 +231,8 @@ class ptx_parser {
         return result;
     }
     void storage(bool external, const std::string& space, ptx_body* body = nullptr,
-            std::map<std::string, std::string>* scope = nullptr) {
+            std::map<std::string, std::string>* scope = nullptr,
+            llvm::GlobalValue::LinkageTypes linkage = llvm::GlobalValue::ExternalLinkage) {
         auto data = declaration(external && space == ".shared");
         auto original = data.name.text;
         if (scope) {
@@ -273,11 +274,12 @@ class ptx_parser {
         }
         expect(";");
         if (!external || address_space == 3) {
+            variable->setLinkage(scope ? llvm::GlobalValue::InternalLinkage : linkage);
             variable->setInitializer(address_space == 3 ? llvm::UndefValue::get(data.storage(context)) : llvm::Constant::getNullValue(data.storage(context)));
             globals.push_back({data, variable, std::move(initializer)});
         }
     }
-    void callable(bool kernel, bool external) {
+    void callable(bool kernel, bool external, llvm::GlobalValue::LinkageTypes linkage = llvm::GlobalValue::ExternalLinkage) {
         std::vector<ptx_parameter> results;
         if (!kernel && peek().text == "(") results = parameter_list();
         if (results.size() > 1) ptx_fail(results[1].name, "PTX ABI permits a single return parameter");
@@ -314,6 +316,7 @@ class ptx_parser {
         }
         if (external) ptx_fail(name, "extern function cannot have a body");
         if (!function->isDeclaration()) ptx_fail(name, "duplicate function definition");
+        function->setLinkage(linkage);
         if (peek().text != "{") ptx_fail(peek(), "unsupported kernel directive or declaration", true);
         expect("{");
         ptx_body body{name, function, parameters, results, {}, {}, {}, {}, {}};
@@ -1482,11 +1485,16 @@ public:
         module->setDataLayout("e-p:64:64-p1:64:64-p3:32:32-p4:64:64-p5:32:32-p6:32:32-i64:64-i128:128-v16:16-v32:32-n16:32:64");
         module->getOrInsertNamedMetadata("cudavm.ir.stage")->addOperand(llvm::MDNode::get(context, llvm::MDString::get(context, "cudavm.portable")));
         while (peek().text != "<eof>") {
-            accept(".visible"); bool external = accept(".extern");
-            if (accept(".entry")) callable(true, external);
-            else if (accept(".func")) callable(false, external);
+            bool visible = accept(".visible"), weak = !visible && accept(".weak");
+            bool external = !visible && !weak && accept(".extern");
+            auto linkage = weak ? llvm::GlobalValue::WeakAnyLinkage : visible || external || !relocatable
+                ? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage;
+            if (accept(".entry")) callable(true, external, weak ? llvm::GlobalValue::WeakAnyLinkage : llvm::GlobalValue::ExternalLinkage);
+            else if (accept(".func")) callable(false, external, linkage);
             else if (peek().text == ".global" || peek().text == ".const" || peek().text == ".shared") {
-                auto space = take(); storage(external, space.text);
+                auto space = take();
+                if (weak && space.text == ".shared") ptx_fail(space, "weak shared storage is unsupported", true);
+                storage(external, space.text, nullptr, nullptr, linkage);
             } else ptx_fail(peek(), "unsupported module declaration or directive", true);
         }
         bool has_kernel = false;

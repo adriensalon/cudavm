@@ -35,6 +35,7 @@ struct program_image {
     std::vector<nvidia_managed_binding> managed;
     std::shared_ptr<void> managed_image;
     bool managed_conflict = false;
+    std::vector<std::vector<std::byte>> link_inputs;
 };
 struct nvidia_registration { std::string identity; };
 struct nvidia_launch_frame { dim3 grid, block; size_t shared; cudaStream_t stream; };
@@ -202,6 +203,7 @@ void bind_symbol(const void* token, const cudavmProgram* program, const char* sy
 
 std::shared_ptr<void> runtime_managed_image(program_image& program) {
     if (program.managed.empty()) return {};
+    require(!program.bytes.empty(), CUDA_ERROR_NOT_SUPPORTED, "managed variables in unfinished NVIDIA device links are not supported");
     if (!program.managed_image) {
         std::vector<const char*> names; std::vector<const void*> slots; std::vector<size_t> sizes;
         for (auto& entry : program.managed) { names.push_back(entry.symbol.c_str()); slots.push_back(entry.host); sizes.push_back(entry.bytes); }
@@ -217,10 +219,24 @@ CUlibrary runtime_library(const std::string& identity) {
     if (auto it = global().libraries.find(identity); it != global().libraries.end()) return it->second;
     // Unregistration may erase the program while the Driver call releases our
     // mutex. Own the bytes until loading finishes, then reject stale publication.
-    auto managed = runtime_managed_image(program->second); auto image = program->second.bytes; auto epoch = global().epoch;
+    auto managed = runtime_managed_image(program->second); auto image = program->second.bytes;
+    auto inputs = program->second.link_inputs; auto epoch = global().epoch; auto device = runtime_device;
+    if (!inputs.empty()) {
+        CUcontext current = nullptr; check(cuCtxGetCurrent(&current));
+        if (current) check(cuCtxGetDevice(&device));
+    }
+    std::vector<const void*> data; std::vector<size_t> sizes;
+    for (auto& input : inputs) { data.push_back(input.data()); sizes.push_back(input.size() - 1); }
     CUlibrary candidate = nullptr;
-    check(runtime_driver_wait([&] { return managed ? cudavmDriverLoadManagedRegistration(&candidate, managed.get())
-        : cudavmDriverLoadRegisteredLibrary(&candidate, image.data(), image.size()); }));
+    check(runtime_driver_wait([&] {
+        if (managed) return cudavmDriverLoadManagedRegistration(&candidate, managed.get());
+        if (!image.empty()) {
+            auto status = cudavmDriverLoadRegisteredLibrary(&candidate, image.data(), image.size());
+            if (status == CUDA_SUCCESS || inputs.empty() || cudavmDriverBackend() == driver_backend::cuda
+                || (status != CUDA_ERROR_NOT_SUPPORTED && status != CUDA_ERROR_NO_BINARY_FOR_GPU)) return status;
+        }
+        return cudavmDriverLoadRegisteredRdcLibrary(&candidate, data.data(), sizes.data(), data.size(), device);
+    }));
     CUlibrary library = nullptr; bool inserted = false;
     try {
         require(epoch == cudavmDriverEpoch(), CUDA_ERROR_NOT_INITIALIZED, "Driver shutdown while loading a registered library");
@@ -228,7 +244,15 @@ CUlibrary runtime_library(const std::string& identity) {
         require(current != global().programs.end() && !current->second.retiring, CUDA_ERROR_NOT_PERMITTED, "registered program was unloaded during loading");
         auto selected = global().libraries.emplace(identity, candidate); library = selected.first->second; inserted = selected.second;
     } catch (...) { runtime_driver_wait([&] { return cuLibraryUnload(candidate); }); throw; }
-    if (!inserted && candidate != library) check(runtime_driver_wait([&] { return cuLibraryUnload(candidate); }));
+    if (!inserted && candidate != library) {
+        check(runtime_driver_wait([&] { return cuLibraryUnload(candidate); }));
+        // Discarding a concurrent load releases the Runtime lock too. The
+        // selected library may have retired while that duplicate was drained.
+        auto current = global().programs.find(identity); auto loaded = global().libraries.find(identity);
+        require(current != global().programs.end() && !current->second.retiring
+            && loaded != global().libraries.end() && loaded->second == library,
+            CUDA_ERROR_NOT_PERMITTED, "registered program was unloaded during duplicate loading");
+    }
     return library;
 }
 CUkernel runtime_registered_kernel(const void* token) {
