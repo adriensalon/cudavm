@@ -71,7 +71,7 @@ struct cubin_reader {
             if (section.name.starts_with(".nv.shared.")) {
                 cubin_check(section.type == 8 && section.flags == 0x43 && section.link == 0 && section.stride == 0,
                     "invalid static shared section");
-                cubin_check(section.size && section.size <= 32768, "unsupported static shared extent", true);
+                cubin_check(section.size <= 32768, "unsupported static shared extent", true);
                 cubin_check(section.alignment && section.alignment <= 256 && !(section.alignment & (section.alignment - 1)),
                     "invalid static shared alignment");
             } else if ((section.flags & 2) && !section.name.starts_with(".text.") && !section.name.starts_with(".nv.constant0."))
@@ -95,6 +95,7 @@ struct cubin_kernel {
     const cubin_section* text;
     std::vector<cubin_parameter> parameters;
     unsigned base = 0, size = 0, shared_size = 0, shared_alignment = 1;
+    bool shared_storage = false;
 };
 std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
     std::vector<cubin_kernel> kernels; std::set<std::string> names;
@@ -166,6 +167,7 @@ std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
         cubin_check(found != kernels.end() && section.info < input.sections.size() && &input.sections[section.info] == found->text,
             "invalid static shared owner");
         found->shared_size = unsigned(section.size); found->shared_alignment = unsigned(section.alignment);
+        found->shared_storage = true;
     }
     input.records(input.named(".nv.info"), [&](unsigned format, unsigned attr, unsigned size, const fatbin_reader& record) {
         cubin_check(format == 4 && size == 8 && (attr == 0x2f || attr == 0x11 || attr == 0x12), "unsupported module information", true);
@@ -201,13 +203,13 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         // earlier shared accesses with later ones. Require a CTA barrier to
         // finish that memory phase before erasing a subsequent token sync.
         shared_reconvergence |= shared && (op == 0x945 || op == 0x941);
-        shared |= op == 0x984 || op == 0x388;
+        shared |= op == 0x984 || op == 0x388 || op == 0x38c || op == 0x38d || op == 0x3a8 || op == 0x3a9 || op == 0x98e;
         if (op == 0xb1d) shared = false; // Its exact unpredicated form is checked below.
         if (op == 0x947) pending.emplace_back(branch_target(pc, lo, hi), shared);
         if ((op != 0x947 && op != 0x94d) || predicate != 7) pending.emplace_back(pc + 16, shared);
     }
-    // No instruction observes the active warp mask. Shared accesses and CTA
-    // barriers are accepted only outside token regions, where explicit CTA
+    // No instruction observes the active warp mask. Shared accesses, atomics
+    // and CTA barriers are accepted only outside token regions, where explicit CTA
     // synchronization supplies inter-thread ordering. A BSYNC enclosing shared
     // communication would itself need a warp rendezvous and is not erased.
     std::map<size_t, size_t> regions;
@@ -236,6 +238,8 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         auto active = scope(pc);
         if (op == 0x984 || op == 0x388 || op == 0xb1d)
             cubin_check(active.empty(), "shared communication inside a reconvergence region is unsupported", true);
+        if (op == 0x38c || op == 0x38d || op == 0x3a8 || op == 0x3a9 || op == 0x98e)
+            cubin_check(active.empty(), "atomic communication inside a reconvergence region is unsupported", true);
         if (op == 0x945) {
             auto barrier = (lo >> 16) & 255;
             for (auto begin : active) cubin_check(((words.number(begin, 8) >> 16) & 255) != barrier,
@@ -258,13 +262,15 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         if (op == 0x94d) cubin_check(active.empty(), "exit bypasses reconvergence sync");
         if ((op != 0x947 && op != 0x94d) || predicate != 7) edge(pc + 16);
     }
-    cubin_check(!shared_reconvergence, "reconvergence after shared communication requires a full-block barrier", true);
+    cubin_check(!shared_reconvergence, "reconvergence after shared communication or atomics requires a full-block barrier", true);
     std::string output = ".visible .entry " + kernel.name + "(";
     for (unsigned i = 0; i < kernel.parameters.size(); ++i)
         output += (i ? "," : "") + std::string(".param .b") + std::to_string(kernel.parameters[i].size * 8) + " arg" + std::to_string(i);
-    output += "){ .reg .b32 %r<255>,%u<63>,%scratch,%constant,%shared_base,%shared_address; .reg .b64 %a,%b,%c; .reg .f32 %f<3>; .reg .pred %p<7>,%pt;\nsetp.eq.u32 %pt,0,0;\n";
+    output += "){ .reg .b32 %r<255>,%u<63>,%scratch,%constant,%shared_base,%shared_dynamic,%shared_static_address,%shared_address; .reg .b64 %a,%b,%c; .reg .f32 %f<3>; .reg .pred %p<7>,%pt,%shared_is_static;\nsetp.eq.u32 %pt,0,0;\n";
     if (kernel.shared_size) output += ".shared .align " + std::to_string(kernel.shared_alignment) + " .b8 shared_storage[" +
         std::to_string(kernel.shared_size) + "];\nmov.u32 %shared_base,shared_storage;\n";
+    if (kernel.shared_storage) output += ".extern .shared .align " + std::to_string(std::max(16u, kernel.shared_alignment)) +
+        " .b8 dynamic_storage[];\nmov.u32 %shared_dynamic,dynamic_storage;\n";
     std::array<std::optional<uint32_t>, 256> known{}; known[255] = 0;
     auto reg = [&](unsigned id) { cubin_check(id <= 255 && id != 1, "stack-register use is unsupported", true); return id == 255 ? std::string("0") : "%r" + std::to_string(id); };
     uint64_t uniform_defined = uint64_t(1) << 63;
@@ -320,6 +326,22 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         auto join = [&](const std::string& low, const std::string& high, const std::string& name) {
             output += guard + "cvt.u64.u32 " + name + "," + low + ";\n" + guard + "cvt.u64.u32 %c," + high +
                 ";\n" + guard + "shl.b64 %c,%c,32;\n" + guard + "or.b64 " + name + "," + name + ",%c;\n";
+        };
+        auto shared_address = [&](bool scaled) {
+            if (!kernel.shared_storage) fail("missing shared storage");
+            output += guard + (scaled ? "shl.b32 %shared_address," : "mov.u32 %shared_address,") + reg(left) + (scaled ? ",2;\n" : ";\n");
+            auto displacement = int32_t(lo >> 32) >> 8;
+            output += guard + "add.u32 %shared_address,%shared_address," + std::to_string(uint32_t(displacement)) + ";\n";
+            // SASS addresses one contiguous static/dynamic segment. Common IR
+            // may place synchronization scratch between those allocations, so
+            // translate each side separately instead of assuming adjacency.
+            if (kernel.shared_size) {
+                output += guard + "setp.lt.u32 %shared_is_static,%shared_address," + std::to_string(kernel.shared_size) + ";\n" +
+                    guard + "add.u32 %shared_static_address,%shared_base,%shared_address;\n";
+            }
+            output += guard + "sub.u32 %shared_address,%shared_address," + std::to_string(kernel.shared_size) + ";\n" +
+                guard + "add.u32 %shared_address,%shared_dynamic,%shared_address;\n";
+            if (kernel.shared_size) output += guard + "selp.u32 %shared_address,%shared_static_address,%shared_address,%shared_is_static;\n";
         };
         output += "L" + std::to_string(pc) + ":\n";
         std::string instruction; std::optional<uint32_t> constant;
@@ -377,18 +399,40 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             // displacement. Reject width, cache, predicate-result and address
             // extensions rather than discarding their fields.
             if ((hi != (load ? 0x1800u : 0x800u) && hi != (load ? 0x5800u : 0x4800u)) ||
-                (load ? right != 0 : dest != 0) || !kernel.shared_size)
-                fail("unsupported shared memory encoding or missing static storage");
-            if (hi & 0x4000) output += guard + "shl.b32 %shared_address," + reg(left) + ",2;\n";
-            else output += guard + "mov.u32 %shared_address," + reg(left) + ";\n";
-            auto displacement = int32_t(lo >> 32) >> 8;
-            output += guard + "add.u32 %shared_address,%shared_address," + std::to_string(uint32_t(displacement)) + ";\n";
-            output += guard + "add.u32 %shared_address,%shared_address,%shared_base;\n";
+                (load ? right != 0 : dest != 0))
+                fail("unsupported shared memory encoding");
+            shared_address(bool(hi & 0x4000));
             instruction = load ? "ld.shared.u32 " + reg(dest) + ",[%shared_address];" : "st.shared.u32 [%shared_address]," + reg(right) + ";";
+        } else if (op == 0x38c || op == 0x38d) {
+            bool cas = op == 0x38d;
+            if ((hi & ~uint64_t(0x40ff)) != 0 || (!cas && (hi & 255) != 255))
+                fail("unsupported shared atomic encoding");
+            shared_address(bool(hi & 0x4000));
+            instruction = cas ? "atom.relaxed.cta.shared.cas.b32 " + (dest == 255 ? std::string("%scratch") : reg(dest)) +
+                ",[%shared_address]," + reg(right) + "," + reg(unsigned(hi) & 255) + ";" :
+                dest == 255 ? "red.relaxed.cta.shared.add.u32 [%shared_address]," + reg(right) + ";" :
+                "atom.relaxed.cta.shared.add.u32 " + reg(dest) + ",[%shared_address]," + reg(right) + ";";
+        } else if (op == 0x3a8 || op == 0x3a9 || op == 0x98e) {
+            bool cas = op == 0x3a9, reduction = op == 0x98e;
+            if ((cas ? (hi & ~uint64_t(255)) != 0x1f4100 : hi != (reduction ? 0x114100u : 0x1f41ffu)) ||
+                (reduction && dest != 0) || left >= 254 || left % 2)
+                fail("unsupported global atomic encoding");
+            join(reg(left), reg(left + 1), "%a");
+            auto displacement = int32_t(lo >> 32) >> 8;
+            auto address = "[%a" + std::string(displacement < 0 ? "-" : "+") +
+                std::to_string(displacement < 0 ? -int64_t(displacement) : displacement) + "]";
+            instruction = cas ? "atom.relaxed.gpu.global.cas.b32 " + (dest == 255 ? std::string("%scratch") : reg(dest)) +
+                "," + address + "," + reg(right) + "," + reg(unsigned(hi) & 255) + ";" :
+                reduction || dest == 255 ? "red.relaxed.gpu.global.add.u32 " + address + "," + reg(right) + ";" :
+                "atom.relaxed.gpu.global.add.u32 " + reg(dest) + "," + address + "," + reg(right) + ";";
         } else if (op == 0xb1d) {
             if (lo != 0x7b1d || hi != 0 || kernel.text->flags != 0x100006)
                 fail("unsupported full-block barrier encoding");
             instruction = "bar.sync 0;";
+        } else if ((op == 0x212 || op == 0x812) && (hi & ~uint64_t(0xffff)) == 0x78e0000 && (op == 0x812 || !(lo >> 40))) {
+            instruction = "lop3.b32 " + reg(dest) + "," + reg(left) + "," +
+                (op == 0x812 ? std::to_string(uint32_t(lo >> 32)) : reg(right)) + "," + reg(unsigned(hi) & 255) + "," +
+                std::to_string(unsigned(hi >> 8) & 255) + ";";
         } else if ((op == 0x210 || op == 0x810 || op == 0xa10) && (hi & ~uint64_t(0xe0000)) == 0x7f1e0ff &&
                    ((hi >> 17) & 7) != 7 && predicate == 7 && (op != 0x210 || !(lo >> 40))) {
             // IADD3 Rd, Pn, Ra, Rb/imm32, RZ: retain the carry used by the
@@ -414,21 +458,21 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             // value per invocation preserves the checked, unpredicated forms.
             auto a = uniform(left), b = uniform(right), c = uniform(unsigned(hi) & 63);
             instruction = "mad.lo.u32 " + uniform(dest, true) + "," + a + "," + b + "," + c + ";";
-        } else if (op == 0x224 || op == 0x424 || op == 0x824 || op == 0xa24 || op == 0xc24 || op == 0x624 ||
+        } else if (op == 0x224 || op == 0x424 || op == 0x824 || op == 0xa24 || op == 0xc24 || op == 0xe24 || op == 0x624 ||
                    op == 0x225 || op == 0x825 || op == 0xa25 || op == 0x625 || op == 0x227 || op == 0x827) {
             bool wide = (op & 15) == 5, high_product = (op & 15) == 7;
             unsigned form = op & 0xe00, addend = unsigned(hi) & 255;
-            uint64_t expected = form == 0xc00 ? 0xf8e0000 : 0x78e0000;
+            uint64_t expected = form == 0xc00 || form == 0xe00 ? 0xf8e0000 : 0x78e0000;
             if ((hi & ~uint64_t(0x2ff)) != expected || ((wide || high_product) && (hi & 0x200)))
                 fail("unsupported IMAD modifier");
-            if ((form == 0x200 || form == 0xc00) && (lo >> 40)) fail("unsupported IMAD register modifier");
+            if ((form == 0x200 || form == 0xc00 || form == 0xe00) && (lo >> 40)) fail("unsupported IMAD register modifier");
             if (high_product && addend != 255) fail("unsupported IMAD high-product addend");
             if (pc == 0 && predicate == 7 && dest == 1 && left == 255 && form == 0x600 && addend == 255 && bank_offset() == 0x28) {
                 // IMAD.MOV is another dead stack-pointer prologue. R1 reads
                 // still reject, including through a paired address operand.
             } else {
                 auto source = form == 0xa00 ? bank_word() : form == 0x400 ? reg(addend) : form == 0x800 ? std::to_string(uint32_t(lo >> 32)) :
-                    form == 0xc00 ? uniform(right) : form == 0x600 ? reg(addend) : reg(right);
+                    form == 0xc00 ? uniform(right) : form == 0x600 || form == 0xe00 ? reg(addend) : reg(right);
                 if (wide) {
                     if (dest >= 254 || dest % 2) fail("invalid wide IMAD destination");
                     if (form == 0x600) {
@@ -448,7 +492,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                     instruction = "cvt.u32.u64 " + reg(dest + 1) + ",%a;";
                     known[dest + 1].reset();
                 } else {
-                    auto third = form == 0x600 ? bank_word() : form == 0x400 ? std::to_string(uint32_t(lo >> 32)) : reg(addend);
+                    auto third = form == 0x600 ? bank_word() : form == 0xe00 ? uniform(right) : form == 0x400 ? std::to_string(uint32_t(lo >> 32)) : reg(addend);
                     instruction = std::string(high_product ? "mad.hi.u32 " : "mad.lo.u32 ") + reg(dest) + "," + reg(left) + "," + source + "," + third + ";";
                 }
             }
@@ -539,7 +583,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         else if (op == 0x918 && hi == 0 && !(lo >> 16)) { }
         else fail("unsupported SM75 instruction encoding " + std::to_string(lo) + "/" + std::to_string(hi));
         if (!instruction.empty()) output += guard + instruction + "\n";
-        if (op != 0x386 && op != 0x986 && op != 0x388 && op != 0xb1d && op != 0x947 && op != 0x94d && op != 0x918 && op != 0x20c && op != 0x80c && op != 0xa0c && op != 0xc0c && op != 0x20b && op != 0x81c &&
+        if (dest != 255 && op != 0x386 && op != 0x986 && op != 0x388 && op != 0x98e && op != 0xb1d && op != 0x947 && op != 0x94d && op != 0x918 && op != 0x20c && op != 0x80c && op != 0xa0c && op != 0xc0c && op != 0x20b && op != 0x81c &&
             op != 0xab9 && op != 0x9c3 && op != 0x2a4 && op != 0x899 && op != 0x945 && op != 0x941 && op != 0x355)
             known[dest] = predicate == 7 ? constant : std::nullopt;
     }

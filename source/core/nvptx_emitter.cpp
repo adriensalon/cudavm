@@ -27,6 +27,15 @@ std::string emit_cuda(const llvm::Module& portable, const std::string& architect
 }
 std::string emit_cuda_ir(const llvm::Module& input, const std::string& architecture, std::string* target_data_layout) {
     auto module = llvm::CloneModule(input);
+    // Imported extern shared storage has an undef initializer so the portable
+    // linker owns its per-kernel identity. NVPTX must emit an unsized external
+    // declaration: a defined zero-sized global becomes one byte of static
+    // storage and does not bind the launch's dynamic shared allocation.
+    for (auto& storage : module->globals()) if (storage.getAddressSpace() == 3 &&
+        module->getDataLayout().getTypeAllocSize(storage.getValueType()).getFixedValue() == 0) {
+        storage.setInitializer(nullptr);
+        storage.setLinkage(llvm::GlobalValue::ExternalLinkage);
+    }
     // Clang lowers printf to the driver's vprintf protocol. Preserve CUDA's
     // null-format result even when that lower-level service expects a string.
     // Device malloc also cannot represent an allocation whose size wraps its
