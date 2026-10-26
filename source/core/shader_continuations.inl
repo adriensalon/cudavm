@@ -145,7 +145,7 @@ llvm::Function* make_call_context_equal() {
     b.CreateBr(loop);b.SetInsertPoint(yes);b.CreateRet(b.getTrue());b.SetInsertPoint(no);b.CreateRet(b.getFalse());
     return function;
 }
-llvm::Function* make_collective_poll() {
+llvm::Function* make_collective_poll(const std::vector<unsigned>& warp_sync_states) {
     auto* contexts=collective_frames?make_call_context_equal():nullptr;
     auto* poll=llvm::Function::Create(llvm::FunctionType::get(b.getInt64Ty(),arguments({b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()}),false),llvm::GlobalValue::InternalLinkage,"cudavm.collective.poll",*result);
     auto* first=llvm::BasicBlock::Create(b.getContext(),"entry",poll);
@@ -160,6 +160,7 @@ llvm::Function* make_collective_poll() {
     auto* id=linear_thread(); auto* base=b.CreateAnd(id,b.getInt32(~31u));
     auto* block=b.CreateICmpUGE(poll->getArg(2),b.getInt32(32));
     auto* active=b.CreateICmpEQ(poll->getArg(2),b.getInt32(20));
+    auto* warp_sync=b.CreateICmpEQ(poll->getArg(2),b.getInt32(7));
     auto* start=b.CreateSelect(block,b.getInt32(0),base);
     auto* count=thread_count(); auto* warp_end=b.CreateAdd(base,b.getInt32(32));
     auto* end=b.CreateSelect(block,count,b.CreateSelect(b.CreateICmpULT(count,warp_end),count,warp_end));
@@ -171,8 +172,15 @@ llvm::Function* make_collective_poll() {
     auto* pc=collective_load(collective_pointer(collective_pc,index));
     auto* live=b.CreateICmpNE(pc,b.getInt32(0));
     llvm::Value* same=b.CreateICmpEQ(pc,poll->getArg(1));
+    // On SM70+ warp barriers rendezvous by member mask, including barriers in
+    // different divergent arms. Other collectives retain their instruction and
+    // call-context identity. The immutable PC snapshot identifies barrier
+    // arrivals; masks are read only after that test succeeds.
+    llvm::Value* at_warp_sync=b.getFalse();
+    for(auto state:warp_sync_states) at_warp_sync=b.CreateOr(at_warp_sync,b.CreateICmpEQ(pc,b.getInt32(state)));
+    same=b.CreateSelect(warp_sync,at_warp_sync,same);
     if(contexts) {
-        b.CreateCondBr(b.CreateAnd(same,b.CreateNot(block)),context_test,context_done);b.SetInsertPoint(context_test);
+        b.CreateCondBr(b.CreateAnd(same,b.CreateNot(b.CreateOr(block,warp_sync))),context_test,context_done);b.SetInsertPoint(context_test);
         std::vector<llvm::Value*> args{id,index,collective_load(collective_pointer(collective_frames,id)),collective_load(collective_pointer(collective_frames,index))};
         if(opencl) for(unsigned i=0;i<packet_resource_count;++i) args.push_back(poll->getArg(unsigned(poll->arg_size()-packet_resource_count+i)));
         auto* equal=b.CreateCall(contexts,args);b.CreateBr(context_done);b.SetInsertPoint(context_done);
@@ -301,7 +309,9 @@ void make_continuations() {
         } else if(!llvm::isa<llvm::ReturnInst>(terminator) && !llvm::isa<llvm::UnreachableInst>(terminator)) fail(kernel,"unsupported continuation terminator");
         b.CreateStore(next,local_pc);b.CreateBr(latch);terminator->eraseFromParent();
     }
-    auto* poll=make_collective_poll();
+    std::vector<unsigned> warp_sync_states;
+    for(auto& site:sites) if(site.operation==7) warp_sync_states.push_back(states.at(site.wait));
+    auto* poll=make_collective_poll(warp_sync_states);
     std::vector<unsigned> named_wait_states;
     for(auto& site:sites) if(site.operation>=36)named_wait_states.push_back(states.at(site.warp_wait));
     auto* named_warp_poll=named_barriers?make_named_warp_poll(named_wait_states):nullptr;

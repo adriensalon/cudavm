@@ -189,29 +189,19 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
     for (size_t pc = 0; pc < code.size(); pc += 16) if ((words.number(pc, 8) & 0xfff) == 0x947)
         targets.insert(branch_target(pc, words.number(pc, 8), words.number(pc + 8, 8)));
     std::set<size_t> reachable;
-    std::set<std::pair<size_t, bool>> memory_states;
-    std::vector<std::pair<size_t, bool>> pending{{0, false}};
-    bool shared_reconvergence = false;
+    std::vector<size_t> pending{0};
     while (!pending.empty()) {
-        auto [pc, shared] = pending.back(); pending.pop_back();
+        auto pc = pending.back(); pending.pop_back();
         cubin_check(pc < code.size(), "kernel control flow falls beyond its code extent");
-        if (!memory_states.emplace(pc, shared).second) continue;
-        reachable.insert(pc);
+        if (!reachable.insert(pc).second) continue;
         auto lo = words.number(pc, 8), hi = words.number(pc + 8, 8);
         auto op = unsigned(lo & 0xfff), predicate = unsigned(lo >> 12) & 15;
-        // Even a region containing no shared instructions can rendezvous
-        // earlier shared accesses with later ones. Require a CTA barrier to
-        // finish that memory phase before erasing a subsequent token sync.
-        shared_reconvergence |= shared && (op == 0x945 || op == 0x941);
-        shared |= op == 0x984 || op == 0x388 || op == 0x38c || op == 0x38d || op == 0x3a8 || op == 0x3a9 || op == 0x98e;
-        if (op == 0xb1d) shared = false; // Its exact unpredicated form is checked below.
-        if (op == 0x947) pending.emplace_back(branch_target(pc, lo, hi), shared);
-        if ((op != 0x947 && op != 0x94d) || predicate != 7) pending.emplace_back(pc + 16, shared);
+        if (op == 0x947) pending.push_back(branch_target(pc, lo, hi));
+        if ((op != 0x947 && op != 0x94d) || predicate != 7) pending.push_back(pc + 16);
     }
-    // No instruction observes the active warp mask. Shared accesses, atomics
-    // and CTA barriers are accepted only outside token regions, where explicit CTA
-    // synchronization supplies inter-thread ordering. A BSYNC enclosing shared
-    // communication would itself need a warp rendezvous and is not erased.
+    // Retain the validated lexical token scopes as explicit member masks in
+    // common IR. Branch ballots partition the current cohort; BSYNC reunites
+    // the saved BSSY cohort through the shared warp-barrier implementation.
     std::map<size_t, size_t> regions;
     size_t uniform_prefix = code.size();
     for (auto pc : reachable) {
@@ -236,10 +226,8 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         auto lo = words.number(pc, 8), hi = words.number(pc + 8, 8) & ((uint64_t(1) << 41) - 1);
         unsigned op = unsigned(lo & 0xfff), predicate = unsigned(lo >> 12) & 15;
         auto active = scope(pc);
-        if (op == 0x984 || op == 0x388 || op == 0xb1d)
-            cubin_check(active.empty(), "shared communication inside a reconvergence region is unsupported", true);
-        if (op == 0x38c || op == 0x38d || op == 0x3a8 || op == 0x3a9 || op == 0x98e)
-            cubin_check(active.empty(), "atomic communication inside a reconvergence region is unsupported", true);
+        if (op == 0xb1d)
+            cubin_check(active.empty(), "CTA barrier inside a reconvergence region is unsupported", true);
         if (op == 0x945) {
             auto barrier = (lo >> 16) & 255;
             for (auto begin : active) cubin_check(((words.number(begin, 8) >> 16) & 255) != barrier,
@@ -262,11 +250,12 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         if (op == 0x94d) cubin_check(active.empty(), "exit bypasses reconvergence sync");
         if ((op != 0x947 && op != 0x94d) || predicate != 7) edge(pc + 16);
     }
-    cubin_check(!shared_reconvergence, "reconvergence after shared communication or atomics requires a full-block barrier", true);
     std::string output = ".visible .entry " + kernel.name + "(";
     for (unsigned i = 0; i < kernel.parameters.size(); ++i)
         output += (i ? "," : "") + std::string(".param .b") + std::to_string(kernel.parameters[i].size * 8) + " arg" + std::to_string(i);
     output += "){ .reg .b32 %r<255>,%u<63>,%scratch,%constant,%shared_base,%shared_dynamic,%shared_static_address,%shared_address; .reg .b64 %a,%b,%c; .reg .f32 %f<3>; .reg .pred %p<7>,%pt,%shared_is_static;\nsetp.eq.u32 %pt,0,0;\n";
+    if (!regions.empty())
+        output += ".reg .b32 %cohort,%taken,%fallthrough,%token<16>; .reg .pred %branch_taken;\nactivemask.b32 %cohort;\n";
     if (kernel.shared_size) output += ".shared .align " + std::to_string(kernel.shared_alignment) + " .b8 shared_storage[" +
         std::to_string(kernel.shared_size) + "];\nmov.u32 %shared_base,shared_storage;\n";
     if (kernel.shared_storage) output += ".extern .shared .align " + std::to_string(std::max(16u, kernel.shared_alignment)) +
@@ -575,10 +564,19 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             instruction = std::string(form == 0x70e170 ? "not.pred " : "and.pred ") + pred(destination) + "," + pred(source) +
                 (form == 0x70e170 ? ";" : ",%pt;");
         } else if (op == 0x947 && (hi & ~uint64_t(0x3ffff)) == 0x3800000 && (lo & 0xffff0000) == 0) {
+            if (!regions.empty() && predicate != 7 && reachable.contains(pc)) {
+                output += std::string(predicate & 8 ? "not.pred " : "and.pred ") + "%branch_taken," + pred(predicate & 7) +
+                    (predicate & 8 ? ";\n" : ",%pt;\n");
+                output += "vote.sync.ballot.b32 %taken,%branch_taken,%cohort;\nxor.b32 %fallthrough,%cohort,%taken;\n"
+                    "selp.b32 %cohort,%taken,%fallthrough,%branch_taken;\n";
+            }
             instruction = "bra L" + std::to_string(branch_target(pc, lo, hi)) + ";";
         } else if (op == 0x945 || op == 0x941 || op == 0x355) {
             // Reachable token operations were checked against the CFG above.
             cubin_check(reachable.contains(pc), "unreachable reconvergence instruction", true);
+            auto token = "%token" + std::to_string(unsigned(lo >> 16) & 255);
+            if (op == 0x945) instruction = "mov.b32 " + token + ",%cohort;";
+            if (op == 0x941) instruction = "bar.warp.sync " + token + ";\nmov.b32 %cohort," + token + ";";
         } else if (op == 0x94d && hi == 0x3800000 && !(lo >> 16)) instruction = "ret;";
         else if (op == 0x918 && hi == 0 && !(lo >> 16)) { }
         else fail("unsupported SM75 instruction encoding " + std::to_string(lo) + "/" + std::to_string(hi));

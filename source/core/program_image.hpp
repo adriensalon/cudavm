@@ -13,7 +13,7 @@ namespace cudavm {
 // Bump the IR/native profiles when the producer or semantic ABI becomes incompatible.
 inline constexpr std::string_view program_image_magic = "CUDAVM-PROGRAM-IMAGE\n";
 inline constexpr std::string_view program_image_ir_profile = "cudavm-llvm-22.1.4-ir-v1";
-inline constexpr uint32_t program_image_native_profile = 1;
+inline constexpr uint32_t program_image_native_profile = 2;
 inline constexpr size_t program_image_limit = 256 * 1024 * 1024;
 struct program_image_artifact {
     uint32_t backend = 0, profile = program_image_native_profile, memory_abi = packet_memory_abi;

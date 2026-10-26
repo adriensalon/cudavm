@@ -145,7 +145,7 @@ llvm::json::Object inspect_native(const llvm::Module& portable, native_target ta
             auto origin = function.getFnAttribute("cudavm.cuda.origin").getValueAsString();
             if (origin.contains("barrier")) requirements.insert("cuda-barriers");
             if (origin.contains("shfl") || origin.contains("vote") || origin.contains("match")
-                || origin.contains("redux") || origin.contains("warp")) requirements.insert("cuda-warp-semantics");
+                || origin.contains("redux") || origin.contains("warp") || origin.contains("activemask")) requirements.insert("cuda-warp-semantics");
         }
         for (const auto& block : function) for (const auto& instruction : block) {
             if (const auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
