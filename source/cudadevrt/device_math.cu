@@ -66,6 +66,26 @@ extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_ta
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_rcp(float x) {return cudavm::math_reciprocal_mode(x,1); }
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_sqrt(float x) {unsigned b=__builtin_bit_cast(unsigned,x),a=b&0x7fffffffu; if(!a || b==0x7f800000u)return x; if(a>0x7f800000u)return __builtin_bit_cast(float,b|0x00400000u); if(b&0x80000000u)return __builtin_bit_cast(float,0x7fc00000u); return __builtin_elementwise_sqrt(x); }
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_rsqrt(float x) {return cudavm::math_reciprocal_mode(__cudavm_native_half_sqrt(x),1); }
+namespace cudavm {
+// Within this range, native add/multiply cannot produce a subnormal nonzero
+// result or overflow. Cancellation of two binary32 operands is at least 2^-60.
+__device__ static inline bool bounded_float_arithmetic_operand(unsigned bits) {
+ unsigned magnitude=bits&0x7fffffffu;
+ return !magnitude || (magnitude>=(90u<<23) && magnitude<(161u<<23));
+}
+}
+extern "C" __device__ __attribute__((used)) inline float __cudavm_native_add_f32(float a,float b) {
+ unsigned x=__builtin_bit_cast(unsigned,a),y=__builtin_bit_cast(unsigned,b);
+ if(cudavm::bounded_float_arithmetic_operand(x) && cudavm::bounded_float_arithmetic_operand(y))return a+b;
+ return __builtin_bit_cast(float,__cudavm_native_word_f32_add(x,y,0));
+}
+extern "C" __device__ __attribute__((used)) inline float __cudavm_native_mul_f32(float a,float b) {
+ unsigned x=__builtin_bit_cast(unsigned,a),y=__builtin_bit_cast(unsigned,b);
+ if(cudavm::bounded_float_arithmetic_operand(x) && cudavm::bounded_float_arithmetic_operand(y))return a*b;
+ // An addend with the product's zero sign makes exact FMA round precisely
+ // once as multiplication does, including both representations of zero.
+ return __builtin_bit_cast(float,__cudavm_native_word_f32_fma(x,y,(x^y)&0x80000000u));
+}
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_fma(float a,float b,float c) {
  unsigned x=__builtin_bit_cast(unsigned,a),y=__builtin_bit_cast(unsigned,b),z=__builtin_bit_cast(unsigned,c);
  unsigned ax=x&0x7fffffffu,ay=y&0x7fffffffu,az=z&0x7fffffffu;

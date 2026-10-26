@@ -749,11 +749,18 @@ class ptx_parser {
         }
         if((op=="fma" || op=="add" || op=="sub" || op=="mul") && (type.kind=='f' || type.kind=='h') &&
                 (parts.size()==2 || (parts.size()==3 && parts[1]=="rn") ||
+                    (type.kind=='f' && type.bits==32 && parts==std::vector<std::string>{op,"rn","ftz","f32"}) ||
                     ((type.bits==16 || type.kind=='h') && ((parts.size()==3 && parts[1]=="sat") || (parts.size()==4 && parts[1]=="rn" && parts[2]=="sat"))) ||
                     (op=="fma" && (type.bits==16 || type.kind=='h') && parts.size()==4 && parts[1]=="rn" && parts[2]=="relu"))) {
             bool fused=op=="fma";arity(fused?4:3);
+            bool flush=type.kind=='f' && type.bits==32 && parts.size()==4 && parts[2]=="ftz";
             auto* a=read(operands[1],type);auto* c=read(operands[2],type);
+            if(flush){a=flush_float(a);c=flush_float(c);}
             auto compute=[&](llvm::Value* a,llvm::Value* c,llvm::Value* d)->llvm::Value* {
+                if(type.kind=='f' && type.bits==32 && !fused && parts.size()>=3 && parts[1]=="rn") {
+                    if(op=="sub")c=b.CreateBitCast(b.CreateXor(word(c),b.getInt32(0x80000000)),b.getFloatTy());
+                    return helper(op=="mul"?"mul_f32":"add_f32",{a,c},b.getFloatTy());
+                }
                 llvm::Value* v=fused?b.CreateIntrinsic(a->getType(),llvm::Intrinsic::fma,{a,c,d}):op=="add"?b.CreateFAdd(a,c):op=="sub"?b.CreateFSub(a,c):b.CreateFMul(a,c);
                 bool saturate=std::find(parts.begin(),parts.end(),"sat")!=parts.end();
                 bool relu=std::find(parts.begin(),parts.end(),"relu")!=parts.end();
@@ -768,11 +775,13 @@ class ptx_parser {
                 return v;
             };
             auto* d=fused?read(operands[3],type):nullptr;
+            if(flush && d)d=flush_float(d);
             if(type.kind=='h') {
                 auto lane=[&](unsigned shift){auto half=[&](llvm::Value* x){return b.CreateBitCast(b.CreateTrunc(b.CreateLShr(x,shift),b.getInt16Ty()),b.getHalfTy());};return b.CreateZExt(word(compute(half(a),half(c),d?half(d):nullptr)),b.getInt32Ty());};
                 return done(b.CreateOr(lane(0),b.CreateShl(lane(16),16)),type);
             }
-            return done(compute(a,c,d),type);
+            auto* result=compute(a,c,d);
+            return done(flush?flush_float(result):result,type);
         }
         if(op=="div" && type.kind=='f' && type.bits==32 && parts==std::vector<std::string>{"div","rn","f32"}) {
             arity(3);return done(b.CreateFDiv(read(operands[1],type),read(operands[2],type)),type);
