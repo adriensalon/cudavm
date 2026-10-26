@@ -727,7 +727,13 @@ struct lowering {
         if (auto* integer = llvm::dyn_cast<llvm::ConstantInt>(input)) return llvm::ConstantInt::get(type(integer->getType()), integer->getValue().zextOrTrunc(type(integer->getType())->getIntegerBitWidth()));
         if(auto* floating=llvm::dyn_cast<llvm::ConstantFP>(input);floating && (floating->getType()->isDoubleTy() || floating->getType()->isFloatTy() || floating->getType()->isHalfTy()))
             return llvm::ConstantInt::get(type(floating->getType()),floating->getValueAPF().bitcastToAPInt().zextOrTrunc(type(floating->getType())->getIntegerBitWidth()));
-        if (llvm::isa<llvm::UndefValue>(input) || llvm::isa<llvm::PoisonValue>(input)) return canonical(llvm::UndefValue::get(type(input->getType())), input->getType());
+        if (llvm::isa<llvm::UndefValue>(input) || llvm::isa<llvm::PoisonValue>(input)) {
+            // Predicated register writes can retain an unspecified old value
+            // on paths that never consume it. DXIL rejects undef select/PHI
+            // operands even on those paths; choose zero as a valid refinement.
+            auto* target = type(input->getType());
+            return canonical(dxil ? llvm::Constant::getNullValue(target) : llvm::UndefValue::get(target), input->getType());
+        }
         if (auto* constant = llvm::dyn_cast<llvm::Constant>(input); constant && !constant->getType()->isPointerTy()) return const_cast<llvm::Constant*>(constant);
         fail(*input, "unsupported or non-dominating value");
     }

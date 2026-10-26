@@ -20,7 +20,7 @@ void cubin_check(bool valid, const std::string& reason, bool unsupported = false
 struct cubin_section {
     std::string name;
     uint32_t type, link, info;
-    uint64_t flags, offset, size, stride;
+    uint64_t flags, offset, size, stride, alignment;
 };
 struct cubin_parameter { unsigned offset, size; };
 struct cubin_reader {
@@ -58,7 +58,7 @@ struct cubin_reader {
         for (size_t i = 0; i < count; ++i) {
             auto at = table + i * width;
             cubin_section section{string(strings, size_t(number(at))), uint32_t(number(at + 4)), uint32_t(number(at + 40)),
-                uint32_t(number(at + 44)), number(at + 8, 8), number(at + 24, 8), number(at + 32, 8), number(at + 56, 8)};
+                uint32_t(number(at + 44)), number(at + 8, 8), number(at + 24, 8), number(at + 32, 8), number(at + 56, 8), number(at + 48, 8)};
             cubin_check(unique.insert(section.name).second, "duplicate section name");
             cubin_check(section.type != 11, "dynamic symbols are unsupported", true);
             sections.push_back(std::move(section));
@@ -68,8 +68,14 @@ struct cubin_reader {
                 cubin_check(section.info < sections.size(), "invalid relocation target");
                 cubin_check(sections[section.info].name.starts_with(".debug"), "code/data relocations are unsupported", true);
             }
-            if ((section.flags & 2) && !section.name.starts_with(".text.") && !section.name.starts_with(".nv.constant0."))
-                cubin_check(section.size == 0, "global, shared and additional constant storage are unsupported", true);
+            if (section.name.starts_with(".nv.shared.")) {
+                cubin_check(section.type == 8 && section.flags == 0x43 && section.link == 0 && section.stride == 0,
+                    "invalid static shared section");
+                cubin_check(section.size && section.size <= 32768, "unsupported static shared extent", true);
+                cubin_check(section.alignment && section.alignment <= 256 && !(section.alignment & (section.alignment - 1)),
+                    "invalid static shared alignment");
+            } else if ((section.flags & 2) && !section.name.starts_with(".text.") && !section.name.starts_with(".nv.constant0."))
+                cubin_check(section.size == 0, "global and additional constant storage are unsupported", true);
         }
     }
     template<class Visit> void records(const cubin_section& section, Visit visit) const {
@@ -88,7 +94,7 @@ struct cubin_kernel {
     std::string name;
     const cubin_section* text;
     std::vector<cubin_parameter> parameters;
-    unsigned base = 0, size = 0;
+    unsigned base = 0, size = 0, shared_size = 0, shared_alignment = 1;
 };
 std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
     std::vector<cubin_kernel> kernels; std::set<std::string> names;
@@ -103,7 +109,7 @@ std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
             cubin_check(!name.empty() && name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.$") == name.npos
                 && !(name.front() >= '0' && name.front() <= '9'), "unsupported kernel symbol spelling", true);
             const auto& text = input.sections[section];
-            cubin_check(text.type == 1 && text.flags == 6, "unsupported code section", true);
+            cubin_check(text.type == 1 && (text.flags == 6 || text.flags == 0x100006), "unsupported code section", true);
             cubin_check(text.name == ".text." + name && symbols.number(at + 8, 8) == 0 && symbols.number(at + 16, 8) == text.size,
                 "unsupported function extent", true);
             cubin_check(names.insert(name).second && kernels.size() < 256, "duplicate/excessive kernels");
@@ -155,6 +161,12 @@ std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
     cubin_check(!kernels.empty(), "no kernel symbols");
     for (const auto& section : input.sections) if (section.name.starts_with(".text."))
         cubin_check(names.contains(section.name.substr(6)), "text section lacks a kernel symbol");
+    for (const auto& section : input.sections) if (section.name.starts_with(".nv.shared.")) {
+        auto found = std::find_if(kernels.begin(), kernels.end(), [&](const auto& kernel) { return kernel.name == section.name.substr(11); });
+        cubin_check(found != kernels.end() && section.info < input.sections.size() && &input.sections[section.info] == found->text,
+            "invalid static shared owner");
+        found->shared_size = unsigned(section.size); found->shared_alignment = unsigned(section.alignment);
+    }
     input.records(input.named(".nv.info"), [&](unsigned format, unsigned attr, unsigned size, const fatbin_reader& record) {
         cubin_check(format == 4 && size == 8 && (attr == 0x2f || attr == 0x11 || attr == 0x12), "unsupported module information", true);
         if (attr != 0x2f) cubin_check(record.number(4) == 0, "stack frames are unsupported", true);
@@ -175,20 +187,29 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
     for (size_t pc = 0; pc < code.size(); pc += 16) if ((words.number(pc, 8) & 0xfff) == 0x947)
         targets.insert(branch_target(pc, words.number(pc, 8), words.number(pc + 8, 8)));
     std::set<size_t> reachable;
-    std::vector<size_t> pending{0};
+    std::set<std::pair<size_t, bool>> memory_states;
+    std::vector<std::pair<size_t, bool>> pending{{0, false}};
+    bool shared_reconvergence = false;
     while (!pending.empty()) {
-        auto pc = pending.back(); pending.pop_back();
+        auto [pc, shared] = pending.back(); pending.pop_back();
         cubin_check(pc < code.size(), "kernel control flow falls beyond its code extent");
-        if (!reachable.insert(pc).second) continue;
+        if (!memory_states.emplace(pc, shared).second) continue;
+        reachable.insert(pc);
         auto lo = words.number(pc, 8), hi = words.number(pc + 8, 8);
         auto op = unsigned(lo & 0xfff), predicate = unsigned(lo >> 12) & 15;
-        if (op == 0x947) pending.push_back(branch_target(pc, lo, hi));
-        if ((op != 0x947 && op != 0x94d) || predicate != 7) pending.push_back(pc + 16);
+        // Even a region containing no shared instructions can rendezvous
+        // earlier shared accesses with later ones. Require a CTA barrier to
+        // finish that memory phase before erasing a subsequent token sync.
+        shared_reconvergence |= shared && (op == 0x945 || op == 0x941);
+        shared |= op == 0x984 || op == 0x388;
+        if (op == 0xb1d) shared = false; // Its exact unpredicated form is checked below.
+        if (op == 0x947) pending.emplace_back(branch_target(pc, lo, hi), shared);
+        if ((op != 0x947 && op != 0x94d) || predicate != 7) pending.emplace_back(pc + 16, shared);
     }
-    // In this scalar profile no operation observes the active warp mask, and
-    // shared memory, atomics and warp collectives are not accepted. Structured
-    // reconvergence can therefore use the per-invocation CFG, after proving
-    // that every edge preserves the nested BSSY/BSYNC regions.
+    // No instruction observes the active warp mask. Shared accesses and CTA
+    // barriers are accepted only outside token regions, where explicit CTA
+    // synchronization supplies inter-thread ordering. A BSYNC enclosing shared
+    // communication would itself need a warp rendezvous and is not erased.
     std::map<size_t, size_t> regions;
     size_t uniform_prefix = code.size();
     for (auto pc : reachable) {
@@ -213,6 +234,8 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         auto lo = words.number(pc, 8), hi = words.number(pc + 8, 8) & ((uint64_t(1) << 41) - 1);
         unsigned op = unsigned(lo & 0xfff), predicate = unsigned(lo >> 12) & 15;
         auto active = scope(pc);
+        if (op == 0x984 || op == 0x388 || op == 0xb1d)
+            cubin_check(active.empty(), "shared communication inside a reconvergence region is unsupported", true);
         if (op == 0x945) {
             auto barrier = (lo >> 16) & 255;
             for (auto begin : active) cubin_check(((words.number(begin, 8) >> 16) & 255) != barrier,
@@ -235,10 +258,13 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         if (op == 0x94d) cubin_check(active.empty(), "exit bypasses reconvergence sync");
         if ((op != 0x947 && op != 0x94d) || predicate != 7) edge(pc + 16);
     }
+    cubin_check(!shared_reconvergence, "reconvergence after shared communication requires a full-block barrier", true);
     std::string output = ".visible .entry " + kernel.name + "(";
     for (unsigned i = 0; i < kernel.parameters.size(); ++i)
         output += (i ? "," : "") + std::string(".param .b") + std::to_string(kernel.parameters[i].size * 8) + " arg" + std::to_string(i);
-    output += "){ .reg .b32 %r<255>,%u<63>,%scratch,%constant; .reg .b64 %a,%b,%c; .reg .f32 %f<3>; .reg .pred %p<7>,%pt;\nsetp.eq.u32 %pt,0,0;\n";
+    output += "){ .reg .b32 %r<255>,%u<63>,%scratch,%constant,%shared_base,%shared_address; .reg .b64 %a,%b,%c; .reg .f32 %f<3>; .reg .pred %p<7>,%pt;\nsetp.eq.u32 %pt,0,0;\n";
+    if (kernel.shared_size) output += ".shared .align " + std::to_string(kernel.shared_alignment) + " .b8 shared_storage[" +
+        std::to_string(kernel.shared_size) + "];\nmov.u32 %shared_base,shared_storage;\n";
     std::array<std::optional<uint32_t>, 256> known{}; known[255] = 0;
     auto reg = [&](unsigned id) { cubin_check(id <= 255 && id != 1, "stack-register use is unsupported", true); return id == 255 ? std::string("0") : "%r" + std::to_string(id); };
     uint64_t uniform_defined = uint64_t(1) << 63;
@@ -279,7 +305,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         // Only the acyclic entry prefix may define uniform state in a branched
         // kernel. Those definitions dominate every later read and cannot be
         // revisited by a loop or overwritten by a divergent arm.
-        if (pc >= uniform_prefix && (op == 0xab9 || op == 0x9c3 || op == 0x2a4))
+        if (pc >= uniform_prefix && (op == 0xab9 || op == 0x9c3 || op == 0x2a4 || op == 0x899))
             fail("uniform writes across branches are unsupported");
         std::string guard = predicate == 7 ? "" : "@" + std::string(predicate & 8 ? "!" : "") + pred(predicate & 7) + " ";
         auto bank_offset = [&] {
@@ -299,6 +325,8 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         std::string instruction; std::optional<uint32_t> constant;
         if (op == 0x202 && hi == 0xf00 && (lo & 0xffffff00ff000000ull) == 0) {
             instruction = "mov.b32 " + reg(dest) + "," + reg(right) + ";"; constant = known[right];
+        } else if (op == 0xc02 && hi == 0x8000f00 && !(lo >> 40) && left == 0) {
+            instruction = "mov.b32 " + reg(dest) + "," + uniform(right) + ";";
         } else if (op == 0x802 && hi == 0xf00 && left == 0) {
             instruction = "mov.b32 " + reg(dest) + "," + std::to_string(uint32_t(lo >> 32)) + ";"; constant = uint32_t(lo >> 32);
         } else if (op == 0xa02 && hi == 0xf00 && (lo & 0xffc000ffff000000ull) == 0) {
@@ -343,6 +371,24 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             auto displacement = load && !uniform_address ? int32_t(lo >> 32) : int32_t(lo >> 32) >> 8;
             auto address = "[%a" + std::string(displacement < 0 ? "-" : "+") + std::to_string(displacement < 0 ? -int64_t(displacement) : displacement) + "]";
             instruction = load ? "ld.global.u32 " + reg(dest) + "," + address + ";" : "st.global.u32 " + address + "," + reg(right) + ";";
+        } else if (op == 0x984 || op == 0x388) {
+            bool load = op == 0x984;
+            // Scalar LDS.U/STS with a byte or X4 address and signed immediate
+            // displacement. Reject width, cache, predicate-result and address
+            // extensions rather than discarding their fields.
+            if ((hi != (load ? 0x1800u : 0x800u) && hi != (load ? 0x5800u : 0x4800u)) ||
+                (load ? right != 0 : dest != 0) || !kernel.shared_size)
+                fail("unsupported shared memory encoding or missing static storage");
+            if (hi & 0x4000) output += guard + "shl.b32 %shared_address," + reg(left) + ",2;\n";
+            else output += guard + "mov.u32 %shared_address," + reg(left) + ";\n";
+            auto displacement = int32_t(lo >> 32) >> 8;
+            output += guard + "add.u32 %shared_address,%shared_address," + std::to_string(uint32_t(displacement)) + ";\n";
+            output += guard + "add.u32 %shared_address,%shared_address,%shared_base;\n";
+            instruction = load ? "ld.shared.u32 " + reg(dest) + ",[%shared_address];" : "st.shared.u32 [%shared_address]," + reg(right) + ";";
+        } else if (op == 0xb1d) {
+            if (lo != 0x7b1d || hi != 0 || kernel.text->flags != 0x100006)
+                fail("unsupported full-block barrier encoding");
+            instruction = "bar.sync 0;";
         } else if ((op == 0x210 || op == 0x810 || op == 0xa10) && (hi & ~uint64_t(0xe0000)) == 0x7f1e0ff &&
                    ((hi >> 17) & 7) != 7 && predicate == 7 && (op != 0x210 || !(lo >> 40))) {
             // IADD3 Rd, Pn, Ra, Rb/imm32, RZ: retain the carry used by the
@@ -356,10 +402,12 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             auto source = op == 0xa10 ? bank_word() : reg(right);
             output += guard + "selp.u32 %scratch,1,0," + pred(unsigned(hi >> 23) & 7) + ";\n" + guard + "add.u32 %scratch,%scratch," + reg(left) + ";\n";
             instruction = "add.u32 " + reg(dest) + ",%scratch," + source + ";";
-        } else if ((op == 0x210 || op == 0x810 || op == 0xa10) && (hi & ~uint64_t(255)) == 0x7ffe000) {
+        } else if ((op == 0x210 || op == 0x810 || op == 0xa10) && (hi & ~uint64_t(0x1ff)) == 0x7ffe000) {
             if (op == 0x210 && (lo >> 40)) fail("unsupported IADD3 register modifier");
             auto source = op == 0xa10 ? bank_word() : op == 0x210 ? reg(right) : std::to_string(uint32_t(lo >> 32));
-            output += guard + "add.u32 %scratch," + reg(left) + "," + source + ";\n";
+            auto first = reg(left);
+            if (hi & 0x100) { output += guard + "sub.u32 %scratch,0," + first + ";\n"; first = "%scratch"; }
+            output += guard + "add.u32 %scratch," + first + "," + source + ";\n";
             instruction = "add.u32 " + reg(dest) + ",%scratch," + reg(unsigned(hi) & 255) + ";";
         } else if (op == 0x2a4 && (hi & ~uint64_t(63)) == 0xf8e0200 && !(lo >> 40) && predicate == 7) {
             // Uniform values retain a distinct register file. Representing each
@@ -422,6 +470,16 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                 output += guard + "setp.gt.u64 %p0,%a,4294967295;\n";
                 instruction = "cvt.u32.u64 " + reg(dest) + ",%a;";
             }
+        } else if (op == 0x211 && (hi & ~uint64_t(0xf800)) == 0x78e00ff && !(lo >> 40)) {
+            unsigned shift = unsigned(hi >> 11) & 31;
+            output += guard + "shl.b32 %scratch," + reg(left) + "," + std::to_string(shift) + ";\n";
+            instruction = "add.u32 " + reg(dest) + ",%scratch," + reg(right) + ";";
+        } else if ((op == 0x819 || op == 0x899) && left == (op == 0x899 ? 63u : 255u) &&
+                   (hi & ~uint64_t(255)) == (op == 0x899 ? 0x8011600u : 0x11600u) && uint32_t(lo >> 32) < 32) {
+            unsigned source = unsigned(hi) & 255;
+            if (op == 0x899 && predicate != 7) fail("unsupported uniform shift predicate");
+            auto value = op == 0x899 ? uniform(source) : reg(source);
+            instruction = "shr.u32 " + (op == 0x899 ? uniform(dest, true) : reg(dest)) + "," + value + "," + std::to_string(uint32_t(lo >> 32)) + ";";
         } else if (op == 0x819 && hi == 0x6ff && uint32_t(lo >> 32) < 32) {
             instruction = "shl.b32 " + reg(dest) + "," + reg(left) + "," + std::to_string(uint32_t(lo >> 32)) + ";";
         } else if (op == 0x221 || op == 0x421 || op == 0xa21 || op == 0x220 || op == 0x820 || op == 0xa20 || op == 0x223 || op == 0x823 || op == 0xa23) {
@@ -458,12 +516,12 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             auto positive = reg(left), negative = op == 0x807 ? std::to_string(uint32_t(lo >> 32)) : reg(right);
             if (hi & 0x4000000) std::swap(positive, negative);
             instruction = "selp.b32 " + reg(dest) + "," + positive + "," + negative + "," + pred(unsigned(hi >> 23) & 7) + ";";
-        } else if ((op == 0x20c || op == 0x80c || op == 0xa0c) && dest == 0 && (op != 0x20c || !(lo >> 40)) &&
-                   (hi & ~uint64_t(0xe7200)) == 0x3f00070) {
+        } else if ((op == 0x20c || op == 0x80c || op == 0xa0c || op == 0xc0c) && dest == 0 && ((op != 0x20c && op != 0xc0c) || !(lo >> 40)) &&
+                   (hi & ~uint64_t(0xe7200)) == (op == 0xc0c ? 0xbf00070u : 0x3f00070u)) {
             unsigned comparison = unsigned(hi >> 12) & 7, destination = unsigned(hi >> 17) & 7;
             const char* comparisons[]{"", "lt", "eq", "le", "gt", "ne", "ge", ""};
             if (comparison == 0 || comparison == 7 || destination == 7) fail("unsupported integer comparison modifier");
-            auto source = op == 0xa0c ? bank_word() : op == 0x80c ? std::to_string(uint32_t(lo >> 32)) : reg(right);
+            auto source = op == 0xa0c ? bank_word() : op == 0x80c ? std::to_string(uint32_t(lo >> 32)) : op == 0xc0c ? uniform(right) : reg(right);
             instruction = "setp." + std::string(comparisons[comparison]) + (hi & 0x200 ? ".s32 " : ".u32 ") + pred(destination) + "," + reg(left) + "," + source + ";";
         } else if (op == 0x81c && !(lo >> 16)) {
             auto form = hi & ~uint64_t(0x38e0000);
@@ -481,8 +539,8 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         else if (op == 0x918 && hi == 0 && !(lo >> 16)) { }
         else fail("unsupported SM75 instruction encoding " + std::to_string(lo) + "/" + std::to_string(hi));
         if (!instruction.empty()) output += guard + instruction + "\n";
-        if (op != 0x386 && op != 0x986 && op != 0x947 && op != 0x94d && op != 0x918 && op != 0x20c && op != 0x80c && op != 0xa0c && op != 0x20b && op != 0x81c &&
-            op != 0xab9 && op != 0x9c3 && op != 0x2a4 && op != 0x945 && op != 0x941 && op != 0x355)
+        if (op != 0x386 && op != 0x986 && op != 0x388 && op != 0xb1d && op != 0x947 && op != 0x94d && op != 0x918 && op != 0x20c && op != 0x80c && op != 0xa0c && op != 0xc0c && op != 0x20b && op != 0x81c &&
+            op != 0xab9 && op != 0x9c3 && op != 0x2a4 && op != 0x899 && op != 0x945 && op != 0x941 && op != 0x355)
             known[dest] = predicate == 7 ? constant : std::nullopt;
     }
     // ptxas pads the section with unreachable NOPs after its exit/stop loop.
