@@ -96,6 +96,7 @@ struct cubin_kernel {
     std::vector<cubin_parameter> parameters;
     unsigned base = 0, size = 0, shared_size = 0, shared_alignment = 1;
     bool shared_storage = false;
+    std::map<size_t, unsigned> warp_barriers;
 };
 std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
     std::vector<cubin_kernel> kernels; std::set<std::string> names;
@@ -115,6 +116,7 @@ std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
                 "unsupported function extent", true);
             cubin_check(names.insert(name).second && kernels.size() < 256, "duplicate/excessive kernels");
             cubin_kernel kernel{name, &text, {}}; std::map<unsigned, cubin_parameter> layout; bool bank = false, extent = false; unsigned declared_size = 0;
+            std::optional<std::vector<unsigned>> cooperative_offsets, cooperative_masks;
             input.records(input.named(".nv.info." + name), [&](unsigned format, unsigned attr, unsigned size, const fatbin_reader& record) {
                 if (attr == 0xa) {
                     cubin_check(format == 4 && size == 8 && !bank, "invalid parameter bank"); bank = true;
@@ -147,9 +149,40 @@ std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
                     cubin_check(format == 4 && size % 4 == 0, "invalid exit offsets");
                     for (unsigned offset = 0; offset < size; offset += 4)
                         cubin_check(record.number(offset) < text.size && record.number(offset) % 16 == 0, "invalid exit offset");
+                } else if (attr == 0x28 || attr == 0x29) {
+                    auto& count = attr == 0x28 ? cooperative_offsets : cooperative_masks;
+                    cubin_check(format == 4 && size % 4 == 0 && !count, "invalid cooperative instruction metadata");
+                    count.emplace();
+                    for (unsigned at = 0; at < size; at += 4) {
+                        auto value = record.number(at);
+                        count->push_back(unsigned(value));
+                        if (attr == 0x28) {
+                            cubin_check(value < text.size && value % 16 == 0, "invalid cooperative instruction offset");
+                            auto opcode = input.number(text.offset + value, 2) & 0xfff;
+                            cubin_check(opcode == 0x389 || opcode == 0x589 || opcode == 0x989 || opcode == 0xf89 ||
+                                opcode == 0x806 || opcode == 0x348 || opcode == 0x948 || opcode == 0x918,
+                                "invalid cooperative instruction opcode");
+                        }
+                    }
                 } else cubin_fail("unsupported kernel information attribute " + std::to_string(attr), true);
             });
             cubin_check(bank && extent, "missing parameter metadata");
+            cubin_check(bool(cooperative_offsets) == bool(cooperative_masks) &&
+                (!cooperative_offsets || cooperative_offsets->size() == cooperative_masks->size()), "inconsistent cooperative instruction metadata");
+            if (cooperative_offsets) for (unsigned i = 0; i < cooperative_offsets->size(); ++i) {
+                auto lo = input.number(text.offset + (*cooperative_offsets)[i], 8);
+                unsigned mask = (*cooperative_masks)[i];
+                if ((lo & 0xfff) == 0x918) {
+                    // CUDA 12.4 can encode warp sync as a NOP carrying its
+                    // mask in these paired records. It is not padding.
+                    cubin_check(mask == UINT32_MAX || ((mask & 0xffffff00u) == 0x05000000u && (mask & 255) != 1),
+                        "unsupported cooperative mask register", true);
+                    cubin_check(kernel.warp_barriers.emplace((*cooperative_offsets)[i], mask).second, "duplicate cooperative instruction offset");
+                } else {
+                    auto expected = (lo & 0xfff) == 0x348 ? 0x05000000u | (unsigned(lo >> 32) & 255) : UINT32_MAX;
+                    cubin_check(mask == expected, "unsupported cooperative mask register", true);
+                }
+            }
             unsigned end = 0;
             for (auto [ordinal, parameter] : layout) {
                 cubin_check(ordinal == kernel.parameters.size() && parameter.offset == ((end + parameter.size - 1) & ~(parameter.size - 1)), "invalid scalar parameter layout");
@@ -203,9 +236,13 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
     // common IR. Branch ballots partition the current cohort; BSYNC reunites
     // the saved BSSY cohort through the shared warp-barrier implementation.
     std::map<size_t, size_t> regions;
+    bool warp_operations = !kernel.warp_barriers.empty();
     size_t uniform_prefix = code.size();
     for (auto pc : reachable) {
         auto lo = words.number(pc, 8), hi = words.number(pc + 8, 8) & ((uint64_t(1) << 41) - 1);
+        unsigned opcode = unsigned(lo & 0xfff);
+        warp_operations |= opcode == 0x806 || opcode == 0x389 || opcode == 0x589 ||
+            opcode == 0x989 || opcode == 0xf89 || opcode == 0x348 || opcode == 0x948;
         if ((lo & 0xfff) == 0x947) uniform_prefix = std::min({uniform_prefix, pc, branch_target(pc, lo, hi)});
         if ((lo & 0xfff) != 0x945) continue;
         unsigned barrier = unsigned(lo >> 16) & 255;
@@ -254,8 +291,9 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
     for (unsigned i = 0; i < kernel.parameters.size(); ++i)
         output += (i ? "," : "") + std::string(".param .b") + std::to_string(kernel.parameters[i].size * 8) + " arg" + std::to_string(i);
     output += "){ .reg .b32 %r<255>,%u<63>,%scratch,%constant,%shared_base,%shared_dynamic,%shared_static_address,%shared_address; .reg .b64 %a,%b,%c; .reg .f32 %f<3>; .reg .pred %p<7>,%pt,%shared_is_static;\nsetp.eq.u32 %pt,0,0;\n";
-    if (!regions.empty())
-        output += ".reg .b32 %cohort,%taken,%fallthrough,%token<16>; .reg .pred %branch_taken;\nactivemask.b32 %cohort;\n";
+    bool track_cohort = warp_operations || !regions.empty();
+    if (track_cohort)
+        output += ".reg .b32 %cohort,%members,%taken,%fallthrough,%token<16>; .reg .pred %branch_taken;\nactivemask.b32 %cohort;\n";
     if (kernel.shared_size) output += ".shared .align " + std::to_string(kernel.shared_alignment) + " .b8 shared_storage[" +
         std::to_string(kernel.shared_size) + "];\nmov.u32 %shared_base,shared_storage;\n";
     if (kernel.shared_storage) output += ".extern .shared .align " + std::to_string(std::max(16u, kernel.shared_alignment)) +
@@ -332,9 +370,18 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                 guard + "add.u32 %shared_address,%shared_dynamic,%shared_address;\n";
             if (kernel.shared_size) output += guard + "selp.u32 %shared_address,%shared_static_address,%shared_address,%shared_is_static;\n";
         };
+        auto warp_members = [&] {
+            // SASS participants are the current cohort filtered by instruction
+            // predication, not the whole warp or the backend's subgroup.
+            auto test = predicate == 7 ? "%pt" : std::string(predicate & 8 ? "!" : "") + pred(predicate & 7);
+            output += "vote.sync.ballot.b32 %members," + test + ",%cohort;\n";
+        };
         output += "L" + std::to_string(pc) + ":\n";
         std::string instruction; std::optional<uint32_t> constant;
-        if (op == 0x202 && hi == 0xf00 && (lo & 0xffffff00ff000000ull) == 0) {
+        if (auto barrier = kernel.warp_barriers.find(pc); barrier != kernel.warp_barriers.end()) {
+            if (lo != 0x7918 || hi != 0) fail("unsupported cooperative warp barrier encoding");
+            instruction = "bar.warp.sync " + (barrier->second == UINT32_MAX ? std::to_string(UINT32_MAX) : reg(barrier->second & 255)) + ";";
+        } else if (op == 0x202 && hi == 0xf00 && (lo & 0xffffff00ff000000ull) == 0) {
             instruction = "mov.b32 " + reg(dest) + "," + reg(right) + ";"; constant = known[right];
         } else if (op == 0xc02 && hi == 0x8000f00 && !(lo >> 40) && left == 0) {
             instruction = "mov.b32 " + reg(dest) + "," + uniform(right) + ";";
@@ -360,10 +407,48 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             unsigned special = unsigned(hi >> 8);
             const char* component = special >= 0x21 && special <= 0x23 ? "%tid." :
                 special >= 0x25 && special <= 0x27 ? "%ctaid." : nullptr;
-            if (!component) fail("unsupported special register " + std::to_string(special));
-            if (op == 0x9c3 && (special < 0x25 || predicate != 7)) fail("unsupported uniform special register");
-            unsigned axis = special >= 0x25 ? special - 0x25 : special - 0x21;
-            instruction = "mov.u32 " + (op == 0x9c3 ? uniform(dest, true) : reg(dest)) + "," + component + "xyz"[axis] + ";";
+            if (special == 0 && op == 0x919) instruction = "mov.u32 " + reg(dest) + ",%laneid;";
+            else {
+                if (!component) fail("unsupported special register " + std::to_string(special));
+                if (op == 0x9c3 && (special < 0x25 || predicate != 7)) fail("unsupported uniform special register");
+                unsigned axis = special >= 0x25 ? special - 0x25 : special - 0x21;
+                instruction = "mov.u32 " + (op == 0x9c3 ? uniform(dest, true) : reg(dest)) + "," + component + "xyz"[axis] + ";";
+            }
+        } else if (op == 0x389 || op == 0x589 || op == 0x989 || op == 0xf89) {
+            bool immediate_offset = op == 0x989 || op == 0xf89, immediate_control = op == 0x589 || op == 0xf89;
+            uint64_t fields = uint64_t(3) << 58 | (immediate_offset ? uint64_t(31) << 53 : uint64_t(255) << 32) |
+                (immediate_control ? uint64_t(0x1f1f) << 40 : 0);
+            if ((lo & ~(fields | uint64_t(0xffffffff))) != 0 || (hi & ~uint64_t(immediate_control ? 0xe0000 : 0xe00ff)) != 0)
+                fail("unsupported shuffle encoding");
+            auto offset = immediate_offset ? std::to_string(unsigned(lo >> 53) & 31) : reg(right);
+            auto control = immediate_control ? std::to_string(unsigned(lo >> 40) & 0x1f1f) : reg(unsigned(hi) & 255);
+            unsigned destination = unsigned(hi >> 17) & 7;
+            const char* modes[]{"idx", "up", "down", "bfly"};
+            warp_members();
+            instruction = "shfl.sync." + std::string(modes[unsigned(lo >> 58) & 3]) + ".b32 " +
+                (dest == 255 ? std::string("_") : reg(dest)) + (destination == 7 ? "" : "|" + pred(destination)) + "," +
+                reg(left) + "," + offset + "," + control + ",%members;";
+        } else if (op == 0x806) {
+            // VOTE.ANY writes a ballot and optionally its any predicate.
+            if ((lo >> 24) != 0 || (hi & ~uint64_t(0x78e0000)) != 0x100)
+                fail("unsupported vote encoding");
+            warp_members();
+            auto test = std::string(hi & 0x4000000 ? "!" : "") + pred(unsigned(hi >> 23) & 7);
+            unsigned destination = unsigned(hi >> 17) & 7;
+            auto target = dest == 255 ? std::string("%scratch") : reg(dest);
+            // Compute before writing: the source and result predicates may alias.
+            output += guard + "vote.sync.ballot.b32 %scratch," + test + ",%members;\n";
+            instruction = "mov.b32 " + target + ",%scratch;";
+            if (destination != 7) {
+                // The result predicate can also be this instruction's guard.
+                // Publish the register result before changing that guard.
+                output += guard + instruction + "\n";
+                instruction = "setp.ne.u32 " + pred(destination) + ",%scratch,0;";
+            }
+        } else if (op == 0x348 || op == 0x948) {
+            if ((uint32_t(lo) & 0xffff0000u) != 0 || (op == 0x348 && (lo >> 40)) || hi != 0x3800000)
+                fail("unsupported warp barrier encoding");
+            instruction = "bar.warp.sync " + (op == 0x948 ? std::to_string(uint32_t(lo >> 32)) : reg(right)) + ";";
         } else if ((op == 0x381 && hi == 0x1ee900) || (op == 0x981 && hi == 0xc1ee900) ||
                    (op == 0x986 && (hi & ~uint64_t(63)) == 0xc10e900) || (op == 0x386 && hi == 0x10e900)) {
             bool uniform_address = op == 0x981 || op == 0x986, load = op == 0x381 || op == 0x981;
@@ -418,10 +503,19 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             if (lo != 0x7b1d || hi != 0 || kernel.text->flags != 0x100006)
                 fail("unsupported full-block barrier encoding");
             instruction = "bar.sync 0;";
-        } else if ((op == 0x212 || op == 0x812) && (hi & ~uint64_t(0xffff)) == 0x78e0000 && (op == 0x812 || !(lo >> 40))) {
-            instruction = "lop3.b32 " + reg(dest) + "," + reg(left) + "," +
-                (op == 0x812 ? std::to_string(uint32_t(lo >> 32)) : reg(right)) + "," + reg(unsigned(hi) & 255) + "," +
-                std::to_string(unsigned(hi >> 8) & 255) + ";";
+        } else if ((op == 0x212 || op == 0x812 || op == 0xa12) &&
+                   (hi & ~uint64_t(0xeffff)) == 0x7800000u &&
+                   (op == 0x812 || op == 0xa12 || !(lo >> 40))) {
+            auto second = op == 0xa12 ? bank_word() :
+                op == 0x812 ? std::to_string(uint32_t(lo >> 32)) : reg(right);
+            output += guard + "lop3.b32 %scratch," + reg(left) + "," + second + "," + reg(unsigned(hi) & 255) + "," +
+                std::to_string(unsigned(hi >> 8) & 255) + ";\n";
+            unsigned destination = unsigned(hi >> 17) & 7;
+            instruction = "mov.b32 " + (dest == 255 ? std::string("%scratch") : reg(dest)) + ",%scratch;";
+            if (destination != 7) {
+                output += guard + instruction + "\n";
+                instruction = "setp.ne.u32 " + pred(destination) + ",%scratch,0;";
+            }
         } else if ((op == 0x210 || op == 0x810 || op == 0xa10) && (hi & ~uint64_t(0xe0000)) == 0x7f1e0ff &&
                    ((hi >> 17) & 7) != 7 && predicate == 7 && (op != 0x210 || !(lo >> 40))) {
             // IADD3 Rd, Pn, Ra, Rb/imm32, RZ: retain the carry used by the
@@ -564,7 +658,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             instruction = std::string(form == 0x70e170 ? "not.pred " : "and.pred ") + pred(destination) + "," + pred(source) +
                 (form == 0x70e170 ? ";" : ",%pt;");
         } else if (op == 0x947 && (hi & ~uint64_t(0x3ffff)) == 0x3800000 && (lo & 0xffff0000) == 0) {
-            if (!regions.empty() && predicate != 7 && reachable.contains(pc)) {
+            if (track_cohort && predicate != 7 && reachable.contains(pc)) {
                 output += std::string(predicate & 8 ? "not.pred " : "and.pred ") + "%branch_taken," + pred(predicate & 7) +
                     (predicate & 8 ? ";\n" : ",%pt;\n");
                 output += "vote.sync.ballot.b32 %taken,%branch_taken,%cohort;\nxor.b32 %fallthrough,%cohort,%taken;\n"
