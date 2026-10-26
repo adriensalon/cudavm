@@ -132,7 +132,10 @@ std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
                     cubin_check(format == 4 && size == 4, "invalid producer information");
                     cubin_check(record.number(0) == (attr == 0x36 ? 1u : 124u), "unsupported producer information", true);
                 } else if (attr == 0x1b) cubin_check(format == 3, "invalid register limit");
-                else if (attr == 0x4) cubin_check(format == 1 && size == 0, "invalid CTAID.Z usage record");
+                else if (attr == 0x1e) {
+                    cubin_check(format == 4 && size == 4, "invalid reconvergence stack information");
+                    cubin_check(record.number(0) == 0, "reconvergence stack spills are unsupported", true);
+                } else if (attr == 0x4) cubin_check(format == 1 && size == 0, "invalid CTAID.Z usage record");
                 else if (attr == 0x1c) {
                     cubin_check(format == 4 && size % 4 == 0, "invalid exit offsets");
                     for (unsigned offset = 0; offset < size; offset += 4)
@@ -182,14 +185,69 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         if (op == 0x947) pending.push_back(branch_target(pc, lo, hi));
         if ((op != 0x947 && op != 0x94d) || predicate != 7) pending.push_back(pc + 16);
     }
-    bool has_branch = std::any_of(reachable.begin(), reachable.end(), [&](size_t pc) { return (words.number(pc, 8) & 0xfff) == 0x947; });
+    // In this scalar profile no operation observes the active warp mask, and
+    // shared memory, atomics and warp collectives are not accepted. Structured
+    // reconvergence can therefore use the per-invocation CFG, after proving
+    // that every edge preserves the nested BSSY/BSYNC regions.
+    std::map<size_t, size_t> regions;
+    size_t uniform_prefix = code.size();
+    for (auto pc : reachable) {
+        auto lo = words.number(pc, 8), hi = words.number(pc + 8, 8) & ((uint64_t(1) << 41) - 1);
+        if ((lo & 0xfff) == 0x947) uniform_prefix = std::min({uniform_prefix, pc, branch_target(pc, lo, hi)});
+        if ((lo & 0xfff) != 0x945) continue;
+        unsigned barrier = unsigned(lo >> 16) & 255;
+        cubin_check(uint32_t(lo) == (barrier << 16 | 0x7945) && barrier < 16 &&
+            (hi & ~uint64_t(0x3ffff)) == 0x3800000, "unsupported BSSY encoding", true);
+        auto end = branch_target(pc, lo, hi);
+        cubin_check(end > pc + 16 && words.number(end - 16, 8) == (uint64_t(barrier) << 16 | 0x7941) &&
+            (words.number(end - 8, 8) & ((uint64_t(1) << 41) - 1)) == 0x3800000,
+            "invalid reconvergence target");
+        regions.emplace(pc, end);
+    }
+    auto scope = [&](size_t pc) {
+        std::vector<size_t> active;
+        for (const auto& [begin, end] : regions) if (begin < pc && pc < end) active.push_back(begin);
+        return active;
+    };
+    for (auto pc : reachable) {
+        auto lo = words.number(pc, 8), hi = words.number(pc + 8, 8) & ((uint64_t(1) << 41) - 1);
+        unsigned op = unsigned(lo & 0xfff), predicate = unsigned(lo >> 12) & 15;
+        auto active = scope(pc);
+        if (op == 0x945) {
+            auto barrier = (lo >> 16) & 255;
+            for (auto begin : active) cubin_check(((words.number(begin, 8) >> 16) & 255) != barrier,
+                "reused active reconvergence barrier");
+            active.push_back(pc);
+        } else if (op == 0x941) {
+            cubin_check(!active.empty() && regions.at(active.back()) == pc + 16 &&
+                lo == ((words.number(active.back(), 8) & 0xff0000) | 0x7941) && hi == 0x3800000,
+                "invalid reconvergence sync");
+            active.pop_back();
+        } else if (op == 0x355) {
+            auto barrier = (lo >> 24) & 255;
+            cubin_check(lo == (barrier << 24 | 0xff7355) && barrier < 16 && hi == 0x100000,
+                "unsupported reconvergence clear", true);
+            for (auto begin : active) cubin_check(((words.number(begin, 8) >> 16) & 255) != barrier,
+                "clearing active reconvergence barrier");
+        }
+        auto edge = [&](size_t next) { cubin_check(active == scope(next), "branch crosses a reconvergence region"); };
+        if (op == 0x947) edge(branch_target(pc, lo, hi));
+        if (op == 0x94d) cubin_check(active.empty(), "exit bypasses reconvergence sync");
+        if ((op != 0x947 && op != 0x94d) || predicate != 7) edge(pc + 16);
+    }
     std::string output = ".visible .entry " + kernel.name + "(";
     for (unsigned i = 0; i < kernel.parameters.size(); ++i)
         output += (i ? "," : "") + std::string(".param .b") + std::to_string(kernel.parameters[i].size * 8) + " arg" + std::to_string(i);
     output += "){ .reg .b32 %r<255>,%u<63>,%scratch,%constant; .reg .b64 %a,%b,%c; .reg .f32 %f<3>; .reg .pred %p<7>,%pt;\nsetp.eq.u32 %pt,0,0;\n";
     std::array<std::optional<uint32_t>, 256> known{}; known[255] = 0;
     auto reg = [&](unsigned id) { cubin_check(id <= 255 && id != 1, "stack-register use is unsupported", true); return id == 255 ? std::string("0") : "%r" + std::to_string(id); };
-    auto uniform = [&](unsigned id) { cubin_check(id <= 63, "invalid uniform register"); return id == 63 ? std::string("0") : "%u" + std::to_string(id); };
+    uint64_t uniform_defined = uint64_t(1) << 63;
+    auto uniform = [&](unsigned id, bool write = false) {
+        cubin_check(id <= 63 && (!write || id != 63), "invalid uniform register");
+        if (write) uniform_defined |= uint64_t(1) << id;
+        else cubin_check((uniform_defined & (uint64_t(1) << id)) != 0, "uninitialized uniform register", true);
+        return id == 63 ? std::string("0") : "%u" + std::to_string(id);
+    };
     auto pred = [](unsigned id) { return id == 7 ? std::string("%pt") : "%p" + std::to_string(id); };
     auto constant_load = [&](const std::string& dest, const std::string& next, unsigned offset, unsigned size, const std::string& guard) {
         // CUDA 12.4's SM75 launch ABI stores block and grid dimensions before
@@ -218,12 +276,11 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         unsigned op = unsigned(lo & 0xfff), predicate = unsigned(lo >> 12) & 15, dest = unsigned(lo >> 16) & 255,
             left = unsigned(lo >> 24) & 255, right = unsigned(lo >> 32) & 255;
         auto fail = [&](const std::string& reason) { cubin_fail(kernel.name + "+" + std::to_string(pc) + ": " + reason, true); };
-        // Per-invocation copies implement uniform values along the checked
-        // straight-line/early-exit paths. A uniform write in one divergent arm
-        // can affect other lanes after reconvergence; that needs a separate
-        // warp-state contract. Do not silently treat it as a thread register.
-        if (has_branch && (op == 0xab9 || op == 0x9c3 || op == 0x2a4 || op == 0xc24 || op == 0x981 || op == 0x986))
-            fail("uniform registers across branches are unsupported");
+        // Only the acyclic entry prefix may define uniform state in a branched
+        // kernel. Those definitions dominate every later read and cannot be
+        // revisited by a loop or overwritten by a divergent arm.
+        if (pc >= uniform_prefix && (op == 0xab9 || op == 0x9c3 || op == 0x2a4))
+            fail("uniform writes across branches are unsupported");
         std::string guard = predicate == 7 ? "" : "@" + std::string(predicate & 8 ? "!" : "") + pred(predicate & 7) + " ";
         auto bank_offset = [&] {
             if (lo & 0xffc0000000000000ull) fail("unsupported constant-bank operand");
@@ -259,7 +316,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         } else if (op == 0xab9 && (hi == 0x800 || hi == 0xa00) && left == 0 && right == 0 && predicate == 7) {
             unsigned width = hi == 0xa00 ? 8 : 4;
             if (dest + width / 4 > 63 || (width == 8 && dest % 2)) fail("invalid uniform constant destination");
-            output += constant_load(uniform(dest), width == 8 ? uniform(dest + 1) : "", bank_offset(), width, guard);
+            output += constant_load(uniform(dest, true), width == 8 ? uniform(dest + 1, true) : "", bank_offset(), width, guard);
         } else if ((op == 0x919 || op == 0x9c3) && (lo >> 24) == 0 && (hi & ~uint64_t(0xff00)) == 0) {
             unsigned special = unsigned(hi >> 8);
             const char* component = special >= 0x21 && special <= 0x23 ? "%tid." :
@@ -267,7 +324,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             if (!component) fail("unsupported special register " + std::to_string(special));
             if (op == 0x9c3 && (special < 0x25 || predicate != 7)) fail("unsupported uniform special register");
             unsigned axis = special >= 0x25 ? special - 0x25 : special - 0x21;
-            instruction = "mov.u32 " + (op == 0x9c3 ? uniform(dest) : reg(dest)) + "," + component + "xyz"[axis] + ";";
+            instruction = "mov.u32 " + (op == 0x9c3 ? uniform(dest, true) : reg(dest)) + "," + component + "xyz"[axis] + ";";
         } else if ((op == 0x381 && hi == 0x1ee900) || (op == 0x981 && hi == 0xc1ee900) ||
                    (op == 0x986 && (hi & ~uint64_t(63)) == 0xc10e900) || (op == 0x386 && hi == 0x10e900)) {
             bool uniform_address = op == 0x981 || op == 0x986, load = op == 0x381 || op == 0x981;
@@ -307,8 +364,9 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         } else if (op == 0x2a4 && (hi & ~uint64_t(63)) == 0xf8e0200 && !(lo >> 40) && predicate == 7) {
             // Uniform values retain a distinct register file. Representing each
             // value per invocation preserves the checked, unpredicated forms.
-            instruction = "mad.lo.u32 " + uniform(dest) + "," + uniform(left) + "," + uniform(right) + "," + uniform(unsigned(hi) & 63) + ";";
-        } else if (op == 0x224 || op == 0x824 || op == 0xa24 || op == 0xc24 || op == 0x624 ||
+            auto a = uniform(left), b = uniform(right), c = uniform(unsigned(hi) & 63);
+            instruction = "mad.lo.u32 " + uniform(dest, true) + "," + a + "," + b + "," + c + ";";
+        } else if (op == 0x224 || op == 0x424 || op == 0x824 || op == 0xa24 || op == 0xc24 || op == 0x624 ||
                    op == 0x225 || op == 0x825 || op == 0xa25 || op == 0x625 || op == 0x227 || op == 0x827) {
             bool wide = (op & 15) == 5, high_product = (op & 15) == 7;
             unsigned form = op & 0xe00, addend = unsigned(hi) & 255;
@@ -321,7 +379,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                 // IMAD.MOV is another dead stack-pointer prologue. R1 reads
                 // still reject, including through a paired address operand.
             } else {
-                auto source = form == 0xa00 ? bank_word() : form == 0x800 ? std::to_string(uint32_t(lo >> 32)) :
+                auto source = form == 0xa00 ? bank_word() : form == 0x400 ? reg(addend) : form == 0x800 ? std::to_string(uint32_t(lo >> 32)) :
                     form == 0xc00 ? uniform(right) : form == 0x600 ? reg(addend) : reg(right);
                 if (wide) {
                     if (dest >= 254 || dest % 2) fail("invalid wide IMAD destination");
@@ -342,9 +400,27 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                     instruction = "cvt.u32.u64 " + reg(dest + 1) + ",%a;";
                     known[dest + 1].reset();
                 } else {
-                    auto third = form == 0x600 ? bank_word() : reg(addend);
+                    auto third = form == 0x600 ? bank_word() : form == 0x400 ? std::to_string(uint32_t(lo >> 32)) : reg(addend);
                     instruction = std::string(high_product ? "mad.hi.u32 " : "mad.lo.u32 ") + reg(dest) + "," + reg(left) + "," + source + "," + third + ";";
                 }
+            }
+        } else if (op == 0xa11) {
+            // Checked unsigned index*4 + bank pointer pair, with P0 carry.
+            bool high = hi == 0xf14ff;
+            if ((!high && hi != 0x78010ff) || right || predicate != 7)
+                fail("unsupported LEA modifier");
+            output += "cvt.u64.u32 %a," + reg(left) + ";\nshl.b64 %a,%a,2;\n";
+            if (high) {
+                output += guard + "shr.u64 %a,%a,32;\n" + guard + "selp.u32 %scratch,1,0,%p0;\n" +
+                    guard + "cvt.u32.u64 %constant,%a;\n" + guard + "add.u32 %scratch,%scratch,%constant;\n";
+                auto source = bank_word();
+                instruction = "add.u32 " + reg(dest) + ",%scratch," + source + ";";
+            } else {
+                auto source = bank_word();
+                output += guard + "cvt.u32.u64 %scratch,%a;\n" + guard + "cvt.u64.u32 %a,%scratch;\n" +
+                    guard + "cvt.u64.u32 %b," + source + ";\n" + guard + "add.u64 %a,%a,%b;\n";
+                output += guard + "setp.gt.u64 %p0,%a,4294967295;\n";
+                instruction = "cvt.u32.u64 " + reg(dest) + ",%a;";
             }
         } else if (op == 0x819 && hi == 0x6ff && uint32_t(lo >> 32) < 32) {
             instruction = "shl.b32 " + reg(dest) + "," + reg(left) + "," + std::to_string(uint32_t(lo >> 32)) + ";";
@@ -382,13 +458,13 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             auto positive = reg(left), negative = op == 0x807 ? std::to_string(uint32_t(lo >> 32)) : reg(right);
             if (hi & 0x4000000) std::swap(positive, negative);
             instruction = "selp.b32 " + reg(dest) + "," + positive + "," + negative + "," + pred(unsigned(hi >> 23) & 7) + ";";
-        } else if ((op == 0x20c || op == 0xa0c) && dest == 0 && (op != 0x20c || !(lo >> 40)) &&
-                   (hi & ~uint64_t(0xe7000)) == 0x3f00070) {
+        } else if ((op == 0x20c || op == 0x80c || op == 0xa0c) && dest == 0 && (op != 0x20c || !(lo >> 40)) &&
+                   (hi & ~uint64_t(0xe7200)) == 0x3f00070) {
             unsigned comparison = unsigned(hi >> 12) & 7, destination = unsigned(hi >> 17) & 7;
             const char* comparisons[]{"", "lt", "eq", "le", "gt", "ne", "ge", ""};
             if (comparison == 0 || comparison == 7 || destination == 7) fail("unsupported integer comparison modifier");
-            auto source = op == 0xa0c ? bank_word() : reg(right);
-            instruction = "setp." + std::string(comparisons[comparison]) + ".u32 " + pred(destination) + "," + reg(left) + "," + source + ";";
+            auto source = op == 0xa0c ? bank_word() : op == 0x80c ? std::to_string(uint32_t(lo >> 32)) : reg(right);
+            instruction = "setp." + std::string(comparisons[comparison]) + (hi & 0x200 ? ".s32 " : ".u32 ") + pred(destination) + "," + reg(left) + "," + source + ";";
         } else if (op == 0x81c && !(lo >> 16)) {
             auto form = hi & ~uint64_t(0x38e0000);
             if (form != 0x70e170 && form != 0x70f070) fail("unsupported predicate LUT");
@@ -398,12 +474,15 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                 (form == 0x70e170 ? ";" : ",%pt;");
         } else if (op == 0x947 && (hi & ~uint64_t(0x3ffff)) == 0x3800000 && (lo & 0xffff0000) == 0) {
             instruction = "bra L" + std::to_string(branch_target(pc, lo, hi)) + ";";
+        } else if (op == 0x945 || op == 0x941 || op == 0x355) {
+            // Reachable token operations were checked against the CFG above.
+            cubin_check(reachable.contains(pc), "unreachable reconvergence instruction", true);
         } else if (op == 0x94d && hi == 0x3800000 && !(lo >> 16)) instruction = "ret;";
         else if (op == 0x918 && hi == 0 && !(lo >> 16)) { }
         else fail("unsupported SM75 instruction encoding " + std::to_string(lo) + "/" + std::to_string(hi));
         if (!instruction.empty()) output += guard + instruction + "\n";
-        if (op != 0x386 && op != 0x986 && op != 0x947 && op != 0x94d && op != 0x918 && op != 0x20c && op != 0xa0c && op != 0x20b && op != 0x81c &&
-            op != 0xab9 && op != 0x9c3 && op != 0x2a4)
+        if (op != 0x386 && op != 0x986 && op != 0x947 && op != 0x94d && op != 0x918 && op != 0x20c && op != 0x80c && op != 0xa0c && op != 0x20b && op != 0x81c &&
+            op != 0xab9 && op != 0x9c3 && op != 0x2a4 && op != 0x945 && op != 0x941 && op != 0x355)
             known[dest] = predicate == 7 ? constant : std::nullopt;
     }
     // ptxas pads the section with unreachable NOPs after its exit/stop loop.
