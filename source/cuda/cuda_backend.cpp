@@ -4,6 +4,7 @@
 #include "shader_ptx.hpp"
 #include "nvidia_image.hpp"
 #include "nvidia_managed_image.hpp"
+#include "../core/module_descriptor.hpp"
 #include <cctype>
 #include <fstream>
 #include <iterator>
@@ -511,6 +512,34 @@ struct cuda_module : executable, std::enable_shared_from_this<cuda_module> {
     bool layout_metadata = false;
     std::vector<std::string> names;
     explicit cuda_module(std::shared_ptr<cuda_context> input) : context(std::move(input)) {}
+    void relocate_globals(const std::vector<global_descriptor>& globals) {
+        if (globals.empty()) return;
+        cuda_context_guard guard(*context);
+        std::vector<CUdeviceptr> addresses; std::set<std::string> names;
+        for (const auto& global : globals) {
+            require(!global.symbol.empty() && global.symbol.find('\0') == global.symbol.npos && names.insert(global.symbol).second,
+                CUDA_ERROR_INVALID_IMAGE, "invalid native relocation symbol");
+            CUdeviceptr address{}; size_t size{};
+            auto status = context->api->global(&address, &size, value, global.symbol.c_str());
+            require(status != CUDA_ERROR_NOT_FOUND, CUDA_ERROR_INVALID_IMAGE, "native relocation symbol is absent from the module");
+            check(status, "cuModuleGetGlobal for relocation");
+            require(size == global.initializer.size(), CUDA_ERROR_INVALID_IMAGE, "native relocation storage extent mismatch");
+            addresses.push_back(address);
+        }
+        std::vector<std::pair<CUdeviceptr, uint64_t>> writes;
+        for (size_t i = 0; i < globals.size(); ++i) {
+            uint64_t end = 0;
+            for (auto relocation : globals[i].relocations) {
+                require(relocation.target < globals.size() && relocation.offset >= end && uint64_t(relocation.offset) + 8 <= globals[i].initializer.size()
+                    && relocation.addend <= globals[relocation.target].initializer.size(), CUDA_ERROR_INVALID_IMAGE, "invalid native global relocation");
+                require(addresses[relocation.target] <= UINT64_MAX - relocation.addend, CUDA_ERROR_INVALID_IMAGE, "native relocation address overflow");
+                writes.emplace_back(addresses[i] + relocation.offset, addresses[relocation.target] + relocation.addend);
+                end = uint64_t(relocation.offset) + 8;
+            }
+        }
+        for (const auto& [address, pointer] : writes) check(context->api->write(address, &pointer, 8), "native global relocation write");
+        check(context->api->driver.get<decltype(&cuStreamSynchronize)>("cuStreamSynchronize")(nullptr), "native global relocation completion");
+    }
     ~cuda_module() {
         if (value && !library && context->api->push(context->value) == CUDA_SUCCESS) {
             context->api->unload(value);
@@ -1053,6 +1082,9 @@ struct cuda_session : session {
             result->names = ptx_entry_names(static_cast<const char*>(image));
             try { result->data_views = decode_data_views(static_cast<const char*>(image)); }
             catch (const std::exception& e) { throw failure(CUDA_ERROR_INVALID_IMAGE, e.what()); }
+            try { result->relocate_globals(decode_native_global_relocations(static_cast<const char*>(image))); }
+            catch (const failure&) { throw; }
+            catch (const std::exception& e) { throw failure(CUDA_ERROR_INVALID_IMAGE, e.what()); }
         }
         else if (auto bytes = nvidia_image_length(image)) cuda_image_metadata(*result, std::span(static_cast<const std::byte*>(image), bytes));
         return result;
@@ -1076,6 +1108,9 @@ struct cuda_session : session {
             result->names = ptx_entry_names(image);
             try { result->data_views = decode_data_views(image); }
             catch (const std::exception& e) { throw failure(CUDA_ERROR_INVALID_IMAGE, e.what()); }
+            try { result->relocate_globals(decode_native_global_relocations(image)); }
+            catch (const failure&) { throw; }
+            catch (const std::exception& e) { throw failure(CUDA_ERROR_INVALID_IMAGE, e.what()); }
         }
         else if (!image.empty()) cuda_image_metadata(*result, std::as_bytes(std::span(image.data(), image.size())));
         return result;
@@ -1088,6 +1123,9 @@ struct cuda_device_library : device_library, std::enable_shared_from_this<cuda_d
     bool layout_metadata = false;
     std::vector<std::string> names;
     std::map<std::string, data_view_descriptor> views;
+    std::vector<global_descriptor> relocations;
+    std::mutex relocation_mutex;
+    std::vector<std::weak_ptr<cuda_context>> relocated_contexts;
     explicit cuda_device_library(std::shared_ptr<cuda_api> input) : api(std::move(input)) {}
     ~cuda_device_library() { if (value) { auto fn = reinterpret_cast<decltype(&cuLibraryUnload)>(api->driver.find("cuLibraryUnload")); if (fn) fn(value); } }
     CUkernel kernel_handle(const char* name) {
@@ -1138,7 +1176,15 @@ struct cuda_device_library : device_library, std::enable_shared_from_this<cuda_d
     std::shared_ptr<executable> bind(session& owner) override {
         auto& target = static_cast<cuda_session&>(owner); auto result = std::make_shared<cuda_module>(target.context);
         cuda_context_guard guard(*target.context); check(api->driver.get<decltype(&cuLibraryGetModule)>("cuLibraryGetModule")(&result->value, value), "cuLibraryGetModule");
-        result->library = shared_from_this(); result->layouts = layouts; result->layout_metadata = layout_metadata; result->names = names; result->data_views = views; return result;
+        result->library = shared_from_this(); result->layouts = layouts; result->layout_metadata = layout_metadata; result->names = names; result->data_views = views;
+        if (!relocations.empty()) {
+            std::lock_guard lock(relocation_mutex);
+            std::erase_if(relocated_contexts, [](const auto& context) { return context.expired(); });
+            if (std::none_of(relocated_contexts.begin(), relocated_contexts.end(), [&](const auto& context) { return context.lock() == target.context; })) {
+                result->relocate_globals(relocations); relocated_contexts.push_back(target.context);
+            }
+        }
+        return result;
     }
     std::shared_ptr<executable> bind_registered(session& owner, std::span<const std::byte> image, const std::map<std::string, std::shared_ptr<buffer>>& storage) override {
         auto& target = static_cast<cuda_session&>(owner); cuda_context_guard guard(*target.context);
@@ -1219,6 +1265,7 @@ struct cuda_backend : backend {
         if (!text.empty() && (text.front() == '.' || text.front() == '/' || std::isspace(static_cast<unsigned char>(text.front())))) {
             result->layouts = ptx_parameter_layouts(text); result->layout_metadata = true; result->names = ptx_entry_names(text);
             try { result->views = decode_data_views(text); } catch (const std::exception& e) { throw failure(CUDA_ERROR_INVALID_IMAGE, e.what()); }
+            try { result->relocations = decode_native_global_relocations(text); } catch (const std::exception& e) { throw failure(CUDA_ERROR_INVALID_IMAGE, e.what()); }
         }
         else if (!text.empty()) cuda_image_metadata(*result, std::as_bytes(std::span(text.data(), text.size())));
         return result;

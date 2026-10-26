@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 #include <stdexcept>
+#include <set>
 
 // Compiler/Driver transport, carried in comments in otherwise ordinary PTX.
 // NVIDIA consumes the same PTX; native module adapters consume this versioned payload.
@@ -25,6 +26,8 @@ struct global_descriptor { std::string symbol; uint32_t alignment; std::string i
 struct module_descriptor { std::vector<kernel_descriptor> entries; std::vector<global_descriptor> globals; };
 inline constexpr std::string_view module_descriptor_begin = "// CUDAVM-NATIVE-MODULE-V1-BEGIN\n";
 inline constexpr std::string_view module_descriptor_end = "// CUDAVM-NATIVE-MODULE-V1-END";
+inline constexpr std::string_view native_global_relocations_begin = "// CUDAVM-NATIVE-GLOBAL-RELOCATIONS-V1-BEGIN\n";
+inline constexpr std::string_view native_global_relocations_end = "// CUDAVM-NATIVE-GLOBAL-RELOCATIONS-V1-END";
 inline bool has_module_descriptor(std::string_view text) { return text.find(module_descriptor_begin) != text.npos; }
 inline std::string encode_module_descriptor(const std::vector<kernel_descriptor>& entries, const std::vector<global_descriptor>& globals = {}) {
     if (entries.size() > 4096 || globals.size() > 4096) throw std::runtime_error("native module inventory exceeds transport limit");
@@ -143,4 +146,32 @@ inline module_descriptor decode_module_descriptor(std::string_view ptx) {
     return result;
 }
 inline std::vector<kernel_descriptor> decode_kernel_descriptors(std::string_view ptx) { return decode_module_descriptor(ptx).entries; }
+inline std::string encode_native_global_relocations(const std::vector<global_descriptor>& globals) {
+    auto encoded = encode_module_descriptor({}, globals);
+    auto payload = encoded.substr(module_descriptor_begin.size(), encoded.size() - module_descriptor_begin.size() - module_descriptor_end.size() - 1);
+    return std::string(native_global_relocations_begin) + payload + std::string(native_global_relocations_end) + '\n';
+}
+inline std::vector<global_descriptor> decode_native_global_relocations(std::string_view text) {
+    auto start = text.find(native_global_relocations_begin);
+    if (start == text.npos) return {};
+    if (text.find(native_global_relocations_begin, start + native_global_relocations_begin.size()) != text.npos)
+        throw std::runtime_error("duplicate native global relocations");
+    start += native_global_relocations_begin.size(); auto end = text.find(native_global_relocations_end, start);
+    if (end == text.npos || end - start > 136 * 1024 * 1024) throw std::runtime_error("truncated native global relocations");
+    auto decoded = decode_module_descriptor(std::string(module_descriptor_begin) + std::string(text.substr(start, end - start)) + std::string(module_descriptor_end));
+    if (!decoded.entries.empty()) throw std::runtime_error("unexpected native relocation kernel entries");
+    std::set<std::string> names;
+    auto valid = [](bool condition) { if (!condition) throw std::runtime_error("invalid native global relocation inventory"); };
+    for (const auto& global : decoded.globals) {
+        valid(!global.symbol.empty() && global.symbol.find('\0') == global.symbol.npos && names.insert(global.symbol).second && !global.initializer.empty()
+            && global.alignment && global.alignment <= 65536 && !(global.alignment & (global.alignment - 1)));
+        uint64_t end = 0;
+        for (auto relocation : global.relocations) {
+            valid(relocation.target < decoded.globals.size() && relocation.offset >= end && uint64_t(relocation.offset) + 8 <= global.initializer.size()
+                && relocation.addend <= decoded.globals[relocation.target].initializer.size());
+            end = uint64_t(relocation.offset) + 8;
+        }
+    }
+    return std::move(decoded.globals);
+}
 }

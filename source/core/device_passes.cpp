@@ -1333,11 +1333,19 @@ void resolve_device_data_aliases(llvm::Module& module, bool final_link) {
         aliases.push_back(&alias);
     }
     // Exported views retain the backing object without creating another allocation.
+    llvm::removeFromUsedLists(module, [&](llvm::Constant* value) {
+        return llvm::is_contained(aliases, value->stripPointerCasts());
+    });
     llvm::appendToCompilerUsed(module, roots);
     for (auto* alias : aliases) alias->replaceAllUsesWith(alias->getAliasee());
     for (auto* alias : aliases) alias->eraseFromParent();
 }
 std::string emit_data_views(const llvm::Module& module) {
+    if (llvm::any_of(module.aliases(), [](const auto& alias) { return !alias.getValueType()->isFunctionTy(); })) {
+        auto resolved = llvm::CloneModule(module);
+        resolve_device_data_aliases(*resolved, true);
+        return emit_data_views(*resolved);
+    }
     std::string output;
     if (auto* views = module.getNamedMetadata("cudavm.data.views.v1")) {
         std::map<std::string, std::string> rows;

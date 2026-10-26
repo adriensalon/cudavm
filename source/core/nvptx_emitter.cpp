@@ -1,5 +1,6 @@
 #include "compiler.hpp"
 #include "native_emission.hpp"
+#include "module_descriptor.hpp"
 #include <stdexcept>
 #include <optional>
 #include <mutex>
@@ -78,6 +79,27 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
     resolve_device_function_aliases(*module, true, true);
     resolve_device_data_aliases(*module, true);
     normalize_device_relocations(*module);
+    // ELF sections can contain pointers to their own interior. PTX cannot
+    // initialize that aggregate with a self reference. Retain the exact section
+    // layout and relocate its pointer slots after the native loader assigns
+    // addresses, using the same descriptor as the shader loaders.
+    std::string relocated_storage;
+    if (module->getNamedMetadata("cudavm.import.cubin.sm75") && llvm::any_of(module->globals(), [](const auto& global) {
+            return global.hasInitializer() && (global.getAddressSpace() == 1 || global.getAddressSpace() == 4);
+        })) {
+        auto encoded = emit_native_module(*module);
+        auto descriptor = decode_module_descriptor(encoded);
+        for (const auto& storage : descriptor.globals) if (!storage.relocations.empty()) {
+            auto* old = module->getGlobalVariable(storage.symbol, true);
+            if (!old) throw std::runtime_error("native relocation lost its storage: " + storage.symbol);
+            auto* bytes = llvm::ConstantDataArray::getString(module->getContext(), storage.initializer, false);
+            auto* variable = new llvm::GlobalVariable(*module, bytes->getType(), false, old->getLinkage(), bytes, "", nullptr,
+                old->getThreadLocalMode(), old->getAddressSpace());
+            variable->setAlignment(old->getAlign().valueOrOne()); variable->takeName(old);
+            old->replaceAllUsesWith(variable); old->eraseFromParent();
+            relocated_storage = encode_native_global_relocations(descriptor.globals);
+        }
+    }
     // NVPTX's legacy alloca-hoisting pass moves every constant-count alloca
     // to the entry, including repeated allocations whose live addresses escape
     // a loop iteration. Keep those counts in a native register so they retain
@@ -149,6 +171,6 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
     if (machine->addPassesToEmitFile(passes, stream, nullptr, llvm::CodeGenFileType::AssemblyFile))
         throw std::runtime_error("NVPTX assembly emission is unavailable");
     passes.run(*module);
-    return std::string(code.begin(), code.end()) + emit_data_views(*module);
+    return std::string(code.begin(), code.end()) + emit_data_views(*module) + relocated_storage;
 }
 }
