@@ -678,17 +678,18 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             left = unsigned(lo >> 24) & 255, right = unsigned(lo >> 32) & 255;
         auto fail = [&](const std::string& reason) { cubin_fail((function ? function->name : kernel.name) + "+" + std::to_string(pc) + ": " + reason, true); };
         std::string guard = predicate == 7 ? "" : "@" + std::string(predicate & 8 ? "!" : "") + pred(predicate & 7) + " ";
-        auto bank_index = [&] {
-            if (lo >> 59) fail("unsupported constant-bank operand");
+        auto bank_index = [&](bool negated = false) {
+            if ((lo >> 59) & ~(negated ? uint64_t(0x10) : uint64_t(0))) fail("unsupported constant-bank operand");
             return unsigned(lo >> 54) & 31;
         };
-        auto bank_offset = [&] {
-            (void)bank_index();
+        auto bank_offset = [&](bool negated = false) {
+            (void)bank_index(negated);
             return unsigned(lo >> 40 & 0x3fff) * 4;
         };
-        auto bank_word = [&] {
+        auto bank_word = [&](bool negated = false) {
             if (right) fail("unsupported indexed constant-bank operand");
-            output += constant_load("%constant", "", bank_offset(), 4, guard, bank_index());
+            output += constant_load("%constant", "", bank_offset(negated), 4, guard, bank_index(negated));
+            if (negated) output += guard + "sub.u32 %constant,0,%constant;\n";
             return std::string("%constant");
         };
         auto join = [&](const std::string& low, const std::string& high, const std::string& name) {
@@ -1130,6 +1131,13 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             instruction = "bfind.u32 " + reg(dest) + "," + uniform(right) + ";";
         } else if (op == 0xd09 && hi == 0x8000000 && left == 0 && !(lo >> 38)) {
             instruction = "popc.b32 " + reg(dest) + "," + uniform(right) + ";";
+        } else if (op == 0x292 && predicate == 7 && !(lo >> 38) &&
+                   (hi & ~uint64_t(0xff3f)) == 0xf8e0000) {
+            // Register ULOP3.LUT with discarded predicate output. As with the
+            // other uniform operations, read aliased inputs before the write.
+            auto first = uniform(left), second = uniform(right), third = uniform(unsigned(hi) & 63);
+            instruction = "lop3.b32 " + uniform(dest, true) + "," + first + "," + second + "," + third + "," +
+                std::to_string(unsigned(hi >> 8) & 255) + ";";
         } else if ((op == 0x290 || op == 0x890) && predicate == 7) {
             auto source = op == 0x890 ? std::to_string(uint32_t(lo >> 32)) : uniform(right);
             auto a = uniform(left);
@@ -1482,7 +1490,10 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                         known[dest + 1].reset();
                     }
                 } else {
-                    auto third = form == 0x600 ? bank_word() : form == 0xe00 ? uniform(right) : form == 0x400 ? std::to_string(uint32_t(lo >> 32)) : reg(addend);
+                    // Low IMAD's bank-addend form carries the addend sign in
+                    // bit 63 of the first word (including IMAD.MOV -c[...]).
+                    // Wide products and other bank operands keep rejecting it.
+                    auto third = form == 0x600 ? bank_word(bool(lo >> 63)) : form == 0xe00 ? uniform(right) : form == 0x400 ? std::to_string(uint32_t(lo >> 32)) : reg(addend);
                     if (hi & 0x800) {output += guard + "sub.u32 %tmp0,0," + third + ";\n";third = "%tmp0";}
                     auto second_known = form == 0x400 ? known[addend] : form == 0x800 ? std::optional<uint32_t>(uint32_t(lo >> 32)) :
                         form == 0x200 ? known[right] : std::nullopt;

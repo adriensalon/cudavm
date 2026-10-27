@@ -4,3 +4,9 @@ kernel_launch/kernel_launch.ptx -text
 shared_memory/shared_memory.cu -text
 dynamic_shared_memory/dynamic_shared_memory.cu -text
 atomic_operations/atomic_operations.cu -text
+warp_shuffle/warp_shuffle.cu -text
+warp_shuffle/warp_shuffle.ptx -text
+warp_shuffle/warp_shuffle.ll -text
+warp_vote/warp_vote.cu -text
+warp_vote/warp_vote.ptx -text
+warp_vote/warp_vote.ll -text

@@ -1,0 +1,14 @@
+{
+  "producer": "NVIDIA nvcc 12.4.131",
+  "architecture": "sm_75",
+  "command": "nvcc -arch=sm_75 -O3 -cubin --allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -ccbin <MSVC-14.44.35207-x64> test/warp_vote/warp_vote.cu -o test/warp_vote/warp_vote.cubin",
+  "host_compiler": "MSVC 14.44.35207 x64",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "warp_vote.cu": "6dbc379f50642e2169ea7677bd9dff7cf630f62e6454788185d6d1f39039faff",
+    "warp_vote.ptx": "39a4126b7de51d6b65cdd46a83462fa80164a5637c8f25b75576e6edcc4f5f51",
+    "warp_vote.ll": "3a376f6925d24da27adf344f81e2d42ecb55eddcdedf65746e24abe312c69ca8",
+    "warp_vote.cubin": "3bd654e9aaee538adb36a9963808b8731d3615cde8df0f141cc34e1142edc18b"
+  }
+}

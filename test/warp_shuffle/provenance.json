@@ -1,0 +1,14 @@
+{
+  "producer": "NVIDIA nvcc 12.4.131",
+  "architecture": "sm_75",
+  "command": "nvcc -arch=sm_75 -O3 -cubin --allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -ccbin <MSVC-14.44.35207-x64> test/warp_shuffle/warp_shuffle.cu -o test/warp_shuffle/warp_shuffle.cubin",
+  "host_compiler": "MSVC 14.44.35207 x64",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "warp_shuffle.cu": "a267007c075c1749539cece3dc291c7231713255404ae8bb44e79d58e98ea3e4",
+    "warp_shuffle.ptx": "8bffbc4afd7b2f1d664b54cbcaf5b0ed0fb3e3d53fe97dd94c1d1320169896b1",
+    "warp_shuffle.ll": "5a4a0124851112d017531fda3912ecd810f20e47593292206cbbd23b4b2739ca",
+    "warp_shuffle.cubin": "bf17f08fbea6d31f61b5c318f0eda1170628a580bf21c33a8dd017428ee11924"
+  }
+}
