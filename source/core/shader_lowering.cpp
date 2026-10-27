@@ -304,6 +304,8 @@ struct lowering {
     llvm::IRBuilder<> b;
     llvm::Function *entry = nullptr, *resolve = nullptr, *read = nullptr, *write = nullptr;
     llvm::Function *output_read = nullptr, *output_write = nullptr;
+    bool volatile_memory = false;
+    std::map<llvm::Function*,llvm::Function*> volatile_helpers;
     std::map<llvm::Function*, llvm::Value*> output_routes;
     llvm::GlobalVariable* shared = nullptr;
     llvm::Constant* names[packet_resource_count]{};
@@ -383,6 +385,7 @@ struct lowering {
     }
     llvm::Value* call_helper(llvm::Function* function, std::initializer_list<llvm::Value*> base) {
         auto first = base.begin();
+        bool memory_access=function==read || function==write;
         if (arena_local && (function == read || function == write)) {
             auto known = llvm::computeKnownBits(*first, result->getDataLayout());
             llvm::APInt mask(64, 0xffffffffc0000000ull), local(64, 0xffffffff80000000ull);
@@ -394,8 +397,10 @@ struct lowering {
                 offset = b.CreateURem(b.CreateLShr(offset, b.getInt32(2)), b.getInt32(std::max(2u, (local_bytes + 3) / 4)));
                 auto* pointer = stack_word(nullptr, offset);
                 auto* previous = b.CreateAlignedLoad(b.getInt32Ty(), pointer, llvm::Align(4));
+                previous->setVolatile(volatile_memory);
                 if (function == read) return previous;
-                return b.CreateAlignedStore(b.CreateOr(b.CreateAnd(previous, b.CreateNot(*(first + 2))), b.CreateAnd(*(first + 1), *(first + 2))), pointer, llvm::Align(4));
+                auto* stored=b.CreateAlignedStore(b.CreateOr(b.CreateAnd(previous, b.CreateNot(*(first + 2))), b.CreateAnd(*(first + 1), *(first + 2))), pointer, llvm::Align(4));
+                stored->setVolatile(volatile_memory);return stored;
             }
         }
         if (function == read || function == write) {
@@ -427,6 +432,21 @@ struct lowering {
             auto* caller = b.GetInsertBlock()->getParent();
             for (unsigned i=0;i<packet_resource_count;++i)
                 args.push_back(caller->getArg(unsigned(caller->arg_size() - packet_resource_count + i)));
+        }
+        if(volatile_memory && memory_access) {
+            auto [at,inserted]=volatile_helpers.try_emplace(function);
+            if(inserted) {
+                llvm::ValueToValueMapTy values;
+                auto* clone=llvm::CloneFunction(function,values);clone->setName(function->getName()+".volatile");
+                for(auto& block:*clone)for(auto& instruction:block) {
+                    if(auto* load=llvm::dyn_cast<llvm::LoadInst>(&instruction))load->setVolatile(true);
+                    if(auto* store=llvm::dyn_cast<llvm::StoreInst>(&instruction))store->setVolatile(true);
+                    if(auto* atomic=llvm::dyn_cast<llvm::AtomicRMWInst>(&instruction))atomic->setVolatile(true);
+                    if(auto* atomic=llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&instruction))atomic->setVolatile(true);
+                }
+                at->second=clone;
+            }
+            function=at->second;
         }
         return b.CreateCall(function, args);
     }
@@ -1241,6 +1261,8 @@ struct lowering {
         return true;
     }
     llvm::Value* call(const llvm::CallInst& instruction) {
+        if(auto* diagnostic=instruction.getMetadata("cudavm.inline.ptx.error"))
+            fail(instruction,llvm::cast<llvm::MDString>(diagnostic->getOperand(0))->getString().str().c_str());
         llvm::Value* image = nullptr; if (image_operation(instruction, image)) return image;
         auto* function = instruction.getCalledFunction();
         if (!function) fail(instruction, "indirect calls or CUDA inline assembly require fallback");
@@ -1517,7 +1539,11 @@ struct lowering {
         if (llvm::isa<llvm::PHINode>(input)) return;
         if (auto* frozen = llvm::dyn_cast<llvm::FreezeInst>(&input)) { values[&input] = value(frozen->getOperand(0)); return; }
         if(auto* fence=llvm::dyn_cast<llvm::FenceInst>(&input)) {
-            if(!opencl && fence->getOrdering()==llvm::AtomicOrdering::SequentiallyConsistent)
+            if(fence->getSyncScopeID()==llvm::SyncScope::SingleThread)
+                // Preserve the compiler barrier conservatively on native GPUs.
+                // Vulkan forbids ordered Invocation-scope memory barriers.
+                memory_fence(llvm::AtomicOrdering::AcquireRelease,b.getContext().getOrInsertSyncScopeID("device"));
+            else if(!opencl && fence->getOrdering()==llvm::AtomicOrdering::SequentiallyConsistent)
                 atomic(101,b.getInt64(0),b.getInt32(0),nullptr,fence->getOrdering(),llvm::AtomicOrdering::Monotonic,fence->getSyncScopeID());
             else memory_fence(fence->getOrdering(),fence->getSyncScopeID());
             return;
@@ -1598,11 +1624,15 @@ struct lowering {
                 auto* previous=atomic(100,value(memory->getPointerOperand()),zero,zero,memory->getOrdering(),memory->getOrdering(),memory->getSyncScopeID());
                 values[&input]=previous;return;
             }
-            values[&input] = load(value(memory->getPointerOperand()), memory->getType(), unsigned(memory->getAlign().value())); return;
+            volatile_memory=memory->isVolatile();
+            values[&input] = load(value(memory->getPointerOperand()), memory->getType(), unsigned(memory->getAlign().value()));
+            volatile_memory=false;return;
         }
         if (auto* memory = llvm::dyn_cast<llvm::StoreInst>(&input)) {
             if (memory->isAtomic()) {validate_atomic_storage(input,memory->getValueOperand()->getType(),memory->getAlign());atomic(llvm::AtomicRMWInst::Xchg,value(memory->getPointerOperand()),value(memory->getValueOperand()),nullptr,memory->getOrdering(),llvm::AtomicOrdering::Monotonic,memory->getSyncScopeID());return;}
-            store(value(memory->getPointerOperand()), value(memory->getValueOperand()), unsigned(memory->getAlign().value()), memory->getValueOperand()->getType()); return;
+            volatile_memory=memory->isVolatile();
+            store(value(memory->getPointerOperand()), value(memory->getValueOperand()), unsigned(memory->getAlign().value()), memory->getValueOperand()->getType());
+            volatile_memory=false;return;
         }
         if (auto* operation = llvm::dyn_cast<llvm::CallInst>(&input)) { if (auto* out = call(*operation)) values[&input] = canonical(out,input.getType()); return; }
         if (auto* control = llvm::dyn_cast<llvm::SwitchInst>(&input)) {
@@ -1846,6 +1876,7 @@ std::unique_ptr<llvm::Module> prepare_native_shader_module(const llvm::Module& i
         global->replaceAllUsesWith(llvm::ConstantExpr::getAddrSpaceCast(replacement, global->getType())); global->eraseFromParent();
     }
     lower_shader_half(*module);
+    lower_inline_ptx(*module);
     lower_half_math_intrinsics(*module);
     scalar_math(*module);
     // Scalarize helper aggregates while their copies are still intrinsics.

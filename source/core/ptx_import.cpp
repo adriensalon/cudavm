@@ -2268,55 +2268,205 @@ public:
 std::unique_ptr<llvm::Module> import_ptx(llvm::LLVMContext& context, std::string_view input, std::string_view architecture, bool relocatable) {
     return ptx_parser(context, input).parse(architecture, relocatable);
 }
-llvm::Value* import_numeric_inline_ptx(llvm::CallInst& call) {
+llvm::Value* import_inline_ptx(llvm::CallInst& call) {
     auto* assembly=llvm::cast<llvm::InlineAsm>(call.getCalledOperand());
+    auto fail=[](const std::string& message) { throw std::runtime_error("inline PTX: "+message); };
+    if(assembly->isAlignStack() || assembly->getDialect()!=llvm::InlineAsm::AD_ATT)
+        fail("unsupported assembly dialect or stack alignment");
     auto constraints=assembly->ParseConstraints();
-    if(constraints.empty() || constraints[0].Type!=llvm::InlineAsm::isOutput || constraints[0].isIndirect || !call.getType()->isSingleValueType())
-        throw std::runtime_error("numeric PTX requires one scalar register result");
-    if(constraints.size()!=call.arg_size()+1)throw std::runtime_error("unsupported numeric PTX constraints");
-    auto width=[](llvm::Type* t){return unsigned(t->getPrimitiveSizeInBits());};
-    std::vector<llvm::Type*> types{call.getType()};
-    for(unsigned i=0;i<call.arg_size();++i) {
-        if(constraints[i+1].Type!=llvm::InlineAsm::isInput || constraints[i+1].isIndirect)throw std::runtime_error("unsupported numeric PTX input constraint");
-        types.push_back(call.getArgOperand(i)->getType());
+    if(constraints.empty() && !assembly->getConstraintString().empty())fail("invalid constraints");
+    std::vector<llvm::Type*> outputs;
+    if(auto* structure=llvm::dyn_cast<llvm::StructType>(call.getType()))
+        outputs.assign(structure->element_begin(),structure->element_end());
+    else if(!call.getType()->isVoidTy())outputs.push_back(call.getType());
+    struct operand { llvm::Type* type; llvm::Value* input; std::string text; unsigned bits; };
+    std::vector<operand> operands;
+    std::string register_prefix="%__cudavm_operand";
+    while(assembly->getAsmString().contains(register_prefix))register_prefix+='_';
+    bool memory=false,inputs=false,clobbers=false;
+    unsigned argument=0,output=0;
+    for(const auto& constraint:constraints) {
+        if(constraint.isIndirect || constraint.isMultipleAlternative || constraint.isCommutative || constraint.Codes.size()!=1)
+            fail("unsupported indirect, alternative or commutative constraint");
+        const auto& code=constraint.Codes[0];
+        if(constraint.Type==llvm::InlineAsm::isClobber) {
+            if(code!="{memory}")fail("unsupported clobber "+code);
+            memory=true;clobbers=true;continue;
+        }
+        if(clobbers)fail("operand follows clobber");
+        llvm::Type* type=nullptr;llvm::Value* input=nullptr;
+        if(constraint.Type==llvm::InlineAsm::isOutput) {
+            if(inputs || output>=outputs.size())fail("output constraint does not match result type");
+            type=outputs[output++];
+        } else if(constraint.Type==llvm::InlineAsm::isInput) {
+            inputs=true;
+            if(argument>=call.arg_size())fail("missing input operand");
+            input=call.getArgOperand(argument++);type=input->getType();
+        } else fail("unsupported label constraint");
+        if(!type->isPointerTy() && !type->isIntegerTy() && !type->isFloatingPointTy())fail("register operand must be scalar");
+        unsigned bits=type->isPointerTy()?64:unsigned(type->getPrimitiveSizeInBits());
+        unsigned match=0;
+        if(constraint.Type==llvm::InlineAsm::isInput && !llvm::StringRef(code).getAsInteger(10,match)) {
+            if(match>=outputs.size() || match>=operands.size() || operands[match].type!=type || operands[match].input)
+                fail("invalid tied input constraint "+code);
+            operands[match].input=input;
+            operands.push_back({type,nullptr,operands[match].text,bits});continue;
+        }
+        if(code=="n") {
+            auto* immediate=llvm::dyn_cast_or_null<llvm::ConstantInt>(input);
+            if(!immediate || immediate->getBitWidth()>64)fail("immediate constraint requires a constant integer of at most 64 bits");
+            operands.push_back({type,nullptr,std::to_string(immediate->getSExtValue()),bits});continue;
+        }
+        bool valid=(code=="h" && type->isIntegerTy(16)) || (code=="r" && type->isIntegerTy(32)) ||
+            (code=="l" && (type->isIntegerTy(64) || (type->isPointerTy() && type->getPointerAddressSpace()==0))) ||
+            (code=="f" && type->isFloatTy()) || (code=="d" && type->isDoubleTy());
+        if(!valid)fail("register constraint "+code+" does not match operand type");
+        operands.push_back({type,input,register_prefix+std::to_string(operands.size()),bits});
     }
-    auto spelling=[&](unsigned i){auto bits=width(types[i]);if(bits!=16 && bits!=32 && bits!=64)throw std::runtime_error("unsupported numeric PTX register width");return ".b"+std::to_string(bits);};
+    if(output!=outputs.size() || argument!=call.arg_size())fail("constraint count does not match signature");
     auto& module=*call.getModule();unsigned ordinal=0;std::string name;
-    do {name="__cudavm_inline_numeric_"+std::to_string(ordinal++);}while(module.getNamedValue(name));
-    std::string source=".version 8.4\n.target sm_75\n.address_size 64\n.func (.param "+spelling(0)+" result) "+name+"(";
-    for(unsigned i=1;i<types.size();++i)source+=(i>1?", ":"")+std::string(".param ")+spelling(i)+" arg"+std::to_string(i);
-    source+=") {\n";
-    for(unsigned i=0;i<types.size();++i)source+=".reg "+spelling(i)+" %cv"+std::to_string(i)+";\n";
-    for(unsigned i=1;i<types.size();++i)source+="ld.param"+spelling(i)+" %cv"+std::to_string(i)+", [arg"+std::to_string(i)+"];\n";
-    if(constraints[0].hasMatchingInput())source+="mov"+spelling(0)+" %cv0, %cv"+std::to_string(constraints[0].MatchingInput)+";\n";
-    auto text=assembly->getAsmString();
+    do {name="__cudavm_inline_ptx_"+std::to_string(ordinal++);}while(module.getNamedValue(name));
+    std::string architecture;
+    if(auto* abi=module.getNamedMetadata("cudavm.source.abi");abi && abi->getNumOperands()) {
+        auto* row=abi->getOperand(0);
+        if(row->getNumOperands()>2)if(auto* value=llvm::dyn_cast<llvm::MDString>(row->getOperand(2)))architecture=value->getString().str();
+    }
+    if(architecture.empty())if(auto* abi=module.getNamedMetadata("cudavm.import.architecture");abi && abi->getNumOperands())
+        if(auto* value=llvm::dyn_cast<llvm::MDString>(abi->getOperand(0)->getOperand(0)))architecture=value->getString().str();
+    if(architecture.empty())fail("missing source architecture");
+    std::string body;auto text=assembly->getAsmString();
     for(size_t i=0;i<text.size();) {
-        if(text[i]=='$' && i+1<text.size() && text[i+1]=='$'){source+='$';i+=2;}
+        if(text[i]=='$' && i+1<text.size() && text[i+1]=='$'){body+='$';i+=2;}
         else if(text[i]=='$' && i+1<text.size() && std::isdigit(static_cast<unsigned char>(text[i+1]))) {
             size_t end=i+1;while(end<text.size() && std::isdigit(static_cast<unsigned char>(text[end])))++end;
-            auto index=std::stoul(text.substr(i+1,end-i-1).str());if(index>=types.size())throw std::runtime_error("invalid numeric PTX operand reference");
-            source+="%cv"+std::to_string(index);i=end;
-        } else if(text.substr(i,5)==".reg."){source+=".reg .";i+=5;}
-        else source+=text[i++];
+            unsigned index=0;
+            if(text.slice(i+1,end).getAsInteger(10,index) || index>=operands.size())fail("invalid operand reference");
+            body+=operands[index].text;i=end;
+        } else if(text[i]=='$' && i+1<text.size() && text[i+1]=='{')fail("unsupported operand modifier");
+        else if(text.substr(i,5)==".reg."){body+=".reg .";i+=5;}
+        else body+=text[i++];
     }
-    source+="\nst.param"+spelling(0)+" [result], %cv0; ret; }\n.entry __cudavm_inline_unused() {ret;}\n";
-    auto imported=import_ptx(module.getContext(),source);
-    auto* original=imported->getFunction(name);
-    auto* function=llvm::Function::Create(original->getFunctionType(),llvm::GlobalValue::InternalLinkage,name,module);
+    // The block may branch only within its own scope. Returning from a temporary
+    // wrapper would silently change a kernel return or skip result packaging.
+    int depth=0;
+    for(const auto& token:ptx_tokens(body)) {
+        if(token.text=="{")++depth;
+        if(token.text=="}" && --depth<0)fail("unbalanced assembly block");
+        if(token.text=="ret" || token.text=="exit" || token.text=="call" || token.text.starts_with("call.") ||
+            token.text==".entry" || token.text==".func" || token.text==".extern")fail("unsupported block control transfer or external declaration");
+    }
+    if(depth)fail("unbalanced assembly block");
+    auto spelling=[](const operand& operand){return ".b"+std::to_string(operand.bits);};
+    std::string source=".version 8.4\n.target "+architecture+"\n.address_size 64\n.func ";
+    if(!outputs.empty())source+="(.param .b64 result["+std::to_string(outputs.size())+"]) ";
+    source+=name+"(";
+    std::vector<llvm::Value*> arguments;
+    for(unsigned i=0;i<operands.size();++i)if(operands[i].input) {
+        source+=(arguments.empty()?"":", ")+std::string(".param ")+spelling(operands[i])+" arg"+std::to_string(i);
+        arguments.push_back(operands[i].input);
+    }
+    source+=") {\n";
+    for(unsigned i=0;i<operands.size();++i) {
+        const auto& operand=operands[i];
+        if(operand.text!=register_prefix+std::to_string(i))continue;
+        source+=".reg "+spelling(operand)+" "+operand.text+";\n";
+        if(operand.input)source+="ld.param"+spelling(operand)+" "+operand.text+", [arg"+std::to_string(i)+"];\n";
+    }
+    source+="{\n"+body+"\n}\n";
+    if(!outputs.empty())source+=".reg .b64 __cudavm_result;\n";
+    for(unsigned i=0;i<outputs.size();++i) {
+        source+=(operands[i].bits==64?"mov.b64 ":"cvt.u64.u"+std::to_string(operands[i].bits)+" ")+std::string("__cudavm_result, ")+operands[i].text+";\n";
+        source+="st.param.b64 [result+"+std::to_string(i*8)+"], __cudavm_result;\n";
+    }
+    source+="ret; }\n";
+    auto imported=import_ptx(module.getContext(),source,{},true);
+    auto* original=imported->getFunction(name);original->setLinkage(llvm::GlobalValue::ExternalLinkage);
+    bool convergent=call.isConvergent();
+    for(const auto& function:*imported)for(const auto& block:function)for(const auto& instruction:block)
+        if(auto* operation=llvm::dyn_cast<llvm::CallBase>(&instruction))convergent|=operation->isConvergent();
+    // A volatile block's explicit memory operations must survive optimization,
+    // including when the C++ caller discards its register results.
+    if(assembly->hasSideEffects())for(auto& block:*original)for(auto& instruction:block) {
+        if(auto* load=llvm::dyn_cast<llvm::LoadInst>(&instruction))load->setVolatile(true);
+        if(auto* store=llvm::dyn_cast<llvm::StoreInst>(&instruction))store->setVolatile(true);
+        if(auto* atomic=llvm::dyn_cast<llvm::AtomicRMWInst>(&instruction))atomic->setVolatile(true);
+        if(auto* atomic=llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&instruction))atomic->setVolatile(true);
+    }
+    // Resolve declarations explicitly, including internal numeric definitions.
+    // LLVM module linking treats internal names as separate identities and can
+    // otherwise rename the existing helper away from its canonical spelling.
+    // Cloning also leaves source ABI/architecture metadata unchanged.
     llvm::ValueToValueMapTy values;
-    for(auto& f:*imported)if(f.isDeclaration()) {
-        auto* existing=module.getFunction(f.getName());
-        if(f.isIntrinsic())existing=llvm::cast<llvm::Function>(module.getOrInsertFunction(f.getName(),f.getFunctionType()).getCallee());
-        else if(!existing || existing->isDeclaration() || existing->getFunctionType()!=f.getFunctionType())throw std::runtime_error("missing numeric PTX helper: "+f.getName().str());
-        values[&f]=existing;
+    for(auto& function:*imported)if(function.isDeclaration()) {
+        auto* existing=module.getFunction(function.getName());
+        if(existing && existing->getFunctionType()!=function.getFunctionType())fail("conflicting helper signature: "+function.getName().str());
+        if(!existing && function.getName().starts_with("__cudavm_native_"))fail("missing numeric helper: "+function.getName().str());
+        if(!existing) {
+            existing=llvm::Function::Create(function.getFunctionType(),llvm::GlobalValue::ExternalLinkage,function.getName(),module);
+            existing->copyAttributesFrom(&function);
+        }
+        values[&function]=existing;
     }
-    for(unsigned i=0;i<function->arg_size();++i)values[original->getArg(i)]=function->getArg(i);
-    llvm::SmallVector<llvm::ReturnInst*> returns;
-    llvm::CloneFunctionInto(function,original,values,llvm::CloneFunctionChangeType::DifferentModule,returns);
+    for(auto& function:*imported)if(!function.isDeclaration()) {
+        auto* clone=llvm::Function::Create(function.getFunctionType(),llvm::GlobalValue::InternalLinkage,function.getName(),module);
+        clone->copyAttributesFrom(&function);values[&function]=clone;
+        for(unsigned i=0;i<function.arg_size();++i)values[function.getArg(i)]=clone->getArg(i);
+    }
+    for(auto& global:imported->globals()) {
+        auto* clone=new llvm::GlobalVariable(module,global.getValueType(),global.isConstant(),llvm::GlobalValue::InternalLinkage,
+            nullptr,global.getName(),nullptr,global.getThreadLocalMode(),global.getAddressSpace());
+        clone->copyAttributesFrom(&global);values[&global]=clone;
+    }
+    for(auto& global:imported->globals())if(global.hasInitializer())
+        llvm::cast<llvm::GlobalVariable>(values[&global])->setInitializer(llvm::MapValue(global.getInitializer(),values));
+    for(auto& function:*imported)if(!function.isDeclaration()) {
+        llvm::SmallVector<llvm::ReturnInst*> returns;
+        llvm::CloneFunctionInto(llvm::cast<llvm::Function>(values[&function]),&function,values,
+            llvm::CloneFunctionChangeType::DifferentModule,returns);
+    }
+    auto* function=llvm::cast<llvm::Function>(values[original]);
     function->addFnAttr(llvm::Attribute::AlwaysInline);
-    llvm::IRBuilder<> b(&call);std::vector<llvm::Value*> args;
-    for(unsigned i=0;i<call.arg_size();++i)args.push_back(b.CreateBitCast(call.getArgOperand(i),llvm::Type::getIntNTy(module.getContext(),width(types[i+1]))));
-    return b.CreateBitCast(b.CreateCall(function,args),call.getType());
+    llvm::IRBuilder<> b(&call);
+    for(auto*& value:arguments) {
+        auto* type=llvm::Type::getIntNTy(module.getContext(),value->getType()->isPointerTy()?64:unsigned(value->getType()->getPrimitiveSizeInBits()));
+        value=value->getType()->isPointerTy()?b.CreatePtrToInt(value,type):b.CreateBitCast(value,type);
+    }
+    if(memory)b.CreateFence(llvm::AtomicOrdering::SequentiallyConsistent,llvm::SyncScope::SingleThread);
+    auto* invocation=b.CreateCall(function,arguments);invocation->setDebugLoc(call.getDebugLoc());
+    if(convergent){function->addFnAttr(llvm::Attribute::Convergent);invocation->setConvergent();}
+    if(memory)b.CreateFence(llvm::AtomicOrdering::SequentiallyConsistent,llvm::SyncScope::SingleThread);
+    if(outputs.empty())return invocation;
+    llvm::Value* result=llvm::UndefValue::get(call.getType());
+    for(unsigned i=0;i<outputs.size();++i) {
+        llvm::Value* value=b.CreateExtractValue(invocation,i);
+        value=b.CreateTruncOrBitCast(value,llvm::Type::getIntNTy(module.getContext(),operands[i].bits));
+        value=outputs[i]->isPointerTy()?b.CreateIntToPtr(value,outputs[i]):b.CreateBitCast(value,outputs[i]);
+        result=call.getType()->isStructTy()?b.CreateInsertValue(result,value,i):value;
+    }
+    return result;
+}
+void lower_inline_ptx(llvm::Module& module) {
+    std::vector<llvm::CallInst*> calls;
+    for(auto& function:module)for(auto& block:function)for(auto& instruction:block)
+        if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->isInlineAsm())calls.push_back(call);
+    for(auto* call:calls) {
+        try {
+            // Object image assembly retains its specialized descriptor lowering.
+            // Inspect tokens so image spellings inside comments do not hide an
+            // otherwise supported arithmetic block from the common importer.
+            auto text=llvm::cast<llvm::InlineAsm>(call->getCalledOperand())->getAsmString();
+            bool image=false;
+            for(const auto& token:ptx_tokens(text.str()))
+                image|=token.text.starts_with("tex.") || token.text.starts_with("suld.") || token.text.starts_with("sust.");
+            if(image)continue;
+            auto* result=import_inline_ptx(*call);
+            if(!call->getType()->isVoidTy())call->replaceAllUsesWith(result);
+            call->eraseFromParent();
+        } catch(const std::exception& error) {
+            auto diagnostic="inline PTX in "+call->getFunction()->getName().str()+": "+error.what();
+            call->setMetadata("cudavm.inline.ptx.error",llvm::MDNode::get(module.getContext(),llvm::MDString::get(module.getContext(),diagnostic)));
+        }
+    }
 }
 
 }

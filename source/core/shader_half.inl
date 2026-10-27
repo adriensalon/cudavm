@@ -209,7 +209,7 @@ void lower_shader_half(llvm::Module& module) {
             // correction terms. Decode it with the external PTX importer so
             // both input paths retain exactly the same instruction semantics.
             if(text.find("f16")!=std::string::npos || text=="rcp.approx.ftz.f32$0,$1;" || text=="max.f32$0,$1,$2;" || text=="min.f32$0,$1,$2;")
-                result=import_numeric_inline_ptx(*call);
+                result=import_inline_ptx(*call);
             else continue;
         }
         if(result->getType()!=call->getType()) {
