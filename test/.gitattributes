@@ -2,3 +2,5 @@
 # Preserve the exact producer inputs whose byte hashes accompany the cubins.
 kernel_launch/kernel_launch.ptx -text
 shared_memory/shared_memory.cu -text
+dynamic_shared_memory/dynamic_shared_memory.cu -text
+atomic_operations/atomic_operations.cu -text

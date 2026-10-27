@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA nvcc 12.4.131",
+  "architecture": "sm_75",
+  "command": "nvcc -arch=sm_75 -O3 -cubin --allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -ccbin <MSVC-14.44.35207-x64> cooperative.cu -o input.cubin",
+  "stored_as": {
+    "cooperative.cu": "atomic_operations.cu",
+    "input.cubin": "atomic_operations.cubin"
+  },
+  "sha256": {
+    "atomic_operations.cu": "525a9feec690454d88527f23168427678c42abcf92d114b254673bb13ed531cf",
+    "atomic_operations.cubin": "0a10039ded7558e8d0c2128cf439d1ec2d3a9174f1b03e301b3a13ce06c551cc"
+  }
+}

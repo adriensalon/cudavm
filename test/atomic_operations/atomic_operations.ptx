@@ -1,0 +1,77 @@
+.version 6.5
+.target sm_75
+.address_size 64
+.extern .shared .align 4 .b8 dynamic_values[];
+
+.visible .entry global_add(.param .u64 out, .param .u64 state, .param .u32 count) {
+ .reg .b64 %out, %state, %address;
+ .reg .b32 %lane, %lanes, %block, %index, %count, %delta, %bucket, %old;
+ .reg .pred %valid;
+ ld.param.u64 %out,[out]; ld.param.u64 %state,[state]; ld.param.u32 %count,[count];
+ mov.u32 %lane,%tid.x; mov.u32 %lanes,%ntid.x; mov.u32 %block,%ctaid.x;
+ mad.lo.u32 %index,%block,%lanes,%lane;
+ setp.lt.u32 %valid,%index,%count; selp.u32 %delta,1,0,%valid;
+ and.b32 %bucket,%index,1; mad.wide.u32 %address,%bucket,4,%state;
+ atom.global.add.u32 %old,[%address],%delta;
+ mad.wide.u32 %out,%index,4,%out; st.global.u32 [%out],%old;
+ add.u64 %address,%address,8; red.global.add.u32 [%address],%delta; ret;
+}
+.visible .entry global_cas(.param .u64 out, .param .u64 state, .param .u32 replacement) {
+ .reg .b64 %out, %state;
+ .reg .b32 %lane, %lanes, %block, %index, %replacement, %old, %unused;
+ ld.param.u64 %out,[out]; ld.param.u64 %state,[state]; ld.param.u32 %replacement,[replacement];
+ mov.u32 %lane,%tid.x; mov.u32 %lanes,%ntid.x; mov.u32 %block,%ctaid.x;
+ mad.lo.u32 %index,%block,%lanes,%lane;
+ atom.global.cas.b32 %old,[%state],0,%replacement;
+ mad.wide.u32 %out,%index,4,%out; st.global.u32 [%out],%old;
+ add.u64 %state,%state,4; atom.global.cas.b32 %unused,[%state],0,%replacement; ret;
+}
+.visible .entry shared_cas(.param .u64 out, .param .u32 replacement, .param .u32 unused) {
+ // Shared-space offsets are 32-bit; global device addresses remain 64-bit.
+ .reg .b64 %out, %destination;
+ .reg .b32 %shared, %address;
+ .reg .b32 %lane, %lanes, %block, %grid, %index, %replacement, %old, %discard, %value, %offset;
+ .reg .pred %initialize, %first;
+ ld.param.u64 %out,[out]; ld.param.u32 %replacement,[replacement];
+ mov.u32 %lane,%tid.x; mov.u32 %lanes,%ntid.x; mov.u32 %block,%ctaid.x; mov.u32 %grid,%nctaid.x;
+ mov.u32 %shared,dynamic_values;
+ setp.lt.u32 %initialize,%lane,2; @!%initialize bra ready;
+ mad.lo.u32 %address,%lane,4,%shared; mov.u32 %value,0; st.shared.u32 [%address],%value;
+ready:
+ bar.sync 0;
+ atom.shared.cas.b32 %old,[%shared],0,%replacement;
+ add.u32 %address,%shared,4; atom.shared.cas.b32 %discard,[%address],0,%replacement;
+ mad.lo.u32 %index,%block,%lanes,%lane;
+ mad.wide.u32 %destination,%index,4,%out; st.global.u32 [%destination],%old;
+ bar.sync 0;
+ setp.eq.u32 %first,%lane,0; @!%first ret;
+ ld.shared.u32 %value,[%shared+4]; mad.lo.u32 %offset,%grid,%lanes,%block;
+ mad.wide.u32 %destination,%offset,4,%out; st.global.u32 [%destination],%value; ret;
+}
+.visible .entry shared_histogram(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .reg .b64 %out, %in, %destination;
+ .reg .b32 %shared, %address;
+ .reg .b32 %lane, %lanes, %block, %grid, %index, %count, %value, %bucket, %delta, %old, %offset;
+ .reg .pred %initialize, %valid;
+ ld.param.u64 %out,[out]; ld.param.u64 %in,[in]; ld.param.u32 %count,[count];
+ mov.u32 %lane,%tid.x; mov.u32 %lanes,%ntid.x; mov.u32 %block,%ctaid.x; mov.u32 %grid,%nctaid.x;
+ mad.lo.u32 %index,%block,%lanes,%lane; mov.u32 %shared,dynamic_values;
+ setp.lt.u32 %initialize,%lane,4; @!%initialize bra ready;
+ mad.lo.u32 %address,%lane,4,%shared; mov.u32 %value,0;
+ st.shared.u32 [%address],%value; st.shared.u32 [%address+16],%value;
+ready:
+ bar.sync 0; setp.lt.u32 %valid,%index,%count; selp.u32 %delta,1,0,%valid;
+ mov.u32 %value,0; @!%valid bra add;
+ mad.wide.u32 %in,%index,4,%in; ld.global.u32 %value,[%in];
+add:
+ and.b32 %bucket,%value,3; mad.lo.u32 %address,%bucket,4,%shared;
+ atom.shared.add.u32 %old,[%address],%delta;
+ add.u32 %address,%address,16; red.shared.add.u32 [%address],%delta;
+ mad.lo.u32 %offset,%grid,8,%index;
+ mad.wide.u32 %destination,%offset,4,%out; st.global.u32 [%destination],%old;
+ bar.sync 0; @!%initialize ret;
+ mad.lo.u32 %address,%lane,4,%shared;
+ mad.lo.u32 %offset,%block,8,%lane; mad.wide.u32 %destination,%offset,4,%out;
+ ld.shared.u32 %value,[%address]; st.global.u32 [%destination],%value;
+ ld.shared.u32 %value,[%address+16]; st.global.u32 [%destination+16],%value; ret;
+}
