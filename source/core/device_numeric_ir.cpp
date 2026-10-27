@@ -14,7 +14,12 @@
 
 namespace cudavm {
 void link_device_numeric_ir(llvm::Module& module) {
-    if (module.getNamedMetadata("cudavm.numeric.helpers")) return;
+    if (module.getNamedMetadata("cudavm.numeric.helpers")) {
+        // Retained programs may carry an older helper set. Re-link when the
+        // directed-rounding entry point is absent, even if its marker exists.
+        auto* rounding=module.getFunction("__cudavm_native_word_f32_fma_mode");
+        if(rounding && !rounding->isDeclaration())return;
+    }
     auto files=llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
     add_embedded_files(*files, "/cudavm_resources");
     auto source=std::string(device_source("device_numeric_entry.cu"));

@@ -1,6 +1,7 @@
 #pragma once
 #include "shader_packet.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -20,6 +21,8 @@ struct kernel_descriptor {
     uint32_t memory_abi = packet_memory_abi;
     bool call_frames = false;
     uint32_t services = 0;
+    std::array<uint32_t,3> required_block{};
+    uint32_t max_block_threads = 0;
 };
 struct global_relocation { uint32_t offset, target; uint64_t addend; };
 struct global_descriptor { std::string symbol; uint32_t alignment; std::string initializer; std::vector<global_relocation> relocations; };
@@ -59,6 +62,10 @@ inline std::string encode_module_descriptor(const std::vector<kernel_descriptor>
     if (std::any_of(entries.begin(), entries.end(), [](const auto& entry) { return entry.services != 0; })) {
         number(0x31565253); number(uint32_t(entries.size()));
         for (const auto& entry : entries) number(entry.services);
+    }
+    if (std::any_of(entries.begin(),entries.end(),[](const auto& entry){return entry.max_block_threads || entry.required_block[0];})) {
+        number(0x31444e42); number(uint32_t(entries.size()));
+        for(const auto& entry:entries) {for(auto axis:entry.required_block)number(axis);number(entry.max_block_threads);}
     }
     // ADR2 makes incompatible loaders reject widened records and native slots.
     number(0x32524441); number(uint32_t(entries.size()));
@@ -135,6 +142,18 @@ inline module_descriptor decode_module_descriptor(std::string_view ptx) {
                 if (entry.services & ~7u || ((entry.services & 4u) && !(entry.services & 2u))) throw std::runtime_error("invalid native service flags");
             }
             trailer = number();
+        }
+        if (trailer == 0x31444e42) {
+            if(number()!=result.entries.size())throw std::runtime_error("invalid native launch bounds descriptor");
+            for(auto& entry:result.entries) {
+                uint64_t threads=1;
+                for(auto& axis:entry.required_block) {axis=number();if(axis>1024)throw std::runtime_error("invalid required block shape");threads*=axis;}
+                entry.max_block_threads=number();
+                if(threads>1024 || entry.max_block_threads>1024 ||
+                    ((entry.required_block[0] || entry.required_block[1] || entry.required_block[2]) && !threads) ||
+                    (threads && entry.max_block_threads))throw std::runtime_error("invalid native launch bounds");
+            }
+            trailer=number();
         }
         if (trailer != 0x32524441 || number() != result.entries.size()) throw std::runtime_error("invalid native memory descriptor");
         for (auto& entry : result.entries) {

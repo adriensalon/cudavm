@@ -126,7 +126,7 @@ extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word
 // DXIL's multiply-add does not promise a single binary32 rounding. Keep the
 // exact product and a jammed addend until the final rounding, including FTZ
 // sensitive inputs. Other shader inputs use this same strict FMA contract.
-extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f32_fma(unsigned a,unsigned b,unsigned c) {
+extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f32_fma_mode(unsigned a,unsigned b,unsigned c,unsigned mode) {
     unsigned ax=a&0x7fffffffu,bx=b&0x7fffffffu,cx=c&0x7fffffffu,sign=(a^b)&0x80000000u,cs=c&0x80000000u;
     if(ax>0x7f800000u || bx>0x7f800000u || cx>0x7f800000u || (ax==0x7f800000u && !bx) || (bx==0x7f800000u && !ax))return 0x7fc00000u;
     if(ax==0x7f800000u || bx==0x7f800000u)return cx==0x7f800000u && sign!=cs?0x7fc00000u:sign|0x7f800000u;
@@ -135,7 +135,7 @@ extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word
     unsigned long long product=static_cast<unsigned long long>((ax&0x7fffffu)|(ae?0x800000u:0u))*((bx&0x7fffffu)|(be?0x800000u:0u));
     unsigned long long addend=(cx&0x7fffffu)|(ce?0x800000u:0u);
     int pe=int(ae?ae:1)+int(be?be:1)-300,qe=int(ce?ce:1)-150;
-    if(!product && !addend)return sign==cs?sign:0u;
+    if(!product && !addend)return sign==cs?sign:mode==2u?0x80000000u:0u;
     if(!product)return c;
     int top=pe+48>qe+24?pe+48:qe+24,base=top-60;
     product=pe>=base?product<<unsigned(pe-base):cudavm::half_shift_jam(product,unsigned(base-pe));
@@ -144,14 +144,18 @@ extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word
     if(sign==cs)magnitude=product+addend;
     else if(product>=addend)magnitude=product-addend;
     else {magnitude=addend-product;sign=cs;}
-    if(!magnitude)return 0;
+    if(!magnitude)return mode==2u?0x80000000u:0u;
     int exponent=63-__builtin_clzll(magnitude)+base;
     int shift=(exponent<-126?-149:exponent-23)-base;
     unsigned long long q=magnitude,rem=0,mid=0;
     if(shift>0){q=shift<64?magnitude>>shift:0;rem=shift<64?magnitude&((1ull<<shift)-1):magnitude;mid=shift<=64?1ull<<(shift-1):0;}
     else q=magnitude<<unsigned(-shift);
-    q+=shift>0 && shift<=64 && (rem>mid || (rem==mid && (q&1)));
+    bool increment=mode==0u?(shift>0 && shift<=64 && (rem>mid || (rem==mid && (q&1)))):mode==2u?(sign!=0u && rem!=0ull):mode==3u?(sign==0u && rem!=0ull):false;
+    q+=unsigned(increment);
     if(exponent<-126)return sign|unsigned(q);
     if(q>=0x1000000ull){q>>=1;++exponent;}
-    return exponent>127?sign|0x7f800000u:sign|unsigned(exponent+127)<<23|(unsigned(q)&0x7fffffu);
+    return exponent>127?sign|((mode==1u || (mode==2u && !sign) || (mode==3u && sign))?0x7f7fffffu:0x7f800000u):sign|unsigned(exponent+127)<<23|(unsigned(q)&0x7fffffu);
+}
+extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f32_fma(unsigned a,unsigned b,unsigned c) {
+    return __cudavm_native_word_f32_fma_mode(a,b,c,0u);
 }

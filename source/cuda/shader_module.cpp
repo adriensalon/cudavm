@@ -86,7 +86,10 @@ struct shader_kernel : kernel {
           dynamic_shared_limit(std::min(32768u, s.shader_limits().shared_bytes) - e.shared_bytes) {}
     int attribute(CUfunction_attribute which) override {
         switch (which) {
-        case CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: return int(std::min(1024u, owner.native_block_limit()));
+        case CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: {
+            auto limit=entry.max_block_threads?entry.max_block_threads:1024u;
+            return int(std::min(limit,owner.native_block_limit()));
+        }
         case CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: return int(entry.shared_bytes);
         case CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: return int(entry.local_bytes);
         // Shader lowering uses registry global storage for CUDA constants and
@@ -145,6 +148,10 @@ struct shader_kernel : kernel {
         return size_t(invocations) * stride;
     }
     void validate_shape(const launch_shape& shape) {
+        if(entry.required_block[0])
+            require(std::equal(entry.required_block.begin(),entry.required_block.end(),shape.block),CUDA_ERROR_INVALID_VALUE,"launch block dimensions differ from PTX reqntid");
+        if(entry.max_block_threads)
+            require(uint64_t(shape.block[0])*shape.block[1]*shape.block[2]<=entry.max_block_threads,CUDA_ERROR_INVALID_VALUE,"launch block exceeds PTX maxntid");
         owner.check_device_fault();
         const auto& options = shape.options;
         if (options.access_policy) {

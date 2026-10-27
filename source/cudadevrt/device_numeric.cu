@@ -489,7 +489,7 @@ CV_FN cv64 cvDoubleDivide(cv64 a,cv64 b) {
     quotient.lo=quotient.lo|((remainder.lo|remainder.hi)!=0u?1u:0u);
     return cvDoubleRound(quotient,exponent,sign);
 }
-CV_FN uint cvAtomicFloatAdd(uint a,uint b,uint flush) {
+CV_FN uint cvAtomicFloatAdd(uint a,uint b,uint flush,uint mode=0u) {
     if(flush!=0u) {
         if((a&0x7f800000u)==0u)a=a&0x80000000u;
         if((b&0x7f800000u)==0u)b=b&0x80000000u;
@@ -504,7 +504,7 @@ CV_FN uint cvAtomicFloatAdd(uint a,uint b,uint flush) {
     }
     if(magnitude_a<magnitude_b) {uint temporary=a;a=b;b=temporary;temporary=magnitude_a;magnitude_a=magnitude_b;magnitude_b=temporary;}
     uint sign=a&0x80000000u;
-    if(magnitude_b==0u)return magnitude_a==0u?(a&b):a;
+    if(magnitude_b==0u)return magnitude_a==0u?(mode==2u?(a|b):(a&b)):a;
     uint exponent=magnitude_a>>23u,other_exponent=magnitude_b>>23u;
     uint left=((a&0x7fffffu)|(exponent!=0u?0x800000u:0u))<<3u;
     uint right=((b&0x7fffffu)|(other_exponent!=0u?0x800000u:0u))<<3u;
@@ -518,13 +518,14 @@ CV_FN uint cvAtomicFloatAdd(uint a,uint b,uint flush) {
         if(significand>=0x8000000u) {significand=(significand>>1u)|(significand&1u);++exponent;}
     } else {
         significand=left-right;
-        if(significand==0u)return 0u;
+        if(significand==0u)return mode==2u?0x80000000u:0u;
         while(significand<0x4000000u && exponent>1u) {significand<<=1u;--exponent;}
     }
     uint rounded=significand>>3u,tail=significand&7u;
-    if(tail>4u || (tail==4u && (rounded&1u)!=0u))++rounded;
+    bool increment=mode==0u?(tail>4u || (tail==4u && (rounded&1u)!=0u)):mode==2u?(sign!=0u && tail!=0u):mode==3u?(sign==0u && tail!=0u):false;
+    if(increment)++rounded;
     if(rounded>=0x1000000u) {rounded>>=1u;++exponent;}
-    if(exponent>=255u)return sign|0x7f800000u;
+    if(exponent>=255u)return sign|((mode==1u || (mode==2u && !sign) || (mode==3u && sign))?0x7f7fffffu:0x7f800000u);
     if(exponent==1u && rounded<0x800000u)exponent=0u;
     uint result=sign|(exponent<<23u)|(rounded&0x7fffffu);
     if(flush!=0u && (result&0x7f800000u)==0u)result=result&0x80000000u;
@@ -536,6 +537,21 @@ namespace cudavm {
 __device__ static inline cv64 split(unsigned long long x){return cvMake(unsigned(x),unsigned(x>>32));}
 __device__ static inline unsigned long long join(cv64 x){return (unsigned long long)(x.lo)|((unsigned long long)(x.hi)<<32);}
 }
+extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_integral(unsigned long long bits,unsigned mode) {
+    auto sign=bits&0x8000000000000000ull, magnitude=bits&0x7fffffffffffffffull;
+    unsigned exponent=unsigned(magnitude>>52);
+    if(exponent>=1075u || magnitude==0ull)return bits;
+    if(exponent<1023u) {
+        bool increment=mode==0u?magnitude>0x3fe0000000000000ull:mode==2u?sign!=0ull:mode==3u?sign==0ull:false;
+        return sign|(increment?0x3ff0000000000000ull:0ull);
+    }
+    unsigned shift=1075u-exponent;
+    auto fraction=magnitude&((1ull<<shift)-1ull), retained=magnitude>>shift;
+    if(fraction==0ull)return bits;
+    auto halfway=1ull<<(shift-1u);
+    bool increment=mode==0u?(fraction>halfway || (fraction==halfway && (retained&1ull))):mode==2u?sign!=0ull:mode==3u?sign==0ull:false;
+    return sign|((retained+unsigned(increment))<<shift);
+}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_add(unsigned long long a,unsigned long long b){using namespace cudavm;return join(cvDoubleAdd(split(a),split(b)));}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_sub(unsigned long long a,unsigned long long b){using namespace cudavm;return join(cvDoubleSubtract(split(a),split(b)));}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_mul(unsigned long long a,unsigned long long b){using namespace cudavm;return join(cvDoubleMultiply(split(a),split(b)));}
@@ -544,6 +560,7 @@ extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f32_to_f64(unsigned bits){using namespace cudavm;return join(cvFloatBitsToDoubleBits(bits));}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f64_to_f32(unsigned long long bits,unsigned mode){using namespace cudavm;return cvDoubleBitsToFloatBitsMode(split(bits),mode);}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f32_add(unsigned a,unsigned b,unsigned flush){using namespace cudavm;return cvAtomicFloatAdd(a,b,flush);}
+extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f32_add_mode(unsigned a,unsigned b,unsigned mode){using namespace cudavm;return cvAtomicFloatAdd(a,b,0u,mode);}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_u64_to_f32(unsigned long long bits,unsigned mode){using namespace cudavm;return cvU64ToFloatBitsMode(split(bits),mode);}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_i64_to_f32(unsigned long long bits,unsigned mode){using namespace cudavm;return cvI64ToFloatBitsMode(split(bits),mode);}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f32_to_i64(unsigned bits,unsigned mode){using namespace cudavm;return join(cvFloatBitsTo64Mode(bits,mode));}

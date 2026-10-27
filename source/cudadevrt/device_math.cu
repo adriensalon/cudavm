@@ -76,12 +76,12 @@ __device__ static inline bool bounded_float_arithmetic_operand(unsigned bits) {
 }
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_add_f32(float a,float b) {
  unsigned x=__builtin_bit_cast(unsigned,a),y=__builtin_bit_cast(unsigned,b);
- if(cudavm::bounded_float_arithmetic_operand(x) && cudavm::bounded_float_arithmetic_operand(y))return a+b;
+ if((x&0x7fffffffu) && (y&0x7fffffffu) && cudavm::bounded_float_arithmetic_operand(x) && cudavm::bounded_float_arithmetic_operand(y))return a+b;
  return __builtin_bit_cast(float,__cudavm_native_word_f32_add(x,y,0));
 }
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_mul_f32(float a,float b) {
  unsigned x=__builtin_bit_cast(unsigned,a),y=__builtin_bit_cast(unsigned,b);
- if(cudavm::bounded_float_arithmetic_operand(x) && cudavm::bounded_float_arithmetic_operand(y))return a*b;
+ if((x&0x7fffffffu) && (y&0x7fffffffu) && cudavm::bounded_float_arithmetic_operand(x) && cudavm::bounded_float_arithmetic_operand(y))return a*b;
  // An addend with the product's zero sign makes exact FMA round precisely
  // once as multiplication does, including both representations of zero.
  return __builtin_bit_cast(float,__cudavm_native_word_f32_fma(x,y,(x^y)&0x80000000u));
@@ -92,7 +92,7 @@ extern "C" __device__ __attribute__((used)) inline float __cudavm_native_fma(flo
  bool sx=!ax || (ax>=(90u<<23) && ax<(161u<<23));
  bool sy=!ay || (ay>=(90u<<23) && ay<(161u<<23));
  bool sz=!az || (az>=(90u<<23) && az<(161u<<23));
- if(sx && sy && sz)return __builtin_elementwise_fma(a,b,c);
+ if(ax && ay && az && sx && sy && sz)return __builtin_elementwise_fma(a,b,c);
  return __builtin_bit_cast(float,__cudavm_native_word_f32_fma(x,y,z));}
 #undef CV_MATH_CLZ
 #undef CV_MATH_FMA

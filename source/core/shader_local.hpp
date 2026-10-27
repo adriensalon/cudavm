@@ -31,7 +31,7 @@ struct shader_local_layout {
         };
         for (const auto& block : function) for (const auto& instruction : block)
             if (auto* allocation = llvm::dyn_cast<llvm::AllocaInst>(&instruction)) {
-                if (!allocation->isStaticAlloca()) { dynamic = true; continue; }
+                if (!allocation->isStaticAlloca() || allocation->getMetadata("cudavm.ptx.dynamic")) { dynamic = true; continue; }
                 auto* count = llvm::cast<llvm::ConstantInt>(allocation->getArraySize());
                 allocations[allocation] = reserve(layout.getTypeAllocSize(allocation->getAllocatedType()).getFixedValue(),
                     count->getValue().getLimitedValue(), allocation->getAlign().value());

@@ -2,6 +2,9 @@
 #include "compiler.hpp"
 #include "compiler_profiles.hpp"
 #include "device_conversions.hpp"
+#include "device_services.hpp"
+#include "device_math.hpp"
+#include "device_integers.hpp"
 #include "integer_ir.hpp"
 #include <algorithm>
 #include <cctype>
@@ -10,16 +13,19 @@
 #include <set>
 #include <vector>
 #include <llvm/ADT/StringRef.h>
+#include <llvm/ADT/APFloat.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 #include <llvm/IR/InlineAsm.h>
+#include <llvm/IR/GlobalAlias.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Support/Error.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Utils/Cloning.h>
@@ -50,7 +56,11 @@ std::vector<ptx_token> ptx_tokens(std::string_view input) {
         ptx_token token{{}, line, column};
         if (input[at] == '"') {
             token.text += input[at]; advance();
-            while (at < input.size() && input[at] != '"' && input[at] != '\n' && input[at] != '\\') {
+            while (at < input.size() && input[at] != '"' && input[at] != '\n') {
+                if (input[at] == '\\') {
+                    token.text += input[at]; advance();
+                    if (at == input.size() || input[at] == '\n') ptx_fail(token,"unterminated string escape");
+                }
                 token.text += input[at]; advance();
             }
             if (at == input.size() || input[at] != '"') ptx_fail(token, "unsupported or unterminated string literal", true);
@@ -60,7 +70,9 @@ std::vector<ptx_token> ptx_tokens(std::string_view input) {
         } else {
             while (at < input.size()) {
                 auto c = static_cast<unsigned char>(input[at]);
-                if (!std::isalnum(c) && c != '_' && c != '$' && c != '%' && c != '.') break;
+                bool exponent_sign=(c=='+' || c=='-') && !token.text.empty() && std::isdigit(static_cast<unsigned char>(token.text.front())) &&
+                    (token.text.back()=='e' || token.text.back()=='E');
+                if (!std::isalnum(c) && c != '_' && c != '$' && c != '%' && c != '.' && !exponent_sign) break;
                 token.text += char(c); advance();
             }
             if (token.text.empty()) ptx_fail(token, "unrecognized character");
@@ -77,6 +89,15 @@ uint64_t ptx_unsigned(const ptx_token& token) {
     if (text.empty() || text.getAsInteger(0, value)) ptx_fail(token, "invalid integer literal");
     return value;
 }
+uint64_t ptx_floating_bits(const ptx_token& token,unsigned bits,bool negative) {
+    llvm::APFloat value(llvm::APFloat::IEEEdouble());
+    auto converted=value.convertFromString(token.text,llvm::APFloat::rmNearestTiesToEven);
+    if(!converted){llvm::consumeError(converted.takeError());ptx_fail(token,"invalid floating literal");}
+    if(negative)value.changeSign();
+    bool loses=false;
+    if(bits!=64)value.convert(bits==16?llvm::APFloat::IEEEhalf():llvm::APFloat::IEEEsingle(),llvm::APFloat::rmNearestTiesToEven,&loses);
+    return value.bitcastToAPInt().getZExtValue();
+}
 bool ptx_identifier(const std::string& text) {
     if (text.empty() || (!std::isalpha(static_cast<unsigned char>(text[0])) && text[0] != '_' && text[0] != '$')) return false;
     return std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '$'; });
@@ -90,7 +111,7 @@ struct ptx_type {
         return (kind == 'f') == (other.kind == 'f');
     }
     llvm::IntegerType* storage(llvm::LLVMContext& context) const { return llvm::IntegerType::get(context, bits); }
-    llvm::Type* value(llvm::LLVMContext& context) const { return kind == 'f' ? (bits==16?llvm::Type::getHalfTy(context):llvm::Type::getFloatTy(context)) : storage(context); }
+    llvm::Type* value(llvm::LLVMContext& context) const { return kind == 'f' ? (bits==16?llvm::Type::getHalfTy(context):bits==64?llvm::Type::getDoubleTy(context):llvm::Type::getFloatTy(context)) : storage(context); }
 };
 ptx_type ptx_scalar(const ptx_token& token, bool memory = false) {
     auto name = token.text; if (name.starts_with('.')) name.erase(0, 1);
@@ -98,7 +119,7 @@ ptx_type ptx_scalar(const ptx_token& token, bool memory = false) {
     if (name == "pred" && !memory) return {1, 'p'};
     for (auto prefix : {'b', 'u', 's', 'f'}) for (unsigned bits : {8u, 16u, 32u, 64u})
         if (name == prefix + std::to_string(bits)) {
-            if ((prefix == 'f' && bits != 32 && bits != 16) || (!memory && bits == 8)) break;
+            if ((prefix == 'f' && bits == 8) || (!memory && bits == 8)) break;
             return {bits, prefix};
         }
     ptx_fail(token, "unsupported scalar type", true);
@@ -153,6 +174,7 @@ struct ptx_body {
     std::map<std::string, llvm::Value*> locals;
     std::vector<ptx_instruction> instructions;
     std::map<std::string, ptx_call_prototype> prototypes;
+    std::map<std::string,std::vector<std::string>> vectors;
 };
 struct ptx_global {
     ptx_parameter declaration;
@@ -167,22 +189,157 @@ class ptx_parser {
     std::unique_ptr<llvm::Module> module;
     std::vector<ptx_body> bodies;
     std::map<std::string, ptx_signature> signatures;
+    std::map<std::string,llvm::GlobalValue::LinkageTypes> declared_linkages;
     std::vector<ptx_global> globals;
     std::map<std::string, ptx_token> symbols;
     unsigned symbol_counter = 0;
     unsigned source_sm = 0;
     unsigned source_version = 0;
     bool relocatable = false;
+    std::vector<std::pair<ptx_token,ptx_token>> aliases;
     const ptx_token& peek() const { return tokens.at(cursor); }
     ptx_token take() { auto token = peek(); if (cursor + 1 < tokens.size()) ++cursor; return token; }
     bool accept(const char* text) { if (peek().text != text) return false; take(); return true; }
     ptx_token expect(const char* text) { auto token = take(); if (token.text != text) ptx_fail(token, std::string("expected '") + text + "'"); return token; }
     ptx_token identifier() { auto token = take(); if (!ptx_identifier(token.text)) ptx_fail(token, "expected identifier"); return token; }
 
+    bool debug_directive() {
+        if (peek().text != ".file" && peek().text != ".loc") return false;
+        auto directive=take(); auto file=take();
+        if (!ptx_unsigned(file)) ptx_fail(file,"invalid debug file index");
+        if (directive.text==".file") {
+            auto path=take(); if(path.text.size()<2 || path.text.front()!='"' || path.text.back()!='"')ptx_fail(path,"expected debug filename");
+            if(accept(",")){ptx_unsigned(take());expect(",");ptx_unsigned(take());}
+        } else {
+            ptx_unsigned(take());ptx_unsigned(take());
+            while(accept(",")) {
+                auto property=take();
+                if(property.text=="function_name") {
+                    auto value=take();if(value.text.empty() || (value.text.front()!='"' && !ptx_identifier(value.text)))ptx_fail(value,"invalid debug function name");
+                } else if(property.text=="inlined_at") {ptx_unsigned(take());ptx_unsigned(take());ptx_unsigned(take());}
+                else ptx_fail(property,"unsupported location property",true);
+            }
+        }
+        return true;
+    }
+    bool pragma() {
+        if (!accept(".pragma")) return false;
+        do {
+            auto hint=take();
+            if(hint.text!="\"nounroll\"" && hint.text!="\"used\"")ptx_fail(hint,"unsupported pragma",true);
+        } while(accept(","));
+        expect(";"); return true;
+    }
+    void function_directives(llvm::Function& function,bool kernel) {
+        bool shape=false;
+        while(peek().text.starts_with('.')) {
+            if(pragma())continue;
+            auto directive=take();
+            if(directive.text==".noreturn") {
+                if(kernel || !function.getReturnType()->isVoidTy())ptx_fail(directive,"invalid noreturn function");
+                function.addFnAttr(llvm::Attribute::NoReturn); continue;
+            }
+            bool required=directive.text==".reqntid", maximum=directive.text==".maxntid";
+            bool hint=directive.text==".maxnreg" || directive.text==".minnctapersm" || directive.text==".maxnctapersm";
+            if(!kernel || (!required && !maximum && !hint))ptx_fail(directive,"unsupported kernel directive",true);
+            std::vector<uint64_t> values;
+            do {
+                auto token=take();auto value=ptx_unsigned(token);
+                if(!value || value>UINT32_MAX || values.size()>=(hint?1u:3u))ptx_fail(token,"invalid kernel directive value");
+                values.push_back(value);
+            } while(accept(","));
+            if(required || maximum) {
+                if(shape)ptx_fail(directive,"conflicting block shape directives");shape=true;
+                uint64_t threads=1;
+                for(auto value:values) {if(value>1024 || threads>1024/value)ptx_fail(directive,"block size exceeds 1024 threads");threads*=value;}
+                auto key=required?"reqntid":"maxntid";
+                std::string dimensions;
+                for(unsigned axis=0;axis<3;++axis) {
+                    auto value=axis<values.size()?values[axis]:1;
+                    dimensions+=(axis?",":"")+std::to_string(value);
+                    function.addFnAttr(std::string("cudavm.ptx.")+key+"."+char('x'+axis),std::to_string(value));
+                    auto* data=llvm::MDNode::get(context,{llvm::ValueAsMetadata::get(&function),llvm::MDString::get(context,std::string(key)+char('x'+axis)),
+                        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context),value))});
+                    module->getOrInsertNamedMetadata("nvvm.annotations")->addOperand(data);
+                }
+                // LLVM 22 reads launch bounds from attributes during NVPTX
+                // emission; the imported per-axis attributes serve shaders.
+                function.addFnAttr(std::string("nvvm.")+key,dimensions);
+            } else function.addFnAttr("cudavm.ptx"+directive.text,std::to_string(values[0]));
+        }
+    }
+    std::pair<std::string,llvm::FunctionType*> external_builtin(const std::string& name) {
+        auto* pointer=llvm::PointerType::get(context,0);auto* word=llvm::Type::getInt32Ty(context);auto* wide=llvm::Type::getInt64Ty(context);
+        auto* real=llvm::Type::getFloatTy(context);auto* empty=llvm::Type::getVoidTy(context);
+        auto signature=[&](const std::string& symbol,llvm::Type* result,std::vector<llvm::Type*> args) {
+            return std::make_pair(symbol,llvm::FunctionType::get(result,args,false));
+        };
+        if(name=="malloc")return signature(name,pointer,{wide});
+        if(name=="free")return signature(name,empty,{pointer});
+        if(name=="__nv_aligned_device_malloc" || name=="__nv_aligned_device_malloc_impl")return signature(name,pointer,{wide,wide});
+        if(name=="vprintf")return signature(name,word,{pointer,pointer});
+        if(name=="__assertfail")return signature(name,empty,{pointer,pointer,word,pointer,wide});
+        for(const auto& operation:device_math_operations) if(name==std::string("__nv_")+operation.name) {
+            std::string symbol;
+            if(operation.intrinsic)symbol=operation.intrinsic;
+            else if(operation.llvm_intrinsic)symbol=operation.llvm_intrinsic;
+            else {
+                symbol=operation.name;symbol.pop_back();symbol="__cudavm_native_"+symbol;
+            }
+            return signature(symbol,real,std::vector<llvm::Type*>(operation.arguments,real));
+        }
+        if(name=="__nv_fmaf_rn")return signature("llvm.fma.f32",real,{real,real,real});
+        for(const auto& conversion:device_conversions)if(name==std::string("__nv_")+conversion.name) {
+            auto* floating=conversion.real_bits==64?llvm::Type::getDoubleTy(context):real;
+            auto* integer=llvm::Type::getIntNTy(context,conversion.integer_bits);
+            return signature(conversion.intrinsic,conversion.to_real?static_cast<llvm::Type*>(floating):integer,{conversion.to_real?static_cast<llvm::Type*>(integer):floating});
+        }
+        for(const auto& conversion:double_conversions)if(name==std::string("__nv_")+conversion.name)
+            return signature(conversion.intrinsic,real,{llvm::Type::getDoubleTy(context)});
+        for(const auto& operation:device_integer_operations)if(name==std::string("__nv_")+operation.name) {
+            auto* type=llvm::Type::getIntNTy(context,operation.bits);
+            return signature(operation.intrinsic,type,std::vector<llvm::Type*>(operation.arguments,type));
+        }
+        return {{},nullptr};
+    }
+    bool resolved_external(const llvm::Function& function) {
+        return external_builtin(function.getName().str()).second || std::any_of(aliases.begin(),aliases.end(),[&](const auto& alias){return alias.first.text==function.getName();});
+    }
+    void normalize_external_abi() {
+        std::vector<llvm::Function*> declarations;
+        for(auto& function:*module)if(function.isDeclaration() && !function.use_empty() && external_builtin(function.getName().str()).second)declarations.push_back(&function);
+        for(auto* function:declarations) {
+            auto name=function->getName().str();auto [symbol,type]=external_builtin(name);
+            const auto& signature=signatures.at(name);
+            auto fail=[&] {ptx_fail(symbols.at(name),"incompatible external builtin ABI");};
+            if(function->arg_size()!=type->getNumParams() || signature.second.size()>1)fail();
+            for(const auto& parameter:signature.first)if(parameter.array)fail();
+            if(!signature.second.empty() && signature.second[0].array)fail();
+            auto compatible=[](llvm::Type* bits,llvm::Type* native) {
+                return bits->isIntegerTy(native->isPointerTy()?64:native->getPrimitiveSizeInBits());
+            };
+            for(unsigned i=0;i<function->arg_size();++i)if(!compatible(function->getArg(i)->getType(),type->getParamType(i)))fail();
+            if(type->getReturnType()->isVoidTy()!=function->getReturnType()->isVoidTy() ||
+                (!type->getReturnType()->isVoidTy() && !compatible(function->getReturnType(),type->getReturnType())))fail();
+            if(symbol==name)function->setName(name+"$ptx_abi");
+            auto native=module->getOrInsertFunction(symbol,type);
+            llvm::IRBuilder<> builder(llvm::BasicBlock::Create(context,"entry",function));
+            std::vector<llvm::Value*> arguments;
+            for(unsigned i=0;i<function->arg_size();++i) {
+                auto* value=static_cast<llvm::Value*>(function->getArg(i));auto* target=type->getParamType(i);
+                arguments.push_back(target->isPointerTy()?builder.CreateIntToPtr(value,target):builder.CreateBitCast(value,target));
+            }
+            auto* call=builder.CreateCall(native,arguments);
+            if(type->getReturnType()->isVoidTy())builder.CreateRetVoid();
+            else builder.CreateRet(type->getReturnType()->isPointerTy()?builder.CreatePtrToInt(call,function->getReturnType()):builder.CreateBitCast(call,function->getReturnType()));
+            function->setLinkage(llvm::GlobalValue::InternalLinkage);function->addFnAttr(llvm::Attribute::AlwaysInline);
+        }
+    }
+
 
     unsigned alignment() {
         auto token = take(); auto value = ptx_unsigned(token);
-        if (!value || value > 256 || (value & (value - 1))) ptx_fail(token, "invalid storage alignment");
+        if (!value || value > 65536 || (value & (value - 1))) ptx_fail(token, "invalid storage alignment");
         return unsigned(value);
     }
     ptx_parameter declaration(bool unsized = false, bool parameter = false, bool register_parameter = false) {
@@ -276,6 +433,13 @@ class ptx_parser {
         expect(";");
         if (!external || address_space == 3) {
             variable->setLinkage(scope ? llvm::GlobalValue::InternalLinkage : linkage);
+            if(linkage==llvm::GlobalValue::CommonLinkage) {
+                variable->setMetadata("cudavm.ptx.common",llvm::MDNode::get(context,{}));
+                if(!initializer.empty()) {
+                    variable->setLinkage(llvm::GlobalValue::ExternalLinkage);
+                    variable->setMetadata("cudavm.ptx.common.initialized",llvm::MDNode::get(context,{}));
+                }
+            }
             variable->setInitializer(address_space == 3 ? llvm::UndefValue::get(data.storage(context)) : llvm::Constant::getNullValue(data.storage(context)));
             globals.push_back({data, variable, std::move(initializer)});
         }
@@ -303,6 +467,7 @@ class ptx_parser {
         if (!function) function = llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage, name.text, *module);
         if (kernel) function->addFnAttr("cudavm.kernel");
         signatures[name.text] = {parameters, results};
+        declared_linkages[name.text]=linkage;
         if (!kernel) function->addFnAttr("cudavm.ptx.signature", ptx_signature_key(signatures.at(name.text)));
         for (unsigned i = 0; i < parameters.size(); ++i) {
             if (kernel && inputs[i]->isPointerTy()) {
@@ -311,6 +476,7 @@ class ptx_parser {
             }
             function->getArg(i)->setName(parameters[i].name.text);
         }
+        function_directives(*function,kernel);
         if (accept(";")) {
             if (kernel) ptx_fail(name, "kernel declarations require a definition", true);
             return;
@@ -320,7 +486,7 @@ class ptx_parser {
         function->setLinkage(linkage);
         if (peek().text != "{") ptx_fail(peek(), "unsupported kernel directive or declaration", true);
         expect("{");
-        ptx_body body{name, function, parameters, results, {}, {}, {}, {}, {}};
+        ptx_body body{name, function, parameters, results, {}, {}, {}, {}, {}, {}};
         auto* entry = llvm::BasicBlock::Create(context, "entry", function); llvm::IRBuilder<> allocations(entry);
         std::vector<std::map<std::string, std::string>> scopes(1);
         auto add_slot = [&](const ptx_parameter& parameter, llvm::Value* input = nullptr, bool byval = false) {
@@ -339,22 +505,29 @@ class ptx_parser {
         auto resolve = [&](ptx_token token) {
             for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope)
                 if (auto found = scope->find(token.text); found != scope->end()) { token.text = found->second; break; }
+            auto dot=token.text.rfind('.');
+            if(dot!=std::string::npos && dot+2<token.text.size() && (token.text[dot+1]=='b' || token.text[dot+1]=='h'))
+                for(auto scope=scopes.rbegin();scope!=scopes.rend();++scope)
+                    if(auto found=scope->find(token.text.substr(0,dot));found!=scope->end()){token.text=found->second+token.text.substr(dot);break;}
             return token;
         };
         while (true) {
             if (accept("}")) { if (scopes.size() == 1) break; scopes.pop_back(); continue; }
             if (accept("{")) { scopes.emplace_back(); continue; }
             if (peek().text == "<eof>") ptx_fail(peek(), "unterminated function body");
-            if (accept(".pragma")) {
-                auto hint = take(); if (hint.text != "\"nounroll\"") ptx_fail(hint, "unsupported pragma", true);
-                expect(";"); continue;
-            }
+            if (debug_directive() || pragma()) continue;
             if (accept(".param")) {
-                auto parameter = declaration(); auto original = parameter.name.text;
-                if (scopes.back().contains(original)) ptx_fail(parameter.name, "duplicate local parameter");
-                parameter.name.text = name.text + "$param$" + std::to_string(symbol_counter++);
-                add_slot(parameter); scopes.back().erase(parameter.name.text); scopes.back()[original] = parameter.name.text;
-                expect(";"); continue;
+                auto parameter = declaration();
+                for(;;) {
+                    auto original = parameter.name.text;
+                    if (scopes.back().contains(original)) ptx_fail(parameter.name, "duplicate local parameter");
+                    auto current=parameter;current.name.text=name.text+"$param$"+std::to_string(symbol_counter++);
+                    add_slot(current);scopes.back().erase(current.name.text);scopes.back()[original]=current.name.text;
+                    if(accept(";"))break;
+                    expect(",");parameter.name=identifier();parameter.count=1;parameter.array=false;
+                    if(accept("[")){parameter.array=true;parameter.count=ptx_unsigned(take());expect("]");if(!parameter.count || parameter.count>(1u<<24))ptx_fail(parameter.name,"invalid parameter extent");}
+                }
+                continue;
             }
             bool external_storage = accept(".extern");
             if (peek().text == ".shared") { take(); storage(external_storage, ".shared", &body, &scopes.back()); continue; }
@@ -372,6 +545,7 @@ class ptx_parser {
                 continue;
             }
             if (accept(".reg")) {
+                unsigned lanes=accept(".v2")?2:accept(".v4")?4:1;
                 auto type = ptx_scalar(take());
                 for (;;) {
                     auto reg = take();
@@ -388,7 +562,13 @@ class ptx_parser {
                         if (body.registers.size() >= 65536) ptx_fail(reg, "register resource limit exceeded", true);
                         auto unique = symbol + "$" + std::to_string(symbol_counter++);
                         scopes.back()[symbol] = unique;
-                        body.registers.emplace(unique, ptx_register{type, allocations.CreateAlloca(type.storage(context))});
+                        if(lanes==1)body.registers.emplace(unique, ptx_register{type, allocations.CreateAlloca(type.storage(context))});
+                        else for(unsigned lane=0;lane<lanes;++lane) {
+                            const char components[]{'x','y','z','w'};
+                            auto scalar=unique+"."+std::to_string(lane);
+                            scopes.back()[symbol+"."+components[lane]]=scalar;body.vectors[unique].push_back(scalar);
+                            body.registers.emplace(scalar,ptx_register{type,allocations.CreateAlloca(type.storage(context))});
+                        }
                     }
                     if (accept(";")) break;
                     expect(",");
@@ -433,6 +613,10 @@ class ptx_parser {
                     if (nesting) ptx_fail(instruction.opcode, "unbalanced operand");
                     for (const auto& operand : instruction.operands) if (operand.empty()) ptx_fail(instruction.opcode, "empty operand");
                 }
+            }
+            for(auto& operand:instruction.operands)if(operand.size()==6 && operand.front().text=="[" && operand.back().text=="]" &&
+                (operand[2].text=="+" || operand[2].text=="-") && (operand[3].text=="+" || operand[3].text=="-")) {
+                operand[2].text=operand[2].text==operand[3].text?"+":"-";operand.erase(operand.begin()+3);
             }
             body.instructions.push_back(std::move(instruction));
             if (body.instructions.size() > 65536) ptx_fail(peek(), "instruction resource limit exceeded", true);
@@ -540,6 +724,133 @@ class ptx_parser {
             return b.CreateBitCast(b.CreateSelect(b.CreateICmpULT(b.CreateAnd(bits, b.getInt32(0x7fffffff)), b.getInt32(0x800000)),
                 b.CreateAnd(bits, b.getInt32(0x80000000)), bits), b.getFloatTy());
         };
+        if(type.kind=='f' && type.bits==32 && (op=="add" || op=="sub" || op=="mul" || op=="fma") &&
+            (std::find(parts.begin(),parts.end(),"sat")!=parts.end() || (parts.size()>2 && (parts[1]=="rz" || parts[1]=="rm" || parts[1]=="rp")))) {
+            unsigned at=1,mode=0;const std::vector<std::string> modes{"rn","rz","rm","rp"};
+            if(at<parts.size()-1)if(auto found=std::find(modes.begin(),modes.end(),parts[at]);found!=modes.end()){mode=unsigned(found-modes.begin());++at;}
+            bool flush=at<parts.size()-1 && parts[at]=="ftz";if(flush)++at;
+            bool saturate=at<parts.size()-1 && parts[at]=="sat";if(saturate)++at;
+            if(at!=parts.size()-1)ptx_fail(instruction.opcode,"unsupported FP32 arithmetic modifier",true);
+            arity(op=="fma"?4:3);auto* a=read(operands[1],type);auto* c=read(operands[2],type);
+            if(flush){a=flush_float(a);c=flush_float(c);}
+            llvm::Value* result=nullptr;
+            if(op=="add" || op=="sub")result=helper("word_f32_add_mode",{word(a),op=="sub"?b.CreateXor(word(c),b.getInt32(0x80000000)):word(c),b.getInt32(mode)},b.getInt32Ty());
+            else {
+                llvm::Value* addend=op=="fma"?read(operands[3],type):nullptr;
+                if(addend && flush)addend=flush_float(addend);
+                auto* bits=addend?word(addend):b.CreateAnd(b.CreateXor(word(a),word(c)),b.getInt32(0x80000000));
+                result=helper("word_f32_fma_mode",{word(a),word(c),bits,b.getInt32(mode)},b.getInt32Ty());
+            }
+            if(saturate) {
+                auto* zero=b.CreateOr(b.CreateICmpSLT(result,b.getInt32(0)),b.CreateICmpUGT(b.CreateAnd(result,b.getInt32(0x7fffffff)),b.getInt32(0x7f800000)));
+                result=b.CreateSelect(zero,b.getInt32(0),b.CreateSelect(b.CreateICmpUGT(result,b.getInt32(0x3f800000)),b.getInt32(0x3f800000),result));
+            }
+            result=b.CreateBitCast(result,b.getFloatTy());return done(flush?flush_float(result):result,type);
+        }
+        if (op == "cvt" && parts.size() >= 3) {
+            auto destination = ptx_scalar({parts[parts.size()-2], instruction.opcode.line, instruction.opcode.column});
+            bool extended = (type.kind == 'f' && type.bits == 64) || (destination.kind == 'f' && destination.bits == 64) ||
+                (destination.kind == 'f' && destination.bits == 16 && type.kind != 'f') ||
+                (type.kind == 'f' && type.bits == 16 && destination.kind != 'f');
+            if (extended) {
+                arity(2);
+                unsigned mode = 0;
+                bool integral = false;
+                if (parts.size() == 4) {
+                    const std::vector<std::string> modes{"rn","rz","rm","rp","rni","rzi","rmi","rpi"};
+                    auto found = std::find(modes.begin(), modes.end(), parts[1]);
+                    if (found == modes.end()) ptx_fail(instruction.opcode, "unsupported extended conversion modifier", true);
+                    mode = unsigned(found - modes.begin()) % 4; integral = found - modes.begin() >= 4;
+                } else if (parts.size() != 3) ptx_fail(instruction.opcode, "unsupported extended conversion modifier", true);
+                auto* input = read(operands[1], type, type.kind != 'f');
+                llvm::Value* result = nullptr;
+                if (type.kind != 'f' && destination.kind == 'f') {
+                    if (parts.size() != 4 || integral || (type.kind != 's' && type.kind != 'u'))
+                        ptx_fail(instruction.opcode, "integer conversion requires a floating rounding mode");
+                    auto* extended_input = type.signed_integer() ? b.CreateSExtOrTrunc(input,b.getInt64Ty()) : b.CreateZExtOrTrunc(input,b.getInt64Ty());
+                    if (destination.bits == 16) {
+                        auto* negative = type.signed_integer() ? b.CreateICmpSLT(extended_input,b.getInt64(0)) : b.getFalse();
+                        auto* magnitude = b.CreateSelect(negative,b.CreateNeg(extended_input),extended_input);
+                        result = helper("word_f16_round",{magnitude,b.getInt32(0),b.CreateZExt(negative,b.getInt32Ty()),b.getInt32(mode)},b.getInt32Ty());
+                        result = b.CreateBitCast(b.CreateTrunc(result,b.getInt16Ty()),b.getHalfTy());
+                    } else {
+                        result = helper(type.signed_integer()?"word_i64_to_f64":"word_u64_to_f64",{extended_input,b.getInt32(mode)},b.getInt64Ty());
+                        result = b.CreateBitCast(result,b.getDoubleTy());
+                    }
+                } else if (type.kind == 'f' && destination.kind != 'f') {
+                    if (parts.size() != 4 || !integral || (destination.kind != 's' && destination.kind != 'u'))
+                        ptx_fail(instruction.opcode, "floating conversion requires an integer destination and rounding mode");
+                    if (type.bits == 16) {
+                        result = helper("word_f16_to_integer",{b.CreateZExt(word(input),b.getInt32Ty()),b.getInt32(mode),b.getInt32(destination.bits),b.getInt32(!destination.signed_integer())},b.getInt64Ty());
+                        result = b.CreateSelect(b.CreateICmpUGT(b.CreateAnd(word(input),b.getInt16(0x7fff)),b.getInt16(0x7c00)),b.getInt64(0),result);
+                    } else {
+                        auto* bits = word(input);
+                        auto* magnitude = b.CreateAnd(bits,b.getInt64(0x7fffffffffffffffull));
+                        auto* negative = b.CreateICmpSLT(bits,b.getInt64(0));
+                        auto* nan = b.CreateICmpUGT(magnitude,b.getInt64(0x7ff0000000000000ull));
+                        auto* overflow = b.CreateICmpUGE(magnitude,b.getInt64(uint64_t(1023 + destination.bits - unsigned(destination.signed_integer())) << 52));
+                        result = helper("word_f64_to_i64",{bits,b.getInt32(mode)},b.getInt64Ty());
+                        auto low = destination.signed_integer() ? llvm::APInt::getSignedMinValue(destination.bits).sext(64) : llvm::APInt(64,0);
+                        auto high = destination.signed_integer() ? llvm::APInt::getSignedMaxValue(destination.bits).zext(64) : llvm::APInt::getMaxValue(destination.bits).zext(64);
+                        auto* minimum = llvm::ConstantInt::get(context,low); auto* maximum = llvm::ConstantInt::get(context,high);
+                        if (destination.bits < 64) {
+                            result = b.CreateSelect(destination.signed_integer()?b.CreateICmpSLT(result,minimum):b.CreateICmpULT(result,minimum),minimum,result);
+                            result = b.CreateSelect(destination.signed_integer()?b.CreateICmpSGT(result,maximum):b.CreateICmpUGT(result,maximum),maximum,result);
+                        }
+                        result = b.CreateSelect(overflow,b.CreateSelect(negative,minimum,maximum),result);
+                        if (!destination.signed_integer()) result = b.CreateSelect(negative,b.getInt64(0),result);
+                        result = b.CreateSelect(nan,b.getInt64(0),result);
+                    }
+                    result = b.CreateTruncOrBitCast(result,destination.storage(context));
+                } else if (type.kind == 'f' && destination.kind == 'f') {
+                    if (type.bits == destination.bits) {
+                        if (parts.size() != 4 || !integral) ptx_fail(instruction.opcode,"integral conversion requires an integer rounding mode");
+                        result = b.CreateBitCast(helper("word_f64_integral",{word(input),b.getInt32(mode)},b.getInt64Ty()),b.getDoubleTy());
+                    } else if (destination.bits == 64) {
+                        if (parts.size() != 3 || integral) ptx_fail(instruction.opcode,"widening conversion has no rounding modifier");
+                        if (type.bits == 16) input = real(input);
+                        result = b.CreateBitCast(helper("word_f32_to_f64",{word(input)},b.getInt64Ty()),b.getDoubleTy());
+                    } else {
+                        if (parts.size() != 4 || integral) ptx_fail(instruction.opcode,"narrowing conversion requires a floating rounding mode");
+                        result = helper(destination.bits == 16?"word_f64_to_f16":"word_f64_to_f32",{word(input),b.getInt32(mode)},b.getInt32Ty());
+                        if (destination.bits == 16) result = b.CreateTrunc(result,b.getInt16Ty());
+                        result = b.CreateBitCast(result,destination.value(context));
+                    }
+                }
+                if (!result) ptx_fail(instruction.opcode,"unsupported extended conversion",true);
+                write(operands[0],result,destination,destination.kind != 'f'); return true;
+            }
+        }
+        if (type.kind == 'f' && type.bits == 64 && (op == "add" || op == "sub" || op == "mul" || op == "div")) {
+            if (parts.size() != 2 && (parts.size() != 3 || parts[1] != "rn")) ptx_fail(instruction.opcode,"unsupported FP64 arithmetic modifier",true);
+            arity(3); auto* a=read(operands[1],type); auto* c=read(operands[2],type);
+            auto* result = op=="add"?b.CreateFAdd(a,c):op=="sub"?b.CreateFSub(a,c):op=="mul"?b.CreateFMul(a,c):b.CreateFDiv(a,c);
+            return done(result,type);
+        }
+        if(op=="testp" && parts.size()==3 && type.kind=='f' && type.bits>=32) {
+            arity(2);auto* bits=word(read(operands[1],type));
+            auto constant=[&](uint64_t value){return llvm::ConstantInt::get(bits->getType(),value);};
+            auto* magnitude=b.CreateAnd(bits,constant(type.bits==64?0x7fffffffffffffffull:0x7fffffffull));
+            auto* infinity=constant(type.bits==64?0x7ff0000000000000ull:0x7f800000ull);
+            auto* normal=constant(type.bits==64?0x0010000000000000ull:0x00800000ull);
+            llvm::Value* result=nullptr;
+            if(parts[1]=="finite")result=b.CreateICmpULT(magnitude,infinity);
+            else if(parts[1]=="infinite")result=b.CreateICmpEQ(magnitude,infinity);
+            else if(parts[1]=="number")result=b.CreateICmpULE(magnitude,infinity);
+            else if(parts[1]=="notanumber")result=b.CreateICmpUGT(magnitude,infinity);
+            else if(parts[1]=="normal")result=b.CreateAnd(b.CreateICmpUGE(magnitude,normal),b.CreateICmpULT(magnitude,infinity));
+            else if(parts[1]=="subnormal")result=b.CreateAnd(b.CreateICmpNE(magnitude,constant(0)),b.CreateICmpULT(magnitude,normal));
+            else ptx_fail(instruction.opcode,"unsupported floating classification",true);
+            return done(result,{1,'p'});
+        }
+        if(op=="slct" && (parts.size()==3 || (parts.size()==4 && parts[1]=="ftz"))) {
+            arity(4);bool flush=parts.size()==4;
+            auto destination=ptx_scalar({parts[parts.size()-2],instruction.opcode.line,instruction.opcode.column});
+            if((type.kind!='s' && type.kind!='f') || type.bits!=32 || (flush && type.kind!='f'))ptx_fail(instruction.opcode,"unsupported selection type",true);
+            auto* condition=read(operands[3],type);if(flush)condition=flush_float(condition);
+            auto* selected=type.kind=='f'?b.CreateFCmpOGE(condition,llvm::ConstantFP::get(b.getFloatTy(),0)):b.CreateICmpSGE(condition,b.getInt32(0));
+            return done(b.CreateSelect(selected,read(operands[1],destination),read(operands[2],destination)),destination);
+        }
         if (op == "cvt" && parts.size() >= 3) {
             auto destination = ptx_scalar({parts[parts.size() - 2], instruction.opcode.line, instruction.opcode.column});
             bool from_float = type.kind == 'f' && type.bits == 32;
@@ -626,11 +937,12 @@ class ptx_parser {
                 return true;
             }
         }
-        if ((op == "setp" || op == "set") && type.kind == 'f' && type.bits == 32) {
+        if ((op == "setp" || op == "set") && type.kind == 'f' && type.bits >= 32) {
             if (parts.size() < (op == "setp" ? 3u : 4u)) ptx_fail(instruction.opcode, "unsupported FP32 comparison modifier", true);
             unsigned at = 2;
             auto boolean = parts[at] == "and" || parts[at] == "or" || parts[at] == "xor" ? parts[at++] : std::string{};
             bool flush = parts[at] == "ftz"; if (flush) ++at;
+            if (flush && type.bits != 32) ptx_fail(instruction.opcode, "ftz requires FP32", true);
             if (at != parts.size() - (op == "setp" ? 1 : 2)) ptx_fail(instruction.opcode, "unsupported FP32 comparison modifier", true);
             arity(boolean.empty() ? 3 : 4);
             auto* left = read(operands[1], type); auto* right = read(operands[2], type);
@@ -673,16 +985,23 @@ class ptx_parser {
             return done(destination.kind == 'f' ? b.CreateBitCast(result, b.getFloatTy()) : result, destination);
         }
         if(op=="mov" && parts.size()==2 && (operands.size()==2) && (operands[0].size()>1 || operands[1].size()>1)) {
-            // mov.b32 packs/unpacks two independent 16-bit lanes.
-            if(type.bits!=32 || type.kind!='b')return false;
-            auto fields=[&](const auto& v){return v.size()==5 && v[0].text=="{" && v[2].text=="," && v[4].text=="}";};
-            if(fields(operands[1]))return done(b.CreateOr(b.CreateZExt(read({operands[1][1]},{16,'b'}),b.getInt32Ty()),b.CreateShl(b.CreateZExt(read({operands[1][3]},{16,'b'}),b.getInt32Ty()),16)),type);
-            if(fields(operands[0])) {
-                auto* v=read(operands[1],type);
-                write({operands[0][1]},b.CreateTrunc(v,b.getInt16Ty()),{16,'b'},false);
-                write({operands[0][3]},b.CreateTrunc(b.CreateLShr(v,16),b.getInt16Ty()),{16,'b'},false);return true;
+            if(type.kind!='b' || (type.bits!=32 && type.bits!=64))return false;
+            bool packing=operands[1].size()>1;
+            const auto& fields=operands[packing?1:0];
+            unsigned lanes=unsigned(fields.size()-1)/2;
+            if((lanes!=2 && lanes!=4) || fields.size()!=lanes*2+1 || fields.front().text!="{" || fields.back().text!="}")ptx_fail(instruction.opcode,"invalid packed register list");
+            for(unsigned lane=1;lane<lanes;++lane)if(fields[lane*2].text!=",")ptx_fail(instruction.opcode,"invalid packed register separator");
+            auto width=type.bits/lanes;
+            // PTX has no scalar byte registers; byte moves use wider registers.
+            ptx_type element{width,'b'};
+            if(packing) {
+                llvm::Value* result=llvm::ConstantInt::get(type.storage(context),0);
+                for(unsigned lane=0;lane<lanes;++lane)result=b.CreateOr(result,b.CreateShl(b.CreateZExt(read({fields[lane*2+1]},element,true),type.storage(context)),width*lane));
+                return done(result,type);
             }
-            return false;
+            auto* value=read(operands[1],type);
+            for(unsigned lane=0;lane<lanes;++lane)write({fields[lane*2+1]},b.CreateTrunc(b.CreateLShr(value,width*lane),element.storage(context)),element,true);
+            return true;
         }
         if(op=="cvt" && parts.size()>=3) {
             auto destination=ptx_scalar({parts[parts.size()-2],instruction.opcode.line,instruction.opcode.column});
@@ -704,12 +1023,12 @@ class ptx_parser {
             }
         }
         if((type.kind=='f' || type.kind=='h') && (op=="neg" || op=="abs") && parts.size()==2) {
-            arity(2);auto* v=word(read(operands[1],type));auto sign=type.kind=='h'?0x80008000u:type.bits==16?0x8000u:0x80000000u;
+            arity(2);auto* v=word(read(operands[1],type));uint64_t sign=type.kind=='h'?0x80008000ull:type.bits==16?0x8000ull:type.bits==64?0x8000000000000000ull:0x80000000ull;
             auto* mask=llvm::ConstantInt::get(v->getType(),sign);
             v=op=="neg"?b.CreateXor(v,mask):b.CreateAnd(v,b.CreateNot(mask));
             return done(type.kind=='f'?b.CreateBitCast(v,type.value(context)):v,type);
         }
-        if((op=="min" || op=="max") && (type.kind=='f' || type.kind=='h') &&
+        if((op=="min" || op=="max") && ((type.kind=='f' && type.bits<64) || type.kind=='h') &&
             (parts.size()==2 || (parts.size()==3 && parts[1]=="NaN" && (type.bits==16 || type.kind=='h')))) {
             arity(3);auto* a=read(operands[1],type);auto* c=read(operands[2],type);
             auto compute=[&](llvm::Value* a,llvm::Value* c)->llvm::Value* {
@@ -757,7 +1076,7 @@ class ptx_parser {
             auto* a=read(operands[1],type);auto* c=read(operands[2],type);
             if(flush){a=flush_float(a);c=flush_float(c);}
             auto compute=[&](llvm::Value* a,llvm::Value* c,llvm::Value* d)->llvm::Value* {
-                if(type.kind=='f' && type.bits==32 && !fused && parts.size()>=3 && parts[1]=="rn") {
+                if(type.kind=='f' && type.bits==32 && !fused) {
                     if(op=="sub")c=b.CreateBitCast(b.CreateXor(word(c),b.getInt32(0x80000000)),b.getFloatTy());
                     return helper(op=="mul"?"mul_f32":"add_f32",{a,c},b.getFloatTy());
                 }
@@ -783,8 +1102,16 @@ class ptx_parser {
             auto* result=compute(a,c,d);
             return done(flush?flush_float(result):result,type);
         }
-        if(op=="div" && type.kind=='f' && type.bits==32 && parts==std::vector<std::string>{"div","rn","f32"}) {
-            arity(3);return done(b.CreateFDiv(read(operands[1],type),read(operands[2],type)),type);
+        if((op=="div" || op=="rcp" || op=="sqrt") && type.kind=='f' && type.bits==32 && parts.size()>=3 &&
+            (parts[1]=="rn" || (op=="div" && (parts[1]=="approx" || parts[1]=="full")))) {
+            bool flush=parts.size()==4 && parts[2]=="ftz";
+            if(parts.size()!=(flush?4u:3u))ptx_fail(instruction.opcode,"unsupported FP32 arithmetic modifier",true);
+            arity(op=="div"?3:2);auto* x=read(operands[1],type);if(flush)x=flush_float(x);
+            llvm::Value* result=nullptr;
+            if(op=="sqrt")result=helper("sqrt",{x},b.getFloatTy());
+            else if(op=="rcp")result=b.CreateFDiv(llvm::ConstantFP::get(b.getFloatTy(),1),x);
+            else {auto* y=read(operands[2],type);if(flush)y=flush_float(y);result=b.CreateFDiv(x,y);}
+            return done(flush?flush_float(result):result,type);
         }
         if((op=="rcp" || op=="sqrt" || op=="rsqrt" || op=="ex2" || op=="lg2" || op=="sin" || op=="cos" || op=="tanh") &&
                 ((type.kind=='f' && type.bits==32 && (parts==std::vector<std::string>{op,"approx","ftz","f32"} || parts==std::vector<std::string>{op,"approx","f32"})) ||
@@ -820,6 +1147,149 @@ class ptx_parser {
     template<class Read, class Write> bool integer_instruction(const std::vector<std::string>& parts,
             const ptx_instruction& instruction, llvm::IRBuilder<>& b, Read read, Write write, llvm::AllocaInst* carry) {
         const auto& op = parts[0]; const auto& operands = instruction.operands; const auto& opcode = instruction.opcode;
+        if((op=="setp" || op=="set") && parts.size()>=3 && (parts.back().starts_with('s') || parts.back().starts_with('u') || parts.back().starts_with('b'))) {
+            auto type=ptx_scalar({parts.back(),opcode.line,opcode.column});
+            unsigned at=2;std::string boolean;
+            if(at<parts.size() && (parts[at]=="and" || parts[at]=="or" || parts[at]=="xor"))boolean=parts[at++];
+            if(parts.size()!=at+(op=="set"?2u:1u) || operands.size()!=(boolean.empty()?3u:4u) || type.bits<16)ptx_fail(opcode,"unsupported integer comparison",true);
+            bool unsigned_value=type.kind!='s';
+            const std::map<std::string,llvm::CmpInst::Predicate> comparisons{{"eq",llvm::CmpInst::ICMP_EQ},{"ne",llvm::CmpInst::ICMP_NE},
+                {"lt",unsigned_value?llvm::CmpInst::ICMP_ULT:llvm::CmpInst::ICMP_SLT},{"le",unsigned_value?llvm::CmpInst::ICMP_ULE:llvm::CmpInst::ICMP_SLE},
+                {"gt",unsigned_value?llvm::CmpInst::ICMP_UGT:llvm::CmpInst::ICMP_SGT},{"ge",unsigned_value?llvm::CmpInst::ICMP_UGE:llvm::CmpInst::ICMP_SGE},
+                {"lo",llvm::CmpInst::ICMP_ULT},{"ls",llvm::CmpInst::ICMP_ULE},{"hi",llvm::CmpInst::ICMP_UGT},{"hs",llvm::CmpInst::ICMP_UGE}};
+            if(!comparisons.contains(parts[1]) || (type.kind=='b' && parts[1]!="eq" && parts[1]!="ne"))ptx_fail(opcode,"unsupported instruction or modifier",true);
+            auto* compared=b.CreateICmp(comparisons.at(parts[1]),read(operands[1],type),read(operands[2],type));
+            llvm::Value* incoming=nullptr;
+            if(!boolean.empty()) {auto tokens=operands[3];bool negate=tokens.front().text=="!";if(negate)tokens.erase(tokens.begin());incoming=read(tokens,{1,'p'});if(negate)incoming=b.CreateNot(incoming);}
+            auto combine=[&](llvm::Value* value)->llvm::Value* {return boolean=="and"?b.CreateAnd(value,incoming):boolean=="or"?b.CreateOr(value,incoming):boolean=="xor"?b.CreateXor(value,incoming):value;};
+            if(op=="setp") {
+                auto positive=combine(compared),negative=combine(b.CreateNot(compared));
+                const auto& destination=operands[0];if(destination.size()!=1 && (destination.size()!=3 || destination[1].text!="|"))ptx_fail(opcode,"invalid comparison destinations");
+                if(destination[0].text!="_")write({destination[0]},positive,{1,'p'},false);
+                if(destination.size()==3 && destination[2].text!="_")write({destination[2]},negative,{1,'p'},false);
+            } else {
+                auto destination=ptx_scalar({parts[parts.size()-2],opcode.line,opcode.column});
+                if(destination.bits!=32 || (destination.kind!='s' && destination.kind!='u' && destination.kind!='f'))ptx_fail(opcode,"invalid comparison result type");
+                auto* result=b.CreateSelect(combine(compared),b.getInt32(destination.kind=='f'?0x3f800000u:0xffffffffu),b.getInt32(0));
+                write(operands[0],destination.kind=='f'?b.CreateBitCast(result,b.getFloatTy()):result,destination,false);
+            }
+            return true;
+        }
+        if (op == "mul24" || op == "mad24" || op == "sad" || op == "abs" || op == "dp4a" || op == "dp2a") {
+            if(op=="abs" && parts.back().starts_with('f'))return false;
+            auto type=ptx_scalar({parts.back(),opcode.line,opcode.column});
+            auto invalid=[&] { ptx_fail(opcode,"unsupported integer instruction",true); };
+            if(type.kind!='s' && type.kind!='u')invalid();
+            if(op=="abs") {
+                if(parts.size()!=2 || type.kind!='s' || type.bits<16)invalid();
+                if(operands.size()!=2)ptx_fail(opcode,"wrong operand count");
+                auto* a=read(operands[1],type);write(operands[0],b.CreateSelect(b.CreateICmpSLT(a,llvm::ConstantInt::get(a->getType(),0)),b.CreateNeg(a),a),type,false);return true;
+            }
+            if(type.bits!=32)invalid();
+            unsigned count=op=="mul24"?3:4;
+            if(operands.size()!=count)ptx_fail(opcode,"wrong operand count");
+            auto lane=[&](llvm::Value* value,unsigned shift,unsigned bits,bool sign)->llvm::Value* {
+                auto* small=b.CreateTrunc(b.CreateLShr(value,shift),b.getIntNTy(bits));
+                return sign?b.CreateSExt(small,b.getInt64Ty()):b.CreateZExt(small,b.getInt64Ty());
+            };
+            auto* a=read(operands[1],{32,'u'});auto* c=read(operands[2],{32,'u'});
+            llvm::Value* result=nullptr;
+            if(op=="mul24" || op=="mad24") {
+                bool sat=parts.size()==4 && parts[2]=="sat";
+                if((parts.size()!=3 && !sat) || (parts[1]!="lo" && parts[1]!="hi") || (sat && (op!="mad24" || parts[1]!="hi" || type.kind!='s')))invalid();
+                result=b.CreateMul(lane(a,0,24,type.signed_integer()),lane(c,0,24,type.signed_integer()));
+                if(parts[1]=="hi")result=type.signed_integer()?b.CreateAShr(result,16):b.CreateLShr(result,16);
+                result=b.CreateTrunc(result,b.getInt32Ty());
+                if(op=="mad24") {
+                    auto* addend=read(operands[3],{32,'b'});
+                    if(sat)result=b.CreateBinaryIntrinsic(llvm::Intrinsic::sadd_sat,result,addend);
+                    else result=b.CreateAdd(result,addend);
+                }
+            } else if(op=="sad") {
+                if(parts.size()!=2)invalid();
+                auto* difference=b.CreateSub(lane(a,0,32,type.signed_integer()),lane(c,0,32,type.signed_integer()));
+                result=b.CreateTrunc(b.CreateSelect(b.CreateICmpSLT(difference,b.getInt64(0)),b.CreateNeg(difference),difference),b.getInt32Ty());
+                result=b.CreateAdd(result,read(operands[3],{32,'b'}));
+            } else {
+                bool four=op=="dp4a";
+                if(parts.size()!=(four?3u:4u) || (!four && parts[1]!="lo" && parts[1]!="hi"))invalid();
+                auto atype=ptx_scalar({parts[parts.size()-2],opcode.line,opcode.column});
+                if(atype.bits!=32 || (atype.kind!='s' && atype.kind!='u') || source_sm<61)invalid();
+                result=b.CreateZExt(read(operands[3],{32,'b'}),b.getInt64Ty());
+                for(unsigned i=0;i<(four?4u:2u);++i)
+                    result=b.CreateAdd(result,b.CreateMul(lane(a,i*(four?8:16),four?8:16,atype.signed_integer()),lane(c,(i+(!four && parts[1]=="hi"?2:0))*8,8,type.signed_integer())));
+                result=b.CreateTrunc(result,b.getInt32Ty());
+            }
+            write(operands[0],result,{32,'u'},false);return true;
+        }
+        if (op.size()>1 && (op.back()=='2' || op.back()=='4') && op.front()=='v') {
+            auto base=op.substr(0,op.size()-1);bool comparison=base=="vset";
+            if(base!="vadd" && base!="vsub" && base!="vavrg" && base!="vabsdiff" && base!="vmin" && base!="vmax" && !comparison)return false;
+            unsigned bits=op.back()=='2'?16:8;
+            if(operands.size()!=4)ptx_fail(opcode,"wrong operand count");
+            if(parts.size()<4 || parts.size()>6)ptx_fail(opcode,"unsupported packed instruction modifier",true);
+            unsigned modifier=4;bool saturate=modifier<parts.size() && parts[modifier]=="sat";if(saturate)++modifier;
+            bool accumulate=modifier<parts.size() && parts[modifier]=="add";if(accumulate)++modifier;
+            if(modifier!=parts.size() || (comparison && saturate))ptx_fail(opcode,"unsupported packed instruction modifier",true);
+            auto dtype=ptx_scalar({parts[1],opcode.line,opcode.column});
+            auto atype=ptx_scalar({parts[comparison?1:2],opcode.line,opcode.column});
+            auto btype=ptx_scalar({parts[comparison?2:3],opcode.line,opcode.column});
+            for(auto type:{dtype,atype,btype})if(type.bits!=32 || (type.kind!='s' && type.kind!='u'))ptx_fail(opcode,"invalid packed instruction type");
+            auto selector=[&](std::vector<ptx_token> tokens,bool source,std::string defaults) {
+                if(tokens.size()!=1)ptx_fail(opcode,"packed operands require registers");
+                auto dot=tokens[0].text.rfind('.');
+                if(dot!=std::string::npos && dot+1<tokens[0].text.size() && (tokens[0].text[dot+1]=='h' || tokens[0].text[dot+1]=='b')) {
+                    auto suffix=tokens[0].text.substr(dot+1);tokens[0].text.resize(dot);
+                    if(suffix.empty() || suffix[0]!=(bits==16?'h':'b'))ptx_fail(opcode,"invalid packed selector");
+                    defaults=suffix.substr(1);
+                }
+                if(defaults.empty() || defaults.size()>(32/bits) || (source && defaults.size()!=32/bits))ptx_fail(opcode,"invalid packed selector");
+                unsigned selected=0;
+                for(char digit:defaults) {
+                    unsigned index=unsigned(digit-'0');
+                    if(index>=(source?64/bits:32/bits) || (!source && (selected&(1u<<index))))ptx_fail(opcode,"invalid packed selector");
+                    selected|=1u<<index;
+                }
+                return std::make_pair(tokens,std::move(defaults));
+            };
+            auto [a_operand,a_selector]=selector(operands[1],true,bits==16?"10":"3210");
+            auto [b_operand,b_selector]=selector(operands[2],true,bits==16?"32":"7654");
+            auto [destination,mask]=selector(operands[0],false,bits==16?"10":"3210");
+            auto* a=read(a_operand,{32,'u'});auto* c=read(b_operand,{32,'u'});auto* merge=read(operands[3],{32,'u'});
+            auto* pair=b.CreateOr(b.CreateZExt(a,b.getInt64Ty()),b.CreateShl(b.CreateZExt(c,b.getInt64Ty()),32));
+            llvm::Value* result=accumulate?merge:b.getInt32(0);
+            for(unsigned shift=0;shift<32;shift+=bits) {
+                auto lane=shift/bits;
+                if(mask.find(char('0'+lane))==mask.npos) {
+                    if(!accumulate)result=b.CreateOr(result,b.CreateAnd(merge,b.getInt32(((1u<<bits)-1)<<shift)));
+                    continue;
+                }
+                auto extend=[&](const std::string& selected,ptx_type type)->llvm::Value* {
+                    auto index=unsigned(selected[selected.size()-1-lane]-'0');
+                    auto* small=b.CreateTrunc(b.CreateLShr(pair,index*bits),b.getIntNTy(bits));
+                    return type.signed_integer()?b.CreateSExt(small,b.getInt32Ty()):b.CreateZExt(small,b.getInt32Ty());
+                };
+                auto* x=extend(a_selector,atype);auto* y=extend(b_selector,btype);llvm::Value* value=nullptr;
+                if(comparison) {
+                    const std::map<std::string,llvm::CmpInst::Predicate> predicates{{"eq",llvm::CmpInst::ICMP_EQ},{"ne",llvm::CmpInst::ICMP_NE},{"lt",llvm::CmpInst::ICMP_SLT},{"le",llvm::CmpInst::ICMP_SLE},{"gt",llvm::CmpInst::ICMP_SGT},{"ge",llvm::CmpInst::ICMP_SGE}};
+                    if(!predicates.contains(parts[3]))ptx_fail(opcode,"invalid packed comparison");
+                    value=b.CreateZExt(b.CreateICmp(predicates.at(parts[3]),x,y),b.getInt32Ty());
+                } else if(base=="vadd" || base=="vavrg") {
+                    value=b.CreateAdd(x,y);
+                    if(base=="vavrg")value=b.CreateAShr(b.CreateAdd(value,b.CreateZExt(b.CreateICmpSGE(value,b.getInt32(0)),b.getInt32Ty())),1);
+                } else if(base=="vsub" || base=="vabsdiff") {
+                    value=b.CreateSub(x,y);
+                    if(base=="vabsdiff")value=b.CreateSelect(b.CreateICmpSLT(value,b.getInt32(0)),b.CreateNeg(value),value);
+                } else value=b.CreateSelect(base=="vmin"?b.CreateICmpSLT(x,y):b.CreateICmpSGT(x,y),x,y);
+                if(saturate) {
+                    auto* minimum=b.getInt32(dtype.signed_integer()?uint32_t(0)-(1u<<(bits-1)):0);
+                    auto* maximum=b.getInt32(dtype.signed_integer()?(1u<<(bits-1))-1:(1u<<bits)-1);
+                    value=b.CreateSelect(b.CreateICmpSLT(value,minimum),minimum,b.CreateSelect(b.CreateICmpSGT(value,maximum),maximum,value));
+                }
+                result=accumulate?b.CreateAdd(result,value):b.CreateOr(result,b.CreateShl(b.CreateAnd(value,b.getInt32((1u<<bits)-1)),shift));
+            }
+            write(destination,result,{32,'u'},false);return true;
+        }
         auto arity = [&](unsigned count) { if (operands.size() != count) ptx_fail(opcode, "wrong operand count"); };
         auto operand = [&](unsigned index, ptx_type type) { return read(operands.at(index), type); };
         auto unsupported = [&] { ptx_fail(opcode, "unsupported integer instruction or modifier", true); };
@@ -951,7 +1421,13 @@ class ptx_parser {
         // CUDA compilers use vector parameter operations for aggregate fields.
         // Expand them into scalar accesses before SSA construction; each lane
         // retains the original predicate and its byte offset.
-        for (const auto& instruction : body.instructions) {
+        for (auto instruction : body.instructions) {
+            for(auto& operand:instruction.operands)if(operand.size()==1 && body.vectors.contains(operand[0].text)) {
+                auto token=operand[0];const auto& lanes=body.vectors.at(token.text);operand.clear();
+                token.text="{";operand.push_back(token);
+                for(const auto& lane:lanes) {if(operand.size()>1){token.text=",";operand.push_back(token);}token.text=lane;operand.push_back(token);}
+                token.text="}";operand.push_back(token);
+            }
             auto text = instruction.opcode.text; size_t at = text.find(".v2."); unsigned lanes = 2;
             if (at == text.npos) { at = text.find(".v4."); lanes = 4; }
             if (at == text.npos || (!text.starts_with("ld.") && !text.starts_with("st."))) { instructions.push_back(instruction); continue; }
@@ -994,7 +1470,8 @@ class ptx_parser {
         };
         auto scalar = [&](const std::vector<ptx_token>& tokens, ptx_type type, bool truncate_memory = false) -> llvm::Value* {
             if (tokens.empty() || tokens.size() > 2) ptx_fail(tokens.empty() ? ptx_token{"operand", 0, 0} : tokens.front(), "expected scalar operand");
-            bool negative = tokens.size() == 2;
+            bool invert=type.kind=='p' && tokens.size()==2 && tokens[0].text=="!";
+            bool negative = tokens.size() == 2 && !invert;
             if (negative && tokens[0].text != "-") ptx_fail(tokens[0], "expected negative immediate");
             const auto& token = tokens.back();
             llvm::Value* value = nullptr;
@@ -1035,19 +1512,22 @@ class ptx_parser {
             } else if (auto* target = module->getFunction(token.text)) {
                 if (negative || type.bits != 64 || type.kind == 'f' || target->hasFnAttribute("cudavm.kernel"))
                     ptx_fail(token, "function address requires a 64-bit device-function operand");
-                if (!relocatable && target->isDeclaration()) ptx_fail(token, "unresolved device function");
+                if (!relocatable && target->isDeclaration() && !resolved_external(*target)) ptx_fail(token, "unresolved device function");
                 value = builder.CreatePtrToInt(target, type.storage(context));
-            } else if (token.text.starts_with("0f") && token.text.size() == 10) {
-                if (type.bits != 32 || negative) ptx_fail(token, "invalid binary32 literal");
+            } else if ((token.text.starts_with("0f") && token.text.size() == 10) || (token.text.starts_with("0d") && token.text.size() == 18)) {
+                auto width = token.text[1] == 'd' ? 64u : 32u;
+                if (type.bits != width || negative) ptx_fail(token, "invalid floating bit literal");
                 uint64_t bits = 0;
                 if (llvm::StringRef(token.text).drop_front(2).getAsInteger(16, bits)) ptx_fail(token, "invalid binary32 literal");
-                value = builder.getInt32(uint32_t(bits));
+                value = llvm::ConstantInt::get(type.storage(context), bits);
             } else {
-                if (type.kind == 'f') ptx_fail(token, "floating literals require PTX 0f binary32 encoding", true);
-                uint64_t integer = token.text == "WARP_SZ" ? 32 : ptx_unsigned(token);
-                value = llvm::ConstantInt::get(type.storage(context), negative ? uint64_t(0) - integer : integer);
+                if(type.kind=='f')value=llvm::ConstantInt::get(type.storage(context),ptx_floating_bits(token,type.bits,negative));
+                else {
+                    uint64_t integer = token.text == "WARP_SZ" ? 32 : ptx_unsigned(token);
+                    value = llvm::ConstantInt::get(type.storage(context),type.kind=='p'?uint64_t(integer!=0):negative ? uint64_t(0) - integer : integer);
+                }
             }
-            return type.kind == 'f' ? builder.CreateBitCast(value, type.value(context)) : value;
+            return type.kind == 'f' ? builder.CreateBitCast(value, type.value(context)) : invert?builder.CreateNot(value):value;
         };
         auto write = [&](const std::vector<ptx_token>& destination, llvm::Value* value, ptx_type result_type, bool relaxed = false) {
             if (destination.size() != 1) ptx_fail(destination.front(), "expected register destination");
@@ -1128,7 +1608,42 @@ class ptx_parser {
                 next = llvm::BasicBlock::Create(context, "fallthrough", &function);
                 builder.CreateCondBr(predicate, execute, next); builder.SetInsertPoint(execute);
             }
-            if (opcode.text == "ret" || opcode.text == "exit") {
+            if(parts.size()==3 && parts[0]=="mov" && (parts[1]=="v2" || parts[1]=="v4")) {
+                arity(2);unsigned lanes=parts[1]=="v2"?2:4;
+                auto type=ptx_scalar({parts[2],opcode.line,opcode.column});
+                for(const auto& fields:instruction.operands)if(fields.size()!=lanes*2+1 || fields.front().text!="{" || fields.back().text!="}")ptx_fail(opcode,"invalid vector register list");
+                for(const auto& fields:instruction.operands)for(unsigned lane=1;lane<lanes;++lane)if(fields[lane*2].text!=",")ptx_fail(opcode,"invalid vector register separator");
+                std::vector<llvm::Value*> values;
+                for(unsigned lane=0;lane<lanes;++lane)values.push_back(scalar({instruction.operands[1][lane*2+1]},type));
+                for(unsigned lane=0;lane<lanes;++lane)write({instruction.operands[0][lane*2+1]},values[lane],type);
+            } else if (parts.size() == 2 && (parts[0] == "alloca" || parts[0] == "stacksave" || parts[0] == "stackrestore")) {
+                if (source_version < 73 || source_sm < 52) ptx_fail(opcode,"stack instructions require PTX 7.3 and sm_52",true);
+                auto type = ptx_scalar({parts[1],opcode.line,opcode.column});
+                if (type.kind != 'u' || (type.bits != 32 && type.bits != 64)) ptx_fail(opcode,"stack instructions require u32 or u64");
+                if (parts[0] == "alloca") {
+                    if (instruction.operands.size() != 2 && instruction.operands.size() != 3) ptx_fail(opcode,"wrong operand count");
+                    uint64_t align = 8;
+                    if (instruction.operands.size() == 3) {
+                        if (instruction.operands[2].size() != 1) ptx_fail(opcode,"alloca alignment must be immediate");
+                        align = ptx_unsigned(instruction.operands[2][0]);
+                        if (!align || (align & (align-1)) || align > (1u<<23)) ptx_fail(opcode,"invalid alloca alignment");
+                    }
+                    // LLVM's dynamic stack allocation produces a generic
+                    // pointer. PTX alloca exposes a local-space address.
+                    auto* allocation = builder.CreateAlloca(builder.getInt8Ty(),operand(1,type),"ptx.dynamic");
+                    allocation->setAlignment(llvm::Align(align));
+                    allocation->setMetadata("cudavm.ptx.dynamic",llvm::MDNode::get(context,{}));
+                    auto* local=builder.CreateAddrSpaceCast(allocation,llvm::PointerType::get(context,5));
+                    write(instruction.operands[0],builder.CreatePtrToInt(local,type.storage(context)),type);
+                } else if (parts[0] == "stacksave") {
+                    arity(1);
+                    auto* pointer = builder.CreateIntrinsic(llvm::PointerType::get(context,0),llvm::Intrinsic::stacksave,{});
+                    write(instruction.operands[0],builder.CreatePtrToInt(pointer,type.storage(context)),type);
+                } else {
+                    arity(1); auto* pointer=builder.CreateIntToPtr(operand(0,type),llvm::PointerType::get(context,0));
+                    builder.CreateIntrinsic(builder.getVoidTy(),llvm::Intrinsic::stackrestore,{pointer});
+                }
+            } else if (opcode.text == "ret" || opcode.text == "exit") {
                 arity(0);
                 if (opcode.text == "exit" && !function.hasFnAttribute("cudavm.kernel")) ptx_fail(opcode, "exit in device functions is unsupported", true);
                 llvm::Value* result = nullptr;
@@ -1139,8 +1654,12 @@ class ptx_parser {
                     result = value;
                 }
                 if (result) builder.CreateRet(result); else builder.CreateRetVoid();
-            } else if (opcode.text == "bar.sync" || opcode.text == "bar.arrive") {
-                bool arrive = opcode.text == "bar.arrive";
+            } else if (opcode.text == "bar.sync" || opcode.text == "bar.arrive" ||
+                       opcode.text == "barrier.sync" || opcode.text == "barrier.arrive" ||
+                       opcode.text == "barrier.cta.sync" || opcode.text == "barrier.cta.arrive" ||
+                       opcode.text == "barrier.cta.sync.aligned" || opcode.text == "barrier.cta.arrive.aligned") {
+                if(opcode.text.starts_with("barrier.cta.") && source_version<78)ptx_fail(opcode,"barrier.cta requires PTX 7.8",true);
+                bool arrive = opcode.text.find("arrive") != std::string::npos;
                 if (instruction.operands.empty() || instruction.operands.size() > 2 || (arrive && instruction.operands.size() != 2))
                     ptx_fail(opcode, "wrong operand count");
                 std::vector<llvm::Value*> args;
@@ -1152,12 +1671,38 @@ class ptx_parser {
                     }
                     args.push_back(value);
                 }
-                auto name = arrive ? "llvm.nvvm.barrier.cta.arrive.aligned.count" :
-                    args.size() == 1 ? "llvm.nvvm.barrier.cta.sync.aligned.all" : "llvm.nvvm.barrier.cta.sync.aligned.count";
+                auto aligned = opcode.text.starts_with("bar.") || opcode.text.ends_with(".aligned");
+                auto name = std::string("llvm.nvvm.barrier.cta.") + (arrive?"arrive":"sync") + (aligned?".aligned.":".") + (args.size()==1?"all":"count");
                 auto callee = module->getOrInsertFunction(name,
                     llvm::FunctionType::get(builder.getVoidTy(), std::vector<llvm::Type*>(args.size(), builder.getInt32Ty()), false));
                 llvm::cast<llvm::Function>(callee.getCallee())->addFnAttr(llvm::Attribute::Convergent);
                 builder.CreateCall(callee, args)->setConvergent();
+            } else if (opcode.text.starts_with("bar.red.") || opcode.text.starts_with("barrier.red.") || opcode.text.starts_with("barrier.cta.red.")) {
+                if(opcode.text.starts_with("barrier.cta.") && source_version<78)ptx_fail(opcode,"barrier.cta requires PTX 7.8",true);
+                std::vector<std::string> fields=parts;
+                bool aligned=fields[0]=="bar" || fields.back()=="aligned";
+                if (fields.back()=="aligned") fields.pop_back();
+                auto red=std::find(fields.begin(),fields.end(),"red");
+                if (red==fields.end() || std::distance(red,fields.end())!=3 ||
+                    (red[1]!="popc" && red[1]!="and" && red[1]!="or") || red[2]!=(red[1]=="popc"?"u32":"pred"))
+                    ptx_fail(opcode,"unsupported barrier reduction",true);
+                if (instruction.operands.size()!=3 && instruction.operands.size()!=4) ptx_fail(opcode,"wrong operand count");
+                std::vector<llvm::Value*> args{operand(1,{32,'u'})};
+                if (auto* id=llvm::dyn_cast<llvm::ConstantInt>(args[0]);id && id->getZExtValue()>=16) ptx_fail(opcode,"invalid CTA barrier operand");
+                if (instruction.operands.size()==4) {
+                    auto* count=operand(2,{32,'u'});
+                    if (auto* n=llvm::dyn_cast<llvm::ConstantInt>(count);n && (!n->getZExtValue() || n->getZExtValue()%32)) ptx_fail(opcode,"invalid CTA barrier operand");
+                    args.push_back(count);
+                }
+                auto predicate=instruction.operands.back();bool negate=predicate.front().text=="!";
+                if(negate)predicate.erase(predicate.begin());
+                auto* value=scalar(predicate,{1,'p'});args.push_back(negate?builder.CreateNot(value):value);
+                std::vector<llvm::Type*> types;for(auto* arg:args)types.push_back(arg->getType());
+                auto* result=red[1]=="popc"?builder.getInt32Ty():builder.getInt1Ty();
+                auto callee=module->getOrInsertFunction("llvm.nvvm.barrier.cta.red."+red[1]+(aligned?".aligned.":".")+(args.size()==2?"all":"count"),llvm::FunctionType::get(result,types,false));
+                auto* call=builder.CreateCall(callee,args);call->setConvergent();
+                llvm::cast<llvm::Function>(callee.getCallee())->addFnAttr(llvm::Attribute::Convergent);
+                write(instruction.operands[0],call,red[1]=="popc"?ptx_type{32,'u'}:ptx_type{1,'p'});
             } else if (parts[0] == "vote" || parts[0] == "shfl" || parts[0] == "match" || parts[0] == "redux" ||
                     parts[0] == "activemask" || opcode.text == "bar.warp.sync") {
                 auto collective = [&](const std::string& name, llvm::Type* result, std::vector<llvm::Value*> args) -> llvm::Value* {
@@ -1241,7 +1786,8 @@ class ptx_parser {
             } else if (parts[0] == "atom" || parts[0] == "red") {
                 bool reduction = parts[0] == "red";
                 auto type = ptx_scalar({parts.back(), opcode.line, opcode.column});
-                bool floating = type.kind == 'f' && type.bits == 32;
+                bool floating = type.kind == 'f' && (type.bits == 32 || type.bits == 64);
+                if (floating && type.bits == 64 && source_sm < 60) ptx_fail(opcode, "FP64 atomic add requires sm_60", true);
                 if (!floating && ((type.bits != 32 && type.bits != 64) || (type.kind != 'b' && type.kind != 'u' && type.kind != 's')))
                     ptx_fail(opcode, "unsupported atomic type", true);
                 std::string operation, scope, semantics, space;
@@ -1262,7 +1808,7 @@ class ptx_parser {
                 bool bits = operation == "and" || operation == "or" || operation == "xor" || operation == "exch" || operation == "cas";
                 bool wrap = operation == "inc" || operation == "dec";
                 if ((floating && operation != "add") || (bits && type.kind != 'b') || (!bits && type.kind == 'b') || (wrap && (type.kind != 'u' || type.bits != 32)) ||
-                        (operation == "add" && type.bits == 64 && type.kind != 'u') ||
+                        (!floating && operation == "add" && type.bits == 64 && type.kind != 'u') ||
                         (reduction && (operation == "cas" || operation == "exch")))
                     ptx_fail(opcode, "invalid atomic operation/type combination");
                 if (reduction && (semantics == "acquire" || semantics == "acq_rel")) ptx_fail(opcode, "reduction cannot acquire");
@@ -1323,14 +1869,14 @@ class ptx_parser {
                     signature = prototype.signature;
                     for (const auto& token : prototype.targets) {
                         auto* function = module->getFunction(token.text);
-                        if (!function || (!relocatable && function->isDeclaration())) ptx_fail(token, "unresolved device function");
+                        if (!function || (!relocatable && function->isDeclaration() && !resolved_external(*function))) ptx_fail(token, "unresolved device function");
                         if (function->hasFnAttribute("cudavm.kernel")) ptx_fail(token, "cannot call a kernel");
                         if (targets.empty()) signature = signatures.at(token.text);
                         else if (ptx_signature_key(signature) != ptx_signature_key(signatures.at(token.text))) ptx_fail(token, "call target signature mismatch");
                         targets.push_back(llvm::ValueAsMetadata::get(function));
                     }
                 } else {
-                    if (!callee || (!relocatable && callee->isDeclaration())) ptx_fail(target[0], "unresolved device function");
+                    if (!callee || (!relocatable && callee->isDeclaration() && !resolved_external(*callee))) ptx_fail(target[0], "unresolved device function");
                     if (callee->hasFnAttribute("cudavm.kernel")) ptx_fail(target[0], "cannot call a kernel");
                     if (instruction.operands.size() > target_index + 2) ptx_fail(opcode, "direct call cannot have a call prototype");
                     signature = signatures.at(target[0].text);
@@ -1395,10 +1941,10 @@ class ptx_parser {
                 auto type = ptx_scalar({parts.back(), opcode.line, opcode.column}, op == "ld" || op == "st");
                 llvm::Value* value = nullptr;
                 if (type.kind == 'p') {
-                    if (parts.size() != 2 || (op != "and" && op != "or" && op != "xor" && op != "not"))
+                    if (parts.size() != 2 || (op != "mov" && op != "and" && op != "or" && op != "xor" && op != "not"))
                         ptx_fail(opcode, "unsupported predicate instruction", true);
-                    arity(op == "not" ? 2 : 3); auto* left = operand(1, type);
-                    value = op == "not" ? builder.CreateNot(left) : op == "and" ? builder.CreateAnd(left, operand(2, type)) :
+                    arity(op == "not" || op == "mov" ? 2 : 3); auto* left = operand(1, type);
+                    value = op == "mov" ? left : op == "not" ? builder.CreateNot(left) : op == "and" ? builder.CreateAnd(left, operand(2, type)) :
                         op == "or" ? builder.CreateOr(left, operand(2, type)) : builder.CreateXor(left, operand(2, type));
                     write(instruction.operands[0], value, type);
                 }
@@ -1632,10 +2178,22 @@ public:
         module->setDataLayout("e-p:64:64-p1:64:64-p3:32:32-p4:64:64-p5:32:32-p6:32:32-i64:64-i128:128-v16:16-v32:32-n16:32:64");
         module->getOrInsertNamedMetadata("cudavm.ir.stage")->addOperand(llvm::MDNode::get(context, llvm::MDString::get(context, "cudavm.portable")));
         while (peek().text != "<eof>") {
+            if(debug_directive() || pragma())continue;
+            if(accept(".section")) {
+                auto section=take(); if(!section.text.starts_with(".debug_"))ptx_fail(section,"unsupported section",true);
+                expect("{");unsigned depth=1;
+                while(depth) {auto token=take();if(token.text=="<eof>")ptx_fail(token,"unterminated debug section");if(token.text=="{")++depth;if(token.text=="}")--depth;}
+                continue;
+            }
+            if(accept(".alias")) {
+                auto alias=identifier();expect(",");auto target=identifier();expect(";");aliases.emplace_back(alias,target);continue;
+            }
             bool visible = accept(".visible"), weak = !visible && accept(".weak");
-            bool external = !visible && !weak && accept(".extern");
-            auto linkage = weak ? llvm::GlobalValue::WeakAnyLinkage : visible || external || !relocatable
+            bool common = !visible && !weak && accept(".common");
+            bool external = !visible && !weak && !common && accept(".extern");
+            auto linkage = common?llvm::GlobalValue::CommonLinkage:weak ? llvm::GlobalValue::WeakAnyLinkage : visible || external || !relocatable
                 ? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage;
+            if(common && peek().text!=".global")ptx_fail(peek(),"common linkage requires global storage");
             if (accept(".entry")) callable(true, external, weak ? llvm::GlobalValue::WeakAnyLinkage : llvm::GlobalValue::ExternalLinkage);
             else if (accept(".func")) callable(false, external, linkage);
             else if (peek().text == ".global" || peek().text == ".const" || peek().text == ".shared") {
@@ -1661,7 +2219,7 @@ public:
                     auto* function = llvm::dyn_cast<llvm::Function>(target);
                     if (data.type.bits != 64 || data.type.kind == 'f' || (function ? function->hasFnAttribute("cudavm.kernel") :
                         target->getAddressSpace() != 1 && target->getAddressSpace() != 4)) ptx_fail(tokens[0], "symbol initializer requires a 64-bit global or device-function address", true);
-                    if (function && !relocatable && function->isDeclaration()) ptx_fail(tokens[0], "unresolved device function");
+                    if (function && !relocatable && function->isDeclaration() && !resolved_external(*function)) ptx_fail(tokens[0], "unresolved device function");
                     llvm::Constant* address = target;
                     if (tokens.size() == 3 && (tokens[1].text == "+" || tokens[1].text == "-")) {
                         if (function) ptx_fail(tokens[0], "function address cannot have a displacement");
@@ -1674,11 +2232,12 @@ public:
                     bool negative = tokens.size() == 2 && tokens[0].text == "-";
                     if (tokens.size() != (negative ? 2u : 1u)) ptx_fail(tokens[0], "unsupported initializer expression", true);
                     const auto& literal = tokens.back(); uint64_t bits;
-                    if (literal.text.starts_with("0f") && literal.text.size() == 10 && data.type.bits == 32 && !negative) {
+                    if (((literal.text.starts_with("0f") && literal.text.size() == 10 && data.type.bits == 32) ||
+                         (literal.text.starts_with("0d") && literal.text.size() == 18 && data.type.bits == 64)) && !negative) {
                         if (llvm::StringRef(literal.text).drop_front(2).getAsInteger(16, bits)) ptx_fail(literal, "invalid binary32 literal");
                     } else {
-                        if (data.type.kind == 'f') ptx_fail(literal, "floating initializers require PTX 0f binary32 encoding", true);
-                        bits = ptx_unsigned(literal); if (negative) bits = uint64_t(0) - bits;
+                        if(data.type.kind=='f')bits=ptx_floating_bits(literal,data.type.bits,negative);
+                        else {bits = ptx_unsigned(literal); if (negative) bits = uint64_t(0) - bits;}
                     }
                     elements[i] = llvm::ConstantInt::get(data.type.storage(context), bits);
                 }
@@ -1686,6 +2245,15 @@ public:
             global.variable->setInitializer(data.array ? llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(data.storage(context)), elements) : elements[0]);
         }
         for (auto& body : bodies) lower(body);
+        for(const auto& [name,target]:aliases) {
+            auto* alias=module->getFunction(name.text);auto* aliasee=module->getFunction(target.text);
+            if(!alias || !alias->isDeclaration() || !aliasee || aliasee->isDeclaration() || alias->hasFnAttribute("cudavm.kernel") || aliasee->hasFnAttribute("cudavm.kernel") ||
+                alias->getFunctionType()!=aliasee->getFunctionType() ||
+                ptx_signature_key(signatures.at(name.text))!=ptx_signature_key(signatures.at(target.text)))ptx_fail(name,"invalid function alias ABI");
+            auto* value=llvm::GlobalAlias::create(alias->getValueType(),0,declared_linkages.at(name.text),name.text+"$alias",aliasee,module.get());
+            value->takeName(alias);alias->replaceAllUsesWith(value);alias->eraseFromParent();
+        }
+        normalize_external_abi();
         for (auto& global : module->globals())
             if (!relocatable && global.isDeclaration() && global.getAddressSpace() != 3 && !global.use_empty()) ptx_fail(symbols.at(global.getName().str()), "unresolved device storage");
         // PTX enters the same portable CUDA semantic identities as source IR.

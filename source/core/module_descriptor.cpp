@@ -121,6 +121,22 @@ std::string emit_native_module(const llvm::Module& input) {
     std::vector<cudavm::kernel_descriptor> entries;
     for (auto& f : *m) if (!f.isDeclaration() && (f.hasFnAttribute("cudavm.kernel") || f.getCallingConv() == llvm::CallingConv::PTX_Kernel)) {
         cudavm::kernel_descriptor entry; entry.symbol = f.getName().str();
+        uint64_t maximum_threads=1; bool maximum=false;
+        for(unsigned axis=0;axis<3;++axis) {
+            auto required=f.getFnAttribute(std::string("cudavm.ptx.reqntid.")+char('x'+axis));
+            if(required.isValid()) {
+                uint64_t value=0;
+                if(required.getValueAsString().getAsInteger(10,value) || !value || value>1024)throw std::runtime_error("invalid PTX required block shape");
+                entry.required_block[axis]=uint32_t(value);
+            }
+            auto limit=f.getFnAttribute(std::string("cudavm.ptx.maxntid.")+char('x'+axis));
+            if(limit.isValid()) {
+                uint64_t value=0;
+                if(limit.getValueAsString().getAsInteger(10,value) || !value || value>1024 || maximum_threads>1024/value)throw std::runtime_error("invalid PTX maximum block size");
+                maximum_threads*=value; maximum=true;
+            }
+        }
+        if(maximum)entry.max_block_threads=uint32_t(maximum_threads);
         uint64_t offset = 0;
         for (auto& arg : f.args()) {
             auto* byval = f.getParamByValType(arg.getArgNo()); auto* t = byval ? byval : arg.getType();

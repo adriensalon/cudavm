@@ -1342,6 +1342,20 @@ struct lowering {
             if (function->getIntrinsicID() == llvm::Intrinsic::lifetime_start || function->getIntrinsicID() == llvm::Intrinsic::lifetime_end ||
                 function->getIntrinsicID() == llvm::Intrinsic::assume || function->getIntrinsicID() == llvm::Intrinsic::experimental_noalias_scope_decl) return nullptr;
             switch (function->getIntrinsicID()) {
+            case llvm::Intrinsic::sadd_sat:
+            case llvm::Intrinsic::ssub_sat: {
+                auto operation=function->getIntrinsicID();
+                bool subtract=operation==llvm::Intrinsic::ssub_sat;
+                auto* left=value(instruction.getArgOperand(0));auto* right=value(instruction.getArgOperand(1));
+                unsigned bits=instruction.getType()->getIntegerBitWidth();
+                auto* result=canonical(subtract?b.CreateSub(left,right):b.CreateAdd(left,right),instruction.getType());
+                auto constant=[&](uint64_t n){return llvm::ConstantInt::get(left->getType(),n);};
+                uint64_t sign=uint64_t(1)<<(bits-1);
+                auto* changed=b.CreateAnd(b.CreateXor(left,result),subtract?b.CreateXor(left,right):b.CreateXor(right,result));
+                auto* overflow=b.CreateICmpNE(b.CreateAnd(changed,constant(sign)),constant(0));
+                auto* limit=b.CreateSelect(b.CreateICmpNE(b.CreateAnd(left,constant(sign)),constant(0)),constant(sign),constant(sign-1));
+                return b.CreateSelect(overflow,limit,result);
+            }
             case llvm::Intrinsic::stacksave:
                 return stack_top ? b.CreateOr(b.getInt64(0xffffffff80000000ull), b.CreateZExt(b.CreateLoad(b.getInt32Ty(), stack_top), b.getInt64Ty()))
                     : b.getInt64(0xffffffff80000000ull + local_bytes);

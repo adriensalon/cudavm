@@ -807,6 +807,15 @@ std::unique_ptr<llvm::Module> link_device(llvm::LLVMContext& context, const comp
                 if (!existing || existing->hasLocalLinkage()) continue;
                 auto* variable = llvm::dyn_cast<llvm::GlobalVariable>(existing);
                 auto* incoming_variable = llvm::dyn_cast<llvm::GlobalVariable>(&incoming);
+                if(variable && incoming_variable && variable->getMetadata("cudavm.ptx.common") && incoming_variable->getMetadata("cudavm.ptx.common")) {
+                    if(variable->getAddressSpace()!=1 || incoming_variable->getAddressSpace()!=1)throw std::runtime_error("invalid PTX common address space");
+                    auto left_size=result->getDataLayout().getTypeAllocSize(variable->getValueType()).getFixedValue();
+                    auto right_size=module->getDataLayout().getTypeAllocSize(incoming_variable->getValueType()).getFixedValue();
+                    bool left_initialized=variable->getMetadata("cudavm.ptx.common.initialized"),right_initialized=incoming_variable->getMetadata("cudavm.ptx.common.initialized");
+                    if((left_initialized && right_initialized) || (left_initialized && left_size<right_size) || (right_initialized && right_size<left_size))
+                        throw std::runtime_error("incompatible initialized PTX common storage: "+incoming.getName().str());
+                    continue;
+                }
                 auto byte_key = [](const llvm::GlobalVariable* value) {
                     auto* array = value ? llvm::dyn_cast<llvm::ArrayType>(value->getValueType()) : nullptr;
                     return array && array->getElementType()->isIntegerTy(8) && value->getMetadata("cudavm.largest.group.key");

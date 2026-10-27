@@ -105,7 +105,7 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
     // a loop iteration. Keep those counts in a native register so they retain
     // PTX's dynamic stack-allocation semantics at their original program point.
     for (auto& function : *module) for (auto& block : function) for (auto& instruction : block)
-        if (auto* allocation = llvm::dyn_cast<llvm::AllocaInst>(&instruction); allocation && !allocation->isStaticAlloca())
+        if (auto* allocation = llvm::dyn_cast<llvm::AllocaInst>(&instruction); allocation && (!allocation->isStaticAlloca() || allocation->getMetadata("cudavm.ptx.dynamic")))
             if (auto* count = llvm::dyn_cast<llvm::ConstantInt>(allocation->getArraySize())) {
                 if (count->getValue().getActiveBits() > 64) throw std::runtime_error("native stack allocation count exceeds 64 bits");
                 llvm::IRBuilder<> builder(allocation);
