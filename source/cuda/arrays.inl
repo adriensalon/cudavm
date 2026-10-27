@@ -20,7 +20,7 @@ void validate_array(const CUDA_ARRAY3D_DESCRIPTOR& d) {
 CUarray publish_array(const std::shared_ptr<context>& owner, const CUDA_ARRAY3D_DESCRIPTOR& d,
                       std::shared_ptr<buffer> native, CUmipmappedArray parent = nullptr) {
     auto entry = std::make_shared<array_entry>(); entry->owner = owner; entry->descriptor = d; entry->native = std::move(native); entry->parent = parent;
-    if (global().kind != cudavmBackendCuda) entry->image_address = reserve_device_address(entry->native->size);
+    if (owner->native->kind() != cudavmBackendCuda) entry->image_address = reserve_device_address(entry->native->size);
     auto handle = reinterpret_cast<CUarray>(global().next_array++);
     global().device_buffers.push_back({owner->device, entry->native});
     global().arrays.emplace(handle, std::move(entry)); return handle;

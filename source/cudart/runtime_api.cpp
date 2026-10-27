@@ -232,7 +232,7 @@ CUlibrary runtime_library(const std::string& identity) {
         if (managed) return cudavmDriverLoadManagedRegistration(&candidate, managed.get());
         if (!image.empty()) {
             auto status = cudavmDriverLoadRegisteredLibrary(&candidate, image.data(), image.size());
-            if (status == CUDA_SUCCESS || inputs.empty() || cudavmDriverBackend() == driver_backend::cuda
+            if (status == CUDA_SUCCESS || inputs.empty()
                 || (status != CUDA_ERROR_NOT_SUPPORTED && status != CUDA_ERROR_NO_BINARY_FOR_GPU)) return status;
         }
         return cudavmDriverLoadRegisteredRdcLibrary(&candidate, data.data(), sizes.data(), data.size(), device);

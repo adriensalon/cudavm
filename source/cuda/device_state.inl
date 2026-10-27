@@ -1,5 +1,5 @@
 int provider_device_attribute(int device, CUdevice_attribute which) {
-    if (global().kind != cudavmBackendCuda && (which == CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID ||
+    if (device_kind(device) != cudavmBackendCuda && (which == CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID ||
         which == CU_DEVICE_ATTRIBUTE_PCI_BUS_ID || which == CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID)) {
         try {
             auto pci = global().provider->device_pci(device);

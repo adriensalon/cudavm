@@ -14,6 +14,9 @@ struct registered_managed_image {
     bool retired = false;
 };
 struct library_entry {
+    std::map<cudavmBackend, std::string> variants;
+    std::vector<std::string> link_inputs;
+    std::map<int, std::string> linked_variants;
     std::shared_ptr<device_library> native;
     std::shared_ptr<registered_managed_image> registration;
     std::string image;

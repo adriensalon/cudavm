@@ -1,5 +1,5 @@
 #include "backend.hpp"
-#include "backend_selection.hpp"
+#include "device_inventory.hpp"
 #if defined(_WIN32)
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -12,10 +12,26 @@ std::optional<std::string> backend_environment(const char* name) {
     // process environment so a failed initialization can be retried after the
     // host fixes its policy, independently of linkage.
     for (;;) {
+        SetLastError(ERROR_SUCCESS);
         auto size = GetEnvironmentVariableA(name, nullptr, 0);
-        if (!size) return {};
-        std::string value(size, '\0'); auto count = GetEnvironmentVariableA(name, value.data(), size);
-        if (!count) return {};
+        if (!size) {
+            // GetEnvironmentVariable cannot distinguish an empty entry from
+            // an absent one. The environment block preserves that distinction.
+            std::optional<std::string> result;
+            auto* block = GetEnvironmentStringsA();
+            if (!block) return {};
+            auto length = std::strlen(name);
+            for (auto* entry = block; *entry; entry += std::strlen(entry) + 1)
+                if (_strnicmp(entry, name, length) == 0 && entry[length] == '=') { result = entry + length + 1; break; }
+            FreeEnvironmentStringsA(block); return result;
+        }
+        std::string value(size, '\0');
+        SetLastError(ERROR_SUCCESS);
+        auto count = GetEnvironmentVariableA(name, value.data(), size);
+        if (!count) {
+            if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) continue;
+            return std::string{};
+        }
         if (count >= size) continue;
         value.resize(count); return value;
     }
@@ -55,17 +71,6 @@ int shader_device_attribute(const shader_resource_limits& limits, CUdevice_attri
 #undef DEVICE_OPTIONAL_PROPERTY
         return 0;
     default: throw failure(CUDA_ERROR_NOT_SUPPORTED, "shader device resource attribute is unavailable");
-    }
-}
-const char* backend_name(cudavmBackend kind) {
-    switch (kind) {
-    case cudavmBackendAuto: return "auto";
-    case cudavmBackendCuda: return "cuda";
-    case cudavmBackendOpenCL: return "opencl";
-    case cudavmBackendOpenGL: return "opengl";
-    case cudavmBackendVulkan: return "vulkan";
-    case cudavmBackendDirectX: return "directx";
-    default: return "invalid";
     }
 }
 std::unique_ptr<backend> make_backend(cudavmBackend kind) {
@@ -111,14 +116,8 @@ std::span<const cudavmBackend> enabled_backends() {
     };
     return kinds;
 }
-bool backend_enabled(cudavmBackend kind) {
-    auto kinds = enabled_backends();
-    return std::find(kinds.begin(), kinds.end(), kind) != kinds.end();
-}
-backend_selection discover_backend(cudavmBackend requested, unsigned int allowed_mask) {
-    std::vector<cudavmBackend> candidates;
-    for (auto kind : enabled_backends())
-        if (allowed_mask & (1u << kind)) candidates.push_back(kind);
-    return discover_backend(requested, candidates, make_backend);
+std::unique_ptr<backend> discover_devices() {
+    return discover_devices(enabled_backends(), backend_environment("CUDAVM_BACKENDS"),
+                            backend_environment("CUDAVM_DEVICES"), make_backend);
 }
 }

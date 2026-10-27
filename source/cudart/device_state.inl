@@ -9,8 +9,7 @@ void runtime_device_flags(unsigned flags) {
 cudaDeviceProp runtime_device_properties(int device) {
     CUdevice native = 0; check(cuDeviceGet(&native, device)); cudaDeviceProp value{};
     check(cuDeviceGetName(value.name, sizeof(value.name), native)); check(cuDeviceTotalMem(&value.totalGlobalMem, native));
-    const bool shader = cudavmDriverBackend() != driver_backend::cuda;
-    auto identity = [&](CUresult status) { if (!shader || status != CUDA_ERROR_NOT_SUPPORTED) check(status); };
+    auto identity = [&](CUresult status) { if (status != CUDA_ERROR_NOT_SUPPORTED) check(status); };
     CUuuid uuid{}; identity(cuDeviceGetUuid(&uuid, native)); static_assert(sizeof(uuid.bytes) == sizeof(value.uuid.bytes));
     std::memcpy(value.uuid.bytes, uuid.bytes, sizeof(uuid.bytes));
 #if defined(_WIN32)

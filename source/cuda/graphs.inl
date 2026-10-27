@@ -725,7 +725,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
                 for (auto& context : operation.contexts)
                     if (context != owner && std::find(contexts.begin(), contexts.end(), context) == contexts.end()) contexts.push_back(context);
                 if (!upload) {
-                    if (node.type == CU_GRAPH_NODE_TYPE_KERNEL && global().kind != cudavmBackendCuda && node.owner.lock() != owner) {
+                    if (node.type == CU_GRAPH_NODE_TYPE_KERNEL && owner->native->kind() != cudavmBackendCuda && node.owner.lock() != owner) {
                         dependencies.insert(dependencies.end(), submitted.begin(), submitted.end());
                         auto node_owner = node.owner.lock();
                         if (std::find(transport_contexts.begin(), transport_contexts.end(), node_owner) == transport_contexts.end()) {
@@ -777,7 +777,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
                     for (auto& dependency : dependencies) inherit_order(done->order, dependency);
                 }
             }
-            bool exclusive = node.type == CU_GRAPH_NODE_TYPE_KERNEL && global().kind != cudavmBackendCuda;
+            bool exclusive = node.type == CU_GRAPH_NODE_TYPE_KERNEL && owner->native->kind() != cudavmBackendCuda;
             auto node_owner = node.owner.lock();
             auto domain = node_owner ? node_owner->command_domain : owner->command_domain;
             replay.push_back({done, std::move(dependencies), std::move(action), priority, std::move(start), exclusive, std::move(domain), {}, std::move(native_lane)}); indices.emplace(node.handle, done);

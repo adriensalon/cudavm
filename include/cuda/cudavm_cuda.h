@@ -6,6 +6,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* Backend tags in the program registration ABI. Device discovery and selection
+   use the standard CUDA device and context APIs. */
 typedef enum cudavmBackend {
     cudavmBackendAuto = -1,
     cudavmBackendCuda = 0,
@@ -14,22 +16,8 @@ typedef enum cudavmBackend {
     cudavmBackendVulkan = 3,
     cudavmBackendDirectX = 4
 } cudavmBackend;
-/* Diagnostics are cudavm extensions, separate from the unchanged CUDA API. */
-CUDAVM_API const char* cudavmBackendName(cudavmBackend backend);
+/* Detailed thread-local diagnostic for the preceding cudavm operation. */
 CUDAVM_API const char* cudavmGetDiagnostic(void);
-/* Before initialization: Auto tries enabled backends in priority order; an
-   explicit backend never falls back. Disabled backends return NOT_SUPPORTED. */
-CUDAVM_API int cudavmSelectBackend(cudavmBackend backend);
-/* Build-time availability, without loading any native drivers. Bit positions
-   are the nonnegative cudavmBackend values. */
-CUDAVM_API unsigned int cudavmGetEnabledBackends(void);
-/* Program policy, set before initialization by generated CMake target startup
-   code. Masks use the same bits as GetEnabledBackends. Policies intersect and
-   persist across shutdown, so excluded adapters cannot be reenabled. */
-CUDAVM_API int cudavmConfigureBackends(unsigned int allowed_mask);
-CUDAVM_API unsigned int cudavmGetAllowedBackends(void);
-/* Returns the committed backend after successful CUDA initialization. */
-CUDAVM_API int cudavmGetBackend(cudavmBackend* output);
 /* Optional dispatch profiling on the current shader context. Enable before
    recording both timing events and keep enabled until both complete. The interval sums device execution of compute
    dispatches in this context; copies and queue/host idle time are excluded.

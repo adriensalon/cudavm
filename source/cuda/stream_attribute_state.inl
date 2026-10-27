@@ -29,10 +29,10 @@ CUstreamAttrValue stream_attribute(const std::shared_ptr<stream_state>& stream, 
     case CU_LAUNCH_ATTRIBUTE_NVLINK_UTIL_CENTRIC_SCHEDULING:
         value.nvlinkUtilCentricScheduling = options.nvlink.value_or(0);
         // Probe availability even for a stream which has no override.
-        if (global().kind == cudavmBackendCuda) context_configuration(owner, [&] { return owner->native->canonical_stream_attribute(attribute, value, stream->priority); });
+        if (owner->native->kind() == cudavmBackendCuda) context_configuration(owner, [&] { return owner->native->canonical_stream_attribute(attribute, value, stream->priority); });
         break;
     case CU_STREAM_ATTRIBUTE_MEM_SYNC_DOMAIN:
-        require(global().kind == cudavmBackendCuda, CUDA_ERROR_NOT_SUPPORTED, "native memory synchronization domains are unavailable");
+        require(owner->native->kind() == cudavmBackendCuda, CUDA_ERROR_NOT_SUPPORTED, "native memory synchronization domains are unavailable");
         value.memSyncDomain = options.domain.value_or(CU_LAUNCH_MEM_SYNC_DOMAIN_DEFAULT); break;
     case CU_STREAM_ATTRIBUTE_MEM_SYNC_DOMAIN_MAP: {
         auto map = options.domain_map ? *options.domain_map : context_configuration(owner, [&] { return owner->native->default_stream_domain_map(); });
@@ -51,10 +51,10 @@ void stream_attribute(const std::shared_ptr<stream_state>& stream, CUstreamAttrI
     else {
         launch_attribute(options, attribute, value);
         if (attribute == CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW) {
-            require(global().kind == cudavmBackendCuda || !options.access_policy->bytes, CUDA_ERROR_NOT_SUPPORTED, "nonempty access policy windows require native resource information");
+            require(owner->native->kind() == cudavmBackendCuda || !options.access_policy->bytes, CUDA_ERROR_NOT_SUPPORTED, "nonempty access policy windows require native resource information");
             access_policy_resources(owner, options);
         } else if (attribute != CU_LAUNCH_ATTRIBUTE_NVLINK_UTIL_CENTRIC_SCHEDULING)
-            require(global().kind == cudavmBackendCuda, CUDA_ERROR_NOT_SUPPORTED, "native memory synchronization domains are unavailable");
+            require(owner->native->kind() == cudavmBackendCuda, CUDA_ERROR_NOT_SUPPORTED, "native memory synchronization domains are unavailable");
     }
     value = context_configuration(owner, [&] { return owner->native->canonical_stream_attribute(attribute, value, stream->priority); });
     if (attribute == CU_STREAM_ATTRIBUTE_SYNCHRONIZATION_POLICY) stream->synchronization_policy = int(value.syncPolicy);

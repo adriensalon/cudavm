@@ -37,9 +37,14 @@ struct failure : std::runtime_error {
 inline void require(bool condition, CUresult error, const char* message) {
     if (!condition) throw failure(error, message);
 }
+inline void require(bool condition, CUresult error, const std::string& message) {
+    if (!condition) throw failure(error, message);
+}
 struct device_info {
     std::string name;
     size_t memory_bytes = 0;
+    cudavmBackend kind = cudavmBackendCuda;
+    int physical_device = -1;
 };
 // Limits of the CUDA-shaped shader transport, intersected with the adapter's
 // native dispatch limits. These do not describe NVIDIA SM residency.
@@ -735,6 +740,8 @@ struct device_library {
 };
 struct backend {
     virtual ~backend() = default;
+    virtual cudavmBackend device_kind(int) const { return cudavmBackendCuda; }
+    virtual int native_device(int device) const { return device; }
     virtual std::string link_registered_images(std::span<const std::string_view>, int) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "native NVIDIA device linking is unavailable");
     }
@@ -773,14 +780,7 @@ std::unique_ptr<backend> make_opengl_backend();
 std::unique_ptr<backend> make_vulkan_backend();
 std::unique_ptr<backend> make_directx_backend();
 std::unique_ptr<backend> make_backend(cudavmBackend);
-const char* backend_name(cudavmBackend);
 std::optional<std::string> backend_environment(const char*);
 std::span<const cudavmBackend> enabled_backends();
-bool backend_enabled(cudavmBackend);
-struct backend_selection {
-    cudavmBackend kind;
-    std::unique_ptr<backend> provider;
-    std::vector<device_info> devices;
-};
-backend_selection discover_backend(cudavmBackend, unsigned int allowed_mask);
+std::unique_ptr<backend> discover_devices();
 }

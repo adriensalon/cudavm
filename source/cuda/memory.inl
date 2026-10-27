@@ -9,7 +9,7 @@ size_t memory_mul(size_t a, size_t b) {
     return a * b;
 }
 size_t maximum_pitch(int device) {
-    if (global().kind != cudavmBackendCuda) return std::numeric_limits<int>::max();
+    if (device_kind(device) != cudavmBackendCuda) return std::numeric_limits<int>::max();
     auto pitch = global().provider->attribute(device, CU_DEVICE_ATTRIBUTE_MAX_PITCH);
     require(pitch > 0, CUDA_ERROR_UNKNOWN, "native maximum pitch is invalid");
     return static_cast<size_t>(pitch);

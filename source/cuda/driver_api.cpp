@@ -162,10 +162,8 @@ struct host_entry {
 #include "library_types_state.inl"
 struct state {
     std::mutex mutex;
-    bool initialized = false, selected = false;
+    bool initialized = false;
     bool shutting_down = false;
-    cudavmBackend kind = cudavmBackendAuto, requested = cudavmBackendAuto;
-    unsigned int allowed_backends = 31;
     std::unique_ptr<backend> provider;
     // Keep the destructor service alive until all context work has retired.
     std::shared_ptr<user_destructor_queue> user_destructors;
@@ -311,23 +309,10 @@ void initialize() {
     auto& value = global();
     require(!value.shutting_down, CUDA_ERROR_NOT_PERMITTED, "shutdown is in progress");
     if (value.initialized) return;
-    auto requested = value.requested;
-    if (!value.selected) {
-        if (auto name = backend_environment("CUDAVM_BACKEND")) {
-            bool found = *name == "auto";
-            for (int i = 0; i < 5; ++i) {
-                auto kind = static_cast<cudavmBackend>(i);
-                if (*name == backend_name(kind)) { requested = kind; found = true; break; }
-            }
-            require(found, CUDA_ERROR_INVALID_VALUE, "CUDAVM_BACKEND must be auto, cuda, opencl, opengl, vulkan or directx");
-        }
-    }
-    // Failed candidates release their loaders before trying another backend.
-    // Only Auto falls back, and state is committed after successful discovery.
-    auto chosen = discover_backend(requested, value.allowed_backends);
-    value.kind = chosen.kind;
-    value.provider = std::move(chosen.provider);
-    value.devices = std::move(chosen.devices);
+    auto provider = discover_devices();
+    auto devices = provider->discover();
+    value.provider = std::move(provider);
+    value.devices = std::move(devices);
     value.initialized = true;
     try { restore_registered_images(); }
     catch (...) {
@@ -339,6 +324,25 @@ void initialize() {
 void driver_ready() { require(global().initialized && !global().shutting_down, CUDA_ERROR_NOT_INITIALIZED, "Driver is uninitialized or shutting down"); }
 void valid_device(int device) {
     require(device >= 0 && static_cast<size_t>(device) < global().devices.size(), CUDA_ERROR_INVALID_DEVICE, "device ordinal out of range");
+}
+cudavmBackend device_kind(int device) {
+    valid_device(device); return global().devices[device].kind;
+}
+int native_device(int device) {
+    valid_device(device); return global().provider->native_device(device);
+}
+std::string device_display_name(int device, size_t capacity) {
+    auto text = global().devices[device].name;
+    if (text.size() <= capacity) return text;
+    auto suffix = text.rfind(" (");
+    if (suffix != std::string::npos && text.size() - suffix <= capacity)
+        return text.substr(0, capacity - (text.size() - suffix)) + text.substr(suffix);
+    return text.substr(0, capacity);
+}
+int cuda_device() {
+    for (size_t i = 0; i < global().devices.size(); ++i)
+        if (global().devices[i].kind == cudavmBackendCuda) return int(i);
+    throw failure(CUDA_ERROR_NOT_SUPPORTED, "native CUDA is unavailable in the visible device inventory");
 }
 int primary_device(CUcontext handle) {
     if (handle) for (auto& [device, record] : global().primary_records) if (record.handle == handle) return device;
@@ -362,20 +366,20 @@ unsigned context_schedule(const std::shared_ptr<context>& owner) {
     auto processors = std::max(1u, std::thread::hardware_concurrency());
     return global().contexts.size() > processors ? CU_CTX_SCHED_YIELD : CU_CTX_SCHED_SPIN;
 }
-void validate_context_flags(unsigned flags, bool allow_map_host = true) {
+void validate_context_flags(int device, unsigned flags, bool allow_map_host = true) {
     auto schedule = flags & CU_CTX_SCHED_MASK;
     require(!(flags & ~unsigned(CU_CTX_FLAGS_MASK)) && (allow_map_host || !(flags & CU_CTX_MAP_HOST)) &&
         (schedule == CU_CTX_SCHED_AUTO || schedule == CU_CTX_SCHED_SPIN ||
          schedule == CU_CTX_SCHED_YIELD || schedule == CU_CTX_SCHED_BLOCKING_SYNC),
         CUDA_ERROR_INVALID_VALUE, "invalid context flags or scheduling combination");
-    require(global().kind == cudavmBackendCuda || !(flags & (CU_CTX_COREDUMP_ENABLE | CU_CTX_USER_COREDUMP_ENABLE)),
+    require(device_kind(device) == cudavmBackendCuda || !(flags & (CU_CTX_COREDUMP_ENABLE | CU_CTX_USER_COREDUMP_ENABLE)),
         CUDA_ERROR_NOT_SUPPORTED, "GPU coredump flags require native CUDA support");
 }
 template<class F> auto context_configuration(const std::shared_ptr<context>& owner, F function) {
     std::lock_guard lock(owner->execution); owner->native->check_device_fault(); return observe_context_errors(owner, function);
 }
 void set_context_flags(const std::shared_ptr<context>& owner, unsigned flags) {
-    validate_context_flags(flags);
+    validate_context_flags(owner->device, flags);
     // MAP_HOST is a creation-time property. cuCtxSetFlags accepts its deprecated
     // spelling but neither enables nor clears it on an existing context.
     flags = (flags & ~unsigned(CU_CTX_MAP_HOST)) | (owner->flags & CU_CTX_MAP_HOST);
@@ -384,7 +388,7 @@ void set_context_flags(const std::shared_ptr<context>& owner, unsigned flags) {
     if (owner->primary) global().primary_flags[owner->device] = actual & ~unsigned(CU_CTX_MAP_HOST);
 }
 void set_primary_flags(int device, unsigned flags, bool legacy = false) {
-    valid_device(device); validate_context_flags(flags, false);
+    valid_device(device); validate_context_flags(device, flags, false);
     auto found = global().primaries.find(device);
     if (found != global().primaries.end()) {
         require(!legacy, CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE, "primary context is already active");
@@ -393,14 +397,14 @@ void set_primary_flags(int device, unsigned flags, bool legacy = false) {
 }
 std::shared_ptr<context> create(int device, bool primary, unsigned flags = 0, CUcontext identity = nullptr) {
     valid_device(device);
-    validate_context_flags(flags, true);
+    validate_context_flags(device, flags, true);
     if (primary) flags |= CU_CTX_MAP_HOST; // Primary contexts always support mapped pinned allocations.
     auto result = std::make_shared<context>();
     result->native = global().provider->open(device, flags);
     result->flags = result->native->get_context_flags(flags);
     result->priority_range = result->native->stream_priority_range();
     result->device = device;
-    if (global().kind != cudavmBackendCuda) {
+    if (device_kind(device) != cudavmBackendCuda) {
         auto& domain = global().command_domains[device];
         if (!domain) domain = std::make_shared<command_domain>();
         result->command_domain = domain;
@@ -825,11 +829,10 @@ extern "C" CUDAVM_CUDA_API CUresult cudavmDriverLoadRegisteredRdcLibrary(CUlibra
             require(images[i] && sizes[i], CUDA_ERROR_INVALID_IMAGE, "empty NVIDIA device link input");
             inputs.emplace_back(static_cast<const char*>(images[i]), sizes[i]);
         }
-        auto image = global().kind == cudavmBackendCuda ? global().provider->link_registered_images(inputs, device)
-            : link_shader_images(inputs, global().kind);
-        // All linking and metadata validation finish before add_library can
-        // expose a handle. Neither failure nor retries mutate the input group.
-        image.push_back(0); *output = registered_library_load(image.data(), image.size());
+        auto entry = std::make_shared<library_entry>(); entry->registered = true;
+        for (auto image : inputs) entry->link_inputs.emplace_back(image);
+        library_metadata(entry, device);
+        *output = add_library(entry);
     });
 }
 extern "C" CUDAVM_CUDA_API CUresult cudavmDriverCreateManagedRegistration(void** output, const void* image, size_t bytes, const char* const* names, const void* const* slots, const size_t* sizes, size_t count) {
@@ -884,44 +887,7 @@ extern "C" CUDAVM_CUDA_API CUresult cudavmDriverReleaseRegisteredModules(CUconte
     });
 }
 
-extern "C" CUDAVM_API const char* cudavmBackendName(cudavmBackend kind) { return backend_name(kind); }
 extern "C" CUDAVM_API const char* cudavmGetDiagnostic() { return diagnostic_text().c_str(); }
-extern "C" CUDAVM_API int cudavmSelectBackend(cudavmBackend kind) {
-    return static_cast<int>(driver_call([&] {
-        require(!global().initialized, CUDA_ERROR_NOT_PERMITTED, "backend cannot change after initialization");
-        require(kind >= cudavmBackendAuto && kind <= cudavmBackendDirectX, CUDA_ERROR_INVALID_VALUE, "invalid backend");
-        require(kind == cudavmBackendAuto || (backend_enabled(kind) && (global().allowed_backends & (1u << kind))),
-                CUDA_ERROR_NOT_SUPPORTED, "requested backend is disabled by this build or program policy");
-        global().requested = kind; global().selected = true;
-    }));
-}
-extern "C" CUDAVM_API unsigned int cudavmGetEnabledBackends() {
-    unsigned int result = 0;
-    for (auto kind : enabled_backends()) result |= 1u << static_cast<unsigned>(kind);
-    return result;
-}
-extern "C" CUDAVM_API int cudavmConfigureBackends(unsigned int mask) {
-    return static_cast<int>(driver_call([&] {
-        auto& value = global();
-        require(!value.initialized, CUDA_ERROR_NOT_PERMITTED, "backend policy cannot change after initialization");
-        require(mask && !(mask & ~31u), CUDA_ERROR_INVALID_VALUE, "invalid backend policy mask");
-        require(!(mask & ~cudavmGetEnabledBackends()), CUDA_ERROR_NOT_SUPPORTED,
-                "backend policy requests an adapter absent from this build");
-        auto allowed = value.allowed_backends & mask;
-        require(allowed != 0, CUDA_ERROR_INVALID_VALUE, "backend policies have no common enabled adapter");
-        value.allowed_backends = allowed;
-    }));
-}
-extern "C" CUDAVM_API unsigned int cudavmGetAllowedBackends() {
-    std::lock_guard lock(global().mutex);
-    return global().allowed_backends & cudavmGetEnabledBackends();
-}
-extern "C" CUDAVM_API int cudavmGetBackend(cudavmBackend* output) {
-    return static_cast<int>(driver_call([&] {
-        driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null backend output");
-        *output = global().kind;
-    }));
-}
 extern "C" CUDAVM_API int cudavmEnableComputeProfiling(int enabled) {
     return static_cast<int>(driver_call([&] {
         driver_ready();require(enabled==0 || enabled==1,CUDA_ERROR_INVALID_VALUE,"invalid compute profiling flag");
@@ -967,12 +933,12 @@ DRIVER_API(cuDeviceGetAttribute, (int* output, CUdevice_attribute attribute, CUd
     *output = attribute == CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS || attribute == CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE_NOR ? 1 :
     attribute == CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES || attribute == CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES ||
     attribute == CU_DEVICE_ATTRIBUTE_HOST_MEMORY_POOLS_SUPPORTED || attribute == CU_DEVICE_ATTRIBUTE_HOST_NUMA_MEMORY_POOLS_SUPPORTED ? 0 :
-    global().kind != cudavmBackendCuda && (attribute == CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH || attribute == CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH) ? 0 :
-    global().kind != cudavmBackendCuda && (attribute == CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY || attribute == CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS ||
+    device_kind(device) != cudavmBackendCuda && (attribute == CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH || attribute == CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH) ? 0 :
+    device_kind(device) != cudavmBackendCuda && (attribute == CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY || attribute == CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS ||
     attribute == CU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST || attribute == CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS ||
     attribute == CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES || attribute == CU_DEVICE_ATTRIBUTE_UNIFIED_FUNCTION_POINTERS) ? 0 :
-    attribute == CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED || attribute == CU_DEVICE_ATTRIBUTE_STREAM_PRIORITIES_SUPPORTED || (attribute == CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY && global().kind != cudavmBackendCuda) ? 1 : attribute == CU_DEVICE_ATTRIBUTE_MAX_PITCH ? static_cast<int>(maximum_pitch(device)) : provider_device_attribute(device, attribute))
-DRIVER_API(cuDeviceGetName, (char* name, int length, CUdevice device), driver_ready(); require(name && length > 0, CUDA_ERROR_INVALID_VALUE, "invalid name output"); valid_device(device); auto& text = global().devices[device].name; size_t count = std::min(text.size(), static_cast<size_t>(length - 1)); std::memcpy(name, text.data(), count); name[count] = 0)
+    attribute == CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED || attribute == CU_DEVICE_ATTRIBUTE_STREAM_PRIORITIES_SUPPORTED || (attribute == CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY && device_kind(device) != cudavmBackendCuda) ? 1 : attribute == CU_DEVICE_ATTRIBUTE_MAX_PITCH ? static_cast<int>(maximum_pitch(device)) : provider_device_attribute(device, attribute))
+DRIVER_API(cuDeviceGetName, (char* name, int length, CUdevice device), driver_ready(); require(name && length > 0, CUDA_ERROR_INVALID_VALUE, "invalid name output"); valid_device(device); auto text = device_display_name(device, size_t(length - 1)); std::memcpy(name, text.data(), text.size()); name[text.size()] = 0)
 DRIVER_API(cuDeviceTotalMem, (size_t* bytes, CUdevice device), driver_ready(); require(bytes, CUDA_ERROR_INVALID_VALUE, "null memory output"); valid_device(device); auto memory = global().devices[device].memory_bytes; require(memory != 0, CUDA_ERROR_NOT_SUPPORTED, "backend memory capacity query is not implemented"); *bytes = memory)
 DRIVER_API(cuCtxCreate, (CUcontext* output, CUctxCreateParams* parameters, unsigned flags, CUdevice device), driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null context output"); require(parameters == nullptr, CUDA_ERROR_NOT_SUPPORTED, "advanced context parameters are not implemented"); auto owner = create(device, false, flags); context_stack().push_back(owner->handle); *output = owner->handle)
 DRIVER_API(cuCtxDestroy, (CUcontext handle), driver_ready(); auto owner = lookup(handle); require(!owner->primary, CUDA_ERROR_INVALID_CONTEXT, "primary contexts must be released"); destroy(owner))
@@ -1049,8 +1015,8 @@ extern "C" CUDAVM_CUDA_API int cudavmDriverIsManagedPointer(CUdeviceptr pointer)
     std::lock_guard lock(global().mutex); auto it = containing(pointer);
     return it != global().allocations.end() && it->second.native->is_managed();
 }
-extern "C" CUDAVM_CUDA_API driver_backend cudavmDriverBackend() {
-    std::lock_guard lock(global().mutex); return driver_backend(global().kind);
+extern "C" CUDAVM_CUDA_API int cudavmDriverPhysicalDevice(int device) {
+    std::lock_guard lock(global().mutex); valid_device(device); return global().devices[device].physical_device;
 }
 extern "C" CUDAVM_CUDA_API const char* cudavmDriverDiagnostic() { return diagnostic_text().c_str(); }
 extern "C" CUDAVM_CUDA_API void cudavmDriverSetDiagnostic(const char* message) {

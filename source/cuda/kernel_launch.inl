@@ -136,7 +136,7 @@ void launch(CUfunction handle, const launch_shape& input, CUstream stream, void*
     if (capture_node(owner, stream, std::move(node))) return;
     for (auto& host : command->hosts) { std::erase_if(host->work, [](auto& item) { return item.expired(); }); host->work.reserve(host->work.size() + 1); }
     auto queue = stream_native(owner, target);
-    auto done = submit_stream(owner, stream, {}, {}, priority, [command, queue] { return command->enqueue(queue.get()); }, global().kind != cudavmBackendCuda, {}, global().kind == cudavmBackendCuda ? queue : nullptr);
+    auto done = submit_stream(owner, stream, {}, {}, priority, [command, queue] { return command->enqueue(queue.get()); }, owner->native->kind() != cudavmBackendCuda, {}, owner->native->kind() == cudavmBackendCuda ? queue : nullptr);
     for (const auto& attribute : {shape.options.programmatic_event, shape.options.completion_event}) if (attribute) {
         auto& event = event_lookup(attribute->handle); event.record = done; event.timestamp.reset();
         event.capture.reset(); event.capture_dependencies.clear(); event.capture_edges.clear();

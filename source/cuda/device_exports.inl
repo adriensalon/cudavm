@@ -14,3 +14,12 @@ DRIVER_API(cuDeviceGetPCIBusId, (char* output, int length, CUdevice device), dri
     require(bytes > 0 && size_t(bytes) < sizeof(text), CUDA_ERROR_UNKNOWN, "native PCI address exceeds its representation");
     std::memcpy(output, text, std::min<size_t>(length, size_t(bytes) + 1)); require(length > bytes, CUDA_ERROR_INVALID_VALUE, "PCI bus output is too small"))
 DRIVER_API(cuDeviceGetByPCIBusId, (CUdevice* output, const char* text), driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null PCI device output"); *output = device_from_pci(text))
+DRIVER_API(cuDeviceCanAccessPeer, (int* output, CUdevice device, CUdevice peer),
+    driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null peer access output"); valid_device(device); valid_device(peer); *output = 0)
+DRIVER_API(cuCtxEnablePeerAccess, (CUcontext peer, unsigned flags),
+    driver_ready(); auto owner = current(); auto other = lookup(peer);
+    require(!flags, CUDA_ERROR_INVALID_VALUE, "peer access flags must be zero"); require(owner != other, CUDA_ERROR_INVALID_CONTEXT, "peer context equals current context");
+    throw failure(CUDA_ERROR_PEER_ACCESS_UNSUPPORTED, "direct peer access is unavailable between these contexts"))
+DRIVER_API(cuCtxDisablePeerAccess, (CUcontext peer),
+    driver_ready(); auto owner = current(); auto other = lookup(peer); require(owner != other, CUDA_ERROR_INVALID_CONTEXT, "peer context equals current context");
+    throw failure(CUDA_ERROR_PEER_ACCESS_NOT_ENABLED, "peer access is not enabled"))

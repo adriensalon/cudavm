@@ -48,12 +48,16 @@ void host_flags(unsigned flags, bool registration) {
     require(!(flags & ~allowed), CUDA_ERROR_INVALID_VALUE, "invalid host allocation/registration flags");
     if (registration) require(!(flags & (CU_MEMHOSTREGISTER_IOMEMORY | CU_MEMHOSTREGISTER_READ_ONLY)),
                               CUDA_ERROR_NOT_SUPPORTED, "I/O and read-only host registrations are not implemented");
-    else require(!(flags & CU_MEMHOSTALLOC_WRITECOMBINED) || global().kind == cudavmBackendCuda,
+    else require(!(flags & CU_MEMHOSTALLOC_WRITECOMBINED) || current()->native->kind() == cudavmBackendCuda,
                  CUDA_ERROR_NOT_SUPPORTED, "write-combined host allocation requires native CUDA");
 }
 bool host_visible(const std::shared_ptr<host_entry>& entry, const std::shared_ptr<context>& owner) {
+    // Native CUDA mappings and shader host buffers use different device pointer
+    // representations. Portable host storage remains usable for host copies,
+    // but does not imply a direct mapping across that boundary.
+    if ((device_kind(entry->device) == cudavmBackendCuda) != (owner->native->kind() == cudavmBackendCuda)) return false;
     return entry->owner.lock() == owner || (entry->flags & CU_MEMHOSTALLOC_PORTABLE) ||
-        (global().kind == cudavmBackendCuda && !entry->registered && global().provider->attribute(owner->device, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING));
+        (owner->native->kind() == cudavmBackendCuda && !entry->registered && global().provider->attribute(owner->device, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING));
 }
 CUdeviceptr host_alias(const std::shared_ptr<host_entry>& entry, const std::shared_ptr<context>& owner) {
     require(!entry->retiring && host_visible(entry, owner),

@@ -66,7 +66,7 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
         };
         if (linear) {
             limit(CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE1D_LINEAR_WIDTH, d.Width);
-            require(global().kind == cudavmBackendCuda || d.Width, CUDA_ERROR_NOT_SUPPORTED, "shader linear textures require at least one complete texel");
+            require(owner->native->kind() == cudavmBackendCuda || d.Width, CUDA_ERROR_NOT_SUPPORTED, "shader linear textures require at least one complete texel");
         }
         else {
             limit(CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE2D_LINEAR_WIDTH, d.Width);
@@ -84,7 +84,7 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
     capture_unsafe(owner);
     if (texture) entry->texture = *texture;
     if (view) entry->view = *view;
-    if (global().kind == cudavmBackendCuda) {
+    if (owner->native->kind() == cudavmBackendCuda) {
         entry->native = context_configuration(owner, [&] { return surface ? owner->native->create_surface(*entry->backing)
             : owner->native->create_texture(*entry->backing, resource, offset, *texture, view); });
     } else {

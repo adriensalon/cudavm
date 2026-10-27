@@ -8,6 +8,11 @@
 #endif
 #include "dynamic_library.hpp"
 #include "device_resources.hpp"
+#if defined(_WIN32)
+#include <CL/cl_d3d11.h>
+#include <dxgi1_2.h>
+#include <wrl/client.h>
+#endif
 namespace cudavm {
 namespace {
 void check(cl_int result, const char* operation) {
@@ -343,11 +348,47 @@ struct opencl_backend : shader_backend {
         check(api->clGetDeviceInfo(native_devices.at(ordinal), CL_DEVICE_UUID_KHR, result.size(), result.data(), nullptr), "CL_DEVICE_UUID_KHR"); return result;
     }
     device_luid_info device_luid(int ordinal) override {
-        device_extension(ordinal, "cl_khr_device_uuid"); cl_bool valid = CL_FALSE; auto device = native_devices.at(ordinal);
+        try { device_extension(ordinal, "cl_khr_device_uuid"); }
+        catch (const failure& error) {
+            if (error.code != CUDA_ERROR_NOT_SUPPORTED) throw;
+            return device_d3d11_luid(ordinal);
+        }
+        cl_bool valid = CL_FALSE; auto device = native_devices.at(ordinal);
         check(api->clGetDeviceInfo(device, CL_DEVICE_LUID_VALID_KHR, sizeof(valid), &valid, nullptr), "CL_DEVICE_LUID_VALID_KHR");
-        require(valid, CUDA_ERROR_NOT_SUPPORTED, "OpenCL device LUID is unavailable"); device_luid_info result;
+        if (!valid) return device_d3d11_luid(ordinal);
+        device_luid_info result;
         check(api->clGetDeviceInfo(device, CL_DEVICE_LUID_KHR, result.bytes.size(), result.bytes.data(), nullptr), "CL_DEVICE_LUID_KHR");
         check(api->clGetDeviceInfo(device, CL_DEVICE_NODE_MASK_KHR, sizeof(result.node_mask), &result.node_mask, nullptr), "CL_DEVICE_NODE_MASK_KHR"); return result;
+    }
+    device_luid_info device_d3d11_luid(int ordinal) {
+#if defined(_WIN32)
+        // Older ICDs can identify their DXGI adapter through the standard
+        // sharing query even when cl_khr_device_uuid is unavailable. No
+        // context or shared allocation is needed to query the adapter.
+        cl_platform_id platform = nullptr;
+        check(api->clGetDeviceInfo(native_devices.at(ordinal), CL_DEVICE_PLATFORM, sizeof(platform), &platform, nullptr), "CL_DEVICE_PLATFORM");
+        auto query = reinterpret_cast<clGetDeviceIDsFromD3D11KHR_fn>(api->clGetExtensionFunctionAddressForPlatform(platform, "clGetDeviceIDsFromD3D11KHR"));
+        require(query, CUDA_ERROR_NOT_SUPPORTED, "OpenCL device LUID is unavailable");
+        dynamic_library dxgi{{"dxgi.dll"}};
+        auto create = dxgi.get<decltype(&CreateDXGIFactory1)>("CreateDXGIFactory1");
+        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+        require(SUCCEEDED(create(IID_PPV_ARGS(&factory))), CUDA_ERROR_NOT_SUPPORTED, "DXGI identity discovery is unavailable");
+        for (UINT i = 0;; ++i) {
+            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+            if (factory->EnumAdapters1(i, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+            if (!adapter) break;
+            cl_uint count = 0;
+            if (query(platform, CL_D3D11_DXGI_ADAPTER_KHR, adapter.Get(), CL_ALL_DEVICES_FOR_D3D11_KHR, 0, nullptr, &count) != CL_SUCCESS || count != 1) continue;
+            cl_device_id matched = nullptr;
+            if (query(platform, CL_D3D11_DXGI_ADAPTER_KHR, adapter.Get(), CL_ALL_DEVICES_FOR_D3D11_KHR, 1, &matched, nullptr) != CL_SUCCESS || matched != native_devices.at(ordinal)) continue;
+            DXGI_ADAPTER_DESC1 description{};
+            if (FAILED(adapter->GetDesc1(&description))) continue;
+            device_luid_info result; std::memcpy(result.bytes.data(), &description.AdapterLuid, result.bytes.size()); result.node_mask = 1; return result;
+        }
+#else
+        (void)ordinal;
+#endif
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "OpenCL device LUID is unavailable");
     }
     pci_address device_pci(int ordinal) override {
         device_extension(ordinal, "cl_khr_pci_bus_info"); cl_device_pci_bus_info_khr info{};

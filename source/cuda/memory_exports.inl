@@ -4,7 +4,7 @@ DRIVER_API(cuMemAllocManaged, (CUdeviceptr* output, size_t bytes, unsigned flags
 DRIVER_API(cuMemGetInfo, (size_t* free, size_t* total),
     driver_ready(); require(free && total, CUDA_ERROR_INVALID_VALUE, "null memory info output");
     auto owner = current(); size_t available = 0, capacity = 0;
-    if (global().kind == cudavmBackendCuda) {
+    if (owner->native->kind() == cudavmBackendCuda) {
         std::lock_guard lock(owner->execution); owner->native->memory_info(available, capacity);
     } else {
         capacity = global().devices[owner->device].memory_bytes;
