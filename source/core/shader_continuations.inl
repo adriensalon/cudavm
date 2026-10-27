@@ -13,7 +13,7 @@ void collective_store(llvm::Value* contents,llvm::Value* pointer) {
     b.CreateAlignedStore(contents,pointer,llvm::Align(4))->setVolatile(true);
 }
 llvm::Function* make_named_arrival() {
-    auto* function=llvm::Function::Create(llvm::FunctionType::get(b.getInt32Ty(),{b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()},false),llvm::GlobalValue::InternalLinkage,"cudavm.barrier.arrive",*result);
+    auto* function=llvm::Function::Create(llvm::FunctionType::get(b.getInt32Ty(),{b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty(),b.getInt32Ty()},false),llvm::GlobalValue::InternalLinkage,"cudavm.barrier.arrive",*result);
     function->addFnAttr(llvm::Attribute::NoInline);
     auto* first=llvm::BasicBlock::Create(b.getContext(),"entry",function);
     auto* retry=llvm::BasicBlock::Create(b.getContext(),"retry",function);
@@ -50,7 +50,23 @@ llvm::Function* make_named_arrival() {
     auto* exchange=b.CreateAtomicCmpXchg(counts(),previous,b.CreateAdd(previous,credit),llvm::Align(4),llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,scope);
     previous->addIncoming(b.CreateExtractValue(exchange,0),retry);
     b.CreateCondBr(b.CreateExtractValue(exchange,1),done,retry);
-    b.SetInsertPoint(done);b.CreateRet(generation);
+    b.SetInsertPoint(done);
+    // Use the same CAS representation as arrival counts on every shader
+    // target, including groupshared storage in DXIL.
+    for(unsigned offset:{48u,64u}) {
+        auto* origin=b.GetInsertBlock();
+        auto accumulator=[&](){return collective_pointer(named_barrier_state,b.CreateAdd(id,b.getInt32(offset)));};
+        auto* initial_sum=b.CreateAtomicCmpXchg(accumulator(),b.getInt32(0),b.getInt32(0),llvm::Align(4),llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,scope);
+        auto* initial_value=b.CreateExtractValue(initial_sum,0);
+        auto* sum_retry=llvm::BasicBlock::Create(b.getContext(),"sum.retry",function);
+        auto* sum_done=llvm::BasicBlock::Create(b.getContext(),"sum.done",function);
+        b.CreateBr(sum_retry);b.SetInsertPoint(sum_retry);
+        auto* sum=b.CreatePHI(b.getInt32Ty(),2);sum->addIncoming(initial_value,origin);
+        auto* sum_exchange=b.CreateAtomicCmpXchg(accumulator(),sum,b.CreateAdd(sum,function->getArg(offset==48?4:5)),llvm::Align(4),llvm::AtomicOrdering::Monotonic,llvm::AtomicOrdering::Monotonic,scope);
+        sum->addIncoming(b.CreateExtractValue(sum_exchange,0),sum_retry);
+        b.CreateCondBr(b.CreateExtractValue(sum_exchange,1),sum_done,sum_retry);b.SetInsertPoint(sum_done);
+    }
+    b.CreateRet(generation);
     return function;
 }
 llvm::Function* make_named_advance() {
@@ -73,6 +89,11 @@ llvm::Function* make_named_advance() {
     auto* required=b.CreateSelect(b.CreateICmpEQ(expected,b.getInt32(0)),function->getArg(0),expected);
     b.CreateCondBr(b.CreateAnd(b.CreateICmpNE(arrived,b.getInt32(0)),b.CreateICmpUGE(arrived,required)),release,next);
     b.SetInsertPoint(release);
+    for(unsigned offset:{48u,64u}) {
+        auto* accumulator=collective_pointer(named_barrier_state,b.CreateAdd(id,b.getInt32(offset)));
+        collective_store(collective_load(accumulator),collective_pointer(named_barrier_state,b.CreateAdd(id,b.getInt32(offset+32))));
+        collective_store(b.getInt32(0),accumulator);
+    }
     collective_store(b.getInt32(0),collective_pointer(named_barrier_state,id));
     collective_store(b.getInt32(0),collective_pointer(named_barrier_state,b.CreateAdd(id,b.getInt32(16))));
     auto* phase=collective_pointer(named_barrier_state,b.CreateAdd(id,b.getInt32(32)));
@@ -89,7 +110,7 @@ llvm::Function* make_named_initialize() {
     auto* done=llvm::BasicBlock::Create(b.getContext(),"done",function);
     b.SetInsertPoint(first);b.CreateBr(head);b.SetInsertPoint(head);
     auto* index=b.CreatePHI(b.getInt32Ty(),2);index->addIncoming(function->getArg(0),first);
-    b.CreateCondBr(b.CreateICmpULT(index,b.getInt32(48)),body,done);b.SetInsertPoint(body);
+    b.CreateCondBr(b.CreateICmpULT(index,b.getInt32(native_named_barrier_state_words)),body,done);b.SetInsertPoint(body);
     collective_store(b.getInt32(0),collective_pointer(named_barrier_state,index));
     index->addIncoming(b.CreateAdd(index,function->getArg(1)),body);b.CreateBr(head);
     b.SetInsertPoint(done);b.CreateRetVoid();return function;
@@ -232,7 +253,8 @@ void make_continuations() {
             b.SetInsertPoint(&*entry->getEntryBlock().getFirstInsertionPt());
             site.generation=b.CreateAlloca(b.getInt32Ty(),nullptr,"barrier.generation");
             b.SetInsertPoint(site.arrival->getTerminator());
-            b.CreateStore(b.CreateCall(named_arrival,{site.call->getArgOperand(0),site.call->getArgOperand(1),linear_thread(),thread_count()}),site.generation);
+            b.CreateStore(b.CreateCall(named_arrival,{site.call->getArgOperand(0),site.call->getArgOperand(1),linear_thread(),thread_count(),
+                site.operation>=38?site.call->getArgOperand(2):b.getInt32(0),b.getInt32(site.operation>=38?1:0)}),site.generation);
         }
         b.SetInsertPoint(arrival->getTerminator()); auto* id=linear_thread();
         collective_store(site.call->getArgOperand(0),collective_pointer(collective_masks,id));

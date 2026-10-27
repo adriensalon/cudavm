@@ -406,20 +406,23 @@ CV_FN int cvDoubleExponent(cv64 a) {
 }
 // The significand carries three guard/round/sticky bits. Underflow shifts at
 // the destination precision before the single nearest-even rounding decision.
-CV_FN cv64 cvDoubleRound(cv64 significand,int exponent,uint sign) {
+CV_FN cv64 cvDoubleRound(cv64 significand,int exponent,uint sign,uint mode=0u) {
     if((significand.lo|significand.hi)==0u) return cvMake(0u,sign);
     if(significand.hi>=0x1000000u) {significand=cvDoubleShiftJam(significand,1u);++exponent;}
     while(significand.hi<0x800000u && exponent>1) {significand=cvShl(significand,1u);--exponent;}
     if(exponent<1) {significand=cvDoubleShiftJam(significand,uint(1-exponent));exponent=1;}
     uint discarded=significand.lo&7u;
     significand=cvShr(significand,3u);
-    if(discarded>4u || (discarded==4u && (significand.lo&1u)!=0u)) significand=cvAdd(significand,cvMake(1u,0u));
+    uint increment=mode==0u?(discarded>4u || (discarded==4u && (significand.lo&1u)!=0u)):
+        discarded!=0u && ((mode==2u && sign!=0u) || (mode==3u && sign==0u));
+    if(increment!=0u) significand=cvAdd(significand,cvMake(1u,0u));
     if(significand.hi>=0x200000u) {significand=cvShr(significand,1u);++exponent;}
-    if(exponent>=2047) return cvMake(0u,sign|0x7ff00000u);
+    if(exponent>=2047) return mode==0u || (mode==2u && sign!=0u) || (mode==3u && sign==0u)?
+        cvMake(0u,sign|0x7ff00000u):cvMake(0xffffffffu,sign|0x7fefffffu);
     if(significand.hi<0x100000u) exponent=0;
     return cvMake(significand.lo,sign|(uint(exponent)<<20u)|(significand.hi&0xfffffu));
 }
-CV_FN cv64 cvDoubleAdd(cv64 a,cv64 b) {
+CV_FN cv64 cvDoubleAdd(cv64 a,cv64 b,uint mode=0u) {
     if(cvDoubleIsNaN(a)!=0u || cvDoubleIsNaN(b)!=0u) return cvMake(0u,0x7ff80000u);
     cv64 ax=cvMake(a.lo,a.hi&0x7fffffffu),bx=cvMake(b.lo,b.hi&0x7fffffffu);
     uint sa=a.hi&0x80000000u,sb=b.hi&0x80000000u;
@@ -428,7 +431,7 @@ CV_FN cv64 cvDoubleAdd(cv64 a,cv64 b) {
         if(ax.hi==0x7ff00000u) return a;
         return b;
     }
-    if((ax.lo|ax.hi)==0u && (bx.lo|bx.hi)==0u) return cvMake(0u,sa&sb);
+    if((ax.lo|ax.hi)==0u && (bx.lo|bx.hi)==0u) return cvMake(0u,sa==sb?sa:mode==2u?0x80000000u:0u);
     if((ax.lo|ax.hi)==0u) return b;
     if((bx.lo|bx.hi)==0u) return a;
     if(cvLt(ax,bx)!=0u) {cv64 temporary=a;a=b;b=temporary;uint sign=sa;sa=sb;sb=sign;}
@@ -437,11 +440,11 @@ CV_FN cv64 cvDoubleAdd(cv64 a,cv64 b) {
     cv64 right=cvDoubleShiftJam(cvShl(cvDoubleSignificand(b),3u),uint(exponent-other_exponent));
     cv64 result;
     if(sa==sb) result=cvAdd(left,right);else result=cvSub(left,right);
-    if((result.lo|result.hi)==0u) return cvMake(0u,0u);
-    return cvDoubleRound(result,exponent,sa);
+    if((result.lo|result.hi)==0u) return cvMake(0u,mode==2u?0x80000000u:0u);
+    return cvDoubleRound(result,exponent,sa,mode);
 }
 CV_FN cv64 cvDoubleSubtract(cv64 a,cv64 b) {b.hi=b.hi^0x80000000u;return cvDoubleAdd(a,b);}
-CV_FN cv64 cvDoubleMultiply(cv64 a,cv64 b) {
+CV_FN cv64 cvDoubleMultiply(cv64 a,cv64 b,uint mode=0u) {
     if(cvDoubleIsNaN(a)!=0u || cvDoubleIsNaN(b)!=0u) return cvMake(0u,0x7ff80000u);
     cv64 ax=cvMake(a.lo,a.hi&0x7fffffffu),bx=cvMake(b.lo,b.hi&0x7fffffffu);
     uint sign=(a.hi^b.hi)&0x80000000u;
@@ -465,7 +468,80 @@ CV_FN cv64 cvDoubleMultiply(cv64 a,cv64 b) {
     cv64 significand=cvOr(cvShr(low,shift),cvShl(high,64u-shift));
     cv64 discarded=cvSub(low,cvShl(cvShr(low,shift),shift));
     significand.lo=significand.lo|((discarded.lo|discarded.hi)!=0u?1u:0u);
-    return cvDoubleRound(significand,exponent,sign);
+    return cvDoubleRound(significand,exponent,sign,mode);
+}
+// Exact binary64 FMA keeps the full product and addend until one rounding.
+// Four little-endian words leave room for carry and three final rounding bits.
+struct double_wide_words { uint words[4]; };
+CV_FN double_wide_words double_wide_from(cv64 value) { double_wide_words r={{value.lo,value.hi,0u,0u}};return r; }
+CV_FN uint double_wide_bit(double_wide_words a,uint bit) {return bit<128u?(a.words[bit/32u]>>(bit%32u))&1u:0u;}
+CV_FN double_wide_words double_wide_shift(double_wide_words a,int shift) {
+    double_wide_words r={{0u,0u,0u,0u}};
+    for(uint bit=0u;bit<128u;++bit) {int source=int(bit)-shift;if(source>=0 && source<128)r.words[bit/32u]|=double_wide_bit(a,uint(source))<<(bit%32u);}
+    if(shift<0) {uint discarded=0u;for(uint bit=0u;bit<128u;++bit)if(bit<uint(-shift))discarded|=double_wide_bit(a,bit);r.words[0]|=discarded;}
+    return r;
+}
+CV_FN int double_wide_top(double_wide_words a) {for(int bit=127;bit>=0;--bit)if(double_wide_bit(a,uint(bit))!=0u)return bit;return -1;}
+CV_FN uint double_wide_less(double_wide_words a,double_wide_words b) {
+    for(int i=3;i>=0;--i)if(a.words[i]!=b.words[i])return a.words[i]<b.words[i]?1u:0u;return 0u;
+}
+CV_FN double_wide_words double_wide_sum(double_wide_words a,double_wide_words b,uint subtract) {
+    double_wide_words r;uint carry=subtract;
+    for(uint i=0u;i<4u;++i) {uint y=subtract!=0u?~b.words[i]:b.words[i],sum=a.words[i]+y;
+        uint next=sum+carry;carry=(sum<a.words[i] || next<sum)?1u:0u;r.words[i]=next;}
+    return r;
+}
+CV_FN cv64 double_wide_round(double_wide_words value,int exponent,uint sign,uint mode) {
+    int top=double_wide_top(value);if(top<0)return cvMake(0u,sign);
+    value=double_wide_shift(value,55-top);
+    return cvDoubleRound(cvMake(value.words[0],value.words[1]),exponent+top-120+1023,sign,mode);
+}
+CV_FN cv64 double_fma(cv64 a,cv64 b,cv64 c,uint mode) {
+    if(cvDoubleIsNaN(a)!=0u || cvDoubleIsNaN(b)!=0u || cvDoubleIsNaN(c)!=0u)return cvMake(0u,0x7ff80000u);
+    uint sign=(a.hi^b.hi)&0x80000000u,cs=c.hi&0x80000000u;
+    cv64 ax=cvMake(a.lo,a.hi&0x7fffffffu),bx=cvMake(b.lo,b.hi&0x7fffffffu),cx=cvMake(c.lo,c.hi&0x7fffffffu);
+    uint az=(ax.lo|ax.hi)==0u,bz=(bx.lo|bx.hi)==0u,cz=(cx.lo|cx.hi)==0u;
+    if(ax.hi==0x7ff00000u || bx.hi==0x7ff00000u) {
+        if(az!=0u || bz!=0u || (cx.hi==0x7ff00000u && cs!=sign))return cvMake(0u,0x7ff80000u);
+        return cvMake(0u,sign|0x7ff00000u);
+    }
+    if(cx.hi==0x7ff00000u)return c;
+    if(az!=0u || bz!=0u)return cvDoubleAdd(cvMake(0u,sign),c,mode);
+    cv64 x=cvDoubleSignificand(a),y=cvDoubleSignificand(b);
+    cv64 low=cvMul(cvMake(x.lo,0u),cvMake(y.lo,0u)),high=cvMul(cvMake(x.hi,0u),cvMake(y.hi,0u));
+    cv64 cross=cvMul(cvMake(x.lo,0u),cvMake(y.hi,0u)),sum=cvAdd(low,cvMake(0u,cross.lo));
+    high=cvAdd(high,cvMake(cross.hi,0u));high=cvAdd(high,cvMake(cvLt(sum,low),0u));low=sum;
+    cross=cvMul(cvMake(x.hi,0u),cvMake(y.lo,0u));sum=cvAdd(low,cvMake(0u,cross.lo));
+    high=cvAdd(high,cvMake(cross.hi,0u));high=cvAdd(high,cvMake(cvLt(sum,low),0u));low=sum;
+    double_wide_words product={{low.lo,low.hi,high.lo,high.hi}};
+    int top=double_wide_top(product),exponent=cvDoubleExponent(a)+cvDoubleExponent(b)-2046+top-104;
+    product=double_wide_shift(product,120-top);
+    if(cz!=0u)return double_wide_round(product,exponent,sign,mode);
+    int ce=cvDoubleExponent(c)-1023,common=exponent>ce?exponent:ce;
+    double_wide_words addend=double_wide_shift(double_wide_from(cvDoubleSignificand(c)),68);
+    product=double_wide_shift(product,exponent-common);addend=double_wide_shift(addend,ce-common);
+    if(sign==cs)return double_wide_round(double_wide_sum(product,addend,0u),common,sign,mode);
+    if(double_wide_less(product,addend)!=0u)return double_wide_round(double_wide_sum(addend,product,1u),common,cs,mode);
+    auto difference=double_wide_sum(product,addend,1u);
+    if(double_wide_top(difference)<0)return cvMake(0u,mode==2u?0x80000000u:0u);
+    return double_wide_round(difference,common,sign,mode);
+}
+CV_FN cv64 double_sqrt(cv64 a,uint mode) {
+    if(cvDoubleIsNaN(a)!=0u)return cvMake(0u,0x7ff80000u);
+    if((a.lo|(a.hi&0x7fffffffu))==0u)return a;
+    if((a.hi&0x80000000u)!=0u)return cvMake(0u,0x7ff80000u);
+    if(a.hi==0x7ff00000u)return a;
+    int exponent=cvDoubleExponent(a)-1023;
+    cv64 significand=cvDoubleSignificand(a);if(exponent%2!=0) {significand=cvShl(significand,1u);--exponent;}
+    auto radicand=double_wide_shift(double_wide_from(significand),58);
+    cv64 remainder=cvMake(0u,0u),root=cvMake(0u,0u);
+    for(int bit=55;bit>=0;--bit) {
+        remainder=cvShl(remainder,2u);remainder.lo|=double_wide_bit(radicand,uint(bit*2+1))*2u+double_wide_bit(radicand,uint(bit*2));
+        cv64 trial=cvShl(root,2u);trial.lo|=1u;uint take=cvLt(remainder,trial)==0u?1u:0u;
+        if(take!=0u)remainder=cvSub(remainder,trial);root=cvShl(root,1u);root.lo|=take;
+    }
+    root.lo|=(remainder.lo|remainder.hi)!=0u?1u:0u;
+    return cvDoubleRound(root,exponent/2+1023,0u,mode);
 }
 CV_FN cv64 cvDoubleDivide(cv64 a,cv64 b) {
     if(cvDoubleIsNaN(a)!=0u || cvDoubleIsNaN(b)!=0u) return cvMake(0u,0x7ff80000u);
@@ -553,6 +629,10 @@ extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_n
     return sign|((retained+unsigned(increment))<<shift);
 }
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_add(unsigned long long a,unsigned long long b){using namespace cudavm;return join(cvDoubleAdd(split(a),split(b)));}
+extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_add_mode(unsigned long long a,unsigned long long b,unsigned mode){using namespace cudavm;return join(cvDoubleAdd(split(a),split(b),mode));}
+extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_mul_mode(unsigned long long a,unsigned long long b,unsigned mode){using namespace cudavm;return join(cvDoubleMultiply(split(a),split(b),mode));}
+extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_fma_mode(unsigned long long a,unsigned long long b,unsigned long long c,unsigned mode){using namespace cudavm;return join(double_fma(split(a),split(b),split(c),mode));}
+extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_sqrt_mode(unsigned long long a,unsigned mode){using namespace cudavm;return join(double_sqrt(split(a),mode));}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_sub(unsigned long long a,unsigned long long b){using namespace cudavm;return join(cvDoubleSubtract(split(a),split(b)));}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_mul(unsigned long long a,unsigned long long b){using namespace cudavm;return join(cvDoubleMultiply(split(a),split(b)));}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_div(unsigned long long a,unsigned long long b){using namespace cudavm;return join(cvDoubleDivide(split(a),split(b)));}

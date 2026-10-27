@@ -21,14 +21,18 @@ inline int native_collective(llvm::StringRef name) {
     if (name=="llvm.nvvm.barrier0" || name.starts_with("llvm.nvvm.barrier.cta.sync.")) return 36;
     if (name.starts_with("llvm.nvvm.barrier.cta.arrive.")) return 37;
     const char* votes[]{"popc","and","or"};
-    for(unsigned i=0;i<3;++i) if(name==std::string("llvm.nvvm.barrier0.")+votes[i] || name.starts_with(std::string("llvm.nvvm.barrier.cta.red.")+votes[i]+".")) return int(32+i);
+    for(unsigned i=0;i<3;++i) {
+        if(name==std::string("llvm.nvvm.barrier0.")+votes[i]) return int(32+i);
+        if(name.starts_with(std::string("llvm.nvvm.barrier.cta.red.")+votes[i]+".")) return int(38+i);
+    }
     return -1;
 }
 // Two words of payload and a program counter/mask per possible CUDA thread,
 // plus the uniform continuation-loop control word (rounded to eight bytes).
 inline constexpr unsigned native_collective_shared_bytes = 16392;
 // Arrival counts, expected counts and generations for the 16 CTA barriers.
-inline constexpr unsigned native_named_barrier_shared_bytes = 192;
+inline constexpr unsigned native_named_barrier_state_words = 112;
+inline constexpr unsigned native_named_barrier_shared_bytes = native_named_barrier_state_words * 4;
 inline bool native_atomic_polling(const llvm::Function& function) {
     for(const auto& block:function) for(const auto& input:block)
         if(auto* load=llvm::dyn_cast<llvm::LoadInst>(&input);load && load->isAtomic() && !input.getMetadata("cudavm.nonblocking")) return true;

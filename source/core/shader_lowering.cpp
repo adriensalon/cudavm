@@ -94,6 +94,19 @@ void scalar_math(llvm::Module& module) {
         }
         if(auto* operation=llvm::dyn_cast<llvm::FCmpInst>(instruction);operation && operation->getOperand(0)->getType()->isDoubleTy())
             if(auto* helper=numeric("f64_compare")) replacement=builder.CreateICmpNE(builder.CreateCall(helper,{bits(operation->getOperand(0)),bits(operation->getOperand(1)),builder.getInt32(operation->getPredicate())}),builder.getInt32(0));
+        if(auto* call=llvm::dyn_cast<llvm::IntrinsicInst>(instruction);call && call->getType()->isDoubleTy()) {
+            if(call->getIntrinsicID()==llvm::Intrinsic::fabs || call->getIntrinsicID()==llvm::Intrinsic::copysign) {
+                auto* magnitude=builder.CreateAnd(bits(call->getArgOperand(0)),builder.getInt64(0x7fffffffffffffffull));
+                if(call->getIntrinsicID()==llvm::Intrinsic::copysign)magnitude=builder.CreateOr(magnitude,builder.CreateAnd(bits(call->getArgOperand(1)),builder.getInt64(0x8000000000000000ull)));
+                replacement=builder.CreateBitCast(magnitude,builder.getDoubleTy());
+            }
+            if(call->getIntrinsicID()==llvm::Intrinsic::fma || call->getIntrinsicID()==llvm::Intrinsic::sqrt) {
+                llvm::SmallVector<llvm::Value*> arguments;for(auto& argument:call->args())arguments.push_back(bits(argument));
+                arguments.push_back(builder.getInt32(0));
+                if(auto* helper=numeric(call->getIntrinsicID()==llvm::Intrinsic::fma?"f64_fma_mode":"f64_sqrt_mode"))
+                    replacement=builder.CreateBitCast(builder.CreateCall(helper,arguments),builder.getDoubleTy());
+            }
+        }
         if(auto* cast=llvm::dyn_cast<llvm::CastInst>(instruction)) {
             auto* source=cast->getOperand(0);
             if(cast->getOpcode()==llvm::Instruction::FPExt && source->getType()->isHalfTy() && cast->getType()->isFloatTy())replacement=half_float(source);
@@ -1071,6 +1084,10 @@ struct lowering {
                 auto* selected=b.CreateSelect(eligible,b.CreateAdd(base,peer),id);
                 answer=b.CreateAlignedLoad(b.getInt32Ty(),pointer(selected),llvm::Align(4));
                 if(shuffle_predicate) answer=pair(answer,b.CreateZExt(eligible,b.getInt32Ty()));
+            } else if(operation>=38 && operation<=40) {
+                auto* truth=collective_load(collective_pointer(named_barrier_state,b.CreateAdd(helper->getArg(0),b.getInt32(80))));
+                auto* count=collective_load(collective_pointer(named_barrier_state,b.CreateAdd(helper->getArg(0),b.getInt32(96))));
+                answer=operation==38?static_cast<llvm::Value*>(truth):b.CreateZExt(operation==39?b.CreateICmpEQ(truth,count):b.CreateICmpNE(truth,b.getInt32(0)),b.getInt32Ty());
             } else if(operation==7 || operation==35 || operation>=36) answer=b.getInt32(0);
             else if(operation==20) answer=helper->getArg(0);
             else {
@@ -1128,11 +1145,12 @@ struct lowering {
         if(operation>=36) {
             mask=call.arg_empty()?b.getInt32(0):value(call.getArgOperand(0));
             if(auto* id=llvm::dyn_cast<llvm::ConstantInt>(mask);id && id->getZExtValue()>=16) fail(call,"CTA barrier ID must be below 16");
-            if(call.arg_size()>1) data=value(call.getArgOperand(1));
+            if(operation>=38) data=call.arg_size()==3?value(call.getArgOperand(1)):b.getInt32(0);
+            else if(call.arg_size()>1) data=value(call.getArgOperand(1));
         }
         auto* high=operation==9 || operation==11?b.CreateTrunc(b.CreateLShr(data,b.getInt64(32)),b.getInt32Ty()):b.getInt32(0);
         if(data->getType()->isFloatTy()) data=b.CreateBitCast(data,b.getInt32Ty()); else data=b.CreateZExtOrTrunc(data,b.getInt32Ty());
-        std::vector<llvm::Value*> args{mask,data,operation<4?value(call.getArgOperand(2)):high,operation<4?value(call.getArgOperand(3)):b.getInt32(0)};
+        std::vector<llvm::Value*> args{mask,data,operation>=38?b.CreateZExt(value(call.getArgOperand(call.arg_size()-1)),b.getInt32Ty()):operation<4?value(call.getArgOperand(2)):high,operation<4?value(call.getArgOperand(3)):b.getInt32(0)};
         if (collective_frames) {
             auto context = call.getOperandBundle("cudavm.call.frame");
             if (!context) fail(call, "collective is missing its device call frame");
@@ -1359,6 +1377,11 @@ struct lowering {
             if (tail.starts_with("nctaid.")) return packet(b.getInt32(axis));
         }
         if (function->isIntrinsic()) {
+            if(instruction.getType()->isDoubleTy() && (function->getIntrinsicID()==llvm::Intrinsic::fabs || function->getIntrinsicID()==llvm::Intrinsic::copysign)) {
+                auto* magnitude=b.CreateAnd(value(instruction.getArgOperand(0)),b.getInt64(0x7fffffffffffffffull));
+                if(function->getIntrinsicID()==llvm::Intrinsic::copysign)magnitude=b.CreateOr(magnitude,b.CreateAnd(value(instruction.getArgOperand(1)),b.getInt64(0x8000000000000000ull)));
+                return magnitude;
+            }
             if(instruction.getType()->isDoubleTy()) fail(instruction,"native double intrinsic requires an exact portable numeric helper");
             if (name.starts_with("llvm.nvvm.")) fail(instruction, "CUDA operation requires explicit native shader lowering");
             if (function->getIntrinsicID() == llvm::Intrinsic::lifetime_start || function->getIntrinsicID() == llvm::Intrinsic::lifetime_end ||
@@ -1615,7 +1638,7 @@ struct lowering {
         if(auto* compare=llvm::dyn_cast<llvm::FCmpInst>(&input);compare && compare->getOperand(0)->getType()->isFloatTy()) {
             values[&input]=b.CreateFCmp(compare->getPredicate(),b.CreateBitCast(value(compare->getOperand(0)),b.getFloatTy()),b.CreateBitCast(value(compare->getOperand(1)),b.getFloatTy()));return;
         }
-        if(input.getType()->isDoubleTy() && llvm::isa<llvm::FPMathOperator>(input)) fail(input,"native double arithmetic requires an exact portable numeric helper");
+        if(input.getType()->isDoubleTy() && llvm::isa<llvm::FPMathOperator>(input) && !llvm::isa<llvm::CallBase>(input)) fail(input,"native double arithmetic requires an exact portable numeric helper");
         if (auto* memory = llvm::dyn_cast<llvm::LoadInst>(&input)) {
             if (memory->isAtomic()) {
                 validate_atomic_storage(input,memory->getType(),memory->getAlign());
@@ -1745,7 +1768,7 @@ struct lowering {
             if(kernel.hasFnAttribute("cudavm.call.frames")) collective_frames=make_state(1024,"cudavm.collective.frames");
             collective_control=new llvm::GlobalVariable(*result,b.getInt32Ty(),false,llvm::GlobalValue::InternalLinkage,llvm::UndefValue::get(b.getInt32Ty()),"cudavm.collective.control",nullptr,llvm::GlobalVariable::NotThreadLocal,3);
             collective_control->setAlignment(llvm::Align(8));
-            if(named_barriers) named_barrier_state=make_state(48,"cudavm.barrier.state");
+            if(named_barriers) named_barrier_state=make_state(native_named_barrier_state_words,"cudavm.barrier.state");
         }
         if (local_bytes && !opencl && !arena_local) {
             auto* local_type = llvm::ArrayType::get(b.getInt32Ty(), std::max(2u,(local_bytes + 3) / 4));

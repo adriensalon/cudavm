@@ -14,6 +14,9 @@ constexpr uint64_t join_packet_word64(packet_word64 n) { return uint64_t(n.lo) |
 
 inline constexpr uint32_t packet_private_high_word = 0xffffffffu;
 inline constexpr uint32_t packet_function_high_word = 0xfffffffeu;
+inline constexpr uint32_t packet_image_high_word = 0xfffffffbu;
+inline constexpr uint64_t packet_image_base = uint64_t(packet_image_high_word) << 32;
+static_assert(packet_image_high_word != packet_private_high_word && packet_image_high_word != packet_function_high_word);
 inline constexpr uint32_t packet_shared_tag = 0x40000000u;
 inline constexpr uint32_t packet_local_tag = 0x80000000u;
 inline constexpr uint32_t packet_parameter_tag = 0xc0000000u;

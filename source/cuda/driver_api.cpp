@@ -216,6 +216,9 @@ struct state {
     std::uintptr_t next_context = 0x10000;
     std::uintptr_t next_interop = 0x3000000;
     CUdeviceptr next_address = 0x10000000000ull;
+    // Shader image descriptors use a separate tagged address range. SM75's
+    // register-bound image instructions consume only the low handle word.
+    uint64_t next_image_address = 256;
     unsigned long long next_buffer_id = 1;
     std::uintptr_t next_stream = 0x4000000, next_event = 0x5000000;
     unsigned long long next_stream_id = 1;
@@ -527,7 +530,7 @@ void launch(CUfunction function, const launch_shape& shape, CUstream stream, voi
             const std::shared_ptr<context>& owner);
 CUdeviceptr reserve_device_address(size_t bytes) {
     constexpr CUdeviceptr alignment = 256;
-    require(bytes <= std::numeric_limits<CUdeviceptr>::max() - global().next_address - alignment,
+    require(global().next_address <= packet_image_base - alignment && bytes <= packet_image_base - global().next_address - alignment,
             CUDA_ERROR_OUT_OF_MEMORY, "device address space exhausted");
     auto address = global().next_address;
     global().next_address += (static_cast<CUdeviceptr>(bytes) + alignment - 1) & ~(alignment - 1);

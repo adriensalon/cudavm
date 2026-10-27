@@ -1,4 +1,5 @@
 #pragma once
+#include "shader_packet.hpp"
 #include <cstdint>
 #include <string_view>
 namespace llvm { class Module; class Function; }
@@ -6,6 +7,7 @@ namespace cudavm {
 inline constexpr uint32_t device_service_heap = 1, device_service_output = 2, device_service_assert = 4;
 inline constexpr uint64_t device_heap_address = 0xfffffffd00000000ull;
 inline constexpr uint64_t device_output_address = 0xfffffffc00000000ull;
+static_assert(uint32_t(device_heap_address >> 32) != packet_image_high_word && uint32_t(device_output_address >> 32) != packet_image_high_word);
 inline constexpr uint32_t device_output_record_bytes = 4096;
 inline constexpr uint32_t device_output_header_bytes = 16;
 inline constexpr uint64_t device_output_max_bytes = uint64_t(1) << 31;

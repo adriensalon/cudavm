@@ -821,6 +821,19 @@ class ptx_parser {
                 write(operands[0],result,destination,destination.kind != 'f'); return true;
             }
         }
+        if(type.kind=='f' && type.bits==64 && op=="rcp" && parts==std::vector<std::string>{"rcp","rn","f64"}) {
+            arity(2);return done(b.CreateBitCast(helper("word_f64_div",{b.getInt64(0x3ff0000000000000ull),word(read(operands[1],type))},b.getInt64Ty()),b.getDoubleTy()),type);
+        }
+        if(type.kind=='f' && type.bits==64 && (op=="add" || op=="sub" || op=="mul" || op=="fma" || op=="sqrt") && parts.size()==3) {
+            const std::vector<std::string> modes{"rn","rz","rm","rp"};auto mode=std::find(modes.begin(),modes.end(),parts[1]);
+            if(mode==modes.end())ptx_fail(instruction.opcode,"unsupported FP64 arithmetic modifier",true);
+            arity(op=="sqrt"?2:op=="fma"?4:3);
+            std::vector<llvm::Value*> values{word(read(operands[1],type))};
+            if(op!="sqrt") {auto* next=word(read(operands[2],type));if(op=="sub")next=b.CreateXor(next,b.getInt64(0x8000000000000000ull));values.push_back(next);}
+            if(op=="fma")values.push_back(word(read(operands[3],type)));
+            values.push_back(b.getInt32(unsigned(mode-modes.begin())));
+            return done(b.CreateBitCast(helper("word_f64_"+(op=="sub"?std::string("add"):op)+"_mode",values,b.getInt64Ty()),b.getDoubleTy()),type);
+        }
         if (type.kind == 'f' && type.bits == 64 && (op == "add" || op == "sub" || op == "mul" || op == "div")) {
             if (parts.size() != 2 && (parts.size() != 3 || parts[1] != "rn")) ptx_fail(instruction.opcode,"unsupported FP64 arithmetic modifier",true);
             arity(3); auto* a=read(operands[1],type); auto* c=read(operands[2],type);
@@ -1027,6 +1040,15 @@ class ptx_parser {
             auto* mask=llvm::ConstantInt::get(v->getType(),sign);
             v=op=="neg"?b.CreateXor(v,mask):b.CreateAnd(v,b.CreateNot(mask));
             return done(type.kind=='f'?b.CreateBitCast(v,type.value(context)):v,type);
+        }
+        if((op=="min" || op=="max") && type.kind=='f' && type.bits==64 && parts.size()==2) {
+            arity(3);auto* a=read(operands[1],type);auto* c=read(operands[2],type);
+            auto* left=word(a);auto* right=word(c);auto* magnitude=b.getInt64(0x7fffffffffffffffull);
+            auto* zeros=b.CreateICmpEQ(b.CreateOr(b.CreateAnd(left,magnitude),b.CreateAnd(right,magnitude)),b.getInt64(0));
+            auto* selected=b.CreateSelect(op=="min"?b.CreateFCmpOLT(a,c):b.CreateFCmpOGT(a,c),a,c);
+            selected=b.CreateSelect(zeros,b.CreateBitCast(op=="min"?b.CreateOr(left,right):b.CreateAnd(left,right),b.getDoubleTy()),selected);
+            selected=b.CreateSelect(b.CreateFCmpUNO(c,c),a,selected);
+            return done(b.CreateSelect(b.CreateFCmpUNO(a,a),c,selected),type);
         }
         if((op=="min" || op=="max") && ((type.kind=='f' && type.bits<64) || type.kind=='h') &&
             (parts.size()==2 || (parts.size()==3 && parts[1]=="NaN" && (type.bits==16 || type.kind=='h')))) {
@@ -1496,10 +1518,13 @@ class ptx_parser {
                             builtin->addFnAttr("cudavm.cuda.origin", "llvm.nvvm.read.ptx.sreg." + families[family] + "." + axis);
                             value = builder.CreateCall(callee);
                         }
-                    for (auto special : {"laneid", "warpsize", "lanemask.eq", "lanemask.lt", "lanemask.le", "lanemask.gt", "lanemask.ge"})
-                        if (token.text == std::string("%") + special)
+                    for (auto special : {"laneid", "warpsize", "lanemask.eq", "lanemask.lt", "lanemask.le", "lanemask.gt", "lanemask.ge"}) {
+                        auto spelling=std::string("%")+special;
+                        if(spelling.starts_with("%lanemask."))spelling[9]='_';
+                        if (token.text == spelling || token.text == std::string("%") + special)
                             value = builder.CreateCall(module->getOrInsertFunction(std::string("llvm.nvvm.read.ptx.sreg.") + special,
                                 llvm::FunctionType::get(builder.getInt32Ty(), {}, false)));
+                    }
                     if (!value) ptx_fail(token, token.text.find('.') == std::string::npos ? "undeclared register" : "unsupported special register",
                         token.text.find('.') != std::string::npos);
                 }

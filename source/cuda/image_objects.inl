@@ -126,7 +126,9 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
                 descriptor[8 + component] = !linear && component < d.NumChannels ? texture_integer_border(texture->borderColor[component],
                     8 * descriptor[14], descriptor[15] == 2, descriptor[5] & 4) : 0;
         }
-        entry->native->handle = reserve_device_address(sizeof(descriptor));
+        require(global().next_image_address <= uint64_t(UINT32_MAX) - 255, CUDA_ERROR_OUT_OF_MEMORY, "image handle space exhausted");
+        entry->native->handle = packet_image_base | global().next_image_address;
+        global().next_image_address += 256;
         entry->descriptor = context_configuration(owner, [&] {
             auto storage = owner->native->allocate(sizeof(descriptor));
             owner->native->write(*storage, 0, std::as_bytes(std::span(descriptor))); return storage;
