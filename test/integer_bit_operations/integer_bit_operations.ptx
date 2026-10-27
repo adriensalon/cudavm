@@ -1,0 +1,27 @@
+// Independently authored PTX; ffs is one plus the leading zeros of reversed bits.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry count_reverse_bits(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .reg .b64 %a,%b,%wide,%reverse;
+ .reg .b32 %i,%block,%threads,%count,%low,%high,%p32,%l32,%r32,%f32,%p64,%l64,%lo,%hi,%f64;
+ .reg .pred %p;
+ mov.u32 %i,%tid.x; mov.u32 %block,%ctaid.x; mov.u32 %threads,%ntid.x;
+ mad.lo.u32 %i,%block,%threads,%i;
+ ld.param.u32 %count,[count]; setp.ge.u32 %p,%i,%count; @%p ret;
+ ld.param.u64 %a,[out]; ld.param.u64 %b,[in];
+ mad.wide.u32 %a,%i,36,%a; mad.wide.u32 %b,%i,8,%b;
+ ld.global.u64 %wide,[%b]; mov.b64 {%low,%high},%wide;
+ popc.b32 %p32,%low; clz.b32 %l32,%low; brev.b32 %r32,%low;
+ clz.b32 %f32,%r32; add.u32 %f32,%f32,1;
+ setp.ne.u32 %p,%low,0; selp.u32 %f32,%f32,0,%p;
+ popc.b64 %p64,%wide; clz.b64 %l64,%wide; brev.b64 %reverse,%wide;
+ mov.b64 {%lo,%hi},%reverse;
+ clz.b64 %f64,%reverse; add.u32 %f64,%f64,1;
+ setp.ne.u64 %p,%wide,0; selp.u32 %f64,%f64,0,%p;
+ st.global.u32 [%a+0],%p32; st.global.u32 [%a+4],%l32;
+ st.global.u32 [%a+8],%r32; st.global.u32 [%a+12],%f32;
+ st.global.u32 [%a+16],%p64; st.global.u32 [%a+20],%l64;
+ st.global.u32 [%a+24],%lo; st.global.u32 [%a+28],%hi; st.global.u32 [%a+32],%f64;
+ ret;
+}

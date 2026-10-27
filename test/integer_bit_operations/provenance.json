@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/integer_bit_operations/integer_bit_operations.ptx -o test/integer_bit_operations/integer_bit_operations.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "integer_bit_operations.cu": "adf3d2058b5016be2b17f2fe503ef626daccf1ba3c9bb8941fd008f8f8b2f060",
+    "integer_bit_operations.ptx": "6e0ef7a1124f5beae285feb0df2e18eb88057232cc3cdced6ddcd44307bbff7d",
+    "integer_bit_operations.ll": "fc220444cc7bbcd0cdc06128cfaf9f1cddace9694bdbc72a0a80b2686b1c2cf7",
+    "integer_bit_operations.cubin": "b1cc41cb4969596aeeb33cca66d605f2d012193982653c146bfdbb7cab25a795"
+  }
+}

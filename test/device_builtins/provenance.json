@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/device_builtins/device_builtins.ptx -o test/device_builtins/device_builtins.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "device_builtins.cu": "4f28b3725b270c1c5a18129e73d08053030e3e0c6a988d142654373281b0b487",
+    "device_builtins.ptx": "a79eb8b6a0c6062368b09a425318582d24732019676bd23f1c2cb5da5c7eb3ce",
+    "device_builtins.ll": "5ca2d29b99d416f10a79511bad26b6cd803b3f35bab63d8a35233ff3989bb942",
+    "device_builtins.cubin": "db2f3196852c44afc775a205ef86a64436678f2e0522d4da92d0a35a63535df9"
+  }
+}

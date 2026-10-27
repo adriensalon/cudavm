@@ -1,0 +1,28 @@
+// Independently authored PTX; assemble the checked-in SM75 cubin with ptxas -O0.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry record_builtins(.param .u64 out, .param .u32 count) {
+ .reg .b64 %a;
+ .reg .b32 %tx,%ty,%tz,%nx,%ny,%nz,%bx,%by,%bz,%gx,%gy,%gz;
+ .reg .b32 %local,%block,%volume,%i,%count,%lane,%warp;
+ .reg .pred %valid;
+ mov.u32 %tx,%tid.x; mov.u32 %ty,%tid.y; mov.u32 %tz,%tid.z;
+ mov.u32 %nx,%ntid.x; mov.u32 %ny,%ntid.y; mov.u32 %nz,%ntid.z;
+ mov.u32 %bx,%ctaid.x; mov.u32 %by,%ctaid.y; mov.u32 %bz,%ctaid.z;
+ mov.u32 %gx,%nctaid.x; mov.u32 %gy,%nctaid.y; mov.u32 %gz,%nctaid.z;
+ mad.lo.u32 %local,%tz,%ny,%ty; mad.lo.u32 %local,%local,%nx,%tx;
+ mad.lo.u32 %block,%bz,%gy,%by; mad.lo.u32 %block,%block,%gx,%bx;
+ mul.lo.u32 %volume,%nx,%ny; mul.lo.u32 %volume,%volume,%nz;
+ mad.lo.u32 %i,%block,%volume,%local;
+ ld.param.u32 %count,[count]; setp.lt.u32 %valid,%i,%count; @!%valid ret;
+ ld.param.u64 %a,[out]; mad.wide.u32 %a,%i,64,%a;
+ mov.u32 %lane,%laneid; mov.u32 %warp,WARP_SZ;
+ st.global.u32 [%a+0],%tx; st.global.u32 [%a+4],%ty; st.global.u32 [%a+8],%tz;
+ st.global.u32 [%a+12],%nx; st.global.u32 [%a+16],%ny; st.global.u32 [%a+20],%nz;
+ st.global.u32 [%a+24],%bx; st.global.u32 [%a+28],%by; st.global.u32 [%a+32],%bz;
+ st.global.u32 [%a+36],%gx; st.global.u32 [%a+40],%gy; st.global.u32 [%a+44],%gz;
+ st.global.u32 [%a+48],%lane; st.global.u32 [%a+52],%warp;
+ st.global.u32 [%a+56],%local; st.global.u32 [%a+60],%block;
+ ret;
+}

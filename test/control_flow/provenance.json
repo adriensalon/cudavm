@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/control_flow/control_flow.ptx -o test/control_flow/control_flow.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "control_flow.cu": "41c1662eebeede25280c25d23913e8fb3cbc609c3b097e960282b0d394e1be88",
+    "control_flow.ptx": "d056542199cff4e55b336d90563a35c15ff295ceb7c006af6bead29f69bb467d",
+    "control_flow.ll": "d3ece09b6cc62c6a1e3759c48249b7af1afe6bdd29b6c7704745865e99c39a37",
+    "control_flow.cubin": "2752dad5bb13f1755a07688b9cb70d211fd01f728ad98acd52ecf2340e6c3385"
+  }
+}
