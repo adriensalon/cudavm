@@ -253,6 +253,7 @@ std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
             cubin_kernel kernel{}; kernel.name = name; kernel.text = &text;
             std::map<unsigned, cubin_parameter> layout; bool bank = false, extent = false; unsigned declared_size = 0;
             std::optional<std::vector<unsigned>> cooperative_offsets, cooperative_masks;
+            bool internal_warp_offsets = false;
             input.records(input.named(".nv.info." + name), [&](unsigned format, unsigned attr, unsigned size, const fatbin_reader& record) {
                 if (attr == 0xa) {
                     cubin_check(format == 4 && size == 8 && !bank, "invalid parameter bank"); bank = true;
@@ -285,6 +286,19 @@ std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
                     cubin_check(format == 4 && size % 4 == 0, "invalid exit offsets");
                     for (unsigned offset = 0; offset < size; offset += 4)
                         cubin_check(record.number(offset) < text.size && record.number(offset) % 16 == 0, "invalid exit offset");
+                } else if (attr == 0x31) {
+                    cubin_check(format == 4 && size % 4 == 0 && !internal_warp_offsets, "invalid internal warp instruction metadata");
+                    internal_warp_offsets = true;
+                    std::set<unsigned> offsets;
+                    for (unsigned at = 0; at < size; at += 4) {
+                        auto offset = unsigned(record.number(at));
+                        cubin_check(offset < text.size && offset % 16 == 0 && offsets.insert(offset).second,
+                            "invalid internal warp instruction offset");
+                        auto lo = input.number(text.offset + offset, 8);
+                        auto hi = input.number(text.offset + offset + 8, 8) & ((uint64_t(1) << 41) - 1);
+                        cubin_check((lo & 0xfff) == 0x806 && !(lo >> 24) && (hi & ~uint64_t(0x78e0000)) == 0x100,
+                            "unsupported internal warp instruction", true);
+                    }
                 } else if (attr == 0x28 || attr == 0x29) {
                     auto& count = attr == 0x28 ? cooperative_offsets : cooperative_masks;
                     cubin_check(format == 4 && size % 4 == 0 && !count, "invalid cooperative instruction metadata");
@@ -403,7 +417,11 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
     cubin_check(!code.empty() && code.size() % 16 == 0 && code.size() <= 65536, "invalid/excessive SM75 code extent");
     std::set<size_t> targets;
     auto branch_target = [&](size_t pc, uint64_t lo, uint64_t hi) {
-        auto displacement = int32_t(lo >> 32);
+        // BRA.U tags the displacement's low bit; it promises a uniform
+        // predicate but retains the same per-invocation control-flow result.
+        auto encoded = uint32_t(lo >> 32);
+        if ((lo & 0xfff) == 0x947) encoded &= ~1u;
+        auto displacement = int32_t(encoded);
         cubin_check((hi & 0x3ffff) == (displacement < 0 ? 0x3ffffu : 0), "unsupported branch displacement", true);
         int64_t target = int64_t(pc) + 16 + displacement;
         cubin_check(target >= 0 && uint64_t(target) < code.size() && target % 16 == 0, "invalid branch target");
@@ -736,11 +754,32 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             if ((uint32_t(lo) & 0xffff0000u) != 0 || (op == 0x348 && (lo >> 40)) || hi != 0x3800000)
                 fail("unsupported warp barrier encoding");
             instruction = "bar.warp.sync " + (op == 0x948 ? std::to_string(uint32_t(lo >> 32)) : reg(right)) + ";";
+        } else if (op == 0x992) {
+            if ((lo >> 16) || (hi & ~uint64_t(0xa000))) fail("unsupported memory fence encoding");
+            instruction = std::string("fence.") + (hi & 0x8000 ? "acq_rel." : "sc.") + (hi & 0x2000 ? "gpu;" : "cta;");
+        } else if (op == 0x98f) {
+            if ((lo >> 16) != 0xff00 || hi != 0x2000000) fail("unsupported cache invalidation encoding");
+            // The acquire half of SM75 device-scope sequences. Keep a fence
+            // even when control flow separates the strong access from IVALL.
+            instruction = "fence.acq_rel.gpu;";
+        } else if (op == 0x9ab) {
+            if ((lo >> 16) || hi) fail("unsupported error barrier encoding");
+            // ERRBAR completes the GPU release sequence's error observation;
+            // common execution observes faults at dispatch completion. Retain
+            // its ordering conservatively in the shared memory representation.
+            instruction = "fence.acq_rel.gpu;";
+        } else if (op == 0x946) {
+            if ((lo >> 16) || hi != 0x3800000) fail("unsupported yield encoding");
+            // A scheduling hint in ptxas polling loops. Continuations already
+            // provide lane progress; the hint has no memory-ordering effect.
         } else if (op == 0x381 || op == 0x981 || op == 0x986 || op == 0x386) {
             bool uniform_address = op == 0x981 || op == 0x986, load = op == 0x381 || op == 0x981;
             auto mode = hi & 0xc000000;
-            auto modifiers = uint64_t(0xe00) | (uniform_address ? uint64_t(0xc000000) | (load ? 0 : 63) : 0);
-            if ((hi & ~modifiers) != (load ? 0x1ee100u : 0x10e100u) ||
+            auto strength = hi & 0xe000;
+            bool strong = strength == 0 || strength == 0x4000;
+            auto modifiers = uint64_t(0xe00) | (strong ? uint64_t(0xe000) : 0) |
+                (uniform_address ? uint64_t(0xc000000) | (load ? 0 : 63) : 0);
+            if ((hi & ~modifiers) != (strong ? (load ? 0x1f0100u : 0x110100u) : (load ? 0x1ee100u : 0x10e100u)) ||
                 (uniform_address && mode != 0x8000000 && mode != 0xc000000)) fail("unsupported global memory encoding");
             bool address_pair = !uniform_address || mode == 0xc000000;
             if (address_pair && left >= 254 && !(uniform_address && left == 255)) fail("unsupported extended address register");
@@ -758,7 +797,14 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             // in bits 40..63; LDG uses the full high word for displacement.
             auto displacement = load && !uniform_address ? int32_t(lo >> 32) : int32_t(lo >> 32) >> 8;
             auto address = "[%a" + std::string(displacement < 0 ? "-" : "+") + std::to_string(displacement < 0 ? -int64_t(displacement) : displacement) + "]";
-            instruction = memory_transfer(load, "global", unsigned(hi >> 9) & 7, load ? dest : right, address);
+            if (strong) {
+                if (((hi >> 9) & 7) != 4) fail("unsupported strong memory width/address");
+                // Strong CTA reads provide the acquire behavior for which
+                // ptxas emits no separate IVALL. GPU reads pair with IVALL.
+                auto scope = strength ? "gpu.global" : "cta.global";
+                instruction = std::string(load ? (strength ? "ld.relaxed." : "ld.acquire.") : "st.relaxed.") + scope + ".u32 " +
+                    (load ? (dest == 255 ? std::string("%scratch") : reg(dest)) + "," + address : address + "," + reg(right)) + ";";
+            } else instruction = memory_transfer(load, "global", unsigned(hi >> 9) & 7, load ? dest : right, address);
         } else if (op == 0x984 || op == 0x388) {
             bool load = op == 0x984;
             if ((hi & ~uint64_t(0xce00)) != (load ? 0x1000u : 0) ||
@@ -784,19 +830,29 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                 ",[%shared_address]," + reg(right) + "," + reg(unsigned(hi) & 255) + ";" :
                 dest == 255 ? "red.relaxed.cta.shared.add.u32 [%shared_address]," + reg(right) + ";" :
                 "atom.relaxed.cta.shared.add.u32 " + reg(dest) + ",[%shared_address]," + reg(right) + ";";
-        } else if (op == 0x3a8 || op == 0x3a9 || op == 0x98e) {
+        } else if (op == 0x3a8 || op == 0x9a8 || op == 0x3a9 || op == 0x98e) {
             bool cas = op == 0x3a9, reduction = op == 0x98e;
-            if ((cas ? (hi & ~uint64_t(255)) != 0x1f4100 : hi != (reduction ? 0x114100u : 0x1f41ffu)) ||
-                (reduction && dest != 0) || left >= 254 || left % 2)
+            bool cta = !(hi & 0x4000);
+            auto scoped = hi | 0x4000;
+            bool uniform_address = op == 0x9a8 || (reduction && (hi & 0xc000000));
+            bool valid = uniform_address ?
+                (scoped & ~uint64_t(63)) == (reduction ? 0xc114100u : 0x81f4140u) && left == 255 :
+                cas ? (scoped & ~uint64_t(255)) == 0x1f4100 : scoped == (reduction ? 0x114100u : 0x1f41ffu);
+            if (!valid || (reduction && dest != 0) || (!uniform_address && (left >= 254 || left % 2)))
                 fail("unsupported global atomic encoding");
-            join(reg(left), reg(left + 1), "%a");
+            if (uniform_address) {
+                auto base = unsigned(hi) & 63;
+                if (base >= 62 || base % 2) fail("invalid uniform atomic address pair");
+                join(uniform(base), uniform(base + 1), "%a");
+            } else join(reg(left), reg(left + 1), "%a");
             auto displacement = int32_t(lo >> 32) >> 8;
             auto address = "[%a" + std::string(displacement < 0 ? "-" : "+") +
                 std::to_string(displacement < 0 ? -int64_t(displacement) : displacement) + "]";
-            instruction = cas ? "atom.relaxed.gpu.global.cas.b32 " + (dest == 255 ? std::string("%scratch") : reg(dest)) +
+            auto atomic = std::string(cta ? "atom.acquire.cta.global." : "atom.relaxed.gpu.global.");
+            instruction = cas ? atomic + "cas.b32 " + (dest == 255 ? std::string("%scratch") : reg(dest)) +
                 "," + address + "," + reg(right) + "," + reg(unsigned(hi) & 255) + ";" :
-                reduction || dest == 255 ? "red.relaxed.gpu.global.add.u32 " + address + "," + reg(right) + ";" :
-                "atom.relaxed.gpu.global.add.u32 " + reg(dest) + "," + address + "," + reg(right) + ";";
+                reduction ? std::string(cta ? "red.relaxed.cta.global.add.u32 " : "red.relaxed.gpu.global.add.u32 ") + address + "," + reg(right) + ";" :
+                atomic + "add.u32 " + (dest == 255 ? std::string("%scratch") : reg(dest)) + "," + address + "," + reg(right) + ";";
         } else if (op == 0xb1d) {
             if (lo != 0x7b1d || hi != 0 || kernel.text->flags != 0x100006)
                 fail("unsupported full-block barrier encoding");
@@ -911,6 +967,19 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             instruction = "shr.u32 " + (op == 0x899 ? uniform(dest, true) : reg(dest)) + "," + value + "," + std::to_string(uint32_t(lo >> 32)) + ";";
         } else if (op == 0x819 && hi == 0x6ff && uint32_t(lo >> 32) < 32) {
             instruction = "shl.b32 " + reg(dest) + "," + reg(left) + "," + std::to_string(uint32_t(lo >> 32)) + ";";
+        } else if (op == 0x305 || op == 0x306 || op == 0x307) {
+            bool to_integer = op == 0x305, from_integer = op == 0x306;
+            auto signed_bit = to_integer ? uint64_t(0x100) : from_integer ? uint64_t(0x400) : 0;
+            if ((lo >> 40) || left || (hi & ~(uint64_t(0xc000) | signed_bit)) != (to_integer ? 0x203000u : 0x201000u))
+                fail("unsupported numeric conversion encoding");
+            const char* modes[]{"rn", "rm", "rp", "rz"};
+            auto mode = std::string(modes[(hi >> 14) & 3]);
+            auto integer = hi & signed_bit ? "s32" : "u32";
+            auto destination = dest == 255 ? std::string("%scratch") : reg(dest);
+            if (!from_integer) output += guard + "mov.b32 %f0," + reg(right) + ";\n";
+            output += guard + "cvt." + mode + (from_integer ? ".f32." + std::string(integer) + " %f0," + reg(right) :
+                "i." + std::string(to_integer ? integer : "f32") + ".f32 " + (to_integer ? destination : "%f0") + ",%f0") + ";\n";
+            if (!to_integer) instruction = "mov.b32 " + destination + ",%f0;";
         } else if (op == 0x221 || op == 0x421 || op == 0xa21 || op == 0x220 || op == 0x820 || op == 0xa20 || op == 0x223 || op == 0x823 || op == 0xa23) {
             bool add = op == 0x221 || op == 0x421 || op == 0xa21, multiply = op == 0x220 || op == 0x820 || op == 0xa20;
             bool bank = (op & 0xe00) == 0xa00;
@@ -954,11 +1023,11 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             instruction = "setp." + std::string(comparisons[comparison]) + (hi & 0x200 ? ".s32 " : ".u32 ") + pred(destination) + "," + reg(left) + "," + source + ";";
         } else if (op == 0x81c && !(lo >> 16)) {
             auto form = hi & ~uint64_t(0x38e0000);
-            if (form != 0x70e170 && form != 0x70f070) fail("unsupported predicate LUT");
+            if (form != 0x70e170 && (form & ~uint64_t(0xe000)) != 0x701070) fail("unsupported predicate LUT");
             auto destination = unsigned(hi >> 17) & 7, source = unsigned(hi >> 23) & 7;
             if (destination == 7) fail("unsupported predicate LUT destination");
             instruction = std::string(form == 0x70e170 ? "not.pred " : "and.pred ") + pred(destination) + "," + pred(source) +
-                (form == 0x70e170 ? ";" : ",%pt;");
+                (form == 0x70e170 ? ";" : "," + pred(unsigned(hi >> 13) & 7) + ";");
         } else if (op == 0x944) {
             if (!calls || hi != 0x3c00000 || uint32_t(lo) != 0x7944) fail("unsupported direct call encoding");
             int64_t target = int64_t(start + pc) + 16 + int32_t(lo >> 32);
@@ -995,7 +1064,8 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         else fail("unsupported SM75 instruction encoding " + std::to_string(lo) + "/" + std::to_string(hi));
         if (!instruction.empty()) output += guard + instruction + "\n";
         if (dest != 255 && op != 0x386 && op != 0x986 && op != 0x388 && op != 0x387 && op != 0x98e && op != 0xb1d && op != 0x947 && op != 0x944 && op != 0x950 && op != 0x94d && op != 0x918 && op != 0x20c && op != 0x80c && op != 0xa0c && op != 0xc0c && op != 0x20b && op != 0x81c &&
-            op != 0xab9 && op != 0x9c3 && op != 0x2a4 && op != 0x899 && op != 0x945 && op != 0x941 && op != 0x355)
+            op != 0xab9 && op != 0x9c3 && op != 0x2a4 && op != 0x899 && op != 0x945 && op != 0x941 && op != 0x355 &&
+            op != 0x992 && op != 0x98f && op != 0x9ab && op != 0x946)
             known[dest] = predicate == 7 ? constant : std::nullopt;
     }
     // ptxas pads the section with unreachable NOPs after its exit/stop loop.
@@ -1006,7 +1076,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
 }
 std::unique_ptr<llvm::Module> import_cubin(llvm::LLVMContext& context, std::string_view bytes, std::string_view architecture) {
     cubin_reader input(bytes); auto kernels = cubin_kernels(input);
-    std::string semantics = ".version 6.5\n.target sm_75\n.address_size 64\n" + cubin_storage_declarations(input);
+    std::string semantics = ".version 7.0\n.target sm_75\n.address_size 64\n" + cubin_storage_declarations(input);
     for (const auto& kernel : kernels) {
         semantics += lift_cubin_kernel(input, kernel);
         for (const auto& [offset, function] : kernel.functions) semantics += lift_cubin_kernel(input, kernel, &function);
