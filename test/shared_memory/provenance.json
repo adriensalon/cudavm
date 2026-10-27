@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA nvcc 12.4.131",
+  "architecture": "sm_75",
+  "command": "nvcc -arch=sm_75 -O3 -cubin --allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -ccbin <MSVC-14.44.35207-x64> shared.cu -o input.cubin",
+  "stored_as": {
+    "shared.cu": "shared_memory.cu",
+    "input.cubin": "shared_memory.cubin"
+  },
+  "sha256": {
+    "shared_memory.cu": "6075c69e7632055feaa9e5f12a30ad04f29db372722c4d155b1ce688e0c941e3",
+    "shared_memory.cubin": "a47782bc8b74ab0bde53ce9a2dc6c4af13797f16228afab79e789bc7a31edf71"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 fixture.ptx -o input.cubin",
+  "stored_as": {
+    "fixture.ptx": "kernel_launch.ptx",
+    "input.cubin": "kernel_launch.cubin"
+  },
+  "sha256": {
+    "kernel_launch.ptx": "667c4de8e28cbca9b06bf02d7c34b185899dfb113996b5c54dceddd73de90ed4",
+    "kernel_launch.cubin": "2942cf1b40f3149b764356c8a7803f2e08fec00dd19d5e981a889dbc0066c65a"
+  }
+}

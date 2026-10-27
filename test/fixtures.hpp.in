@@ -1,0 +1,10 @@
+#pragma once
+#include "conformance.hpp"
+namespace cudavm {
+inline constexpr char fixture_source[] = R"cudavm(@fixture_cu@)cudavm";
+inline constexpr char fixture_ptx[] = R"cudavm(@fixture_ptx@)cudavm";
+inline constexpr char fixture_nvvm[] = R"cudavm(@fixture_ll@)cudavm";
+inline constexpr unsigned char fixture_cubin[] = {@fixture_cubin@};
+inline constexpr fixture_data fixtures{
+    fixture_source, fixture_ptx, fixture_nvvm, fixture_cubin};
+}

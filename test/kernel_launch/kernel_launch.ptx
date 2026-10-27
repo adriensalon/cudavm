@@ -1,0 +1,176 @@
+.version 6.5
+.target sm_75
+.address_size 64
+
+// Assemble with CUDA 12.4 ptxas -O0. These entries exercise the bounded SM75
+// decoder without embedding PTX or cudavm descriptors in the resulting ELF.
+.visible .entry cubin_scalar(.param .u64 out, .param .u64 in, .param .u32 add) {
+ .reg .b64 %a, %b;
+ .reg .b32 %x, %y;
+ ld.param.u64 %a, [out]; ld.param.u64 %b, [in]; ld.param.u32 %y, [add];
+ ld.global.u32 %x, [%b+4]; add.u32 %x, %x, %y;
+ st.global.u32 [%a+4], %x; ret;
+}
+.visible .entry cubin_branch(.param .u64 out, .param .u64 in, .param .u32 threshold) {
+ .reg .b64 %a, %b;
+ .reg .b32 %x, %y;
+ .reg .pred %p;
+ ld.param.u64 %a, [out]; ld.param.u64 %b, [in]; ld.param.u32 %y, [threshold];
+ ld.global.u32 %x, [%b]; setp.lt.u32 %p, %x, %y;
+ @%p bra small;
+ add.u32 %x, %x, 5; bra done;
+small:
+ mul.lo.u32 %x, %x, 3;
+done:
+ st.global.u32 [%a], %x; ret;
+}
+
+// Flatten a three-dimensional grid and block. The bound splits a block so
+// inactive threads must preserve output guards. All twelve launch components
+// contribute to either the address or the result.
+.visible .entry cubin_indexed(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .reg .b64 %a, %b;
+ .reg .b32 %tx, %ty, %tz, %nx, %ny, %nz, %bx, %by, %bz, %gx, %gy, %gz;
+ .reg .b32 %t, %block, %volume, %index, %limit, %value;
+ .reg .pred %p;
+ ld.param.u64 %a, [out]; ld.param.u64 %b, [in]; ld.param.u32 %limit, [count];
+ mov.u32 %tx, %tid.x; mov.u32 %ty, %tid.y; mov.u32 %tz, %tid.z;
+ mov.u32 %nx, %ntid.x; mov.u32 %ny, %ntid.y; mov.u32 %nz, %ntid.z;
+ mov.u32 %bx, %ctaid.x; mov.u32 %by, %ctaid.y; mov.u32 %bz, %ctaid.z;
+ mov.u32 %gx, %nctaid.x; mov.u32 %gy, %nctaid.y; mov.u32 %gz, %nctaid.z;
+ mad.lo.u32 %t, %tz, %ny, %ty; mad.lo.u32 %t, %t, %nx, %tx;
+ mad.lo.u32 %block, %bz, %gy, %by; mad.lo.u32 %block, %block, %gx, %bx;
+ mul.lo.u32 %volume, %nx, %ny; mul.lo.u32 %volume, %volume, %nz;
+ mad.lo.u32 %index, %block, %volume, %t;
+ setp.lt.u32 %p, %index, %limit; @!%p ret;
+ mad.wide.u32 %a, %index, 4, %a; mad.wide.u32 %b, %index, 4, %b;
+ ld.global.u32 %value, [%b];
+ mul.lo.u32 %volume, %gx, %gy; mul.lo.u32 %volume, %volume, %gz;
+ add.u32 %value, %value, %index; add.u32 %value, %value, %volume;
+ st.global.u32 [%a], %value; ret;
+}
+
+// Exercise both halves of the address calculation without requiring a huge
+// allocation, including multiplication overflow and carry into the high word.
+.visible .entry cubin_wide(.param .u64 out, .param .u32 left, .param .u32 right, .param .u64 add) {
+ .reg .b64 %a, %value, %add;
+ .reg .b32 %x, %y, %low, %high;
+ ld.param.u64 %a, [out]; ld.param.u32 %x, [left]; ld.param.u32 %y, [right]; ld.param.u64 %add, [add];
+ mad.wide.u32 %value, %x, %y, %add; mov.b64 {%low, %high}, %value;
+ st.global.u32 [%a], %low; st.global.u32 [%a+4], %high; ret;
+}
+
+
+// Machine-code FP32 witnesses retain separate add/multiply and fused results.
+// Source literals are raw binary32 words so NaNs and signed zeros reach the GPU.
+.visible .entry cubin_vector_add(.param .u64 out, .param .u64 x, .param .u64 y, .param .u32 count) {
+ .reg .b64 %a,%xptr,%yptr;
+ .reg .b32 %i,%b,%n,%limit;
+ .reg .f32 %x,%y,%z;
+ .reg .pred %valid;
+ 
+ // Index a 1D launch; each data pointer is advanced independently.
+ mov.u32 %i,%tid.x; mov.u32 %b,%ctaid.x; mov.u32 %n,%ntid.x;
+ mad.lo.u32 %i,%b,%n,%i;
+ ld.param.u32 %limit,[count]; setp.lt.u32 %valid,%i,%limit; @!%valid ret;
+
+ ld.param.u64 %a,[out]; ld.param.u64 %xptr,[x]; ld.param.u64 %yptr,[y];
+ mad.wide.u32 %a,%i,4,%a; mad.wide.u32 %xptr,%i,4,%xptr; mad.wide.u32 %yptr,%i,4,%yptr;
+ ld.global.f32 %x,[%xptr]; ld.global.f32 %y,[%yptr];
+ add.rn.f32 %z,%x,%y; st.global.f32 [%a],%z; ret;
+}
+.visible .entry cubin_saxpy(.param .u64 out, .param .u64 x, .param .u64 y, .param .u32 count, .param .f32 alpha) {
+ .reg .b64 %a,%xptr,%yptr;
+ .reg .b32 %i,%b,%n,%limit;
+ .reg .f32 %x,%y,%z,%alpha;
+ .reg .pred %valid;
+ 
+ // Index a 1D launch; each data pointer is advanced independently.
+ mov.u32 %i,%tid.x; mov.u32 %b,%ctaid.x; mov.u32 %n,%ntid.x;
+ mad.lo.u32 %i,%b,%n,%i;
+ ld.param.u32 %limit,[count]; setp.lt.u32 %valid,%i,%limit; @!%valid ret;
+
+ ld.param.u64 %a,[out]; ld.param.u64 %xptr,[x]; ld.param.u64 %yptr,[y]; ld.param.f32 %alpha,[alpha];
+ mad.wide.u32 %a,%i,4,%a; mad.wide.u32 %xptr,%i,4,%xptr; mad.wide.u32 %yptr,%i,4,%yptr;
+ ld.global.f32 %x,[%xptr]; ld.global.f32 %y,[%yptr];
+ fma.rn.f32 %z,%alpha,%x,%y; st.global.f32 [%a],%z; ret;
+}
+.visible .entry cubin_conditional(.param .u64 out, .param .u64 x, .param .u64 y, .param .u32 count) {
+ .reg .b64 %a,%xptr,%yptr;
+ .reg .b32 %i,%b,%n,%limit;
+ .reg .f32 %x,%y,%z;
+ .reg .pred %valid,%p;
+ 
+ // Index a 1D launch; each data pointer is advanced independently.
+ mov.u32 %i,%tid.x; mov.u32 %b,%ctaid.x; mov.u32 %n,%ntid.x;
+ mad.lo.u32 %i,%b,%n,%i;
+ ld.param.u32 %limit,[count]; setp.lt.u32 %valid,%i,%limit; @!%valid ret;
+
+ ld.param.u64 %a,[out]; ld.param.u64 %xptr,[x]; ld.param.u64 %yptr,[y];
+ mad.wide.u32 %a,%i,4,%a; mad.wide.u32 %xptr,%i,4,%xptr; mad.wide.u32 %yptr,%i,4,%yptr;
+ ld.global.f32 %x,[%xptr]; ld.global.f32 %y,[%yptr];
+ setp.lt.f32 %p,%x,%y; @!%p ret;
+ mul.rn.f32 %z,%x,%y;
+ st.global.f32 [%a],%z; ret;
+}
+.visible .entry cubin_float_ops(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .reg .b64 %a,%input;
+ .reg .b32 %i,%b,%n,%limit,%mask;
+ .reg .f32 %x,%y,%c,%z,%t;
+ .reg .pred %valid,%p<7>;
+ 
+ // Index a 1D launch; each data pointer is advanced independently.
+ mov.u32 %i,%tid.x; mov.u32 %b,%ctaid.x; mov.u32 %n,%ntid.x;
+ mad.lo.u32 %i,%b,%n,%i;
+ ld.param.u32 %limit,[count]; setp.lt.u32 %valid,%i,%limit; @!%valid ret;
+
+ ld.param.u64 %a,[out]; ld.param.u64 %input,[in];
+ mad.wide.u32 %a,%i,144,%a; mad.wide.u32 %input,%i,12,%input;
+ ld.global.f32 %x,[%input]; ld.global.f32 %y,[%input+4]; ld.global.f32 %c,[%input+8];
+ add.rn.f32 %z,%x,%y; st.global.f32 [%a+0],%z;
+ mul.rn.f32 %z,%x,%y; st.global.f32 [%a+4],%z;
+ fma.rn.f32 %z,%x,%y,%c; st.global.f32 [%a+8],%z;
+ mul.rn.f32 %t,%x,%y; add.rn.f32 %z,%t,%c; st.global.f32 [%a+12],%z;
+ add.rn.ftz.f32 %z,%x,%y; st.global.f32 [%a+16],%z;
+ mul.rn.ftz.f32 %z,%x,%y; st.global.f32 [%a+20],%z;
+ fma.rn.ftz.f32 %z,%x,%y,%c; st.global.f32 [%a+24],%z;
+ add.rn.f32 %z,%x,0f3fc00000; st.global.f32 [%a+28],%z;
+ mul.rn.f32 %z,%x,0f3fc00000; st.global.f32 [%a+32],%z;
+ fma.rn.f32 %z,%x,0f3fc00000,%c; st.global.f32 [%a+36],%z;
+ neg.f32 %z,%x; st.global.f32 [%a+40],%z;
+ abs.f32 %z,%x; st.global.f32 [%a+44],%z;
+ setp.eq.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+48],%mask;
+ setp.ne.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+52],%mask;
+ setp.lt.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+56],%mask;
+ setp.le.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+60],%mask;
+ setp.gt.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+64],%mask;
+ setp.ge.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+68],%mask;
+ setp.equ.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+72],%mask;
+ setp.neu.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+76],%mask;
+ setp.ltu.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+80],%mask;
+ setp.leu.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+84],%mask;
+ setp.gtu.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+88],%mask;
+ setp.geu.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+92],%mask;
+ setp.num.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+96],%mask;
+ setp.nan.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+100],%mask;
+
+ // Keep all seven predicates live before consuming any conditional value.
+ setp.lt.f32 %p0,%x,%y; setp.ge.f32 %p1,%x,%y;
+ setp.eq.f32 %p2,%x,%c; setp.neu.f32 %p3,%y,%c;
+ setp.nan.f32 %p4,%x,%y; setp.num.f32 %p5,%x,%c;
+ setp.lt.ftz.f32 %p6,%x,%y;
+ mov.f32 %z,%c; @%p0 add.rn.f32 %z,%x,%y; st.global.f32 [%a+104],%z;
+ mov.f32 %z,%c; @!%p1 mul.rn.f32 %z,%x,%y; st.global.f32 [%a+108],%z;
+ mov.f32 %z,%c; @%p2 fma.rn.f32 %z,%x,%y,%c; st.global.f32 [%a+112],%z;
+ mov.f32 %z,%c; @!%p3 add.rn.f32 %z,%x,0f3fc00000; st.global.f32 [%a+116],%z;
+ mov.f32 %z,%c; @%p4 mul.rn.f32 %z,%x,0f3fc00000; st.global.f32 [%a+120],%z;
+ mov.f32 %z,%c; @!%p5 fma.rn.f32 %z,%x,0f3fc00000,%c; st.global.f32 [%a+124],%z;
+ mov.f32 %z,%c; @%p6 add.rn.ftz.f32 %z,%x,%y; st.global.f32 [%a+128],%z;
+
+ setp.lt.ftz.f32 %p0,%x,%y; selp.u32 %mask,1,0,%p0; st.global.u32 [%a+132],%mask;
+ setp.eq.ftz.f32 %p1,%x,%y; selp.u32 %mask,1,0,%p1; st.global.u32 [%a+136],%mask;
+ // Selection copies raw bits, including signaling NaN payloads and signed zero.
+ selp.b32 %mask,%x,%y,%p0; st.global.b32 [%a+140],%mask;
+ ret;
+}
+

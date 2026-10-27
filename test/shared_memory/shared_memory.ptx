@@ -1,0 +1,78 @@
+.version 6.5
+.target sm_75
+.address_size 64
+
+.visible .entry shared_exchange(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .shared .align 16 .b8 values[516];
+ .reg .b64 %out, %in, %shared, %own, %other;
+ .reg .b32 %lane, %lanes, %block, %index, %count, %value, %step, %steps, %peer;
+ .reg .pred %valid, %again;
+ ld.param.u64 %out,[out]; ld.param.u64 %in,[in]; ld.param.u32 %count,[count];
+ mov.u32 %lane,%tid.x; mov.u32 %lanes,%ntid.x; mov.u32 %block,%ctaid.x;
+ mad.lo.u32 %index,%block,%lanes,%lane;
+ setp.lt.u32 %valid,%index,%count;
+ mov.u32 %value,0; @!%valid bra initialized;
+ mad.wide.u32 %in,%index,4,%in; ld.global.u32 %value,[%in];
+initialized:
+ mov.u64 %shared,values; add.u32 %peer,%lane,1;
+ mad.wide.u32 %own,%peer,4,%shared;
+ shr.u32 %steps,%lane,4; mov.u32 %step,0;
+loop:
+ setp.lt.u32 %again,%step,%steps; @!%again bra ready;
+ mad.lo.u32 %value,%value,3,%step; st.shared.u32 [%own],%value;
+ add.u32 %step,%step,1; bra loop;
+ready:
+ st.shared.u32 [%own],%value; bar.sync 0;
+ sub.u32 %peer,%lanes,%lane;
+ mad.wide.u32 %other,%peer,4,%shared;
+ ld.shared.u32 %value,[%other]; bar.sync 0;
+ mad.lo.u32 %value,%value,3,%lane;
+ st.shared.u32 [%own],%value; bar.sync 0;
+ ld.shared.u32 %value,[%other]; @!%valid ret;
+ mad.wide.u32 %out,%index,4,%out; st.global.u32 [%out],%value; ret;
+}
+.visible .entry shared_transpose(.param .u64 out, .param .u64 in, .param .u32 tiles) {
+ .shared .align 4 .b8 tile[320];
+ .reg .b64 %out, %in, %shared, %address;
+ .reg .b32 %x, %y, %block, %base, %index, %offset, %value, %tiles;
+ .reg .pred %valid;
+ ld.param.u64 %out,[out]; ld.param.u64 %in,[in]; ld.param.u32 %tiles,[tiles];
+ mov.u32 %x,%tid.x; mov.u32 %y,%tid.y; mov.u32 %block,%ctaid.x;
+ mul.lo.u32 %base,%block,64;
+ mad.lo.u32 %index,%y,8,%x; add.u32 %index,%index,%base;
+ mad.wide.u32 %in,%index,4,%in; ld.global.u32 %value,[%in];
+ mov.u64 %shared,tile; mad.lo.u32 %offset,%y,10,%x; add.u32 %offset,%offset,1;
+ mad.wide.u32 %address,%offset,4,%shared; st.shared.u32 [%address],%value;
+ bar.sync 0;
+ setp.lt.u32 %valid,%block,%tiles; @!%valid ret;
+ mad.lo.u32 %offset,%x,10,%y; add.u32 %offset,%offset,1;
+ mad.wide.u32 %address,%offset,4,%shared; ld.shared.u32 %value,[%address];
+ mad.wide.u32 %out,%index,4,%out; st.global.u32 [%out],%value; ret;
+}
+.visible .entry shared_reduce(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .shared .align 4 .b8 values[512];
+ .reg .b64 %out, %in, %shared, %own, %other;
+ .reg .b32 %lane, %lanes, %block, %index, %count, %value, %peer, %step, %rhs;
+ .reg .pred %valid, %active, %more;
+ ld.param.u64 %out,[out]; ld.param.u64 %in,[in]; ld.param.u32 %count,[count];
+ mov.u32 %lane,%tid.x; mov.u32 %lanes,%ntid.x; mov.u32 %block,%ctaid.x;
+ mad.lo.u32 %index,%block,%lanes,%lane; setp.lt.u32 %valid,%index,%count;
+ mov.u32 %value,0; @!%valid bra initialized;
+ mad.wide.u32 %in,%index,4,%in; ld.global.u32 %value,[%in];
+initialized:
+ mov.u64 %shared,values; mad.wide.u32 %own,%lane,4,%shared;
+ st.shared.u32 [%own],%value; bar.sync 0;
+ shr.u32 %step,%lanes,1;
+loop:
+ setp.ne.u32 %more,%step,0; @!%more bra done;
+ setp.lt.u32 %active,%lane,%step; @!%active bra rendezvous;
+ add.u32 %peer,%lane,%step; mad.wide.u32 %other,%peer,4,%shared;
+ ld.shared.u32 %value,[%own]; ld.shared.u32 %rhs,[%other];
+ add.u32 %value,%value,%rhs; st.shared.u32 [%own],%value;
+rendezvous:
+ bar.sync 0; shr.u32 %step,%step,1; bra loop;
+done:
+ setp.eq.u32 %active,%lane,0; @!%active ret;
+ ld.shared.u32 %value,[%own]; mad.wide.u32 %out,%block,4,%out;
+ st.global.u32 [%out],%value; ret;
+}

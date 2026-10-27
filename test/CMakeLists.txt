@@ -1,0 +1,74 @@
+cmake_minimum_required(VERSION 3.24)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(cudavm_conformance LANGUAGES CXX)
+    find_package(cudavm CONFIG REQUIRED COMPONENTS cuda nvrtc nvvm nvjitlink shared)
+    include(CTest)
+endif()
+if(NOT BUILD_TESTING)
+    return()
+endif()
+if(DEFINED CUDAVM_BUILD_COMPILER AND NOT CUDAVM_BUILD_COMPILER)
+    message(STATUS "Public conformance requires the cudavm compiler components")
+    return()
+endif()
+if(DEFINED CUDAVM_BUILD_SHARED AND NOT CUDAVM_BUILD_SHARED)
+    message(STATUS "Public conformance requires the shared cudavm SDK libraries")
+    return()
+endif()
+foreach(component cuda nvrtc nvvm nvjitlink)
+    if(NOT TARGET cudavm::${component}_shared)
+        message(FATAL_ERROR "Public conformance requires cudavm::${component}_shared")
+    endif()
+endforeach()
+get_target_property(conformance_backends cudavm::cuda_shared CUDAVM_COMPILED_BACKENDS)
+
+# Fixtures are data, never CUDA-language build inputs. CMake alone embeds them.
+function(cudavm_add_conformance_slice name)
+    set(fixture_root "${CMAKE_CURRENT_SOURCE_DIR}/${name}")
+    set(generated_root "${CMAKE_CURRENT_BINARY_DIR}/${name}")
+    foreach(kind cu ptx ll)
+        file(READ "${fixture_root}/${name}.${kind}" fixture_${kind})
+    endforeach()
+    file(READ "${fixture_root}/${name}.cubin" fixture_cubin HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," fixture_cubin "${fixture_cubin}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${fixture_root}/${name}.cu" "${fixture_root}/${name}.ptx"
+        "${fixture_root}/${name}.ll" "${fixture_root}/${name}.cubin")
+    file(MAKE_DIRECTORY "${generated_root}")
+    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/fixtures.hpp.in"
+        "${generated_root}/fixtures.hpp" @ONLY)
+    set(target "cudavm-conformance-${name}")
+    add_executable(${target} "${fixture_root}/${name}.cpp" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/conformance.cpp")
+    target_compile_features(${target} PRIVATE cxx_std_20)
+    target_include_directories(${target} PRIVATE "${generated_root}"
+        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}")
+    target_link_libraries(${target} PRIVATE cudavm::cuda_shared cudavm::nvrtc_shared
+        cudavm::nvvm_shared cudavm::nvjitlink_shared)
+    # Place consumers beside the SDK DLLs in a source build. Installed consumers
+    # get their DLLs through the public SDK deployment helper instead.
+    set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    cudavm_configure_runtime_target(${target} RUNTIME cudavm::cuda_shared)
+    if(WIN32 AND MSVC)
+        set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY MultiThreaded)
+    endif()
+    cudavm_deploy_runtime(${target} RUNTIME cudavm::cuda_shared)
+    foreach(component nvrtc nvvm nvjitlink)
+        cudavm_deploy_runtime(${target} RUNTIME cudavm::${component}_shared)
+    endforeach()
+    add_dependencies(cudavm-conformance ${target})
+    foreach(backend IN LISTS conformance_backends)
+        foreach(importer cu ptx cubin nvvm)
+            set(case "conformance.${name}.${backend}.${importer}")
+            add_test(NAME "${case}" COMMAND ${target} "${backend}" "${importer}")
+            set_tests_properties("${case}" PROPERTIES
+                LABELS "conformance;${name};${backend};${importer}"
+                ENVIRONMENT "CUDAVM_BACKENDS=${backend}"
+                WORKING_DIRECTORY "${generated_root}"
+                SKIP_RETURN_CODE 77 TIMEOUT 300 RUN_SERIAL TRUE)
+        endforeach()
+    endforeach()
+endfunction()
+
+add_custom_target(cudavm-conformance)
+cudavm_add_conformance_slice(kernel_launch)
+cudavm_add_conformance_slice(shared_memory)
