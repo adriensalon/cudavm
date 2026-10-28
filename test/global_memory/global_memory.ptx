@@ -1,0 +1,31 @@
+// Independently authored PTX with naturally aligned mixed-width accesses.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry mixed_width_access(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .reg .b64 %a,%b,%wide;
+ .reg .b32 %i,%block,%threads,%count,%value;
+ .reg .pred %p;
+ mov.u32 %i,%tid.x; mov.u32 %block,%ctaid.x; mov.u32 %threads,%ntid.x;
+ mad.lo.u32 %i,%block,%threads,%i;
+ ld.param.u32 %count,[count]; setp.ge.u32 %p,%i,%count; @%p ret;
+ ld.param.u64 %a,[out]; ld.param.u64 %b,[in];
+ mad.wide.u32 %a,%i,16,%a; mad.wide.u32 %b,%i,16,%b;
+ ld.global.u8 %value,[%b]; xor.b32 %value,%value,0xa5; st.global.u8 [%a+1],%value;
+ ld.global.u16 %value,[%b+2]; xor.b32 %value,%value,0x5aa5; st.global.u16 [%a+2],%value;
+ ld.global.u32 %value,[%b+4]; add.u32 %value,%value,0x1020305; st.global.u32 [%a+4],%value;
+ ld.global.u64 %wide,[%b+8]; xor.b64 %wide,%wide,0x0123456789abcdef; st.global.u64 [%a+8],%wide;
+ ret;
+}
+.visible .entry neighbor_byte_access(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .reg .b64 %a,%b;
+ .reg .b32 %i,%block,%threads,%count,%value;
+ .reg .pred %p;
+ mov.u32 %i,%tid.x; mov.u32 %block,%ctaid.x; mov.u32 %threads,%ntid.x;
+ mad.lo.u32 %i,%block,%threads,%i;
+ ld.param.u32 %count,[count]; setp.ge.u32 %p,%i,%count; @%p ret;
+ ld.param.u64 %a,[out]; ld.param.u64 %b,[in];
+ mad.wide.u32 %a,%i,1,%a; mad.wide.u32 %b,%i,1,%b;
+ ld.global.u8 %value,[%b]; xor.b32 %value,%value,0x5a; st.global.u8 [%a],%value;
+ ret;
+}

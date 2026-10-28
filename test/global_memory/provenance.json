@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/global_memory/global_memory.ptx -o test/global_memory/global_memory.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "global_memory.cu": "7b7ddfb1c001107acb5ff6579c6cf3b8f1188da03a36edce994971f31b46934e",
+    "global_memory.ptx": "7551a46e78ec3c691fc049bdd80b1b2311ca87742e7a8e667f4d2113f67a5e99",
+    "global_memory.ll": "8db4fbe50c9d64eddc7395a2b8f39c12c59a95de352c264c537ecc79aa2b7cf8",
+    "global_memory.cubin": "7a5d53e3b47d08f09296da21d113b131126715d2654938e9727bb064236f5930"
+  }
+}

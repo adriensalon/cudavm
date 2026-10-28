@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/integer_permutation/integer_permutation.ptx -o test/integer_permutation/integer_permutation.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "integer_permutation.cu": "8ce4d757ff5dd6dad4357d5c9f6cfb6d9ecb65c7847f83d7cb60273a3a4ea3c9",
+    "integer_permutation.ptx": "94f14b54e45c04111c1dca2ec28748cf9e417d1cdaa35aebca88f11ae75b443e",
+    "integer_permutation.ll": "03593d31b630fd4204897d00c6c2098b002ef9fa73396ec01ab505ca99286c3a",
+    "integer_permutation.cubin": "4eb4277c7abc1a4e9be4483c3ae3fffd223d8e75d18272833fb31b06d7e18e87"
+  }
+}

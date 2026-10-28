@@ -1,0 +1,25 @@
+// Independently authored PTX; both pointer-table levels live in device memory.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry follow_pointers(.param .u64 out, .param .u64 roots, .param .u64 selection, .param .u32 count) {
+ .reg .b64 %a,%root,%table,%data,%selector_ptr,%element_ptr;
+ .reg .b32 %i,%block,%threads,%count,%root_index,%selector,%entry,%element,%value,%lo,%hi;
+ .reg .pred %p;
+ mov.u32 %i,%tid.x; mov.u32 %block,%ctaid.x; mov.u32 %threads,%ntid.x;
+ mad.lo.u32 %i,%block,%threads,%i;
+ ld.param.u32 %count,[count]; setp.ge.u32 %p,%i,%count; @%p ret;
+ ld.param.u64 %root,[roots]; shr.u32 %root_index,%i,2; and.b32 %root_index,%root_index,1;
+ mad.wide.u32 %root,%root_index,8,%root; ld.global.u64 %table,[%root];
+ ld.param.u64 %selector_ptr,[selection]; mad.wide.u32 %selector_ptr,%i,4,%selector_ptr;
+ ld.global.u32 %selector,[%selector_ptr]; and.b32 %entry,%selector,3;
+ mad.wide.u32 %table,%entry,8,%table; ld.global.u64 %data,[%table];
+ setp.eq.u64 %p,%data,0; @%p ret;
+ shr.u32 %element,%selector,2; and.b32 %element,%element,7;
+ mad.wide.u32 %element_ptr,%element,4,%data; ld.global.u32 %value,[%element_ptr];
+ mad.lo.u32 %value,%i,0x101,%value;
+ mov.b64 {%lo,%hi},%data;
+ ld.param.u64 %a,[out]; mad.wide.u32 %a,%i,12,%a;
+ st.global.u32 [%a],%value; st.global.u32 [%a+4],%lo; st.global.u32 [%a+8],%hi;
+ ret;
+}

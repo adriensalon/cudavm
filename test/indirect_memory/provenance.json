@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/indirect_memory/indirect_memory.ptx -o test/indirect_memory/indirect_memory.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "indirect_memory.cu": "056972c24de61d1f13646ceec6c56ef226bc9998eb47608b35cb21fda795f204",
+    "indirect_memory.ptx": "7797cd9949def883b1d74b62ae90098058e249b5bafe7d1a211c061ffe79c15b",
+    "indirect_memory.ll": "9c1dfe09604bf4633160e93f820bb10261f2b0741e13532a46adcdcd53669b47",
+    "indirect_memory.cubin": "12269c033244744125c29fde9f3e95feb1268df12176dca29a9270db53cd04f1"
+  }
+}
