@@ -1,11 +1,1 @@
 *.md
-!/warp_match/warp_match.md
-!/warp_synchronization/warp_synchronization.md
-!/device_calls/device_calls.md
-!/device_allocation/device_allocation.md
-!/memory_fill/memory_fill.md
-!/memory_copy/memory_copy.md
-!/pitched_allocation/pitched_allocation.md
-!/memory_copy_2d/memory_copy_2d.md
-!/memory_copy_3d/memory_copy_3d.md
-!/array_storage/array_storage.md

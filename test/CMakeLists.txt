@@ -110,6 +110,7 @@ cudavm_add_conformance_slice(pitched_allocation API_ONLY FAMILY_CHECKS M01.alloc
 cudavm_add_conformance_slice(memory_copy_2d API_ONLY FAMILY_CHECKS M01.copy M01.padding)
 cudavm_add_conformance_slice(memory_copy_3d API_ONLY FAMILY_CHECKS M01.copy M01.padding)
 cudavm_add_conformance_slice(array_storage API_ONLY COMPONENTS cudart CASES numeric formats planes deferred flags limits validation lifetime FAMILY_CHECKS M01.arrays M01.allocation M01.validation)
+cudavm_add_conformance_slice(mipmapped_arrays API_ONLY COMPONENTS cudart CASES levels transfers validation lifetime FAMILY_CHECKS M01.arrays D04.views)
 cudavm_add_conformance_slice(kernel_launch FAMILY_CHECKS D01.geometry C01.parameters)
 cudavm_add_conformance_slice(shared_memory FAMILY_CHECKS D01.storage D03.barriers)
 cudavm_add_conformance_slice(dynamic_shared_memory FAMILY_CHECKS D01.storage C01.parameters)
