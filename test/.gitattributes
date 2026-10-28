@@ -37,3 +37,12 @@ double_comparison/double_comparison.ll -text
 integer_packed_arithmetic/integer_packed_arithmetic.cu -text
 integer_packed_arithmetic/integer_packed_arithmetic.ptx -text
 integer_packed_arithmetic/integer_packed_arithmetic.ll -text
+warp_match/warp_match.cu -text
+warp_match/warp_match.ptx -text
+warp_match/warp_match.ll -text
+warp_synchronization/warp_synchronization.cu -text
+warp_synchronization/warp_synchronization.ptx -text
+warp_synchronization/warp_synchronization.ll -text
+device_calls/device_calls.cu -text
+device_calls/device_calls.ptx -text
+device_calls/device_calls.ll -text

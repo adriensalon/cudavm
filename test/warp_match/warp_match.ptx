@@ -1,0 +1,75 @@
+// Independently authored PTX 6.5; assembled to a genuine SM75 cubin.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry masked_match(.param .u64 out, .param .u64 in, .param .u32 mask) {
+ .reg .b64 %out, %in, %value;
+ .reg .b32 %i, %thread, %threads, %block, %lane, %mask, %bit, %member, %low, %r, %pword, %phase, %keep;
+ .reg .pred %p, %all;
+ mov.u32 %thread, %tid.x; mov.u32 %threads, %ntid.x; mov.u32 %block, %ctaid.x;
+ mad.lo.u32 %i, %block, %threads, %thread; and.b32 %lane, %thread, 31;
+ ld.param.u32 %mask, [mask]; shl.b32 %bit, 1, %lane;
+ and.b32 %member, %mask, %bit; setp.eq.u32 %p, %member, 0; @%p ret;
+ ld.param.u64 %out, [out]; ld.param.u64 %in, [in];
+ mad.wide.u32 %in, %i, 8, %in; ld.global.u64 %value, [%in]; cvt.u32.u64 %low, %value;
+ mad.wide.u32 %out, %i, 72, %out;
+ match.any.sync.b32 %r, %low, %mask;
+ st.global.u32 [%out+0], %r;
+ match.all.sync.b32 %r|%all, %low, %mask;
+ selp.u32 %pword, 1, 0, %all;
+ st.global.u32 [%out+4], %r; st.global.u32 [%out+8], %pword;
+ match.any.sync.b32 %r, %low, %mask;
+ st.global.u32 [%out+12], %r;
+ match.all.sync.b32 %r|%all, %low, %mask;
+ selp.u32 %pword, 1, 0, %all;
+ st.global.u32 [%out+16], %r; st.global.u32 [%out+20], %pword;
+ match.any.sync.b64 %r, %value, %mask;
+ st.global.u32 [%out+24], %r;
+ match.all.sync.b64 %r|%all, %value, %mask;
+ selp.u32 %pword, 1, 0, %all;
+ st.global.u32 [%out+28], %r; st.global.u32 [%out+32], %pword;
+ match.any.sync.b64 %r, %value, %mask;
+ st.global.u32 [%out+36], %r;
+ match.all.sync.b64 %r|%all, %value, %mask;
+ selp.u32 %pword, 1, 0, %all;
+ st.global.u32 [%out+40], %r; st.global.u32 [%out+44], %pword;
+ match.any.sync.b32 %r, %low, %mask;
+ st.global.u32 [%out+48], %r;
+ match.all.sync.b32 %r|%all, %low, %mask;
+ selp.u32 %pword, 1, 0, %all;
+ st.global.u32 [%out+52], %r; st.global.u32 [%out+56], %pword;
+ match.any.sync.b64 %r, %value, %mask;
+ st.global.u32 [%out+60], %r;
+ match.all.sync.b64 %r|%all, %value, %mask;
+ selp.u32 %pword, 1, 0, %all;
+ st.global.u32 [%out+64], %r; st.global.u32 [%out+68], %pword;
+ ret;
+}
+.visible .entry retiring_match(.param .u64 out, .param .u64 in, .param .u32 mask, .param .u32 keep) {
+ .reg .b64 %out, %in, %value;
+ .reg .b32 %i, %thread, %threads, %block, %lane, %mask, %bit, %member, %low, %r, %pword, %phase, %keep;
+ .reg .pred %p, %all;
+ mov.u32 %thread, %tid.x; mov.u32 %threads, %ntid.x; mov.u32 %block, %ctaid.x;
+ mad.lo.u32 %i, %block, %threads, %thread; and.b32 %lane, %thread, 31;
+ ld.param.u32 %mask, [mask]; shl.b32 %bit, 1, %lane;
+ and.b32 %member, %mask, %bit; setp.eq.u32 %p, %member, 0; @%p ret;
+ ld.param.u32 %keep, [keep]; setp.ge.u32 %p, %lane, %keep; @%p ret;
+ ld.param.u64 %out, [out]; ld.param.u64 %in, [in];
+ mad.wide.u32 %in, %i, 8, %in; ld.global.u64 %value, [%in]; cvt.u32.u64 %low, %value;
+ mad.wide.u32 %out, %i, 96, %out;
+ mov.u32 %phase, 0;
+again:
+ setp.lt.u32 %p, %lane, %phase; @%p ret;
+ match.any.sync.b32 %r, %low, %mask;
+ st.global.u32 [%out+0], %r;
+ match.all.sync.b32 %r|%all, %low, %mask;
+ selp.u32 %pword, 1, 0, %all;
+ st.global.u32 [%out+4], %r; st.global.u32 [%out+8], %pword;
+ match.any.sync.b64 %r, %value, %mask;
+ st.global.u32 [%out+12], %r;
+ match.all.sync.b64 %r|%all, %value, %mask;
+ selp.u32 %pword, 1, 0, %all;
+ st.global.u32 [%out+16], %r; st.global.u32 [%out+20], %pword;
+ add.u64 %out, %out, 24; add.u32 %phase, %phase, 1; setp.lt.u32 %p, %phase, 4; @%p bra again;
+ ret;
+}

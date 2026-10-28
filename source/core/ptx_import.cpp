@@ -1467,6 +1467,8 @@ class ptx_parser {
             auto text = instruction.opcode.text; size_t at = text.find(".v2."); unsigned lanes = 2;
             if (at == text.npos) { at = text.find(".v4."); lanes = 4; }
             if (at == text.npos || (!text.starts_with("ld.") && !text.starts_with("st."))) { instructions.push_back(instruction); continue; }
+            if (text.starts_with("ld.volatile.") || text.starts_with("st.volatile."))
+                ptx_fail(instruction.opcode, "unsupported volatile vector memory instruction", true);
             bool load = text.starts_with("ld.");
             if (instruction.operands.size() != 2) ptx_fail(instruction.opcode, "wrong operand count");
             auto type = ptx_scalar({text.substr(text.rfind('.') + 1), instruction.opcode.line, instruction.opcode.column}, true);
@@ -1997,6 +1999,11 @@ class ptx_parser {
                     bool local = parts.size() == 3 && parts[1] == "local";
                     bool constant = parts.size() == 3 && parts[1] == "const";
                     bool generic = parts.size() == 2;
+                    const bool volatile_shared = parts.size() == 4 && parts[1] == "volatile" && parts[2] == "shared";
+                    if (volatile_shared) {
+                        if (type.bits != 32) ptx_fail(opcode, "unsupported volatile shared memory width", true);
+                        shared = true;
+                    }
                     llvm::AtomicOrdering order = llvm::AtomicOrdering::NotAtomic;
                     llvm::SyncScope::ID sync = llvm::SyncScope::System;
                     if (parts.size() >= 4 && (parts[1] == "relaxed" || parts[1] == "acquire" || parts[1] == "release")) {
@@ -2042,6 +2049,7 @@ class ptx_parser {
                     }
                     if (load) {
                         auto* memory = builder.CreateAlignedLoad(type.storage(context), pointer, llvm::Align(type.bits / 8));
+                        memory->setVolatile(volatile_shared);
                         if (order != llvm::AtomicOrdering::NotAtomic) memory->setAtomic(order, sync);
                         value = memory;
                     }
@@ -2049,6 +2057,7 @@ class ptx_parser {
                         auto* data = scalar(instruction.operands[1], type, true);
                         if (type.kind == 'f') data = builder.CreateBitCast(data, type.storage(context));
                         auto* memory = builder.CreateAlignedStore(data, pointer, llvm::Align(type.bits / 8));
+                        memory->setVolatile(volatile_shared);
                         if (order != llvm::AtomicOrdering::NotAtomic) memory->setAtomic(order, sync);
                     }
                     if (load) write(instruction.operands[0], value, type, true);

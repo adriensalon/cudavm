@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA CUDA 12.4.131 ptxas",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test\\device_calls\\device_calls.ptx -o test\\device_calls\\device_calls.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "device_calls.cu": "435a477b8c73753bc565c6ce1b3f016afe7d3e595ddfdb1a8c210231b87fd13b",
+    "device_calls.ptx": "4eec485841e05daf670e632614b85ecf11cd377808eafd0dc5b350a11cedd46b",
+    "device_calls.ll": "30acb5a1fc12a6a692cbf6d4057dcf8099edc4c7ba7a5d38427f6e5d7edc30d1",
+    "device_calls.cubin": "7ea9a0bc0677b5e82d93e691e4bed928eca677b4feaf8bc57e688139b8e986db"
+  }
+}

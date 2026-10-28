@@ -1413,11 +1413,18 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             if (dest != 255) output += guard + "mov.b32 " + reg(dest) + ",%barrier_result;\n";
             unsigned target = unsigned(hi >> 17) & 7;
             if (target != 7) instruction = "and.pred " + pred(target) + ",%barrier_pred,%pt;";
-        } else if (op == 0x3a1 && hi == 0xe8000 && !(lo >> 40)) {
+        } else if (op == 0x3a1 && (hi == 0xe8000 || hi == 0xe8200) && !(lo >> 40)) {
+            const bool wide = (hi & 0x200) != 0;
+            if (wide && left != 255 && (left >= 254 || left % 2))
+                fail("invalid match 64-bit source pair");
             warp_members();
             if (auto mask = kernel.warp_masks.find(start + pc); mask != kernel.warp_masks.end() && mask->second != UINT32_MAX)
                 output += guard + "and.b32 %members,%members," + reg(mask->second & 255) + ";\n";
-            instruction = "match.any.sync.b32 " + (dest == 255 ? std::string("%scratch") : reg(dest)) + "," + reg(left) + ",%members;";
+            if (wide && left != 255)
+                output += guard + "mov.b64 %wide0,{" + reg(left) + "," + reg(left + 1) + "};\n";
+            instruction = std::string("match.any.sync.") + (wide ? "b64 " : "b32 ") +
+                (dest == 255 ? std::string("%scratch") : reg(dest)) + "," +
+                (wide ? (left == 255 ? "0" : "%wide0") : reg(left)) + ",%members;";
         } else if (op == 0x215) {
             if ((lo >> 40) || (hi & ~uint64_t(0x8ff)) != 0xe0000)
                 fail("unsupported byte absolute-difference encoding");
@@ -1568,11 +1575,12 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                 }
             }
         } else if (op == 0xa11) {
-            // Checked unsigned index*4 + bank pointer pair, with P0 carry.
-            bool high = hi == 0xf14ff;
-            if ((!high && hi != 0x78010ff) || right || predicate != 7)
+            // Checked unsigned index*4/index*8 + bank pointer pair, with P0 carry.
+            bool high = hi == 0xf14ff || hi == 0xf1cff;
+            if ((!high && hi != 0x78010ff && hi != 0x78018ff) || right || predicate != 7)
                 fail("unsupported LEA modifier");
-            output += "cvt.u64.u32 %a," + reg(left) + ";\nshl.b64 %a,%a,2;\n";
+            const unsigned shift = unsigned(hi >> 11) & 31;
+            output += "cvt.u64.u32 %a," + reg(left) + ";\nshl.b64 %a,%a," + std::to_string(shift) + ";\n";
             if (high) {
                 output += guard + "shr.u64 %a,%a,32;\n" + guard + "selp.u32 %scratch,1,0,%p0;\n" +
                     guard + "cvt.u32.u64 %constant,%a;\n" + guard + "add.u32 %scratch,%scratch,%constant;\n";
@@ -1662,8 +1670,10 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             instruction = std::string(form == 0x70e170 ? "not.pred " : "and.pred ") + pred(destination) + "," + pred(source) +
                 (form == 0x70e170 ? ";" : "," + pred(unsigned(hi >> 13) & 7) + ";");
         } else if (op == 0x944) {
-            if (!calls || hi != 0x3c00000 || uint32_t(lo) != 0x7944) fail("unsupported direct call encoding");
-            int64_t target = int64_t(start + pc) + 16 + int32_t(lo >> 32);
+            const auto displacement = int32_t(lo >> 32);
+            if (!calls || hi != (0x3c00000u | (displacement < 0 ? 0x3ffffu : 0)) || uint32_t(lo) != 0x7944)
+                fail("unsupported direct call encoding");
+            int64_t target = int64_t(start + pc) + 16 + displacement;
             if (target < 0 || !kernel.functions.contains(size_t(target))) fail("call target lacks a device function entry");
             output += machine_state(false, "call_registers") + "st.param.b64 [call_stack],%local_base;\n"
                 "st.param.b32 [call_shared],%shared_base;\nst.param.b32 [call_dynamic],%shared_dynamic;\ncall (call_results)," +

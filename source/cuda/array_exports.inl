@@ -9,6 +9,11 @@ DRIVER_API(cuArrayGetDescriptor, (CUDA_ARRAY_DESCRIPTOR* output, CUarray handle)
     auto& d = entry->descriptor; *output = {d.Width, d.Height, d.Format, d.NumChannels})
 DRIVER_API(cuArray3DGetDescriptor, (CUDA_ARRAY3D_DESCRIPTOR* output, CUarray handle),
     driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null array descriptor output"); *output = array_lookup(handle, current())->descriptor)
+DRIVER_API(cuArrayGetMemoryRequirements, (CUDA_ARRAY_MEMORY_REQUIREMENTS* output, CUarray handle, CUdevice device),
+    driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null array memory requirements output");
+    auto entry = array_lookup(handle, current());
+    require(entry->descriptor.Flags & CUDA_ARRAY3D_DEFERRED_MAPPING, CUDA_ERROR_INVALID_VALUE, "array memory requirements require deferred mapping");
+    (void)device; throw failure(CUDA_ERROR_NOT_SUPPORTED, "deferred array memory requirements are not implemented"))
 DRIVER_API(cuArrayDestroy, (CUarray handle), driver_ready(); destroy_array(handle))
 DRIVER_API(cuMipmappedArrayCreate, (CUmipmappedArray* output, const CUDA_ARRAY3D_DESCRIPTOR* d, unsigned levels),
     driver_ready(); require(output && d, CUDA_ERROR_INVALID_VALUE, "null mipmap descriptor or output"); *output = create_mipmapped_array(*d, levels, current()))

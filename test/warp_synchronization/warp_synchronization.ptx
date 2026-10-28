@@ -1,0 +1,70 @@
+// Independently authored PTX 6.5, including distinct divergent warp barriers.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry warp_publish(.param .u64 out, .param .u64 in, .param .u64 scratch,
+    .param .u32 mask, .param .u32 rounds, .param .u32 mode) {
+ .shared .align 4 .b8 values[384];
+ .reg .b32 %r<42>;
+ .reg .b64 %p<9>;
+ .reg .pred %test, %split, %odd, %divergent;
+ mov.u32 %r0, %tid.x; mov.u32 %r1, %tid.y; mov.u32 %r2, %tid.z;
+ mov.u32 %r3, %ntid.x; mov.u32 %r4, %ntid.y; mov.u32 %r5, %ntid.z;
+ mad.lo.u32 %r1, %r2, %r4, %r1; mad.lo.u32 %r0, %r1, %r3, %r0;
+ mul.lo.u32 %r6, %r3, %r4; mul.lo.u32 %r6, %r6, %r5;
+ mov.u32 %r7, %ctaid.x; mul.lo.u32 %r7, %r7, %r6; add.u32 %r8, %r7, %r0;
+ and.b32 %r9, %r0, 31; and.b32 %r10, %r0, 0xffffffe0;
+ sub.u32 %r11, %r6, %r10; min.u32 %r11, %r11, 32;
+ sub.u32 %r12, 32, %r11; shr.u32 %r13, 0xffffffff, %r12;
+ ld.param.u32 %r14, [mask]; and.b32 %r14, %r14, %r13;
+ ld.param.u32 %r15, [rounds]; ld.param.u32 %r16, [mode];
+ setp.eq.u32 %split, %r16, 1; and.b32 %r17, %r9, 1; setp.ne.u32 %odd, %r17, 0;
+ selp.u32 %r18, 0xaaaaaaaa, 0x55555555, %odd;
+ @%split and.b32 %r14, %r14, %r18;
+ shl.b32 %r18, 1, %r9; and.b32 %r18, %r18, %r14;
+ setp.eq.u32 %test, %r18, 0; @%test ret;
+ add.u32 %r19, %r9, 1; and.b32 %r19, %r19, 31;
+find_peer:
+ shl.b32 %r18, 1, %r19; and.b32 %r18, %r18, %r14;
+ setp.ne.u32 %test, %r18, 0; @%test bra found_peer;
+ add.u32 %r19, %r19, 1; and.b32 %r19, %r19, 31; bra find_peer;
+found_peer:
+ add.u32 %r19, %r19, %r10; add.u32 %r20, %r7, %r19;
+ ld.param.u64 %p0, [out]; ld.param.u64 %p1, [in]; ld.param.u64 %p2, [scratch];
+ mad.wide.u32 %p0, %r8, 64, %p0; mad.wide.u32 %p1, %r8, 4, %p1;
+ mad.wide.u32 %p3, %r8, 4, %p2; mad.wide.u32 %p4, %r20, 4, %p2;
+ mul.lo.u32 %r21, %r0, 4; mov.u32 %r22, values; add.u32 %r21, %r22, %r21;
+ mad.lo.u32 %r22, %r19, 4, %r22;
+ shr.u32 %r23, %r0, 5; rem.u32 %r23, %r23, 3; add.u32 %r23, %r23, %r17;
+ setp.ne.u32 %test, %r15, 0; and.pred %test, %test, %split;
+ @%test add.u32 %r15, %r15, %r23;
+ setp.eq.u32 %divergent, %r16, 2; and.pred %odd, %odd, %divergent;
+ rem.u32 %r24, %r9, 3; mov.u32 %r25, 0;
+round_test:
+ setp.ge.u32 %test, %r25, %r15; @%test ret;
+ ld.global.u32 %r26, [%p1]; mad.lo.u32 %r27, %r25, 0x10203, %r8;
+ xor.b32 %r26, %r26, %r27; st.volatile.shared.u32 [%r21], %r26;
+ add.u32 %r27, %r26, 0x9e3779b9; st.global.u32 [%p3], %r27;
+ @%odd bra odd_arm;
+ selp.u32 %r28, %r24, 0, %divergent; add.u32 %r29, %r28, 1;
+ mul.lo.u32 %r28, %r28, %r29; shr.u32 %r28, %r28, 1;
+ ld.volatile.shared.u32 %r29, [%r21]; add.u32 %r29, %r29, %r28; st.volatile.shared.u32 [%r21], %r29;
+ ld.global.u32 %r29, [%p3]; add.u32 %r29, %r29, %r28; st.global.u32 [%p3], %r29;
+ bar.warp.sync %r14;
+ bra read_peer;
+odd_arm:
+ mov.u32 %r30, 0;
+tick_test:
+ setp.ge.u32 %test, %r30, %r24; @%test bra odd_wait;
+ add.u32 %r31, %r30, 1;
+ ld.volatile.shared.u32 %r29, [%r21]; add.u32 %r29, %r29, %r31; st.volatile.shared.u32 [%r21], %r29;
+ ld.global.u32 %r29, [%p3]; add.u32 %r29, %r29, %r31; st.global.u32 [%p3], %r29;
+ add.u32 %r30, %r30, 1; bra tick_test;
+odd_wait:
+ bar.warp.sync %r14;
+read_peer:
+ ld.volatile.shared.u32 %r32, [%r22]; ld.global.u32 %r33, [%p4];
+ st.global.u32 [%p0], %r32; st.global.u32 [%p0+4], %r33;
+ bar.warp.sync %r14;
+ add.u64 %p0, %p0, 8; add.u32 %r25, %r25, 1; bra round_test;
+}

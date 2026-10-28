@@ -23,6 +23,11 @@ RUNTIME_API(cudaArrayGetInfo, (cudaChannelFormatDesc* output, cudaExtent* extent
         (d.Flags & CUDA_ARRAY3D_CUBEMAP ? cudaArrayCubemap : 0) | (d.Flags & CUDA_ARRAY3D_TEXTURE_GATHER ? cudaArrayTextureGather : 0))
 RUNTIME_API(cudaGetChannelDesc, (cudaChannelFormatDesc* output, cudaArray_const_t array),
     require(output, CUDA_ERROR_INVALID_VALUE, "null channel descriptor output"); runtime_current(); *output = runtime_channel_descriptor(runtime_array_info(array)))
+RUNTIME_API(cudaArrayGetMemoryRequirements, (cudaArrayMemoryRequirements* output, cudaArray_t array, int device),
+    require(output, CUDA_ERROR_INVALID_VALUE, "null array memory requirements output"); runtime_current();
+    CUDA_ARRAY_MEMORY_REQUIREMENTS requirements{};
+    check(cuArrayGetMemoryRequirements(&requirements, reinterpret_cast<CUarray>(array), device));
+    *output = {}; output->size = requirements.size; output->alignment = requirements.alignment)
 extern "C" CUDAVM_CUDART_API cudaChannelFormatDesc CUDARTAPI cudaCreateChannelDesc(int x,int y,int z,int w,cudaChannelFormatKind kind) { return {x,y,z,w,kind}; }
 RUNTIME_API(cudaMemcpy2DToArray, (cudaArray_t to,size_t x,size_t y,const void* from,size_t pitch,size_t width,size_t height,cudaMemcpyKind kind),
     require(to,CUDA_ERROR_INVALID_VALUE,"null destination array"); runtime_current();

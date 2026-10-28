@@ -39,7 +39,11 @@ public:
     CUdeviceptr global(const char* name, size_t expected_size) const;
 };
 
-// Each slice supplies one oracle, reused unchanged by every importer and loader.
+// Format-independent Driver API contracts need a device, but no shader compiler
+// or executable-input probe. Their registration has no importer dimension.
+int run_conformance(int argc, char** argv, void (*execute)());
+
+// Execution slices reuse one oracle unchanged by every importer and loader.
 int run_conformance(int argc, char** argv, const fixture_data& fixtures,
                     void (*execute)(const loaded_program&), unsigned load_repetitions = 1);
 void expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> expected,

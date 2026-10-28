@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA CUDA 12.4.131 ptxas",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O3 test\\warp_match\\warp_match.ptx -o test\\warp_match\\warp_match.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "warp_match.cu": "0b8c488f0aa8702bd0853271b9699d1a442c169812aa8ca57365f9da0db93e22",
+    "warp_match.ptx": "d78317942dbf0e84697afeb7355532ca25dfc435549adf581e05b7945aa92ffa",
+    "warp_match.ll": "72c4a5caa33f581aa8fea7969bd2991d25b06a714e8dd53f336913450e31626a",
+    "warp_match.cubin": "73bc6bd5c55e2a857c06cdb715efb696d1193478f7d9918c415fb877aec90f62"
+  }
+}

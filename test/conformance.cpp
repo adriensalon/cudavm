@@ -1,8 +1,10 @@
 #include "conformance.hpp"
 #include <cuda/cudavm_cuda.h>
+#ifdef CUDAVM_CONFORMANCE_EXECUTION
 #include <nvrtc.h>
 #include <nvvm.h>
 #include <nvJitLink.h>
+#endif
 #include <algorithm>
 #include <iostream>
 
@@ -32,6 +34,73 @@ void expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> ex
                 + " got " + std::to_string(actual[i]) + ", expected " + std::to_string(expected[i]));
 }
 
+struct device_context {
+    CUcontext value{};
+    explicit device_context(CUdevice device) { CONFORMANCE_CUDA(cuCtxCreate(&value, nullptr, 0, device)); }
+    ~device_context() { if (value) cuCtxDestroy(value); }
+};
+
+struct conformance_device {
+    CUdevice value{-1};
+    std::string name;
+};
+
+conformance_device select_conformance_device(std::string_view backend, void (*probe)() = nullptr) {
+    const std::array<std::string_view, 5> backends{"cuda", "vulkan", "directx", "opencl", "opengl"};
+    const std::array<std::string_view, 5> labels{"CUDA", "Vulkan", "DirectX", "OpenCL", "OpenGL"};
+    const auto found = std::find(backends.begin(), backends.end(), backend);
+    require(found != backends.end(), "unknown backend: " + std::string(backend));
+    const auto status = cuInit(0);
+    if (status == CUDA_ERROR_NO_DEVICE || status == CUDA_ERROR_SYSTEM_DRIVER_MISMATCH) {
+        std::cout << "SKIP: " << backend << " device/driver unavailable\n";
+        return {};
+    }
+    CONFORMANCE_CUDA(status);
+    int count = 0;
+    CONFORMANCE_CUDA(cuDeviceGetCount(&count));
+    const auto suffix = " (" + std::string(labels[found - backends.begin()]) + ")";
+    for (int ordinal = 0; ordinal < count; ++ordinal) {
+        CUdevice candidate{};
+        char name[256]{};
+        CONFORMANCE_CUDA(cuDeviceGet(&candidate, ordinal));
+        CONFORMANCE_CUDA(cuDeviceGetName(name, sizeof(name), candidate));
+        if (!std::string_view(name).ends_with(suffix)) continue;
+        if (probe) {
+            try {
+                device_context context(candidate);
+                probe();
+            } catch (const conformance_driver_error& error) {
+                if (error.result != CUDA_ERROR_NOT_SUPPORTED
+                    && error.result != CUDA_ERROR_NO_BINARY_FOR_GPU
+                    && error.result != CUDA_ERROR_UNSUPPORTED_PTX_VERSION) throw;
+                std::cout << "unavailable device=" << name << "; " << error.what() << std::endl;
+                continue;
+            }
+        }
+        return {candidate, name};
+    }
+    std::cout << "SKIP: no " << (probe ? "executable " : "") << backend << " device\n";
+    return {};
+}
+
+int run_conformance(int argc, char** argv, void (*execute)()) {
+    try {
+        require(argc == 2, "usage: <executable> <backend>");
+        const auto device = select_conformance_device(argv[1]);
+        if (device.value == -1) return 77;
+        std::cout << "backend=" << argv[1] << " device=" << device.name << std::endl;
+        device_context context(device.value);
+        execute();
+        CONFORMANCE_CUDA(cuCtxSynchronize());
+        std::cout << "PASS\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL: " << error.what() << '\n';
+        return 1;
+    }
+}
+
+#ifdef CUDAVM_CONFORMANCE_EXECUTION
 struct source_program {
     nvrtcProgram value{};
     ~source_program() { if (value) nvrtcDestroyProgram(&value); }
@@ -137,12 +206,6 @@ CUdeviceptr loaded_program::global(const char* name, size_t expected_size) const
     return result;
 }
 
-struct device_context {
-    CUcontext value{};
-    explicit device_context(CUdevice device) { CONFORMANCE_CUDA(cuCtxCreate(&value, nullptr, 0, device)); }
-    ~device_context() { if (value) cuCtxDestroy(value); }
-};
-
 // Availability is checked independently of the slice's input and features.
 // Enumerating an OpenCL endpoint does not imply SPIR-V ingestion.
 void probe_execution() {
@@ -176,44 +239,10 @@ int run_conformance(int argc, char** argv, const fixture_data& fixtures,
         require(argc == 3, "usage: <executable> <backend> <cu|ptx|cubin|nvvm>");
         require(load_repetitions > 0, "at least one loader execution is required");
         const std::string backend = argv[1];
-        const std::array<std::string_view, 5> backends{"cuda", "vulkan", "directx", "opencl", "opengl"};
-        const std::array<std::string_view, 5> labels{"CUDA", "Vulkan", "DirectX", "OpenCL", "OpenGL"};
-        auto found = std::find(backends.begin(), backends.end(), backend);
-        require(found != backends.end(), "unknown backend: " + backend);
-        auto status = cuInit(0);
-        if (status == CUDA_ERROR_NO_DEVICE || status == CUDA_ERROR_SYSTEM_DRIVER_MISMATCH) {
-            std::cout << "SKIP: " << backend << " device/driver unavailable\n";
-            return 77;
-        }
-        CONFORMANCE_CUDA(status);
-        int count = 0;
-        CONFORMANCE_CUDA(cuDeviceGetCount(&count));
-        CUdevice device = -1;
-        char name[256]{};
-        const auto suffix = " (" + std::string(labels[found - backends.begin()]) + ")";
-        for (int ordinal = 0; ordinal < count; ++ordinal) {
-            CUdevice candidate{};
-            CONFORMANCE_CUDA(cuDeviceGet(&candidate, ordinal));
-            CONFORMANCE_CUDA(cuDeviceGetName(name, sizeof(name), candidate));
-            if (!std::string_view(name).ends_with(suffix)) continue;
-            try {
-                device_context context(candidate);
-                probe_execution();
-                device = candidate;
-                break;
-            } catch (const conformance_driver_error& error) {
-                if (error.result != CUDA_ERROR_NOT_SUPPORTED
-                    && error.result != CUDA_ERROR_NO_BINARY_FOR_GPU
-                    && error.result != CUDA_ERROR_UNSUPPORTED_PTX_VERSION) throw;
-                std::cout << "unavailable device=" << name << "; " << error.what() << std::endl;
-            }
-        }
-        if (device == -1) {
-            std::cout << "SKIP: no executable " << backend << " device\n";
-            return 77;
-        }
-        std::cout << "backend=" << backend << " importer=" << argv[2] << " device=" << name << std::endl;
-        device_context context(device);
+        const auto device = select_conformance_device(backend, probe_execution);
+        if (device.value == -1) return 77;
+        std::cout << "backend=" << backend << " importer=" << argv[2] << " device=" << device.name << std::endl;
+        device_context context(device.value);
         // Compiler handles are destroyed before either loader sees the copy.
         const auto image = import_fixture(fixtures, argv[2]);
         for (unsigned repeat = 0; repeat < load_repetitions; ++repeat)
@@ -230,4 +259,5 @@ int run_conformance(int argc, char** argv, const fixture_data& fixtures,
         return 1;
     }
 }
+#endif
 }

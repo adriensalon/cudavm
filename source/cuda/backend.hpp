@@ -155,7 +155,65 @@ inline size_t array_element_bytes(const CUDA_ARRAY3D_DESCRIPTOR& d) {
     case CU_AD_FORMAT_UNSIGNED_INT8: case CU_AD_FORMAT_SIGNED_INT8: component = 1; break;
     case CU_AD_FORMAT_UNSIGNED_INT16: case CU_AD_FORMAT_SIGNED_INT16: case CU_AD_FORMAT_HALF: component = 2; break;
     case CU_AD_FORMAT_UNSIGNED_INT32: case CU_AD_FORMAT_SIGNED_INT32: case CU_AD_FORMAT_FLOAT: component = 4; break;
-    default: throw failure(CUDA_ERROR_NOT_SUPPORTED, "array format requires a separate image layout");
+    case CU_AD_FORMAT_NV12:
+    case CU_AD_FORMAT_UNORM_INT8X1:
+    case CU_AD_FORMAT_UNORM_INT8X2:
+    case CU_AD_FORMAT_UNORM_INT8X4:
+    case CU_AD_FORMAT_UNORM_INT16X1:
+    case CU_AD_FORMAT_UNORM_INT16X2:
+    case CU_AD_FORMAT_UNORM_INT16X4:
+    case CU_AD_FORMAT_SNORM_INT8X1:
+    case CU_AD_FORMAT_SNORM_INT8X2:
+    case CU_AD_FORMAT_SNORM_INT8X4:
+    case CU_AD_FORMAT_SNORM_INT16X1:
+    case CU_AD_FORMAT_SNORM_INT16X2:
+    case CU_AD_FORMAT_SNORM_INT16X4:
+    case CU_AD_FORMAT_BC1_UNORM:
+    case CU_AD_FORMAT_BC1_UNORM_SRGB:
+    case CU_AD_FORMAT_BC2_UNORM:
+    case CU_AD_FORMAT_BC2_UNORM_SRGB:
+    case CU_AD_FORMAT_BC3_UNORM:
+    case CU_AD_FORMAT_BC3_UNORM_SRGB:
+    case CU_AD_FORMAT_BC4_UNORM:
+    case CU_AD_FORMAT_BC4_SNORM:
+    case CU_AD_FORMAT_BC5_UNORM:
+    case CU_AD_FORMAT_BC5_SNORM:
+    case CU_AD_FORMAT_BC6H_UF16:
+    case CU_AD_FORMAT_BC6H_SF16:
+    case CU_AD_FORMAT_BC7_UNORM:
+    case CU_AD_FORMAT_BC7_UNORM_SRGB:
+    case CU_AD_FORMAT_P010:
+    case CU_AD_FORMAT_P016:
+    case CU_AD_FORMAT_NV16:
+    case CU_AD_FORMAT_P210:
+    case CU_AD_FORMAT_P216:
+    case CU_AD_FORMAT_YUY2:
+    case CU_AD_FORMAT_Y210:
+    case CU_AD_FORMAT_Y216:
+    case CU_AD_FORMAT_AYUV:
+    case CU_AD_FORMAT_Y410:
+    case CU_AD_FORMAT_Y416:
+    case CU_AD_FORMAT_Y444_PLANAR8:
+    case CU_AD_FORMAT_Y444_PLANAR10:
+    case CU_AD_FORMAT_YUV444_8bit_SemiPlanar:
+    case CU_AD_FORMAT_YUV444_16bit_SemiPlanar:
+    case CU_AD_FORMAT_UNORM_INT_101010_2:
+    case CU_AD_FORMAT_UINT8_PACKED_422:
+    case CU_AD_FORMAT_UINT8_PACKED_444:
+    case CU_AD_FORMAT_UINT8_SEMIPLANAR_420:
+    case CU_AD_FORMAT_UINT16_SEMIPLANAR_420:
+    case CU_AD_FORMAT_UINT8_SEMIPLANAR_422:
+    case CU_AD_FORMAT_UINT16_SEMIPLANAR_422:
+    case CU_AD_FORMAT_UINT8_SEMIPLANAR_444:
+    case CU_AD_FORMAT_UINT16_SEMIPLANAR_444:
+    case CU_AD_FORMAT_UINT8_PLANAR_420:
+    case CU_AD_FORMAT_UINT16_PLANAR_420:
+    case CU_AD_FORMAT_UINT8_PLANAR_422:
+    case CU_AD_FORMAT_UINT16_PLANAR_422:
+    case CU_AD_FORMAT_UINT8_PLANAR_444:
+    case CU_AD_FORMAT_UINT16_PLANAR_444:
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "array format requires a separate image layout");
+    default: throw failure(CUDA_ERROR_INVALID_VALUE, "invalid array format");
     }
     return component * d.NumChannels;
 }
