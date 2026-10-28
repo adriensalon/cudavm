@@ -62,6 +62,29 @@ void execute_integer_simd_comparison(const loaded_program& program) {
     }
     for (auto a : halves) for (auto b : halves) for (auto c : accumulators)
         corpus.push_back({a | ((a ^ 0x8000) << 16), b | ((65535 - b) << 16), c});
+    // Include all-true/all-false masks and complete reduction counts, as well
+    // as different truth values in adjacent lanes.
+    constexpr uint32_t words[]{0, 1, 0xffffffff, 0x80000000, 0x7fffffff,
+        0x80808080, 0x7f7f7f7f, 0x80008000, 0x7fff7fff, 0x0000ffff,
+        0xffff0000, 0x01010101, 0x01234567, 0x89abcdef, 0x55555555, 0xaaaaaaaa};
+    for (auto a : words) for (auto b : words) for (auto c : accumulators)
+        corpus.push_back({a, b, c});
+    // Every equality mask, including isolated true/false lanes, in both orders.
+    for (unsigned bits : {8u, 16u}) {
+        const unsigned lanes = 32 / bits;
+        uint32_t a = 0;
+        for (unsigned lane = 0; lane < lanes; ++lane)
+            a |= (lane % 2 ? (1u << bits) - 1 : 1u << (bits - 1)) << (lane * bits);
+        for (unsigned equality_mask = 0; equality_mask < (1u << lanes); ++equality_mask) {
+            uint32_t b = a;
+            for (unsigned lane = 0; lane < lanes; ++lane)
+                if (!(equality_mask & (1u << lane))) b ^= 1u << (lane * bits);
+            for (auto c : accumulators) {
+                corpus.push_back({a, b, c});
+                corpus.push_back({b, a, c});
+            }
+        }
+    }
     uint32_t state = 0x23a59c71;
     auto random = [&] { state ^= state << 13; state ^= state >> 17; state ^= state << 5; return state; };
     for (unsigned i = 0; i < 513; ++i) { const auto a = random(), b = random(), c = random(); corpus.push_back({a, b, c}); }
