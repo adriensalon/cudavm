@@ -1,0 +1,33 @@
+// Independently authored PTX; division operands have defined nonzero divisors.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry integer_values(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .reg .b64 %out,%in,%a,%b,%result;
+ .reg .b32 %i,%block,%threads,%count,%x,%y,%divisor,%value;
+ .reg .pred %p;
+ mov.u32 %i,%tid.x; mov.u32 %block,%ctaid.x; mov.u32 %threads,%ntid.x;
+ mad.lo.u32 %i,%block,%threads,%i;
+ ld.param.u32 %count,[count]; setp.ge.u32 %p,%i,%count; @%p ret;
+ ld.param.u64 %out,[out]; ld.param.u64 %in,[in];
+ mad.wide.u32 %out,%i,96,%out; mad.wide.u32 %in,%i,16,%in;
+ ld.global.u64 %a,[%in]; ld.global.u64 %b,[%in+8];
+ cvt.u32.u64 %x,%a; cvt.u32.u64 %y,%b;
+ mov.u32 %divisor,%y; setp.eq.u32 %p,%y,0; @%p mov.u32 %divisor,1;
+ setp.eq.u32 %p,%x,0x80000000; @!%p bra divide;
+ setp.eq.u32 %p,%y,0xffffffff; @%p mov.u32 %divisor,1;
+divide:
+ div.u32 %value,%x,%divisor; cvt.u64.u32 %result,%value; st.global.u64 [%out],%result;
+ rem.u32 %value,%x,%divisor; cvt.u64.u32 %result,%value; st.global.u64 [%out+8],%result;
+ div.s32 %value,%x,%divisor; cvt.u64.u32 %result,%value; st.global.u64 [%out+16],%result;
+ rem.s32 %value,%x,%divisor; cvt.u64.u32 %result,%value; st.global.u64 [%out+24],%result;
+ mul.hi.s32 %value,%x,%y; cvt.u64.u32 %result,%value; st.global.u64 [%out+32],%result;
+ mul.hi.u32 %value,%x,%y; cvt.u64.u32 %result,%value; st.global.u64 [%out+40],%result;
+ mul.wide.u32 %result,%x,%y; st.global.u64 [%out+48],%result;
+ mul.wide.s32 %result,%x,%y; st.global.u64 [%out+56],%result;
+ add.u64 %result,%a,%b; st.global.u64 [%out+64],%result;
+ sub.u64 %result,%a,%b; st.global.u64 [%out+72],%result;
+ mul.hi.u64 %result,%a,%b; st.global.u64 [%out+80],%result;
+ mul.hi.s64 %result,%a,%b; st.global.u64 [%out+88],%result;
+ ret;
+}

@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/block_synchronization/block_synchronization.ptx -o test/block_synchronization/block_synchronization.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "block_synchronization.cu": "954092493bc692355fbd23649d66bb2f09aab344f68767694b4c7c6d5afa4442",
+    "block_synchronization.ptx": "f90f6e0fe400023231bbe7912e8be007d4f614cf8c55b44db196ae2b09cee0cb",
+    "block_synchronization.ll": "1e3d0b3a923b1652435e517a8e1321544bc991000829c20634a7e6afd36a841f",
+    "block_synchronization.cubin": "70f92ee1b549b1387f87096aa72f347eee143ba7eefc199c326eed5caf0e56f4"
+  }
+}

@@ -744,7 +744,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             case 0x209: case 0x809: case 0xa09: case 0x308: case 0x908: case 0x81c:
             case 0x20c: case 0x80c: case 0xa0c: case 0xc0c:
             case 0x20b: case 0x80b: case 0xa0b: case 0x22a: case 0x42a: case 0xa2a:
-            case 0x302: case 0x304: case 0x305: case 0x306: case 0x310: case 0x311: case 0x312: break;
+            case 0x302: case 0x304: case 0x305: case 0x306: case 0x906: case 0x310: case 0x311: case 0x312: break;
             default: return std::nullopt;
             }
             // Predicate-producing instructions encode Pn in fields otherwise
@@ -771,12 +771,14 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                 }
                 return std::string();
             };
-            if (op == 0x304 || op == 0x305 || op == 0x306 || op == 0x310 || op == 0x311 || op == 0x312) {
-                bool to_integer = op == 0x305 || op == 0x311, from_integer = op == 0x306 || op == 0x312;
+            if (op == 0x304 || op == 0x305 || op == 0x306 || op == 0x906 || op == 0x310 || op == 0x311 || op == 0x312) {
+                bool to_integer = op == 0x305 || op == 0x311, from_integer = op == 0x306 || op == 0x906 || op == 0x312;
                 unsigned source_code = unsigned(hi >> 20) & 3, destination_code = unsigned(hi >> 11) & 3;
                 auto allowed = uint64_t(0x301800 | 0xc000) | (to_integer ? 0x12100u : from_integer ? 0x400u : 0u);
                 bool long_form = op == 0x310 || op == 0x311 || op == 0x312;
-                if (left || (lo >> 40) || !source_code || !destination_code || (hi & ~allowed) ||
+                bool immediate = op == 0x906;
+                if (left || (!immediate && (lo >> 40)) || !source_code || !destination_code || (hi & ~allowed) ||
+                        (immediate && (source_code != 2 || destination_code != 2)) ||
                         (long_form != (source_code == 3 || destination_code == 3)) ||
                         (to_integer && bool(hi & 0x2000) != (op == 0x305)) || ((hi & 0x10000) && source_code != 2))
                     fail("unsupported numeric conversion encoding");
@@ -791,7 +793,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                     output += guard + "cvt.u16.u32 %half0," + reg(right) + ";\n";input = "%half0";
                 } else {
                     input = from_integer ? "%tmp0" : "%fp0";
-                    output += guard + "mov.b32 " + input + "," + reg(right) + ";\n";
+                    output += guard + "mov.b32 " + input + "," + (immediate ? std::to_string(uint32_t(lo >> 32)) : reg(right)) + ";\n";
                 }
                 auto result = destination_bits == 64 ? (to_integer ? "%wide1" : "%dfp1") : destination_bits == 16 ? "%half1" : to_integer ? "%tmp1" : "%fp1";
                 const char* modes[]{"rn", "rm", "rp", "rz"};
@@ -1295,9 +1297,11 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             instruction = memory_transfer(load, "shared", unsigned(hi >> 9) & 7, load ? dest : right, "[%shared_address]");
         } else if (op == 0x983 || op == 0x387) {
             bool load = op == 0x983;
-            if ((hi & ~uint64_t(0xe00)) != 0x100000 || (!load && dest != 0) || (!kernel.stack_size && !calls))
+            if ((hi & ~uint64_t(0xe00)) != 0x100000 || (load ? right != 0 : dest != 0) || (!kernel.stack_size && !calls))
                 fail("unsupported local memory encoding");
-            auto displacement = load ? int32_t(lo >> 32) : int32_t(lo >> 32) >> 8;
+            // LDL and STL both carry a signed 24-bit displacement in bits
+            // 40..63. LDL differs here from the ordinary global-load form.
+            auto displacement = int32_t(lo >> 32) >> 8;
             output += guard + "add.u32 %scratch," + reg(left) + "," + std::to_string(uint32_t(displacement)) + ";\n" +
                 guard + "cvt.u64.u32 %local_address,%scratch;\n" + guard + "add.u64 %local_address,%local_base,%local_address;\n";
             instruction = memory_transfer(load, "local", unsigned(hi >> 9) & 7, load ? dest : right, "[%local_address]");
@@ -1400,17 +1404,23 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             }
         } else if ((op == 0x210 || op == 0x810 || op == 0xa10 || op == 0xc10) &&
                    (hi & ~uint64_t(0xe0000)) == (op == 0xc10 ? 0xff1e0ffu : 0x7f1e0ffu) &&
-                   ((hi >> 17) & 7) != 7 && predicate == 7 && ((op != 0x210 && op != 0xc10) || !(lo >> 40))) {
-            // IADD3 Rd, Pn, Ra, Rb/imm32, RZ: retain the carry used by the
-            // following IADD3.X when ptxas forms a 64-bit address.
+                   ((hi >> 17) & 7) != 7 && predicate == 7 &&
+                   (op == 0x210 ? !((lo >> 40) & ~uint64_t(0x800000)) : op != 0xc10 || !(lo >> 40))) {
+            // IADD3 Rd, Pn, Ra, +/-Rb/imm32, RZ. A negated register uses
+            // a + ~b + 1, retaining the no-borrow carry for the high word.
             auto source = op == 0xa10 ? bank_word() : op == 0xc10 ? uniform(right) : op == 0x210 ? reg(right) : std::to_string(uint32_t(lo >> 32));
-            output += "cvt.u64.u32 %a," + reg(left) + ";\ncvt.u64.u32 %b," + source + ";\nadd.u64 %a,%a,%b;\n"
-                "setp.gt.u64 " + pred(unsigned(hi >> 17) & 7) + ",%a,4294967295;\n";
+            output += "cvt.u64.u32 %a," + reg(left) + ";\ncvt.u64.u32 %b," + source + ";\n";
+            if (op == 0x210 && (lo & (uint64_t(1) << 63))) output += "sub.u64 %b,4294967296,%b;\n";
+            output += "add.u64 %a,%a,%b;\nsetp.gt.u64 " + pred(unsigned(hi >> 17) & 7) + ",%a,4294967295;\n";
             instruction = "cvt.u32.u64 " + reg(dest) + ",%a;";
         } else if ((op == 0x210 || op == 0xa10 || op == 0xc10) &&
-                   (hi & ~uint64_t(0x3800000)) == (op == 0xc10 ? 0x87fe4ffu : 0x7fe4ffu) && (op == 0xa10 || !(lo >> 40))) {
-            // IADD3.X Rd, Ra, Rb, RZ, Pn, !PT.
+                   (hi & ~uint64_t(0x3800000)) == (op == 0xc10 ? 0x87fe4ffu : 0x7fe4ffu) &&
+                   (op == 0xa10 || (op == 0x210 ? !((lo >> 40) & ~uint64_t(0x800000)) : !(lo >> 40)))) {
+            // IADD3.X Rd, Ra, Rb/~Rb, RZ, Pn, !PT.
             auto source = op == 0xa10 ? bank_word() : op == 0xc10 ? uniform(right) : reg(right);
+            if (op == 0x210 && (lo & (uint64_t(1) << 63))) {
+                output += guard + "not.b32 %tmp0," + source + ";\n"; source = "%tmp0";
+            }
             output += guard + "selp.u32 %scratch,1,0," + pred(unsigned(hi >> 23) & 7) + ";\n" + guard + "add.u32 %scratch,%scratch," + reg(left) + ";\n";
             instruction = "add.u32 " + reg(dest) + ",%scratch," + source + ";";
         } else if ((op == 0x210 || op == 0x810 || op == 0xa10 || op == 0xc10) &&
@@ -1458,7 +1468,9 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             unsigned form = op & 0xe00, addend = unsigned(hi) & 255;
             uint64_t expected = form == 0xc00 || form == 0xe00 ? 0xf8e0000 : 0x78e0000;
             auto modifiers = uint64_t(0x2ff) | (!wide && !high_product && (form == 0x200 || form == 0x800) ? 0x800u : 0u);
-            if ((hi & ~modifiers) != expected)
+            bool wide_carry_out = wide && form == 0x200 && (hi & ~uint64_t(0xe00ff)) == 0x7800000;
+            bool wide_carry_in = wide && form == 0x200 && (hi & ~uint64_t(0x78000ff)) == 0xe0400;
+            if ((hi & ~modifiers) != expected && !wide_carry_out && !wide_carry_in)
                 fail("unsupported IMAD modifier");
             if ((form == 0x200 || form == 0xc00 || form == 0xe00) && (lo >> 40)) fail("unsupported IMAD register modifier");
             if (pc == 0 && !function && predicate == 7 && dest == 1 && left == 255 && form == 0x600 && addend == 255 &&
@@ -1478,7 +1490,15 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                         if (addend >= 254 || addend % 2) fail(high_product ? "invalid IMAD high-product addend" : "invalid wide IMAD addend");
                         join(reg(addend), reg(addend + 1), "%b");
                     }
-                    output += guard + std::string(hi & 0x200 ? "mul.wide.s32 " : "mul.wide.u32 ") + "%a," + reg(left) + "," + source + ";\n" + guard + "add.u64 %a,%a,%b;\n";
+                    output += guard + std::string(hi & 0x200 ? "mul.wide.s32 " : "mul.wide.u32 ") + "%a," + reg(left) + "," + source + ";\n";
+                    if (wide_carry_out && ((hi >> 17) & 7) != 7) {
+                        // The product fits 64 bits; only adding the register
+                        // pair can overflow. Capture it before aliased writes.
+                        output += guard + "add.u64 %c,%a,%b;\n" + guard + "setp.lt.u64 " + pred(unsigned(hi >> 17) & 7)
+                            + ",%c,%a;\n" + guard + "mov.u64 %a,%c;\n";
+                    } else output += guard + "add.u64 %a,%a,%b;\n";
+                    if (wide_carry_in) output += guard + "selp.u64 %c,1,0," + (hi & 0x4000000 ? "!" : "")
+                        + pred(unsigned(hi >> 23) & 7) + ";\n" + guard + "add.u64 %a,%a,%c;\n";
                     if (high_product) {
                         output += guard + "shr.u64 %a,%a,32;\n";
                         instruction = "cvt.u32.u64 " + reg(dest) + ",%a;";

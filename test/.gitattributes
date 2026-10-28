@@ -10,3 +10,12 @@ warp_shuffle/warp_shuffle.ll -text
 warp_vote/warp_vote.cu -text
 warp_vote/warp_vote.ptx -text
 warp_vote/warp_vote.ll -text
+integer_arithmetic/integer_arithmetic.cu -text
+integer_arithmetic/integer_arithmetic.ptx -text
+integer_arithmetic/integer_arithmetic.ll -text
+block_synchronization/block_synchronization.cu -text
+block_synchronization/block_synchronization.ptx -text
+block_synchronization/block_synchronization.ll -text
+local_memory/local_memory.cu -text
+local_memory/local_memory.ptx -text
+local_memory/local_memory.ll -text

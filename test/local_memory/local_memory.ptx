@@ -1,0 +1,47 @@
+// Independently authored PTX, with real invocation-local loads and stores.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry local_arrays(.param .u64 out, .param .u64 in,
+ .param .u32 count, .param .u32 rounds) {
+ .local .align 16 .b8 values[76];
+ .reg .b64 %out,%in,%local,%own,%other;
+ .reg .b32 %i,%block,%threads,%count,%rounds,%steps,%seed,%slot,%round,%index,%peer,
+   %value,%rhs,%sum,%hash,%temp,%left_guard,%right_guard;
+ .reg .pred %p;
+ mov.u32 %i,%tid.x; mov.u32 %block,%ctaid.x; mov.u32 %threads,%ntid.x;
+ mad.lo.u32 %i,%block,%threads,%i;
+ ld.param.u32 %count,[count]; setp.ge.u32 %p,%i,%count; @%p ret;
+ ld.param.u64 %out,[out]; ld.param.u64 %in,[in]; ld.param.u32 %rounds,[rounds];
+ mad.wide.u32 %in,%i,4,%in; ld.global.u32 %seed,[%in];
+ mov.u64 %local,values;
+ xor.b32 %value,%i,0x13579bdf; st.local.u32 [%local],%value;
+ xor.b32 %value,%seed,0xeca86420; st.local.u32 [%local+72],%value;
+ mov.u32 %slot,0;
+initialize:
+ mad.lo.u32 %value,%slot,0x10203,%seed; mad.lo.u32 %temp,%i,17,%slot;
+ xor.b32 %value,%value,%temp;
+ add.u32 %index,%slot,1; mad.wide.u32 %own,%index,4,%local; st.local.u32 [%own],%value;
+ add.u32 %slot,%slot,1; setp.lt.u32 %p,%slot,17; @%p bra initialize;
+ and.b32 %steps,%i,3; add.u32 %steps,%steps,%rounds; mov.u32 %round,0;
+update:
+ setp.ge.u32 %p,%round,%steps; @%p bra observe;
+ mad.lo.u32 %slot,%round,5,%seed; rem.u32 %slot,%slot,17;
+ add.u32 %index,%slot,1; mad.wide.u32 %own,%index,4,%local;
+ add.u32 %peer,%slot,7; rem.u32 %peer,%peer,17; add.u32 %peer,%peer,1;
+ mad.wide.u32 %other,%peer,4,%local;
+ ld.local.u32 %value,[%own]; ld.local.u32 %rhs,[%other];
+ add.u32 %rhs,%rhs,%round; xor.b32 %value,%value,%rhs; st.local.u32 [%own],%value;
+ add.u32 %round,%round,1; bra update;
+observe:
+ mov.u32 %slot,0; mov.u32 %sum,0; mov.u32 %hash,0;
+checksum:
+ add.u32 %index,%slot,1; mad.wide.u32 %own,%index,4,%local; ld.local.u32 %value,[%own];
+ add.u32 %sum,%sum,%value; mul.lo.u32 %hash,%hash,33; xor.b32 %hash,%hash,%value;
+ add.u32 %slot,%slot,1; setp.lt.u32 %p,%slot,17; @%p bra checksum;
+ rem.u32 %slot,%seed,17; add.u32 %slot,%slot,1; mad.wide.u32 %own,%slot,4,%local;
+ ld.local.u32 %value,[%own]; ld.local.u32 %left_guard,[%local]; ld.local.u32 %right_guard,[%local+72];
+ mad.wide.u32 %out,%i,20,%out;
+ st.global.u32 [%out],%sum; st.global.u32 [%out+4],%hash; st.global.u32 [%out+8],%value;
+ st.global.u32 [%out+12],%left_guard; st.global.u32 [%out+16],%right_guard; ret;
+}

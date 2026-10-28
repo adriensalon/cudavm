@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O3 test/local_memory/local_memory.ptx -o test/local_memory/local_memory.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "local_memory.cu": "83d3e11a2450edf5683688790188205ef235f73ac2489f24abbc3001a2ee82b0",
+    "local_memory.ptx": "d8dc23ddc9277963ece9e75fef5867d75e285f130e122aeac06be7d8b20d6408",
+    "local_memory.ll": "92c1d865f2690cd02df8aff688a0d4d62f55bdc3778b5221bc88aaa53e9e7d08",
+    "local_memory.cubin": "d96a649e4153ffa0c06ea2eeab2c9a63f3a70f6efe68e3d68eed98175387b298"
+  }
+}

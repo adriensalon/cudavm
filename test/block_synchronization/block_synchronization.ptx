@@ -1,0 +1,49 @@
+// Independently authored PTX: every block member reaches every barrier.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry block_rounds(.param .u64 out, .param .u64 in, .param .u64 scratch,
+ .param .u32 count, .param .u32 rounds, .param .u32 pattern) {
+ .shared .align 4 .b8 values[384];
+ .reg .b64 %out,%in,%scratch,%shared,%own,%global,%peer_address;
+ .reg .b32 %lane,%lanes,%block,%base,%i,%count,%rounds,%pattern,%round,%input,%value,
+   %peer,%index,%votes,%every,%any,%shared_sum,%global_sum,%n,%a,%o,%temp;
+ .reg .pred %p,%truth,%all,%some;
+ ld.param.u64 %out,[out]; ld.param.u64 %in,[in]; ld.param.u64 %scratch,[scratch];
+ ld.param.u32 %count,[count]; ld.param.u32 %rounds,[rounds]; ld.param.u32 %pattern,[pattern];
+ mov.u32 %lane,%tid.x; mov.u32 %lanes,%ntid.x; mov.u32 %block,%ctaid.x;
+ mul.lo.u32 %base,%block,%lanes; add.u32 %i,%base,%lane;
+ mad.wide.u32 %in,%i,4,%in; ld.global.u32 %input,[%in];
+ mov.u64 %shared,values; mad.wide.u32 %own,%lane,4,%shared;
+ mad.wide.u32 %global,%i,4,%scratch;
+ mov.u32 %round,0; mov.u32 %votes,0; mov.u32 %every,0; mov.u32 %any,0;
+ mov.u32 %shared_sum,0; mov.u32 %global_sum,0;
+loop:
+ setp.ge.u32 %p,%round,%rounds; @%p bra done;
+ mad.lo.u32 %value,%round,17,%i; xor.b32 %value,%input,%value;
+ st.shared.u32 [%own],%value; add.u32 %value,%value,0x12345; st.global.u32 [%global],%value;
+ setp.ne.u32 %truth,%pattern,0;
+ setp.eq.u32 %p,%pattern,0; @%p bra vote;
+ setp.eq.u32 %p,%pattern,1; @%p bra vote;
+ setp.eq.u32 %p,%pattern,2; @!%p bra mixed;
+ rem.u32 %temp,%round,%lanes; setp.eq.u32 %truth,%lane,%temp; bra vote;
+mixed:
+ add.u32 %temp,%input,%round; and.b32 %temp,%temp,3; setp.ne.u32 %truth,%temp,0;
+vote:
+ bar.red.popc.u32 %n,0,%truth;
+ bar.red.and.pred %all,0,%truth;
+ bar.red.or.pred %some,0,%truth;
+ selp.u32 %a,1,0,%all; selp.u32 %o,1,0,%some;
+ add.u32 %votes,%votes,%n; add.u32 %every,%every,%a; add.u32 %any,%any,%o;
+ add.u32 %peer,%lane,%round; add.u32 %peer,%peer,1; rem.u32 %peer,%peer,%lanes;
+ mad.wide.u32 %peer_address,%peer,4,%shared; ld.shared.u32 %value,[%peer_address];
+ add.u32 %shared_sum,%shared_sum,%value;
+ add.u32 %index,%base,%peer; mad.wide.u32 %peer_address,%index,4,%scratch;
+ ld.global.u32 %value,[%peer_address]; add.u32 %global_sum,%global_sum,%value;
+ bar.sync 0; add.u32 %round,%round,1; bra loop;
+done:
+ setp.ge.u32 %p,%i,%count; @%p ret;
+ mad.wide.u32 %out,%i,20,%out;
+ st.global.u32 [%out],%votes; st.global.u32 [%out+4],%every; st.global.u32 [%out+8],%any;
+ st.global.u32 [%out+12],%shared_sum; st.global.u32 [%out+16],%global_sum; ret;
+}

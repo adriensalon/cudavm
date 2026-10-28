@@ -323,7 +323,10 @@ void emit_compiler_program(const compiler_program& program, const compiler_emit_
         return;
     }
     case compiler_output_kind::program_image: {
-        if (module.getNamedMetadata("cudavm.import.architecture") && !module.getNamedMetadata("cudavm.numeric.helpers")) {
+        // External NVVM images need retained helpers for shader materialization.
+        // Text PTX keeps native intrinsics and must not expose private helpers.
+        if ((module.getNamedMetadata("cudavm.import.architecture") || module.getNamedMetadata("nvvmir.version"))
+            && !module.getNamedMetadata("cudavm.numeric.helpers")) {
             auto complete = prepare_compiler_program(program, {1, 1, 0, 0});
             emit_compiler_program(*complete, request, result);
             return;
