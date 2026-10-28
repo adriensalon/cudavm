@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA CUDA 12.4.131 ptxas",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/integer_simd_comparison/integer_simd_comparison.ptx -o test/integer_simd_comparison/integer_simd_comparison.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "integer_simd_comparison.cu": "a985a9906ba3c7328a05a4650cdd8f8d811893cd9fb174e6104483f8f4e92737",
+    "integer_simd_comparison.ptx": "4aab7ae76291a54992e589dc96d9be65d117f4eab1d6915775e96ae8e681f3a7",
+    "integer_simd_comparison.ll": "20f27a53f5174bdc2bbeeffba3c0ecdc4d2f0a96e4b14644359459ac9b82879f",
+    "integer_simd_comparison.cubin": "0f0eddb873b0a64951d1b72c72c672daed6b9476f8dfc975bd8cd33d667bc672"
+  }
+}

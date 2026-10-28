@@ -1418,6 +1418,14 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             if (auto mask = kernel.warp_masks.find(start + pc); mask != kernel.warp_masks.end() && mask->second != UINT32_MAX)
                 output += guard + "and.b32 %members,%members," + reg(mask->second & 255) + ";\n";
             instruction = "match.any.sync.b32 " + (dest == 255 ? std::string("%scratch") : reg(dest)) + "," + reg(left) + ",%members;";
+        } else if (op == 0x215) {
+            if ((lo >> 40) || (hi & ~uint64_t(0x8ff)) != 0xe0000)
+                fail("unsupported byte absolute-difference encoding");
+            auto addend = unsigned(hi) & 255;
+            if (!(hi & 0x800) && addend != 255 && known[addend] != 0)
+                fail("byte absolute-difference merge requires a known zero operand");
+            instruction = std::string("vabsdiff4.u32.u32.u32") + (hi & 0x800 ? ".add " : " ") +
+                reg(dest) + "," + reg(left) + "," + reg(right) + "," + reg(addend) + ";";
         } else if (op == 0x216 || op == 0x816 || op == 0xa16) {
             if ((hi & ~uint64_t(255)) != 0 || (op == 0x216 && (lo >> 40))) fail("unsupported byte permutation encoding");
             auto control = op == 0xa16 ? bank_word() : op == 0x816 ? std::to_string(uint32_t(lo >> 32)) : reg(right);

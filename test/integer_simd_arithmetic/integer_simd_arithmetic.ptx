@@ -1,0 +1,57 @@
+// Independently authored PTX 6.5, assembled by NVIDIA ptxas for the cubin.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry simd_arithmetic(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .reg .b64 %out,%in;
+ .reg .b32 %i,%block,%block_y,%grid_x,%threads,%count,%a,%b,%c,%zero,%r;
+ .reg .pred %p;
+ mov.u32 %i,%tid.x; mov.u32 %block,%ctaid.x; mov.u32 %threads,%ntid.x;
+ mov.u32 %block_y,%ctaid.y; mov.u32 %grid_x,%nctaid.x;
+ mad.lo.u32 %block,%block_y,%grid_x,%block; mad.lo.u32 %i,%block,%threads,%i;
+ ld.param.u32 %count,[count]; setp.ge.u32 %p,%i,%count; @%p ret;
+ ld.param.u64 %out,[out]; ld.param.u64 %in,[in];
+ mad.wide.u32 %out,%i,80,%out; mad.wide.u32 %in,%i,12,%in;
+ ld.global.u32 %a,[%in]; ld.global.u32 %b,[%in+4]; ld.global.u32 %c,[%in+8]; mov.u32 %zero,0;
+ vabsdiff2.s32.s32.s32 %r,%a,%zero,%zero;
+ st.global.u32 [%out+0],%r;
+ vabsdiff4.s32.s32.s32 %r,%a,%zero,%zero;
+ st.global.u32 [%out+4],%r;
+ vadd2.u32.u32.u32 %r,%a,%b,%zero;
+ st.global.u32 [%out+8],%r;
+ vadd4.u32.u32.u32 %r,%a,%b,%zero;
+ st.global.u32 [%out+12],%r;
+ vsub2.u32.u32.u32 %r,%a,%b,%zero;
+ st.global.u32 [%out+16],%r;
+ vsub4.u32.u32.u32 %r,%a,%b,%zero;
+ st.global.u32 [%out+20],%r;
+ vsub2.u32.u32.u32 %r,%zero,%a,%zero;
+ st.global.u32 [%out+24],%r;
+ vsub4.u32.u32.u32 %r,%zero,%a,%zero;
+ st.global.u32 [%out+28],%r;
+ vabsdiff2.s32.s32.s32 %r,%a,%b,%zero;
+ st.global.u32 [%out+32],%r;
+ vabsdiff4.s32.s32.s32 %r,%a,%b,%zero;
+ st.global.u32 [%out+36],%r;
+ vabsdiff2.u32.u32.u32 %r,%a,%b,%zero;
+ st.global.u32 [%out+40],%r;
+ vabsdiff4.u32.u32.u32 %r,%a,%b,%zero;
+ st.global.u32 [%out+44],%r;
+ vabsdiff2.s32.s32.s32.add %r,%a,%b,%zero;
+ st.global.u32 [%out+48],%r;
+ vabsdiff4.s32.s32.s32.add %r,%a,%b,%zero;
+ st.global.u32 [%out+52],%r;
+ vabsdiff2.u32.u32.u32.add %r,%a,%b,%zero;
+ st.global.u32 [%out+56],%r;
+ vabsdiff4.u32.u32.u32.add %r,%a,%b,%zero;
+ st.global.u32 [%out+60],%r;
+ vabsdiff2.s32.s32.s32.add %r,%a,%b,%c;
+ st.global.u32 [%out+64],%r;
+ vabsdiff4.s32.s32.s32.add %r,%a,%b,%c;
+ st.global.u32 [%out+68],%r;
+ vabsdiff2.u32.u32.u32.add %r,%a,%b,%c;
+ st.global.u32 [%out+72],%r;
+ vabsdiff4.u32.u32.u32.add %r,%a,%b,%c;
+ st.global.u32 [%out+76],%r;
+ ret;
+}

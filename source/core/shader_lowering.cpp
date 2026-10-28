@@ -355,6 +355,24 @@ bool lower_integer_vector_bitcasts(llvm::Module& module) {
     }
     return !memory.empty() || !casts.empty();
 }
+bool lower_integer_vector_sums(llvm::Module& module) {
+    std::vector<llvm::CallInst*> sums;
+    for (auto& function : module) for (auto& block : function) for (auto& instruction : block)
+        if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+            call && call->getIntrinsicID() == llvm::Intrinsic::vector_reduce_add &&
+            llvm::isa<llvm::FixedVectorType>(call->getArgOperand(0)->getType())) sums.push_back(call);
+    for (auto* call : sums) {
+        llvm::IRBuilder<> builder(call);
+        auto* input = call->getArgOperand(0);
+        auto lanes = llvm::cast<llvm::FixedVectorType>(input->getType())->getNumElements();
+        llvm::Value* sum = llvm::ConstantInt::get(call->getType(), 0);
+        for (unsigned lane = 0; lane < lanes; ++lane)
+            sum = builder.CreateAdd(sum, builder.CreateExtractElement(input, lane));
+        call->replaceAllUsesWith(sum);
+        call->eraseFromParent();
+    }
+    return !sums.empty();
+}
 void optimize(llvm::Module& module) {
     llvm::LoopAnalysisManager loops; llvm::FunctionAnalysisManager functions;
     llvm::CGSCCAnalysisManager calls; llvm::ModuleAnalysisManager modules;
@@ -404,7 +422,11 @@ void optimize(llvm::Module& module) {
     finish.run(module, modules);
     // LLVM's scalarizer leaves scalar/vector bitcasts intact. Expose their
     // little-endian lanes explicitly, then scalarize the newly reachable uses.
-    if(lower_integer_vector_bitcasts(module)) {
+    // InstCombine also forms vector sums from scalar lane reductions. Expand
+    // them after its final run so no vector reconstruction reaches lowering.
+    bool packed_values = lower_integer_vector_bitcasts(module);
+    packed_values = lower_integer_vector_sums(module) || packed_values;
+    if(packed_values) {
         modules.invalidate(module,llvm::PreservedAnalyses::none());
         llvm::ModulePassManager packed;
         llvm::FunctionPassManager lanes;lanes.addPass(llvm::ScalarizerPass(scalar));

@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA CUDA 12.4.131 ptxas",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/integer_simd_arithmetic/integer_simd_arithmetic.ptx -o test/integer_simd_arithmetic/integer_simd_arithmetic.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "integer_simd_arithmetic.cu": "bdb0c69f2c609c384ea97467d5cc47ccb03a07db5e04163bf10cd9536653fc65",
+    "integer_simd_arithmetic.ptx": "7e9a2221eba16d53b7e09ffbd13dfd2926978e27597ef32c161d54fa23ad3747",
+    "integer_simd_arithmetic.ll": "42215d67ad5788f8c850e48f17272db84917223f12c7abea19573791d518f882",
+    "integer_simd_arithmetic.cubin": "64256817e09129d148a2c41895b893433dd90c898f74c5c958db38ba69f389ae"
+  }
+}

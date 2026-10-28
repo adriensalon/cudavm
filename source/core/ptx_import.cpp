@@ -1368,11 +1368,20 @@ class ptx_parser {
             if (literal.size() != 1 || !std::isdigit(static_cast<unsigned char>(literal[0].text[0]))) ptx_fail(opcode, "lop3 requires an immediate lookup table");
             auto table = ptx_unsigned(literal[0]); if (table > 255) ptx_fail(literal[0], "lop3 lookup table exceeds 8 bits");
             llvm::Value* nodes[8];
-            for (unsigned i = 0; i < 8; ++i) nodes[i] = b.getInt32(table & (1u << i) ? UINT32_MAX : 0);
-            for (unsigned level = 0; level < 3; ++level) {
-                auto* mask = operand(3 - level, {32, 'b'});
-                for (unsigned i = 0; i < (4u >> level); ++i) nodes[i] = nodes[i * 2] == nodes[i * 2 + 1] ? nodes[i * 2] :
-                    b.CreateOr(b.CreateAnd(b.CreateNot(mask), nodes[i * 2]), b.CreateAnd(mask, nodes[i * 2 + 1]));
+            // Preserve elementary Boolean operations as such. Expanding XOR
+            // into minterms obscures packed carry/borrow correction in shader
+            // optimizers, even after ordinary LLVM instruction combining.
+            if (table == 0x3c) nodes[0] = b.CreateXor(operand(1, {32, 'b'}), operand(2, {32, 'b'}));
+            else if (table == 0xc0) nodes[0] = b.CreateAnd(operand(1, {32, 'b'}), operand(2, {32, 'b'}));
+            else if (table == 0xfc) nodes[0] = b.CreateOr(operand(1, {32, 'b'}), operand(2, {32, 'b'}));
+            else if (table == 0x33) nodes[0] = b.CreateNot(operand(2, {32, 'b'}));
+            else {
+                for (unsigned i = 0; i < 8; ++i) nodes[i] = b.getInt32(table & (1u << i) ? UINT32_MAX : 0);
+                for (unsigned level = 0; level < 3; ++level) {
+                    auto* mask = operand(3 - level, {32, 'b'});
+                    for (unsigned i = 0; i < (4u >> level); ++i) nodes[i] = nodes[i * 2] == nodes[i * 2 + 1] ? nodes[i * 2] :
+                        b.CreateOr(b.CreateAnd(b.CreateNot(mask), nodes[i * 2]), b.CreateAnd(mask, nodes[i * 2 + 1]));
+                }
             }
             if (!predicate) write(operands[0], nodes[0], {32, 'b'});
             else {

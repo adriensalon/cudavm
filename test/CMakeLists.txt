@@ -92,3 +92,5 @@ cudavm_add_conformance_slice(numeric_representations FAMILY_CHECKS D05.represent
 cudavm_add_conformance_slice(float_comparison FAMILY_CHECKS D05.special D05.accuracy)
 cudavm_add_conformance_slice(double_comparison FAMILY_CHECKS D05.special D05.accuracy)
 cudavm_add_conformance_slice(integer_packed_arithmetic FAMILY_CHECKS D05.integer)
+cudavm_add_conformance_slice(integer_simd_arithmetic FAMILY_CHECKS D05.integer)
+cudavm_add_conformance_slice(integer_simd_comparison FAMILY_CHECKS D05.integer)
