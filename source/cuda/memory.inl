@@ -46,13 +46,19 @@ memory_box memory_endpoint(CUmemorytype type, const void* host, CUdeviceptr devi
     if (type == CU_MEMORYTYPE_ARRAY) {
         require(array, CUDA_ERROR_INVALID_VALUE, "null array copy endpoint");
         auto entry = array_lookup(array, owner); auto& d = entry->descriptor;
-        auto element = array_element_bytes(d), row_bytes = d.Width * element;
-        auto array_height = std::max(size_t(1), d.Height), array_depth = std::max(size_t(1), d.Depth);
-        require(x % element == 0 && x <= row_bytes && width <= row_bytes - x &&
+        require(!(d.Flags & CUDA_ARRAY3D_DEFERRED_MAPPING), CUDA_ERROR_INVALID_VALUE, "array backing has not been mapped");
+        auto element = array_element_bytes(d), row_bytes = array_storage_width(d) * element;
+        auto array_height = array_storage_height(d), array_depth = std::max(size_t(1), d.Depth);
+        const bool compressed = array_format_properties(d.Format).encoding == array_storage_encoding::block_compressed;
+        require(x % element == 0 && (!compressed || width % element == 0) && x <= row_bytes && width <= row_bytes - x &&
                 y <= array_height && height <= array_height - y && z <= array_depth && depth <= array_depth - z,
                 CUDA_ERROR_INVALID_VALUE, "array copy exceeds extent or element alignment");
-        memory_box result; result.owner = owner; result.storage = entry->native; result.array = array;
-        result.pitch = row_bytes; result.slice = row_bytes * array_height; result.rows = height; result.depth = depth;
+        memory_box result; result.owner = owner;
+        result.storage = std::shared_ptr<buffer>(entry->native, &entry->native->storage()); result.array = array;
+        result.allocation_offset = entry->native->storage_offset();
+        result.pitch = row_bytes;
+        result.slice = entry->native->array_slice_stride() ? entry->native->array_slice_stride() : row_bytes * array_height;
+        result.rows = height; result.depth = depth;
         if (!width || !height || !depth) return result;
         result.first = z * result.slice + y * row_bytes + x;
         result.span = (depth - 1) * result.slice + (height - 1) * row_bytes + width;

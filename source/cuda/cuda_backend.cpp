@@ -119,6 +119,31 @@ struct cuda_array_buffer : cuda_buffer {
     std::shared_ptr<cuda_mipmapped_storage> mipmapped;
     cuda_array_buffer(std::shared_ptr<cuda_context> owner, const CUDA_ARRAY3D_DESCRIPTOR& d)
         : cuda_buffer(std::move(owner), array_storage_bytes(d), 0, {}), descriptor(d) {}
+    size_t physical_size() const override {
+        return descriptor.Flags & (CUDA_ARRAY3D_DEFERRED_MAPPING | CUDA_ARRAY3D_SPARSE) ? 0 : cuda_buffer::physical_size();
+    }
+    CUDA_ARRAY_MEMORY_REQUIREMENTS array_requirements() const override {
+        cuda_context_guard guard(*context);
+        CUDA_ARRAY_MEMORY_REQUIREMENTS result{};
+        check(context->api->driver.get<decltype(&cuArrayGetMemoryRequirements)>("cuArrayGetMemoryRequirements")(
+            &result, value, context->device), "cuArrayGetMemoryRequirements");
+        return result;
+    }
+    CUDA_ARRAY_SPARSE_PROPERTIES array_sparse_properties() const override {
+        cuda_context_guard guard(*context);
+        CUDA_ARRAY_SPARSE_PROPERTIES result{};
+        check(context->api->driver.get<decltype(&cuArrayGetSparseProperties)>("cuArrayGetSparseProperties")(
+            &result, value), "cuArrayGetSparseProperties");
+        return result;
+    }
+    CUDA_ARRAY_MEMORY_REQUIREMENTS mipmapped_requirements() const override {
+        require(bool(mipmapped), CUDA_ERROR_INVALID_VALUE, "array has no mipmapped allocation");
+        cuda_context_guard guard(*context);
+        CUDA_ARRAY_MEMORY_REQUIREMENTS result{};
+        check(context->api->driver.get<decltype(&cuMipmappedArrayGetMemoryRequirements)>("cuMipmappedArrayGetMemoryRequirements")(
+            &result, mipmapped->value, context->device), "cuMipmappedArrayGetMemoryRequirements");
+        return result;
+    }
     ~cuda_array_buffer() {
         if (value && !mipmapped && context->api->push(context->value) == CUDA_SUCCESS) {
             context->api->driver.get<decltype(&cuArrayDestroy)>("cuArrayDestroy")(value);
@@ -151,8 +176,8 @@ CUDA_MEMCPY3D cuda_array_row(buffer* to, size_t destination, void* host_to,
         auto type = image ? CU_MEMORYTYPE_ARRAY : CU_MEMORYTYPE_DEVICE;
         size_t x = 0, y = 0, z = 0;
         if (image) {
-            auto pitch = image->descriptor.Width * array_element_bytes(image->descriptor);
-            auto height = std::max(size_t(1), image->descriptor.Height);
+            auto pitch = array_storage_width(image->descriptor) * array_element_bytes(image->descriptor);
+            auto height = array_storage_height(image->descriptor);
             x = offset % pitch; y = offset / pitch % height; z = offset / pitch / height;
         }
         auto address = image ? 0 : static_cast<cuda_buffer*>(storage)->address + offset;
@@ -851,6 +876,15 @@ struct cuda_session : session {
     }
     std::unique_ptr<buffer> allocate(size_t size) override { return std::make_unique<cuda_buffer>(context, size); }
     std::shared_ptr<buffer> allocate_array(const CUDA_ARRAY3D_DESCRIPTOR& d) override {
+        const auto format = array_format_properties(d.Format);
+        const bool buffer_layout = format.planes > 1
+            || (format.encoding == array_storage_encoding::packed && format.block_bytes)
+            || (d.Flags & (CUDA_ARRAY3D_DEPTH_TEXTURE | CUDA_ARRAY3D_COLOR_ATTACHMENT | CUDA_ARRAY3D_VIDEO_ENCODE_DECODE));
+        if (buffer_layout) {
+            const auto bytes = array_storage_bytes(d);
+            if (d.Flags & CUDA_ARRAY3D_DEFERRED_MAPPING) return std::make_shared<deferred_array_storage>(bytes);
+            return allocate(bytes);
+        }
         auto result = std::make_shared<cuda_array_buffer>(context, d);
         cuda_context_guard guard(*context);
         check(context->api->driver.get<decltype(&cuArray3DCreate)>("cuArray3DCreate_v2")(&result->value, &d), "cuArray3DCreate_v2");
@@ -859,7 +893,11 @@ struct cuda_session : session {
     std::shared_ptr<image_object> create_texture(buffer& storage, const CUDA_RESOURCE_DESC& input, size_t offset, const CUDA_TEXTURE_DESC& texture, const CUDA_RESOURCE_VIEW_DESC* view) override {
         auto result = std::make_shared<cuda_image_object>(context, false);
         auto resource = input;
-        if (resource.resType == CU_RESOURCE_TYPE_ARRAY) resource.res.array.hArray = static_cast<cuda_array_buffer&>(storage).value;
+        if (resource.resType == CU_RESOURCE_TYPE_ARRAY) {
+            auto* array = dynamic_cast<cuda_array_buffer*>(&storage);
+            require(array && array->value, CUDA_ERROR_NOT_SUPPORTED, "this array layout requires a texture adapter");
+            resource.res.array.hArray = array->value;
+        }
         else if (resource.resType == CU_RESOURCE_TYPE_LINEAR) resource.res.linear.devPtr = storage.native_address() + offset;
         else resource.res.pitch2D.devPtr = storage.native_address() + offset;
         cuda_context_guard guard(*context);
@@ -869,9 +907,11 @@ struct cuda_session : session {
         return result;
     }
     std::shared_ptr<image_object> create_surface(buffer& storage) override {
+        auto* array = dynamic_cast<cuda_array_buffer*>(&storage);
+        require(array && array->value, CUDA_ERROR_NOT_SUPPORTED, "this array layout requires a surface adapter");
         auto result = std::make_shared<cuda_image_object>(context, true);
         CUDA_RESOURCE_DESC resource{}; resource.resType = CU_RESOURCE_TYPE_ARRAY;
-        resource.res.array.hArray = static_cast<cuda_array_buffer&>(storage).value;
+        resource.res.array.hArray = array->value;
         cuda_context_guard guard(*context);
         CUsurfObject handle{};
         check(context->api->driver.get<decltype(&cuSurfObjectCreate)>("cuSurfObjectCreate")(&handle, &resource), "cuSurfObjectCreate");

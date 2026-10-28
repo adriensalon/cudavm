@@ -36,6 +36,7 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
     if (resource.resType == CU_RESOURCE_TYPE_ARRAY) {
         entry->array = array_lookup(resource.res.array.hArray, owner);
         d = entry->array->descriptor; entry->backing = entry->array->native;
+        require(!(d.Flags & CUDA_ARRAY3D_DEFERRED_MAPPING), CUDA_ERROR_INVALID_VALUE, "array backing has not been mapped");
         entry->backing_address = image_address = entry->array->image_address;
         pitch = d.Width * array_element_bytes(d);
         if (surface) require(d.Flags & CUDA_ARRAY3D_SURFACE_LDST, CUDA_ERROR_INVALID_VALUE, "array does not enable surface access");

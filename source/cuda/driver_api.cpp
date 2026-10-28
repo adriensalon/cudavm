@@ -111,6 +111,8 @@ struct array_entry {
     std::shared_ptr<buffer> native;
     CUDA_ARRAY3D_DESCRIPTOR descriptor{};
     CUmipmappedArray parent = nullptr;
+    CUarray parent_array = nullptr;
+    std::vector<CUarray> planes;
     bool retiring = false;
     CUdeviceptr image_address = 0;
 };

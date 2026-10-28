@@ -1,5 +1,6 @@
 #include <cudart/cudavm_registration.h>
 #include "../cuda/driver_api.hpp"
+#include "../cuda/array_api.hpp"
 #include <cstring>
 #include <algorithm>
 #include <limits>

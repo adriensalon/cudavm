@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda/cudavm_cuda.h>
 #include <cuda.h>
+#include "array_api.hpp"
 #include <cuda/cudavm_interop.h>
 #include <algorithm>
 #include <array>
@@ -140,82 +141,37 @@ struct buffer {
     virtual buffer& storage() { return *this; }
     virtual const buffer& storage() const { return *this; }
     virtual size_t storage_offset() const { return 0; }
+    virtual size_t array_slice_stride() const { return 0; }
     virtual std::byte* host_address() const { return nullptr; }
     virtual size_t graph_backing_size() const { return size; }
     virtual size_t physical_size() const { return graph_backing_size(); }
+    virtual CUDA_ARRAY_MEMORY_REQUIREMENTS array_requirements() const {
+        throw failure(CUDA_ERROR_INVALID_VALUE, "array does not use deferred mapping");
+    }
+    virtual CUDA_ARRAY_SPARSE_PROPERTIES array_sparse_properties() const {
+        throw failure(CUDA_ERROR_INVALID_VALUE, "array is not sparse");
+    }
+    virtual CUDA_ARRAY_MEMORY_REQUIREMENTS mipmapped_requirements() const {
+        throw failure(CUDA_ERROR_INVALID_VALUE, "array has no mipmapped allocation");
+    }
     virtual size_t restore_graph() { return size; }
     virtual void trim_graph() { throw failure(CUDA_ERROR_NOT_SUPPORTED, "graph backing cannot be unmapped"); }
 };
-// Transfer layout for ordinary packed CUDA numeric arrays. Sampling and
-// sparse/compressed image layouts have separate backend contracts.
+// Array coordinates exposed to byte-copy APIs address whole storage blocks.
 inline size_t array_element_bytes(const CUDA_ARRAY3D_DESCRIPTOR& d) {
-    require(d.NumChannels == 1 || d.NumChannels == 2 || d.NumChannels == 4, CUDA_ERROR_INVALID_VALUE, "invalid array channel count");
-    size_t component = 0;
-    switch (d.Format) {
-    case CU_AD_FORMAT_UNSIGNED_INT8: case CU_AD_FORMAT_SIGNED_INT8: component = 1; break;
-    case CU_AD_FORMAT_UNSIGNED_INT16: case CU_AD_FORMAT_SIGNED_INT16: case CU_AD_FORMAT_HALF: component = 2; break;
-    case CU_AD_FORMAT_UNSIGNED_INT32: case CU_AD_FORMAT_SIGNED_INT32: case CU_AD_FORMAT_FLOAT: component = 4; break;
-    case CU_AD_FORMAT_NV12:
-    case CU_AD_FORMAT_UNORM_INT8X1:
-    case CU_AD_FORMAT_UNORM_INT8X2:
-    case CU_AD_FORMAT_UNORM_INT8X4:
-    case CU_AD_FORMAT_UNORM_INT16X1:
-    case CU_AD_FORMAT_UNORM_INT16X2:
-    case CU_AD_FORMAT_UNORM_INT16X4:
-    case CU_AD_FORMAT_SNORM_INT8X1:
-    case CU_AD_FORMAT_SNORM_INT8X2:
-    case CU_AD_FORMAT_SNORM_INT8X4:
-    case CU_AD_FORMAT_SNORM_INT16X1:
-    case CU_AD_FORMAT_SNORM_INT16X2:
-    case CU_AD_FORMAT_SNORM_INT16X4:
-    case CU_AD_FORMAT_BC1_UNORM:
-    case CU_AD_FORMAT_BC1_UNORM_SRGB:
-    case CU_AD_FORMAT_BC2_UNORM:
-    case CU_AD_FORMAT_BC2_UNORM_SRGB:
-    case CU_AD_FORMAT_BC3_UNORM:
-    case CU_AD_FORMAT_BC3_UNORM_SRGB:
-    case CU_AD_FORMAT_BC4_UNORM:
-    case CU_AD_FORMAT_BC4_SNORM:
-    case CU_AD_FORMAT_BC5_UNORM:
-    case CU_AD_FORMAT_BC5_SNORM:
-    case CU_AD_FORMAT_BC6H_UF16:
-    case CU_AD_FORMAT_BC6H_SF16:
-    case CU_AD_FORMAT_BC7_UNORM:
-    case CU_AD_FORMAT_BC7_UNORM_SRGB:
-    case CU_AD_FORMAT_P010:
-    case CU_AD_FORMAT_P016:
-    case CU_AD_FORMAT_NV16:
-    case CU_AD_FORMAT_P210:
-    case CU_AD_FORMAT_P216:
-    case CU_AD_FORMAT_YUY2:
-    case CU_AD_FORMAT_Y210:
-    case CU_AD_FORMAT_Y216:
-    case CU_AD_FORMAT_AYUV:
-    case CU_AD_FORMAT_Y410:
-    case CU_AD_FORMAT_Y416:
-    case CU_AD_FORMAT_Y444_PLANAR8:
-    case CU_AD_FORMAT_Y444_PLANAR10:
-    case CU_AD_FORMAT_YUV444_8bit_SemiPlanar:
-    case CU_AD_FORMAT_YUV444_16bit_SemiPlanar:
-    case CU_AD_FORMAT_UNORM_INT_101010_2:
-    case CU_AD_FORMAT_UINT8_PACKED_422:
-    case CU_AD_FORMAT_UINT8_PACKED_444:
-    case CU_AD_FORMAT_UINT8_SEMIPLANAR_420:
-    case CU_AD_FORMAT_UINT16_SEMIPLANAR_420:
-    case CU_AD_FORMAT_UINT8_SEMIPLANAR_422:
-    case CU_AD_FORMAT_UINT16_SEMIPLANAR_422:
-    case CU_AD_FORMAT_UINT8_SEMIPLANAR_444:
-    case CU_AD_FORMAT_UINT16_SEMIPLANAR_444:
-    case CU_AD_FORMAT_UINT8_PLANAR_420:
-    case CU_AD_FORMAT_UINT16_PLANAR_420:
-    case CU_AD_FORMAT_UINT8_PLANAR_422:
-    case CU_AD_FORMAT_UINT16_PLANAR_422:
-    case CU_AD_FORMAT_UINT8_PLANAR_444:
-    case CU_AD_FORMAT_UINT16_PLANAR_444:
-        throw failure(CUDA_ERROR_NOT_SUPPORTED, "array format requires a separate image layout");
-    default: throw failure(CUDA_ERROR_INVALID_VALUE, "invalid array format");
-    }
-    return component * d.NumChannels;
+    const auto format = array_format_properties(d.Format);
+    require(format.valid, CUDA_ERROR_INVALID_VALUE, "invalid array format");
+    require(format.channels ? d.NumChannels == format.channels
+        : d.NumChannels == 1 || d.NumChannels == 2 || d.NumChannels == 4,
+        CUDA_ERROR_INVALID_VALUE, "invalid array channel count for format");
+    require(format.planes == 1, CUDA_ERROR_INVALID_VALUE, "multiplanar transfers require a plane array");
+    return format.block_bytes ? format.block_bytes : format.component_bits / 8 * d.NumChannels;
+}
+inline size_t array_storage_width(const CUDA_ARRAY3D_DESCRIPTOR& d) {
+    return array_block_extent(d.Width, array_format_properties(d.Format).block_width);
+}
+inline size_t array_storage_height(const CUDA_ARRAY3D_DESCRIPTOR& d) {
+    return std::max(size_t(1), array_block_extent(d.Height, array_format_properties(d.Format).block_height));
 }
 inline CUDA_ARRAY3D_DESCRIPTOR array_level_descriptor(CUDA_ARRAY3D_DESCRIPTOR d, unsigned level) {
     d.Width = std::max(size_t(1), d.Width >> level);
@@ -224,13 +180,68 @@ inline CUDA_ARRAY3D_DESCRIPTOR array_level_descriptor(CUDA_ARRAY3D_DESCRIPTOR d,
     return d;
 }
 inline size_t array_storage_bytes(const CUDA_ARRAY3D_DESCRIPTOR& d) {
+    const auto format = array_format_properties(d.Format);
+    require(format.valid && (format.channels ? d.NumChannels == format.channels
+        : d.NumChannels == 1 || d.NumChannels == 2 || d.NumChannels == 4),
+        CUDA_ERROR_INVALID_VALUE, "invalid array format or channel count");
+    if (format.planes > 1) {
+        require(d.Width && d.Height && d.Width % format.subsample_x == 0 && d.Height % format.subsample_y == 0,
+            CUDA_ERROR_INVALID_VALUE, "multiplanar extents must respect chroma subsampling");
+        const size_t component = format.component_bits / 8;
+        const size_t maximum = std::numeric_limits<size_t>::max();
+        require(d.Width <= maximum / component && d.Height <= maximum / (d.Width * component),
+            CUDA_ERROR_INVALID_VALUE, "multiplanar storage size overflow");
+        const size_t luma = d.Width * component * d.Height;
+        const size_t chroma = luma / format.subsample_x / format.subsample_y;
+        require(chroma <= (maximum - luma) / 2, CUDA_ERROR_INVALID_VALUE, "multiplanar storage size overflow");
+        const size_t slice = luma + 2 * chroma;
+        const size_t depth = std::max(size_t(1), d.Depth);
+        require(depth <= maximum / slice, CUDA_ERROR_INVALID_VALUE, "multiplanar storage size overflow");
+        return slice * depth;
+    }
     size_t bytes = array_element_bytes(d);
-    for (auto extent : {d.Width, std::max(size_t(1), d.Height), std::max(size_t(1), d.Depth)}) {
+    for (auto extent : {array_storage_width(d), array_storage_height(d), std::max(size_t(1), d.Depth)}) {
         require(extent && extent <= std::numeric_limits<size_t>::max() / bytes, CUDA_ERROR_INVALID_VALUE, "array storage size overflow");
         bytes *= extent;
     }
     return bytes;
 }
+inline CUDA_ARRAY3D_DESCRIPTOR array_plane_descriptor(const CUDA_ARRAY3D_DESCRIPTOR& d, unsigned plane) {
+    const auto format = array_format_properties(d.Format);
+    require(format.valid && format.planes > 1 && plane < format.planes,
+        CUDA_ERROR_INVALID_VALUE, "invalid format plane");
+    auto result = d;
+    result.Format = format.component_bits == 8 ? CU_AD_FORMAT_UNSIGNED_INT8 : CU_AD_FORMAT_UNSIGNED_INT16;
+    result.NumChannels = plane && format.planes == 2 ? 2 : 1;
+    if (plane) { result.Width /= format.subsample_x; result.Height /= format.subsample_y; }
+    return result;
+}
+struct array_plane_storage : buffer {
+    std::shared_ptr<buffer> parent;
+    size_t offset, slice_stride;
+    array_plane_storage(std::shared_ptr<buffer> input, size_t begin, size_t bytes, size_t slice)
+        : buffer(bytes), parent(std::move(input)), offset(begin), slice_stride(slice) {}
+    buffer& storage() override { return parent->storage(); }
+    const buffer& storage() const override { return parent->storage(); }
+    size_t storage_offset() const override { return parent->storage_offset() + offset; }
+    size_t array_slice_stride() const override { return slice_stride; }
+    size_t physical_size() const override { return 0; }
+};
+// Deferred arrays reserve metadata only. This is the storage/mapping alignment
+// of the buffer-backed array layout, independent of an NVIDIA image's tiling.
+struct deferred_array_storage : buffer {
+    explicit deferred_array_storage(size_t bytes) : buffer(bytes) {}
+    size_t physical_size() const override { return 0; }
+    CUDA_ARRAY_MEMORY_REQUIREMENTS array_requirements() const override {
+        constexpr size_t alignment = 65536;
+        require(size <= std::numeric_limits<size_t>::max() - (alignment - 1),
+            CUDA_ERROR_INVALID_VALUE, "deferred array size overflow");
+        CUDA_ARRAY_MEMORY_REQUIREMENTS result{};
+        result.size = (size + alignment - 1) / alignment * alignment;
+        result.alignment = alignment;
+        return result;
+    }
+};
 // A logical allocation retains its backing and reservation independently of
 // the pool handle. Reuse waits for the frees following queued snapshots;
 // completed cache views with other retained owners remain unavailable.
@@ -620,7 +631,11 @@ struct session {
     virtual std::unique_ptr<buffer> allocate(size_t bytes) = 0;
     // Buffer storage implements allocation and byte transfers on shader
     // adapters. It does not imply native image sampling support.
-    virtual std::shared_ptr<buffer> allocate_array(const CUDA_ARRAY3D_DESCRIPTOR& d) { return allocate(array_storage_bytes(d)); }
+    virtual std::shared_ptr<buffer> allocate_array(const CUDA_ARRAY3D_DESCRIPTOR& d) {
+        const auto bytes = array_storage_bytes(d);
+        if (d.Flags & CUDA_ARRAY3D_DEFERRED_MAPPING) return std::make_shared<deferred_array_storage>(bytes);
+        return allocate(bytes);
+    }
     virtual std::shared_ptr<image_object> create_texture(buffer&, const CUDA_RESOURCE_DESC&, size_t, const CUDA_TEXTURE_DESC&, const CUDA_RESOURCE_VIEW_DESC*) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "native texture objects are unavailable");
     }

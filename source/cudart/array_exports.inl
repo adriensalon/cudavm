@@ -20,7 +20,10 @@ RUNTIME_API(cudaArrayGetInfo, (cudaChannelFormatDesc* output, cudaExtent* extent
     if (output) *output = channel; if (extent) *extent = {d.Width,d.Height,d.Depth};
     if (flags) *flags = (d.Flags & CUDA_ARRAY3D_LAYERED ? cudaArrayLayered : 0) |
         (d.Flags & CUDA_ARRAY3D_SURFACE_LDST ? cudaArraySurfaceLoadStore : 0) |
-        (d.Flags & CUDA_ARRAY3D_CUBEMAP ? cudaArrayCubemap : 0) | (d.Flags & CUDA_ARRAY3D_TEXTURE_GATHER ? cudaArrayTextureGather : 0))
+        (d.Flags & CUDA_ARRAY3D_CUBEMAP ? cudaArrayCubemap : 0) | (d.Flags & CUDA_ARRAY3D_TEXTURE_GATHER ? cudaArrayTextureGather : 0) |
+        (d.Flags & CUDA_ARRAY3D_SPARSE ? cudaArraySparse : 0) | (d.Flags & CUDA_ARRAY3D_DEFERRED_MAPPING ? cudaArrayDeferredMapping : 0) |
+        (d.Flags & CUDA_ARRAY3D_COLOR_ATTACHMENT ? cudaArrayColorAttachment : 0) |
+        (d.Flags & (CUDA_ARRAY3D_DEPTH_TEXTURE | CUDA_ARRAY3D_VIDEO_ENCODE_DECODE)))
 RUNTIME_API(cudaGetChannelDesc, (cudaChannelFormatDesc* output, cudaArray_const_t array),
     require(output, CUDA_ERROR_INVALID_VALUE, "null channel descriptor output"); runtime_current(); *output = runtime_channel_descriptor(runtime_array_info(array)))
 RUNTIME_API(cudaArrayGetMemoryRequirements, (cudaArrayMemoryRequirements* output, cudaArray_t array, int device),
@@ -28,6 +31,20 @@ RUNTIME_API(cudaArrayGetMemoryRequirements, (cudaArrayMemoryRequirements* output
     CUDA_ARRAY_MEMORY_REQUIREMENTS requirements{};
     check(cuArrayGetMemoryRequirements(&requirements, reinterpret_cast<CUarray>(array), device));
     *output = {}; output->size = requirements.size; output->alignment = requirements.alignment)
+RUNTIME_API(cudaMipmappedArrayGetMemoryRequirements, (cudaArrayMemoryRequirements* output, cudaMipmappedArray_t array, int device),
+    require(output, CUDA_ERROR_INVALID_VALUE, "null mipmap requirements output"); runtime_current();
+    CUDA_ARRAY_MEMORY_REQUIREMENTS requirements{};
+    check(cuMipmappedArrayGetMemoryRequirements(&requirements, reinterpret_cast<CUmipmappedArray>(array), device));
+    *output = {}; output->size = requirements.size; output->alignment = requirements.alignment)
+RUNTIME_API(cudaArrayGetPlane, (cudaArray_t* output, cudaArray_t array, unsigned plane),
+    require(output, CUDA_ERROR_INVALID_VALUE, "null array plane output"); runtime_current(); CUarray value{};
+    check(cuArrayGetPlane(&value, reinterpret_cast<CUarray>(array), plane)); *output = reinterpret_cast<cudaArray_t>(value))
+RUNTIME_API(cudaArrayGetSparseProperties, (cudaArraySparseProperties* output, cudaArray_t array),
+    require(output, CUDA_ERROR_INVALID_VALUE, "null sparse properties output"); runtime_current();
+    CUDA_ARRAY_SPARSE_PROPERTIES properties{};
+    check(cuArrayGetSparseProperties(&properties, reinterpret_cast<CUarray>(array)));
+    *output = {}; output->tileExtent = {properties.tileExtent.width, properties.tileExtent.height, properties.tileExtent.depth};
+    output->miptailFirstLevel = properties.miptailFirstLevel; output->miptailSize = properties.miptailSize; output->flags = properties.flags)
 extern "C" CUDAVM_CUDART_API cudaChannelFormatDesc CUDARTAPI cudaCreateChannelDesc(int x,int y,int z,int w,cudaChannelFormatKind kind) { return {x,y,z,w,kind}; }
 RUNTIME_API(cudaMemcpy2DToArray, (cudaArray_t to,size_t x,size_t y,const void* from,size_t pitch,size_t width,size_t height,cudaMemcpyKind kind),
     require(to,CUDA_ERROR_INVALID_VALUE,"null destination array"); runtime_current();
