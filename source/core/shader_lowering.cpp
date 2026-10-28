@@ -353,10 +353,9 @@ bool lower_integer_vector_bitcasts(llvm::Module& module) {
         }
         cast->replaceAllUsesWith(result);cast->eraseFromParent();
     }
-    return !casts.empty();
+    return !memory.empty() || !casts.empty();
 }
 void optimize(llvm::Module& module) {
-    lower_integer_vector_bitcasts(module);
     llvm::LoopAnalysisManager loops; llvm::FunctionAnalysisManager functions;
     llvm::CGSCCAnalysisManager calls; llvm::ModuleAnalysisManager modules;
     llvm::PassBuilder pb;
@@ -386,15 +385,23 @@ void optimize(llvm::Module& module) {
     llvm::FunctionPassManager fp;
     fp.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG)); fp.addPass(llvm::PromotePass());
     fp.addPass(llvm::InstCombinePass()); fp.addPass(llvm::SimplifyCFGPass());
+    passes.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(fp)));
+    passes.run(module, modules);
+    // InstCombine folds a bitcast of a packed word into its vector load/store.
+    // Normalize after that fold and immediately before scalarization, so the
+    // scalarizer keeps each aligned word access intact.
+    if(lower_integer_vector_bitcasts(module))modules.invalidate(module,llvm::PreservedAnalyses::none());
     llvm::ScalarizerPassOptions scalar; scalar.ScalarizeLoadStore = true;
-    fp.addPass(llvm::ScalarizerPass(scalar));
+    llvm::FunctionPassManager remaining;
+    remaining.addPass(llvm::ScalarizerPass(scalar));
     // Scalarization exposes copies and bitfields in CUDA group objects. Fold
     // their initialized tags before lowering a generic group's dispatch, so a
     // legal tile does not retain unreachable grid/abort implementations.
-    fp.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));fp.addPass(llvm::PromotePass());
-    fp.addPass(llvm::InstCombinePass());fp.addPass(llvm::SCCPPass());fp.addPass(llvm::SimplifyCFGPass());
-    passes.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(fp)));
-    passes.run(module, modules);
+    remaining.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));remaining.addPass(llvm::PromotePass());
+    remaining.addPass(llvm::InstCombinePass());remaining.addPass(llvm::SCCPPass());remaining.addPass(llvm::SimplifyCFGPass());
+    llvm::ModulePassManager finish;
+    finish.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(remaining)));
+    finish.run(module, modules);
     // LLVM's scalarizer leaves scalar/vector bitcasts intact. Expose their
     // little-endian lanes explicitly, then scalarize the newly reachable uses.
     if(lower_integer_vector_bitcasts(module)) {
@@ -1785,6 +1792,28 @@ struct lowering {
             bool signed_op = binary->getOpcode() == llvm::Instruction::SDiv || binary->getOpcode() == llvm::Instruction::SRem || binary->getOpcode() == llvm::Instruction::AShr;
             auto* left = signed_op ? signed_value(binary->getOperand(0)) : value(binary->getOperand(0));
             auto* right = signed_op && binary->getOpcode() != llvm::Instruction::AShr ? signed_value(binary->getOperand(1)) : value(binary->getOperand(1));
+            if(binary->getOpcode()==llvm::Instruction::LShr && input.getType()->isIntegerTy(64)) {
+                auto* shift=llvm::dyn_cast<llvm::ConstantInt>(binary->getOperand(1));
+                auto* sum=llvm::dyn_cast<llvm::BinaryOperator>(binary->getOperand(0));
+                bool round_up=false;
+                if(sum && sum->getOpcode()==llvm::Instruction::Add) {
+                    if(auto* bias=llvm::dyn_cast<llvm::ConstantInt>(sum->getOperand(1));bias && bias->isOne()) {
+                        sum=llvm::dyn_cast<llvm::BinaryOperator>(sum->getOperand(0));round_up=true;
+                    }
+                }
+                if(shift && shift->isOne() && sum && sum->getOpcode()==llvm::Instruction::Add) {
+                    auto* x=llvm::dyn_cast<llvm::ZExtInst>(sum->getOperand(0));
+                    auto* y=llvm::dyn_cast<llvm::ZExtInst>(sum->getOperand(1));
+                    if(x && y && x->getSrcTy()->isIntegerTy(32) && y->getSrcTy()->isIntegerTy(32)) {
+                        // Keep unsigned half sums in words, preserving the carry
+                        // without a widened add/shift in shader drivers.
+                        auto* a=value(x->getOperand(0));auto* operand=value(y->getOperand(0));
+                        auto* half=b.CreateLShr(b.CreateXor(a,operand),b.getInt32(1));
+                        auto* average=round_up?b.CreateSub(b.CreateOr(a,operand),half):b.CreateAdd(b.CreateAnd(a,operand),half);
+                        values[&input]=b.CreateZExt(average,b.getInt64Ty());return;
+                    }
+                }
+            }
             if(binary->getOpcode()==llvm::Instruction::SRem) {
                 auto* zero=llvm::ConstantInt::get(left->getType(),0);
                 auto* negative=b.CreateICmpSLT(left,zero);
