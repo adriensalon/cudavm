@@ -851,7 +851,7 @@ class ptx_parser {
             else if(parts[1]=="infinite")result=b.CreateICmpEQ(magnitude,infinity);
             else if(parts[1]=="number")result=b.CreateICmpULE(magnitude,infinity);
             else if(parts[1]=="notanumber")result=b.CreateICmpUGT(magnitude,infinity);
-            else if(parts[1]=="normal")result=b.CreateAnd(b.CreateICmpUGE(magnitude,normal),b.CreateICmpULT(magnitude,infinity));
+            else if(parts[1]=="normal")result=b.CreateOr(b.CreateICmpEQ(magnitude,constant(0)),b.CreateAnd(b.CreateICmpUGE(magnitude,normal),b.CreateICmpULT(magnitude,infinity)));
             else if(parts[1]=="subnormal")result=b.CreateAnd(b.CreateICmpNE(magnitude,constant(0)),b.CreateICmpULT(magnitude,normal));
             else ptx_fail(instruction.opcode,"unsupported floating classification",true);
             return done(result,{1,'p'});
@@ -1034,6 +1034,11 @@ class ptx_parser {
                 arity(2);auto* v=helper("word_f32_to_f16",{word(read(operands[1],type)),b.getInt32(unsigned(found-modes.begin()))},b.getInt32Ty());
                 return done(b.CreateBitCast(b.CreateTrunc(v,b.getInt16Ty()),b.getHalfTy()),destination);
             }
+        }
+        if(op=="copysign" && parts.size()==2 && type.kind=='f' && type.bits>=32) {
+            arity(3);auto* sign=word(read(operands[1],type));auto* magnitude=word(read(operands[2],type));
+            auto* mask=llvm::ConstantInt::get(sign->getType(),uint64_t(1)<<(type.bits-1));
+            return done(b.CreateBitCast(b.CreateOr(b.CreateAnd(magnitude,b.CreateNot(mask)),b.CreateAnd(sign,mask)),type.value(context)),type);
         }
         if((type.kind=='f' || type.kind=='h') && (op=="neg" || op=="abs") && parts.size()==2) {
             arity(2);auto* v=word(read(operands[1],type));uint64_t sign=type.kind=='h'?0x80008000ull:type.bits==16?0x8000ull:type.bits==64?0x8000000000000000ull:0x80000000ull;

@@ -1,0 +1,12 @@
+{
+  "producer": "NVIDIA CUDA 12.4.131 ptxas",
+  "command": "ptxas -arch=sm_75 -O0 test/integer_packed_arithmetic/integer_packed_arithmetic.ptx -o test/integer_packed_arithmetic/integer_packed_arithmetic.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "integer_packed_arithmetic.cu": "999eaf51a92e75dc865a2116d22b4598177e948ad1a18c19950e61e4f670e9d4",
+    "integer_packed_arithmetic.ptx": "fd682277289e1e4ec06ad2fb60dd35c2760c8f82dd8422c7b75f6b876720cbcd",
+    "integer_packed_arithmetic.ll": "2add79bd9f610177ab87b97836dc950030d74a5705a38c5a5a2aba8c96dee89a",
+    "integer_packed_arithmetic.cubin": "313df003502526e1f4952822650580117cc9d72a3ac8637103b3322722553f0c"
+  }
+}

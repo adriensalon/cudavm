@@ -1,5 +1,9 @@
 #pragma once
 namespace cudavm {
+inline constexpr const char* device_dot_intrinsics[] = {
+    "llvm.nvvm.idp4a.s.s", "llvm.nvvm.idp4a.s.u", "llvm.nvvm.idp4a.u.s", "llvm.nvvm.idp4a.u.u",
+    "llvm.nvvm.idp2a.s.s", "llvm.nvvm.idp2a.s.u", "llvm.nvvm.idp2a.u.s", "llvm.nvvm.idp2a.u.u",
+};
 struct device_integer_operation {
     const char* name;
     const char* intrinsic;

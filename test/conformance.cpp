@@ -27,8 +27,9 @@ void expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> ex
                   const std::string& context) {
     require(actual.size() == expected.size(), context + ": output extent");
     for (size_t i = 0; i < actual.size(); ++i)
-        require(actual[i] == expected[i], context + ": word " + std::to_string(i)
-            + " got " + std::to_string(actual[i]) + ", expected " + std::to_string(expected[i]));
+        if (actual[i] != expected[i])
+            throw std::runtime_error(context + ": word " + std::to_string(i)
+                + " got " + std::to_string(actual[i]) + ", expected " + std::to_string(expected[i]));
 }
 
 struct source_program {
@@ -127,6 +128,14 @@ CUfunction loaded_program::function(const char* name) const {
     } else CONFORMANCE_CUDA(cuModuleGetFunction(&result, module, name));
     return result;
 }
+CUdeviceptr loaded_program::global(const char* name, size_t expected_size) const {
+    CUdeviceptr result = 0;
+    size_t size = 0;
+    if (library) CONFORMANCE_CUDA(cuLibraryGetGlobal(&result, &size, library, name));
+    else CONFORMANCE_CUDA(cuModuleGetGlobal(&result, &size, module, name));
+    require(result && size == expected_size, std::string("global symbol extent: ") + name);
+    return result;
+}
 
 struct device_context {
     CUcontext value{};
@@ -162,9 +171,10 @@ void probe_execution() {
 }
 
 int run_conformance(int argc, char** argv, const fixture_data& fixtures,
-                    void (*execute)(const loaded_program&)) {
+                    void (*execute)(const loaded_program&), unsigned load_repetitions) {
     try {
         require(argc == 3, "usage: <executable> <backend> <cu|ptx|cubin|nvvm>");
+        require(load_repetitions > 0, "at least one loader execution is required");
         const std::string backend = argv[1];
         const std::array<std::string_view, 5> backends{"cuda", "vulkan", "directx", "opencl", "opengl"};
         const std::array<std::string_view, 5> labels{"CUDA", "Vulkan", "DirectX", "OpenCL", "OpenGL"};
@@ -206,6 +216,7 @@ int run_conformance(int argc, char** argv, const fixture_data& fixtures,
         device_context context(device);
         // Compiler handles are destroyed before either loader sees the copy.
         const auto image = import_fixture(fixtures, argv[2]);
+        for (unsigned repeat = 0; repeat < load_repetitions; ++repeat)
         for (bool library : {false, true}) {
             std::cout << "loader=" << (library ? "library" : "module") << std::endl;
             loaded_program program(image.data(), library);

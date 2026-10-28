@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/numeric_representations/numeric_representations.ptx -o test/numeric_representations/numeric_representations.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "numeric_representations.cu": "466fd8e99141d8a0c95fd4fed4ba8772c6268125e1f6b1f7f2fdcaf83af49922",
+    "numeric_representations.ptx": "ec60468d85fc4b81d2797a1559a6c60ff53dff1ddee654d318b5aa004ab4c77b",
+    "numeric_representations.ll": "89e4cd1283dcd6709244f0a6a0a3b95ca78da477b73625416f30fa20fd495a8c",
+    "numeric_representations.cubin": "c3ac1e4a8f5461fbcd129283a2c8ed48b27f55328a842db991480e8c0880a233"
+  }
+}

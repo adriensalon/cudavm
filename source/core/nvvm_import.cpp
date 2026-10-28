@@ -58,7 +58,7 @@ bool supported_nvvm_intrinsic(const llvm::Function& function) {
     for (const auto& conversion : device_conversions) if (name == conversion.intrinsic) return true;
     for (const auto& conversion : double_conversions) if (name == conversion.intrinsic) return true;
     for (const auto& operation : device_integer_operations) if (name == operation.intrinsic) return true;
-    for (const auto& operation : device_dot_operations) if (name == operation.intrinsic) return true;
+    for (auto intrinsic : device_dot_intrinsics) if (name == intrinsic) return true;
     for (const auto& operation : device_math_operations) if (operation.intrinsic && name == operation.intrinsic) return true;
     return false;
 }
@@ -94,6 +94,45 @@ std::string protect_nvvm_metadata(std::string_view input) {
             else if (name == "llvm.dbg.cu") output += "!cudavm.nvvm.input.debug";
             else output.append(input.substr(first, i - first));
         } else output += input[i++];
+    }
+    return output;
+}
+std::string upgrade_nvvm_byval(std::string_view input) {
+    if (input.find("byval") == input.npos) return std::string(input);
+    // LLVM 7 infers bare byval's pointee type from the typed pointer. Current
+    // LLVM requires byval(T). Tokenize without touching comments, strings or
+    // quoted identifiers; support the scalar/named pointee profile explicitly.
+    struct token { size_t first, last; };
+    std::vector<token> tokens;
+    auto identifier = [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '.' || c == '$' || c == '-'; };
+    for (size_t i = 0; i < input.size();) {
+        if (std::isspace(static_cast<unsigned char>(input[i]))) { ++i; continue; }
+        if (input[i] == ';') { auto end = input.find('\n', i); i = end == input.npos ? input.size() : end; continue; }
+        auto first = i;
+        if (input[i] == '%' || input[i] == '@') ++i;
+        if (i < input.size() && input[i] == '"') {
+            ++i;
+            while (i < input.size()) {
+                char c = input[i++];
+                if (c == '\\' && i < input.size()) ++i;
+                else if (c == '"') break;
+            }
+        } else {
+            while (i < input.size() && identifier(static_cast<unsigned char>(input[i]))) ++i;
+            if (i == first) ++i;
+        }
+        tokens.push_back({first, i});
+    }
+    auto spelling = [&](size_t i) { return input.substr(tokens[i].first, tokens[i].last - tokens[i].first); };
+    std::string output(input);
+    for (size_t i = tokens.size(); i-- > 2;) {
+        if (spelling(i) != "byval" || (i + 1 < tokens.size() && spelling(i + 1) == "(")) continue;
+        if (spelling(i - 1) != "*") continue;
+        auto type = spelling(i - 2);
+        bool integer = type.size() > 1 && type.front() == 'i' &&
+            std::all_of(type.begin() + 1, type.end(), [](unsigned char c) { return std::isdigit(c); });
+        if (type.front() != '%' && !integer && type != "half" && type != "float" && type != "double") continue;
+        output.insert(tokens[i].last, "(" + std::string(type) + ")");
     }
     return output;
 }
@@ -161,7 +200,7 @@ std::unique_ptr<llvm::Module> import_nvvm(llvm::LLVMContext& context, std::strin
     } else {
         if (input.ends_with('\0')) input = input.drop_back();
         nvvm_require(!input.contains('\0'), "embedded NUL in text input");
-        auto text = protect_nvvm_metadata(input.str());
+        auto text = upgrade_nvvm_byval(protect_nvvm_metadata(input.str()));
         llvm::SMDiagnostic diagnostic;
         module = llvm::parseAssemblyString(text, diagnostic, context);
         if (!module) {

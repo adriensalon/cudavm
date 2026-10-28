@@ -657,6 +657,23 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             const char* dimensions[]{"%ntid.x", "%ntid.y", "%ntid.z", "%nctaid.x", "%nctaid.y", "%nctaid.z"};
             return guard + "mov.u32 " + dest + "," + dimensions[offset / 4] + ";\n";
         }
+        // cvta.const adds the SM75 runtime's generic constant-space base.
+        // Rebind the checked user-constant bank to this imported module's
+        // storage, rather than reading runtime-owned bytes from the ELF image.
+        if ((offset == 0x50 && (size == 4 || size == 8)) || (offset == 0x54 && size == 4)) {
+            auto section = std::find_if(input.sections.begin(), input.sections.end(), [&](const auto& item) {
+                return item.name == ".nv.constant3." + kernel.name;
+            });
+            if (section == input.sections.end()) section = std::find_if(input.sections.begin(), input.sections.end(),
+                [](const auto& item) { return item.name == ".nv.constant3"; });
+            cubin_check(section != input.sections.end() && input.storage.contains(size_t(section - input.sections.begin())),
+                "generic constant address requires defined user-constant storage", true);
+            auto result = guard + "cvta.const.u64 %bank_address," + input.storage.at(size_t(section - input.sections.begin())) + ";\n";
+            if (offset == 0x54) result += guard + "shr.u64 %bank_address,%bank_address,32;\n";
+            result += guard + "cvt.u32.u64 " + dest + ",%bank_address;\n";
+            if (size == 8) result += guard + "shr.u64 %bank_address,%bank_address,32;\n" + guard + "cvt.u32.u64 " + next + ",%bank_address;\n";
+            return result;
+        }
         cubin_check(offset >= kernel.base, "unsupported constant-bank read", true); offset -= kernel.base;
         for (unsigned i = 0; i < kernel.parameters.size(); ++i) {
             auto parameter = kernel.parameters[i];
@@ -738,7 +755,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         // Every source is read before publishing any aliased destination word.
         auto extended_instruction = [&]() -> std::optional<std::string> {
             switch (op) {
-            case 0x219: case 0x819: case 0x309: case 0x301: case 0x300: case 0x213:
+            case 0x219: case 0x819: case 0x226: case 0x238: case 0x309: case 0x301: case 0x300: case 0x213:
             case 0x217: case 0x817: case 0xa17: case 0x21b: case 0x21a: case 0x81a:
             case 0x230: case 0x232: case 0x231: case 0x228: case 0x828: case 0x229: case 0x429: case 0x22b: case 0x42b: case 0x82b:
             case 0x209: case 0x809: case 0xa09: case 0x308: case 0x908: case 0x81c:
@@ -931,12 +948,28 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                     guard + "or.pred %test0,%test0,%test1;\n" + guard + "setp.gt.s32 %test2,%tmp2,126;\n";
                 return "or.pred " + pred(dest & 7) + ",%test0,%test2;";
             }
-            if ((op == 0x219 || op == 0x819) && (hi & ~uint64_t(0x11aff)) == 0x400 &&
+            if (op == 0x226 && (hi & ~uint64_t(0x36ff)) == 0 && !(lo >> 40) &&
+                    (!(hi & 0x2000) || (hi & 0x1000))) {
+                bool two = hi & 0x1000;
+                return std::string(two ? (hi & 0x2000 ? "dp2a.hi" : "dp2a.lo") : "dp4a") +
+                    (hi & 0x200 ? ".s32" : ".u32") + (hi & 0x400 ? ".s32 " : ".u32 ") +
+                    destination + "," + reg(left) + "," + reg(right) + "," + reg(unsigned(hi) & 255) + ";";
+            }
+            if (op == 0x238 && (hi & ~uint64_t(0x3000)) == 0 && left == 0 && !(lo >> 40)) {
+                unsigned width = hi & 0x2000 ? 16 : 8;
+                bool sign = hi & 0x1000;
+                auto minimum = sign ? -int(1u << (width - 1)) : 0;
+                auto maximum = (1u << (width - unsigned(sign))) - 1;
+                output += guard + "max.s32 %tmp0," + reg(right) + "," + std::to_string(minimum) + ";\n";
+                return "min.s32 " + destination + ",%tmp0," + std::to_string(maximum) + ";";
+            }
+            if ((op == 0x219 || op == 0x819) && (hi & ~uint64_t(0x11eff)) == 0 &&
                     (op == 0x819 || !(lo >> 40))) {
                 bool right_shift = hi & 0x1000, high = hi & 0x10000, wrap = hi & 0x800, sign = !(hi & 0x200);
+                unsigned width = hi & 0x400 ? 32 : 64;
                 join(reg(left), reg(unsigned(hi) & 255), "%wide0");
                 auto count = op == 0x819 ? std::to_string(uint32_t(lo >> 32)) : reg(right);
-                output += guard + std::string(wrap ? "and.b32" : "min.u32") + " %tmp0," + count + (wrap ? ",31;\n" : ",32;\n");
+                output += guard + std::string(wrap ? "and.b32" : "min.u32") + " %tmp0," + count + "," + std::to_string(wrap ? width - 1 : width) + ";\n";
                 output += guard + std::string(right_shift ? (sign ? "shr.s64" : "shr.u64") : "shl.b64") + " %wide0,%wide0,%tmp0;\n";
                 if (high) output += guard + "shr.u64 %wide0,%wide0,32;\n";
                 return "cvt.u32.u64 " + destination + ",%wide0;";

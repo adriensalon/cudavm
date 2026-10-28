@@ -207,6 +207,32 @@ nvrtc_output import_cuda_source(llvm::LLVMContext& context, const std::string& s
             {"result", "float"}, {"symbol", "__nv_"+name}, {"arguments", arguments},
             {"name", name}, {"linkage", "extern \"C\" "}, {"call", call}});
     }
+    for (auto real : {"float", "double"}) for (auto name : {"isnan", "isinf", "isfinite", "signbit"}) {
+        bool single = std::string_view(real) == "float";
+        std::string symbol = std::string_view(name) == "isfinite" ? (single ? "finitef" : "isfinited")
+            : std::string(name) + (single ? "f" : "d");
+        rtc_preamble += render_device_source("device_wrapper.cu.in", {
+            {"result", "int"}, {"symbol", "__nv_" + symbol}, {"arguments", std::string(real) + " x"},
+            {"name", name}, {"linkage", ""}, {"call", "x"}});
+    }
+    for (auto name : {"fmin", "fmax", "fabs", "copysign"}) {
+        bool unary = std::string_view(name) == "fabs";
+        rtc_preamble += render_device_source("device_wrapper.cu.in", {
+            {"result", "double"}, {"symbol", "__nv_" + std::string(name)},
+            {"arguments", unary ? "double x" : "double x,double y"},
+            {"name", name}, {"linkage", "extern \"C\" "}, {"call", unary ? "x" : "x,y"}});
+    }
+    for (auto name : {"min", "max"})
+        rtc_preamble += render_device_source("device_wrapper.cu.in", {
+            {"result", "float"}, {"symbol", "__nv_f" + std::string(name) + "f"}, {"arguments", "float x,float y"},
+            {"name", name}, {"linkage", ""}, {"call", "x,y"}});
+    for (auto name : {"min", "max"}) {
+        rtc_preamble += render_device_source("device_wrapper.cu.in", {
+            {"result", "double"}, {"symbol", "__nv_f" + std::string(name)}, {"arguments", "double x,double y"},
+            {"name", name}, {"linkage", ""}, {"call", "x,y"}});
+        for (auto arguments : {"float x,double y", "double x,float y"})
+            rtc_preamble += "__device__ inline double " + std::string(name) + "(" + arguments + ") {return f" + name + "(double(x),double(y));}\n";
+    }
     for (const auto& conversion : device_conversions) {
         const std::string integer = std::string(conversion.signed_value ? "" : "unsigned ")
             + (conversion.integer_bits == 32 ? "int" : "long long");

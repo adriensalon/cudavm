@@ -82,6 +82,18 @@ __device__ inline unsigned __float_as_uint(float x) {return __builtin_bit_cast(u
 __device__ inline int __float_as_int(float x) {return __builtin_bit_cast(int,x);}
 __device__ inline double __longlong_as_double(long long x) {return __builtin_bit_cast(double,x);}
 __device__ inline long long __double_as_longlong(double x) {return __builtin_bit_cast(long long,x);}
+__device__ inline int __double2loint(double x) {
+    unsigned word=unsigned(__builtin_bit_cast(unsigned long long,x));
+    return __builtin_bit_cast(int,word);
+}
+__device__ inline int __double2hiint(double x) {
+    unsigned word=unsigned(__builtin_bit_cast(unsigned long long,x)>>32);
+    return __builtin_bit_cast(int,word);
+}
+__device__ inline double __hiloint2double(int hi,int lo) {
+    unsigned long long bits=(static_cast<unsigned long long>(unsigned(hi))<<32)|unsigned(lo);
+    return __builtin_bit_cast(double,bits);
+}
 __device__ inline float __fmaf_rn(float x,float y,float z) {return __builtin_elementwise_fma(x,y,z);}
 __device__ inline float __fsub_rn(float x,float y) {return x-y;}
 // Parsed by the half header's optional transcendental wrappers. A caller using
@@ -109,6 +121,8 @@ __device__ inline unsigned atomicAnd(unsigned* p,unsigned v) {return __atomic_fe
 __device__ inline unsigned atomicCAS(unsigned* p,unsigned c,unsigned v) {__atomic_compare_exchange_n(p,&c,v,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED);return c;}
 __device__ inline unsigned min(unsigned a,unsigned b) {return a<b?a:b;}
 __device__ inline unsigned max(unsigned a,unsigned b) {return a>b?a:b;}
+__device__ inline int min(int a,int b) {return a<b?a:b;}
+__device__ inline int max(int a,int b) {return a>b?a:b;}
 extern "C" __device__ float __cudavm_rtc_atomic_add_float(float*,float);
 extern "C" __device__ double __cudavm_rtc_atomic_add_double(double*,double);
 __device__ inline float atomicAdd(float* p,float v) { return __cudavm_rtc_atomic_add_float(p,v); }

@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/float_comparison/float_comparison.ptx -o test/float_comparison/float_comparison.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "float_comparison.cu": "0c87ac49db42f022aa111d05d881c7092afde486ab911b40e10af0dde5f3a8d8",
+    "float_comparison.ptx": "071e8b8aee7c3b328ee4ca2a154ecf77241ddcc31852a6167c061f800011fb74",
+    "float_comparison.ll": "fc29b0de06ec7c3bfa3c07bf052e297648fa7997739b701ef5aabc37251c14e6",
+    "float_comparison.cubin": "ed7e693efe3a864c5b567fa2682acc1eca0873dc115ca9b8a4f6e2fa04d8b063"
+  }
+}

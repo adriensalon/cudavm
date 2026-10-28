@@ -4,6 +4,7 @@
 #include "shader_calls.hpp"
 #include "device_services.hpp"
 #include "device_conversions.hpp"
+#include "device_integers.hpp"
 #include "ptx_import.hpp"
 #include "integer_ir.hpp"
 
@@ -60,6 +61,7 @@ void scalar_math(llvm::Module& module) {
     auto* compare = module.getFunction("__cudavm_native_compare");
     auto* square_root = module.getFunction("__cudavm_native_sqrt");
     auto* maximum = module.getFunction("__cudavm_native_max");
+    auto* minimum = module.getFunction("__cudavm_native_min");
     auto* integral = module.getFunction("__cudavm_native_integral");
     auto numeric=[&](const std::string& name){
         auto* function=module.getFunction("__cudavm_native_word_"+name);
@@ -95,6 +97,9 @@ void scalar_math(llvm::Module& module) {
         if(auto* operation=llvm::dyn_cast<llvm::FCmpInst>(instruction);operation && operation->getOperand(0)->getType()->isDoubleTy())
             if(auto* helper=numeric("f64_compare")) replacement=builder.CreateICmpNE(builder.CreateCall(helper,{bits(operation->getOperand(0)),bits(operation->getOperand(1)),builder.getInt32(operation->getPredicate())}),builder.getInt32(0));
         if(auto* call=llvm::dyn_cast<llvm::IntrinsicInst>(instruction);call && call->getType()->isDoubleTy()) {
+            if(call->getIntrinsicID()==llvm::Intrinsic::minnum || call->getIntrinsicID()==llvm::Intrinsic::maxnum)
+                if(auto* helper=numeric("f64_minmax")) replacement=builder.CreateBitCast(builder.CreateCall(helper,
+                    {bits(call->getArgOperand(0)),bits(call->getArgOperand(1)),builder.getInt32(call->getIntrinsicID()==llvm::Intrinsic::maxnum)}),builder.getDoubleTy());
             if(call->getIntrinsicID()==llvm::Intrinsic::fabs || call->getIntrinsicID()==llvm::Intrinsic::copysign) {
                 auto* magnitude=builder.CreateAnd(bits(call->getArgOperand(0)),builder.getInt64(0x7fffffffffffffffull));
                 if(call->getIntrinsicID()==llvm::Intrinsic::copysign)magnitude=builder.CreateOr(magnitude,builder.CreateAnd(bits(call->getArgOperand(1)),builder.getInt64(0x8000000000000000ull)));
@@ -151,6 +156,22 @@ void scalar_math(llvm::Module& module) {
         if (auto* call = llvm::dyn_cast<llvm::CallInst>(instruction); call && call->getCalledFunction()) {
             auto* function = call->getCalledFunction();
             auto name = function->hasFnAttribute("cudavm.cuda.origin") ? function->getFnAttribute("cudavm.cuda.origin").getValueAsString() : function->getName();
+            for(auto intrinsic:device_dot_intrinsics) if(name==intrinsic) {
+                bool two=name.starts_with("llvm.nvvm.idp2a.");
+                auto lane=[&](llvm::Value* source,unsigned shift,unsigned width,bool sign)->llvm::Value* {
+                    auto* small=builder.CreateTrunc(builder.CreateLShr(source,shift),builder.getIntNTy(width));
+                    return sign?builder.CreateSExt(small,builder.getInt32Ty()):builder.CreateZExt(small,builder.getInt32Ty());
+                };
+                bool signed_a=name[name.size()-3]=='s',signed_b=name.back()=='s';
+                llvm::Value* sum=call->getArgOperand(two?3:2);
+                for(unsigned i=0;i<(two?2u:4u);++i) {
+                    auto* a=lane(call->getArgOperand(0),i*(two?16:8),two?16:8,signed_a);
+                    auto* low=lane(call->getArgOperand(1),i*8,8,signed_b);
+                    auto* b=two?builder.CreateSelect(call->getArgOperand(2),lane(call->getArgOperand(1),(i+2)*8,8,signed_b),low):low;
+                    sum=builder.CreateAdd(sum,builder.CreateMul(a,b));
+                }
+                replacement=sum;
+            }
             if((name=="__cudavm_native_sin" || name=="__cudavm_native_cos") && call->arg_size()==1)
                 if(auto* cast=llvm::dyn_cast<llvm::BitCastInst>(call->getArgOperand(0)))
                     if(auto* conversion=llvm::dyn_cast<llvm::CallInst>(cast->getOperand(0));conversion && conversion->getCalledFunction() && conversion->getCalledFunction()->getName()=="__cudavm_native_word_f16_to_f32") {
@@ -174,6 +195,13 @@ void scalar_math(llvm::Module& module) {
             }
             if (square_root && !square_root->isDeclaration() && name == "llvm.nvvm.sqrt.rn.f") replacement = builder.CreateCall(square_root,{call->getArgOperand(0)});
             if (maximum && !maximum->isDeclaration() && name == "llvm.nvvm.fmax.f") replacement = builder.CreateCall(maximum,{call->getArgOperand(0),call->getArgOperand(1)});
+            if (function->isIntrinsic() && call->getType()->isFloatTy()) {
+                auto id = function->getIntrinsicID();
+                auto* helper = id == llvm::Intrinsic::minnum ? minimum : id == llvm::Intrinsic::maxnum ? maximum : nullptr;
+                // Native shader extrema can flush subnormal operands. Use the
+                // same bit-exact numeric selection as CUDA/PTX min/max paths.
+                if (helper && !helper->isDeclaration()) replacement = builder.CreateCall(helper,{call->getArgOperand(0),call->getArgOperand(1)});
+            }
             for(const auto& conversion:device_conversions) if(name==conversion.intrinsic) {
                 auto real=conversion.real_bits==64?"f64":"f32";
                 if(conversion.to_real) {
@@ -269,7 +297,66 @@ bool lower_local_calls(llvm::Module& module) {
     }
     return changed;
 }
+bool lower_integer_vector_bitcasts(llvm::Module& module) {
+    auto word_type=[&](llvm::Type* type)->llvm::IntegerType* {
+        auto* vector=llvm::dyn_cast<llvm::FixedVectorType>(type);
+        if(!vector || !vector->getElementType()->isIntegerTy())return nullptr;
+        unsigned bits=vector->getElementType()->getIntegerBitWidth()*vector->getNumElements();
+        return bits==32 || bits==64?llvm::IntegerType::get(module.getContext(),bits):nullptr;
+    };
+    // Keep naturally aligned packed words as single accesses. Scalarizing a
+    // vector store first creates independent byte/halfword resource updates.
+    std::vector<llvm::Instruction*> memory;
+    for(auto& function:module)for(auto& block:function)for(auto& instruction:block) {
+        if(auto* load=llvm::dyn_cast<llvm::LoadInst>(&instruction);load && !load->isVolatile() && !load->isAtomic()) {
+            if(auto* word=word_type(load->getType());word && load->getAlign().value()>=word->getBitWidth()/8)memory.push_back(load);
+        }
+        if(auto* store=llvm::dyn_cast<llvm::StoreInst>(&instruction);store && !store->isVolatile() && !store->isAtomic()) {
+            if(auto* word=word_type(store->getValueOperand()->getType());word && store->getAlign().value()>=word->getBitWidth()/8)memory.push_back(store);
+        }
+    }
+    for(auto* instruction:memory) {
+        llvm::IRBuilder<> builder(instruction);
+        if(auto* load=llvm::dyn_cast<llvm::LoadInst>(instruction)) {
+            auto* value=builder.CreateAlignedLoad(word_type(load->getType()),load->getPointerOperand(),load->getAlign());
+            load->replaceAllUsesWith(builder.CreateBitCast(value,load->getType()));
+        } else {
+            auto* store=llvm::cast<llvm::StoreInst>(instruction);
+            auto* value=builder.CreateBitCast(store->getValueOperand(),word_type(store->getValueOperand()->getType()));
+            builder.CreateAlignedStore(value,store->getPointerOperand(),store->getAlign());
+        }
+        instruction->eraseFromParent();
+    }
+    std::vector<llvm::BitCastInst*> casts;
+    for(auto& function:module)for(auto& block:function)for(auto& instruction:block)
+        if(auto* cast=llvm::dyn_cast<llvm::BitCastInst>(&instruction)) {
+            auto* source=cast->getOperand(0)->getType();auto* destination=cast->getType();
+            auto* vector=llvm::dyn_cast<llvm::FixedVectorType>(source->isIntegerTy()?destination:source);
+            auto* word=source->isIntegerTy()?source:destination;
+            if(vector && vector->getElementType()->isIntegerTy() && (word->isIntegerTy(32) || word->isIntegerTy(64)))casts.push_back(cast);
+        }
+    for(auto* cast:casts) {
+        llvm::IRBuilder<> builder(cast);
+        auto* source=cast->getOperand(0);bool unpack=source->getType()->isIntegerTy();
+        auto* vector=llvm::cast<llvm::FixedVectorType>(unpack?cast->getType():source->getType());
+        auto* word=unpack?source->getType():cast->getType();
+        unsigned bits=vector->getElementType()->getIntegerBitWidth();
+        llvm::Value* result=unpack?static_cast<llvm::Value*>(llvm::PoisonValue::get(vector)):llvm::ConstantInt::get(word,0);
+        for(unsigned lane=0;lane<vector->getNumElements();++lane) {
+            if(unpack) {
+                auto* shifted=builder.CreateLShr(source,lane*bits);
+                result=builder.CreateInsertElement(result,builder.CreateTrunc(shifted,vector->getElementType()),lane);
+            } else {
+                auto* value=builder.CreateZExt(builder.CreateExtractElement(source,lane),word);
+                result=builder.CreateOr(result,builder.CreateShl(value,lane*bits));
+            }
+        }
+        cast->replaceAllUsesWith(result);cast->eraseFromParent();
+    }
+    return !casts.empty();
+}
 void optimize(llvm::Module& module) {
+    lower_integer_vector_bitcasts(module);
     llvm::LoopAnalysisManager loops; llvm::FunctionAnalysisManager functions;
     llvm::CGSCCAnalysisManager calls; llvm::ModuleAnalysisManager modules;
     llvm::PassBuilder pb;
@@ -308,6 +395,15 @@ void optimize(llvm::Module& module) {
     fp.addPass(llvm::InstCombinePass());fp.addPass(llvm::SCCPPass());fp.addPass(llvm::SimplifyCFGPass());
     passes.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(fp)));
     passes.run(module, modules);
+    // LLVM's scalarizer leaves scalar/vector bitcasts intact. Expose their
+    // little-endian lanes explicitly, then scalarize the newly reachable uses.
+    if(lower_integer_vector_bitcasts(module)) {
+        modules.invalidate(module,llvm::PreservedAnalyses::none());
+        llvm::ModulePassManager packed;
+        llvm::FunctionPassManager lanes;lanes.addPass(llvm::ScalarizerPass(scalar));
+        packed.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(lanes)));
+        packed.run(module,modules);
+    }
 }
 struct lowering {
     llvm::Module& source;
@@ -399,16 +495,17 @@ struct lowering {
     llvm::Value* call_helper(llvm::Function* function, std::initializer_list<llvm::Value*> base) {
         auto first = base.begin();
         bool memory_access=function==read || function==write;
-        if (arena_local && (function == read || function == write)) {
+        if ((arena_local || (dxil && local_storage)) && (function == read || function == write)) {
             auto known = llvm::computeKnownBits(*first, result->getDataLayout());
             llvm::APInt mask(64, 0xffffffffc0000000ull), local(64, 0xffffffff80000000ull);
             if ((known.One & mask) == local && (known.Zero & mask) == (mask ^ local)) {
                 // Proven private addresses need neither allocation lookup nor
                 // resource dispatch. Preserve the ordinary private word/mask
-                // semantics while binding the invocation's stack directly.
+                // semantics with direct access to the invocation's storage.
                 auto* offset = b.CreateAnd(b.CreateTrunc(*first, b.getInt32Ty()), b.getInt32(0x3fffffffu));
                 offset = b.CreateURem(b.CreateLShr(offset, b.getInt32(2)), b.getInt32(std::max(2u, (local_bytes + 3) / 4)));
-                auto* pointer = stack_word(nullptr, offset);
+                auto* pointer = arena_local ? stack_word(nullptr, offset)
+                    : b.CreateInBoundsGEP(local_storage->getValueType(), local_storage, {b.getInt32(0), offset});
                 auto* previous = b.CreateAlignedLoad(b.getInt32Ty(), pointer, llvm::Align(4));
                 previous->setVolatile(volatile_memory);
                 if (function == read) return previous;
@@ -1634,6 +1731,13 @@ struct lowering {
             auto* operation=b.CreateBinOp(binary->getOpcode(),left,right);
             if(auto* produced=llvm::dyn_cast<llvm::Instruction>(operation)) produced->copyIRFlags(binary);
             values[&input]=b.CreateBitCast(operation,b.getInt32Ty());return;
+        }
+        // InstCombine can turn integer classification back into a floating
+        // comparison after scalar_math. Doubles use integer shader storage,
+        // so route these newly exposed comparisons through the same helper.
+        if(auto* compare=llvm::dyn_cast<llvm::FCmpInst>(&input);compare && compare->getOperand(0)->getType()->isDoubleTy()) {
+            values[&input]=b.CreateICmpNE(numeric_call("__cudavm_native_word_f64_compare",b.getInt32Ty(),
+                {value(compare->getOperand(0)),value(compare->getOperand(1)),b.getInt32(compare->getPredicate())}),b.getInt32(0));return;
         }
         if(auto* compare=llvm::dyn_cast<llvm::FCmpInst>(&input);compare && compare->getOperand(0)->getType()->isFloatTy()) {
             values[&input]=b.CreateFCmp(compare->getPredicate(),b.CreateBitCast(value(compare->getOperand(0)),b.getFloatTy()),b.CreateBitCast(value(compare->getOperand(1)),b.getFloatTy()));return;

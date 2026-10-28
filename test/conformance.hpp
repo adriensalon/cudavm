@@ -36,11 +36,12 @@ public:
     loaded_program(const loaded_program&) = delete;
     loaded_program& operator=(const loaded_program&) = delete;
     CUfunction function(const char* name) const;
+    CUdeviceptr global(const char* name, size_t expected_size) const;
 };
 
 // Each slice supplies one oracle, reused unchanged by every importer and loader.
 int run_conformance(int argc, char** argv, const fixture_data& fixtures,
-                    void (*execute)(const loaded_program&));
+                    void (*execute)(const loaded_program&), unsigned load_repetitions = 1);
 void expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> expected,
                   const std::string& context);
 }

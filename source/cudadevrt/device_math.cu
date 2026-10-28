@@ -1,5 +1,17 @@
 #include "device_numeric.cu"
 #include "device_half.cu"
+extern "C" __device__ inline int __nv_isnanf(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)>0x7f800000u;}
+extern "C" __device__ inline int __nv_isinff(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)==0x7f800000u;}
+extern "C" __device__ inline int __nv_finitef(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)<0x7f800000u;}
+extern "C" __device__ inline int __nv_signbitf(float x) {return __builtin_bit_cast(unsigned,x)>>31;}
+extern "C" __device__ inline int __nv_isnand(double x) {return (__builtin_bit_cast(unsigned long long,x)&0x7fffffffffffffffull)>0x7ff0000000000000ull;}
+extern "C" __device__ inline int __nv_isinfd(double x) {return (__builtin_bit_cast(unsigned long long,x)&0x7fffffffffffffffull)==0x7ff0000000000000ull;}
+extern "C" __device__ inline int __nv_isfinited(double x) {return (__builtin_bit_cast(unsigned long long,x)&0x7fffffffffffffffull)<0x7ff0000000000000ull;}
+extern "C" __device__ inline int __nv_signbitd(double x) {return __builtin_bit_cast(unsigned long long,x)>>63;}
+extern "C" __device__ inline double __nv_fabs(double x) {return __builtin_bit_cast(double,__builtin_bit_cast(unsigned long long,x)&0x7fffffffffffffffull);}
+extern "C" __device__ inline double __nv_copysign(double x,double y) {return __builtin_bit_cast(double,(__builtin_bit_cast(unsigned long long,x)&0x7fffffffffffffffull)|(__builtin_bit_cast(unsigned long long,y)&0x8000000000000000ull));}
+extern "C" __device__ inline double __nv_fmin(double x,double y) {return __builtin_bit_cast(double,__cudavm_native_word_f64_minmax(__builtin_bit_cast(unsigned long long,x),__builtin_bit_cast(unsigned long long,y),0));}
+extern "C" __device__ inline double __nv_fmax(double x,double y) {return __builtin_bit_cast(double,__cudavm_native_word_f64_minmax(__builtin_bit_cast(unsigned long long,x),__builtin_bit_cast(unsigned long long,y),1));}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_umulhi32(unsigned a,unsigned b) {return cudavm::cvMulHi(a,b);}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_smulhi32(unsigned a,unsigned b) {return cudavm::cvSMulHi32(a,b);}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_umulhi64(unsigned long long a,unsigned long long b) {

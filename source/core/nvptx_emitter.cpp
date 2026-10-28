@@ -126,6 +126,65 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
         auto* move=llvm::InlineAsm::get(signature,"{ .reg .f32 cvPackedFloat; mov.b32 cvPackedFloat, $1; mov.b32 $0, cvPackedFloat; }","=f,f",false);
         s->setOperand(0,builder.CreateCall(move,{s->getValueOperand()}));
     }
+    // InstCombine uses fabs for exact integer sign masks too. PTX abs.f64
+    // preserves a NaN's sign on some targets and may quiet signaling inputs,
+    // whereas LLVM fabs/copysign must preserve every other encoding bit.
+    // Keep these operations opaque to SelectionDAG's floating-point combines.
+    std::vector<llvm::CallInst*> double_sign_operations;
+    for(auto& function:*module)for(auto& block:function)for(auto& instruction:block)
+        if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->getType()->isDoubleTy() && call->getCalledFunction()) {
+            auto id=call->getCalledFunction()->getIntrinsicID();
+            if(id==llvm::Intrinsic::fabs || id==llvm::Intrinsic::copysign)double_sign_operations.push_back(call);
+        }
+    for(auto* call:double_sign_operations) {
+        llvm::IRBuilder<> builder(call);
+        bool copy=call->getCalledFunction()->getIntrinsicID()==llvm::Intrinsic::copysign;
+        std::vector<llvm::Type*> parameters(copy?2:1,builder.getInt64Ty());
+        auto* signature=llvm::FunctionType::get(builder.getInt64Ty(),parameters,false);
+        auto* operation=llvm::InlineAsm::get(signature,copy
+            ? "{ .reg .b64 sign; and.b64 sign, $2, 0x8000000000000000; and.b64 $0, $1, 0x7fffffffffffffff; or.b64 $0, $0, sign; }"
+            : "and.b64 $0, $1, 0x7fffffffffffffff;",copy?"=l,l,l":"=l,l",false);
+        std::vector<llvm::Value*> arguments;
+        for(auto& argument:call->args())arguments.push_back(builder.CreateBitCast(argument,builder.getInt64Ty()));
+        auto* result=builder.CreateBitCast(builder.CreateCall(operation,arguments),builder.getDoubleTy());
+        call->replaceAllUsesWith(result);call->eraseFromParent();
+    }
+    // The NVPTX narrow saturation expansion can compare a wrapped halfword
+    // with inconsistent upper register bits. Widen each lane before arithmetic
+    // and keep its clamp explicit through instruction selection.
+    std::vector<llvm::CallInst*> narrow_saturation;
+    for(auto& function:*module)for(auto& block:function)for(auto& instruction:block)
+        if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->getCalledFunction()) {
+            auto id=call->getCalledFunction()->getIntrinsicID();
+            auto* element=call->getType()->getScalarType();
+            if(element->isIntegerTy() && element->getIntegerBitWidth()<=16 &&
+                (id==llvm::Intrinsic::sadd_sat || id==llvm::Intrinsic::ssub_sat || id==llvm::Intrinsic::uadd_sat || id==llvm::Intrinsic::usub_sat))narrow_saturation.push_back(call);
+        }
+    for(auto* call:narrow_saturation) {
+        llvm::IRBuilder<> builder(call);
+        auto id=call->getCalledFunction()->getIntrinsicID();
+        bool sign=id==llvm::Intrinsic::sadd_sat || id==llvm::Intrinsic::ssub_sat;
+        bool subtract=id==llvm::Intrinsic::ssub_sat || id==llvm::Intrinsic::usub_sat;
+        unsigned width=call->getType()->getScalarType()->getIntegerBitWidth();
+        auto minimum=sign?-(int64_t(1)<<(width-1)):0;
+        auto maximum=(uint64_t(1)<<(width-unsigned(sign)))-1;
+        auto* vector=llvm::dyn_cast<llvm::FixedVectorType>(call->getType());
+        unsigned lanes=vector?vector->getNumElements():1;
+        llvm::Value* replacement=llvm::PoisonValue::get(call->getType());
+        auto* signature=llvm::FunctionType::get(builder.getInt32Ty(),{builder.getInt32Ty(),builder.getInt32Ty()},false);
+        auto* operation=llvm::InlineAsm::get(signature,std::string(subtract?"sub":"add")+".s32 $0,$1,$2; min.s32 $0,$0,"+
+            std::to_string(maximum)+"; max.s32 $0,$0,"+std::to_string(minimum)+";","=r,r,r",false);
+        for(unsigned lane=0;lane<lanes;++lane) {
+            auto operand=[&](unsigned index) {
+                auto* value=call->getArgOperand(index);
+                if(vector)value=builder.CreateExtractElement(value,lane);
+                return sign?builder.CreateSExt(value,builder.getInt32Ty()):builder.CreateZExt(value,builder.getInt32Ty());
+            };
+            auto* value=builder.CreateTrunc(builder.CreateCall(operation,{operand(0),operand(1)}),call->getType()->getScalarType());
+            replacement=vector?builder.CreateInsertElement(replacement,value,lane):value;
+        }
+        call->replaceAllUsesWith(replacement);call->eraseFromParent();
+    }
     static std::once_flag initialized;
     std::call_once(initialized, [] {
         LLVMInitializeNVPTXTargetInfo(); LLVMInitializeNVPTXTarget();

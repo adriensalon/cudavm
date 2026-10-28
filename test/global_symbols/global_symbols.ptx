@@ -1,0 +1,41 @@
+// Independently authored PTX with exported initialized global and constant arrays.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .global .align 4 .u32 mutable_words[19] = {
+ 0x13579bdf,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,0xeca86420};
+.visible .const .align 4 .u32 constant_words[7] = {
+ 0,1,0x80000000,0xffffffff,0x12345678,0xabcdef01,17};
+.visible .entry read_symbols(.param .u64 out, .param .u32 count) {
+ .reg .b64 %out,%global,%constant,%address,%constant_address;
+ .reg .b32 %i,%block,%threads,%count,%slot,%constant_slot,%value,%other,%result,%lo,%hi;
+ .reg .pred %p;
+ mov.u32 %i,%tid.x; mov.u32 %block,%ctaid.x; mov.u32 %threads,%ntid.x;
+ mad.lo.u32 %i,%block,%threads,%i;
+ ld.param.u32 %count,[count]; setp.ge.u32 %p,%i,%count; @%p ret;
+ ld.param.u64 %out,[out]; mad.wide.u32 %out,%i,28,%out;
+ rem.u32 %slot,%i,17; add.u32 %slot,%slot,1; rem.u32 %constant_slot,%i,7;
+ mov.u64 %global,mutable_words; mad.wide.u32 %global,%slot,4,%global;
+ mov.u64 %constant,constant_words; mad.wide.u32 %constant,%constant_slot,4,%constant;
+ ld.global.u32 %value,[%global]; ld.const.u32 %other,[%constant];
+ xor.b32 %result,%value,%other; add.u32 %result,%result,%i;
+ st.global.u32 [%out],%value; st.global.u32 [%out+4],%other; st.global.u32 [%out+8],%result;
+ cvta.global.u64 %address,%global; cvta.const.u64 %constant_address,%constant;
+ mov.b64 {%lo,%hi},%address; st.global.u32 [%out+12],%lo; st.global.u32 [%out+16],%hi;
+ mov.b64 {%lo,%hi},%constant_address; st.global.u32 [%out+20],%lo; st.global.u32 [%out+24],%hi;
+ ret;
+}
+.visible .entry update_symbols(.param .u32 salt) {
+ .reg .b64 %global,%constant;
+ .reg .b32 %i,%block,%threads,%slot,%value,%other,%salt;
+ .reg .pred %p;
+ mov.u32 %i,%tid.x; mov.u32 %block,%ctaid.x; mov.u32 %threads,%ntid.x;
+ mad.lo.u32 %i,%block,%threads,%i; setp.ge.u32 %p,%i,17; @%p ret;
+ ld.param.u32 %salt,[salt]; add.u32 %slot,%i,1;
+ mov.u64 %global,mutable_words; mad.wide.u32 %global,%slot,4,%global;
+ rem.u32 %slot,%i,7; mov.u64 %constant,constant_words;
+ mad.wide.u32 %constant,%slot,4,%constant;
+ ld.global.u32 %value,[%global]; ld.const.u32 %other,[%constant];
+ xor.b32 %other,%salt,%other; add.u32 %value,%value,%other;
+ st.global.u32 [%global],%value; ret;
+}

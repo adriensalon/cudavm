@@ -1075,8 +1075,14 @@ void lower_device_integers(llvm::Module& module) {
     // Snapshot source assembly before defining native helper bodies. Import
     // only the wrapper's exact register, merge and side-effect contract.
     std::vector<llvm::CallInst*> simd_calls;
-    for(auto& function:module)for(auto& block:function)for(auto& instruction:block)
-        if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->isInlineAsm())simd_calls.push_back(call);
+    for(auto& function:module) {
+        // Prepared NVRTC images and linked programs may enter this pass again.
+        // A generated SIMD body owns its assembly; treating that assembly as a
+        // source wrapper replaces it with a recursive call to the same helper.
+        if(function.hasFnAttribute("cudavm.simd"))continue;
+        for(auto& block:function)for(auto& instruction:block)
+            if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->isInlineAsm())simd_calls.push_back(call);
+    }
     auto* simd_word=llvm::Type::getInt32Ty(module.getContext());
     auto simd_function=[&](const device_simd_operation& operation) {
         auto symbol=std::string("__nv_")+operation.name;

@@ -142,6 +142,13 @@ CV_FN uint cvDoubleCompare(cv64 a, cv64 b, uint predicate) {
     }
     return (predicate&relation)!=0u?1u:0u;
 }
+CV_FN cv64 double_minmax(cv64 a,cv64 b,uint maximum) {
+    if(cvDoubleIsNaN(a)!=0u) return cvDoubleIsNaN(b)!=0u?cvMake(a.lo,a.hi|0x00080000u):b;
+    if(cvDoubleIsNaN(b)!=0u) return a;
+    if((((a.hi|b.hi)&0x7fffffffu)|(a.lo|b.lo))==0u)
+        return cvMake(0u,maximum!=0u?a.hi&b.hi:a.hi|b.hi);
+    return cvDoubleCompare(a,b,maximum!=0u?2u:4u)!=0u?a:b;
+}
 CV_FN uint cvMulHi(uint a, uint b) {
     uint a0=a&65535u,a1=a>>16u,b0=b&65535u,b1=b>>16u;
     uint t=a0*b0;
@@ -423,7 +430,10 @@ CV_FN cv64 cvDoubleRound(cv64 significand,int exponent,uint sign,uint mode=0u) {
     return cvMake(significand.lo,sign|(uint(exponent)<<20u)|(significand.hi&0xfffffu));
 }
 CV_FN cv64 cvDoubleAdd(cv64 a,cv64 b,uint mode=0u) {
-    if(cvDoubleIsNaN(a)!=0u || cvDoubleIsNaN(b)!=0u) return cvMake(0u,0x7ff80000u);
+    // Imported binary64 instructions retain an incoming NaN's payload while
+    // quieting signaling values, including DADD used for abs.f64 by ptxas.
+    if(cvDoubleIsNaN(a)!=0u) return cvMake(a.lo,a.hi|0x00080000u);
+    if(cvDoubleIsNaN(b)!=0u) return cvMake(b.lo,b.hi|0x00080000u);
     cv64 ax=cvMake(a.lo,a.hi&0x7fffffffu),bx=cvMake(b.lo,b.hi&0x7fffffffu);
     uint sa=a.hi&0x80000000u,sb=b.hi&0x80000000u;
     if(ax.hi==0x7ff00000u || bx.hi==0x7ff00000u) {
@@ -637,6 +647,7 @@ extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_n
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_mul(unsigned long long a,unsigned long long b){using namespace cudavm;return join(cvDoubleMultiply(split(a),split(b)));}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_div(unsigned long long a,unsigned long long b){using namespace cudavm;return join(cvDoubleDivide(split(a),split(b)));}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f64_compare(unsigned long long a,unsigned long long b,unsigned predicate){using namespace cudavm;return cvDoubleCompare(split(a),split(b),predicate);}
+extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_minmax(unsigned long long a,unsigned long long b,unsigned maximum){using namespace cudavm;return join(double_minmax(split(a),split(b),maximum));}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f32_to_f64(unsigned bits){using namespace cudavm;return join(cvFloatBitsToDoubleBits(bits));}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f64_to_f32(unsigned long long bits,unsigned mode){using namespace cudavm;return cvDoubleBitsToFloatBitsMode(split(bits),mode);}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f32_add(unsigned a,unsigned b,unsigned flush){using namespace cudavm;return cvAtomicFloatAdd(a,b,flush);}

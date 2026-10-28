@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/global_symbols/global_symbols.ptx -o test/global_symbols/global_symbols.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "global_symbols.cu": "2e8401b072acc8a98fe5a364529c1b67b4b4e860c45124f7f0c6a728767f923f",
+    "global_symbols.ptx": "f25a9a59e96f8cfb98338833c25e648317e1af30e6a2f39a38f266a26c634042",
+    "global_symbols.ll": "0027ab53417de272e0a4f6f1983bf3973f091ab54cc45e5406db00e467815535",
+    "global_symbols.cubin": "3e4cf43c5db8ccbd3f186dde0b6dd6e3ad00d3b67ca4c1090223ae3ae6727763"
+  }
+}
