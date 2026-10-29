@@ -48,7 +48,7 @@ DRIVER_API(cuGraphUpload, (CUgraphExec handle, CUstream stream), driver_ready();
 DRIVER_API(cuGraphLaunch_ptsz, (CUgraphExec handle, CUstream stream), driver_ready(); graph_launch(handle, stream ? stream : CU_STREAM_PER_THREAD, false))
 DRIVER_API(cuGraphUpload_ptsz, (CUgraphExec handle, CUstream stream), driver_ready(); graph_launch(handle, stream ? stream : CU_STREAM_PER_THREAD, true))
 DRIVER_API(cuGraphNodeSetEnabled, (CUgraphExec handle, CUgraphNode node, unsigned enabled),
-    driver_ready(); require(enabled <= 1, CUDA_ERROR_INVALID_VALUE, "node enabled must be zero or one"); auto& value = graph_exec_lookup(handle); auto index = graph_exec_index(value, node);
+    driver_ready(); auto& value = graph_exec_lookup(handle); auto index = graph_exec_index(value, node);
     require(graph_enable_type(value.nodes[index].type), CUDA_ERROR_INVALID_VALUE, "this graph node type cannot be disabled");
     if (value.native) value.native_enables.emplace_back(value.nodes[index].native_node, enabled != 0);
     if (value.enabled[index] != (enabled != 0)) { value.enabled[index] = enabled != 0; value.native_regions.clear(); })

@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/mapped_host_memory/mapped_host_memory.ptx -o test/mapped_host_memory/mapped_host_memory.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "mapped_host_memory.cu": "40b3ad0ddb8ccbd99b99e7a04bc5d7d8f55e42a814702c5a6012e5a4cd8517fe",
+    "mapped_host_memory.ptx": "ac93a1f1e6f15884837291550063c42231be2205ac06d3fae622ddac2de69d22",
+    "mapped_host_memory.ll": "ad95bdd07bb5184ee12277d22640b39643fe3daea64a885fa3db1a5645d4a88c",
+    "mapped_host_memory.cubin": "c38a6ede28c24620cf9fc375ccb6a70cee482fea02226128712ac2272dac3116"
+  }
+}

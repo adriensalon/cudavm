@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/floating_point_atomics/floating_point_atomics.ptx -o test/floating_point_atomics/floating_point_atomics.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "floating_point_atomics.cu": "21e43f4733ab4c319412710046454365d58b5fad1c0182fa80463ee3901208d3",
+    "floating_point_atomics.ptx": "1a884d2369c3836d1560f04da3146c737e9841abcf2e79248f38adf4ed1d0c52",
+    "floating_point_atomics.ll": "b636619786fbfbf94a73bdce9ca45046f0916e493c28431495586943e165c0ab",
+    "floating_point_atomics.cubin": "346f7948412fd3e0f2f169a1dab7e20c239a988666c839e6fe3eb4f6d3037ec8"
+  }
+}

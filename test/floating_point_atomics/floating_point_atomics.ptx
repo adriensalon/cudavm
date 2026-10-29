@@ -1,0 +1,71 @@
+// Independently authored PTX. The cubin is assembled from this file, not CUDA source.
+.version 6.5
+.target sm_75
+.address_size 64
+.shared .align 4 .b8 floating_counters[8];
+
+.visible .entry floating_global_add(.param .u64 out, .param .u64 state,
+                                    .param .u32 count, .param .f32 delta) {
+ .reg .b64 %out, %state;
+ .reg .b32 %index, %lane, %lanes, %block, %count;
+ .reg .f32 %delta, %old;
+ .reg .pred %active;
+ ld.param.u64 %out,[out]; ld.param.u64 %state,[state];
+ ld.param.u32 %count,[count]; ld.param.f32 %delta,[delta];
+ mov.u32 %lane,%tid.x; mov.u32 %lanes,%ntid.x; mov.u32 %block,%ctaid.x;
+ mad.lo.u32 %index,%block,%lanes,%lane;
+ setp.lt.u32 %active,%index,%count; @!%active ret;
+ atom.global.add.f32 %old,[%state],%delta;
+ mad.wide.u32 %out,%index,4,%out; st.global.f32 [%out],%old;
+ add.u64 %state,%state,4; red.global.add.f32 [%state],%delta; ret;
+}
+
+.visible .entry floating_global_double_add(.param .u64 out, .param .u64 state,
+                                           .param .u32 count, .param .f64 delta) {
+ .reg .b64 %out, %state;
+ .reg .b32 %index, %lane, %lanes, %block, %count;
+ .reg .f64 %delta, %old;
+ .reg .pred %active;
+ ld.param.u64 %out,[out]; ld.param.u64 %state,[state];
+ ld.param.u32 %count,[count]; ld.param.f64 %delta,[delta];
+ mov.u32 %lane,%tid.x; mov.u32 %lanes,%ntid.x; mov.u32 %block,%ctaid.x;
+ mad.lo.u32 %index,%block,%lanes,%lane;
+ setp.lt.u32 %active,%index,%count; @!%active ret;
+ atom.global.add.f64 %old,[%state],%delta;
+ mad.wide.u32 %out,%index,8,%out; st.global.f64 [%out],%old;
+ add.u64 %state,%state,8; red.global.add.f64 [%state],%delta; ret;
+}
+
+.visible .entry floating_shared_add(.param .u64 out, .param .u64 totals, .param .u32 count,
+                                    .param .f32 seed, .param .f32 delta) {
+ .reg .b64 %out, %totals;
+ .reg .b32 %shared, %index, %lane, %lanes, %block, %count;
+ .reg .f32 %seed, %delta, %old, %discard, %first, %second;
+ .reg .pred %leader, %active;
+ ld.param.u64 %out,[out]; ld.param.u64 %totals,[totals]; ld.param.u32 %count,[count];
+ ld.param.f32 %seed,[seed]; ld.param.f32 %delta,[delta];
+ mov.u32 %lane,%tid.x; mov.u32 %lanes,%ntid.x; mov.u32 %block,%ctaid.x;
+ mov.u32 %shared,floating_counters;
+ setp.eq.u32 %leader,%lane,0; @!%leader bra ready;
+ st.shared.f32 [%shared],%seed; st.shared.f32 [%shared+4],%seed;
+ready:
+ bar.sync 0;
+ mad.lo.u32 %index,%block,%lanes,%lane;
+ setp.lt.u32 %active,%index,%count; @!%active bra complete;
+ atom.shared.add.f32 %old,[%shared],%delta;
+ atom.shared.add.f32 %discard,[%shared+4],%delta;
+ mad.wide.u32 %out,%index,4,%out; st.global.f32 [%out],%old;
+complete:
+ bar.sync 0; @!%leader ret;
+ ld.shared.f32 %first,[%shared]; ld.shared.f32 %second,[%shared+4];
+ mad.wide.u32 %totals,%block,8,%totals;
+ st.global.f32 [%totals],%first; st.global.f32 [%totals+4],%second; ret;
+}
+
+.visible .entry floating_exchange(.param .u64 out, .param .u64 state, .param .u32 replacement) {
+ .reg .b64 %out, %state;
+ .reg .b32 %replacement, %old;
+ ld.param.u64 %out,[out]; ld.param.u64 %state,[state]; ld.param.u32 %replacement,[replacement];
+ atom.global.exch.b32 %old,[%state],%replacement;
+ st.global.u32 [%out],%old; ret;
+}

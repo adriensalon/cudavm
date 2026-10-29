@@ -44,8 +44,10 @@ public:
 int run_conformance(int argc, char** argv, void (*execute)());
 
 // Execution slices reuse one oracle unchanged by every importer and loader.
+// Context flags declare prerequisites such as host mapping for the slice itself.
 int run_conformance(int argc, char** argv, const fixture_data& fixtures,
-                    void (*execute)(const loaded_program&), unsigned load_repetitions = 1);
+                    void (*execute)(const loaded_program&), unsigned load_repetitions = 1,
+                    unsigned context_flags = 0);
 void expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> expected,
                   const std::string& context);
 }

@@ -36,7 +36,7 @@ void expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> ex
 
 struct device_context {
     CUcontext value{};
-    explicit device_context(CUdevice device) { CONFORMANCE_CUDA(cuCtxCreate(&value, nullptr, 0, device)); }
+    explicit device_context(CUdevice device, unsigned flags = 0) { CONFORMANCE_CUDA(cuCtxCreate(&value, nullptr, flags, device)); }
     ~device_context() { if (value) cuCtxDestroy(value); }
 };
 
@@ -234,7 +234,7 @@ void probe_execution() {
 }
 
 int run_conformance(int argc, char** argv, const fixture_data& fixtures,
-                    void (*execute)(const loaded_program&), unsigned load_repetitions) {
+                    void (*execute)(const loaded_program&), unsigned load_repetitions, unsigned context_flags) {
     try {
         require(argc == 3, "usage: <executable> <backend> <cu|ptx|cubin|nvvm>");
         require(load_repetitions > 0, "at least one loader execution is required");
@@ -242,7 +242,7 @@ int run_conformance(int argc, char** argv, const fixture_data& fixtures,
         const auto device = select_conformance_device(backend, probe_execution);
         if (device.value == -1) return 77;
         std::cout << "backend=" << backend << " importer=" << argv[2] << " device=" << device.name << std::endl;
-        device_context context(device.value);
+        device_context context(device.value, context_flags);
         // Compiler handles are destroyed before either loader sees the copy.
         const auto image = import_fixture(fixtures, argv[2]);
         for (unsigned repeat = 0; repeat < load_repetitions; ++repeat)

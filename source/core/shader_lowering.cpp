@@ -2008,7 +2008,7 @@ struct lowering {
     }
 };
 }
-void scalarize_native_aggregate_phis(llvm::Module& module) {
+void scalarize_native_aggregates(llvm::Module& module) {
     std::vector<llvm::PHINode*> pending;
     for (auto& function : module) for (auto& block : function) for (auto& phi : block.phis())
         if (phi.getType()->isAggregateType()) pending.push_back(&phi);
@@ -2036,6 +2036,20 @@ void scalarize_native_aggregate_phis(llvm::Module& module) {
         }
         phi->eraseFromParent();
     }
+    // A field can come from the untouched part of a partial insertvalue, not
+    // just its last insertion. InstSimplify does not trace that chain. Resolve
+    // it explicitly so numerical helpers do not retain arbitrary aggregate
+    // instructions that DXIL cannot represent. Native cmpxchg result extracts
+    // remain intact because their producer is not an aggregate construction.
+    for (auto& function : module) for (auto& block : function)
+        for (auto iterator = block.begin(); iterator != block.end();) {
+            auto* extracted = llvm::dyn_cast<llvm::ExtractValueInst>(&*iterator++);
+            if (!extracted) continue;
+            if (auto* field = llvm::FindInsertedValue(extracted->getAggregateOperand(), extracted->getIndices())) {
+                extracted->replaceAllUsesWith(field);
+                extracted->eraseFromParent();
+            }
+        }
 }
 std::unique_ptr<llvm::Module> prepare_native_shader_module(const llvm::Module& input) {
     auto module = llvm::CloneModule(input);
@@ -2135,7 +2149,7 @@ std::unique_ptr<llvm::Module> lower_native_shader(const llvm::Module& input, con
     }
     // SPIR-V's aggregate instruction rewriting does not preserve aggregate
     // PHIs. Keep each field's edge value explicit before entering codegen.
-    scalarize_native_aggregate_phis(*module);
+    scalarize_native_aggregates(*module);
     if(auto* directory=std::getenv("CUDAVM_DUMP_NATIVE_DIR")) {
         std::string text;llvm::raw_string_ostream output(text);module->print(output,nullptr);
         write_file(std::string(directory)+"/"+std::to_string(std::hash<std::string>{}(symbol))+"-"+std::to_string(unsigned(environment))+".ll",text);

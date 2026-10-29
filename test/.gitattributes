@@ -46,3 +46,9 @@ warp_synchronization/warp_synchronization.ll -text
 device_calls/device_calls.cu -text
 device_calls/device_calls.ptx -text
 device_calls/device_calls.ll -text
+mapped_host_memory/mapped_host_memory.cu -text
+mapped_host_memory/mapped_host_memory.ptx -text
+mapped_host_memory/mapped_host_memory.ll -text
+floating_point_atomics/floating_point_atomics.cu -text
+floating_point_atomics/floating_point_atomics.ptx -text
+floating_point_atomics/floating_point_atomics.ll -text
