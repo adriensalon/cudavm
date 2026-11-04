@@ -1,22 +1,42 @@
 #include "conformance.hpp"
+#ifndef CUDAVM_CONFORMANCE_HOST_ONLY
 #include <cuda/cudavm_cuda.h>
 #ifdef CUDAVM_CONFORMANCE_EXECUTION
 #include <nvrtc.h>
 #include <nvvm.h>
 #include <nvJitLink.h>
 #endif
+#endif
 #include <algorithm>
 #include <iostream>
 
 namespace cudavm {
+void require(bool condition, const std::string& message) {
+    if (!condition) throw std::runtime_error(message);
+}
+int run_host_conformance(int argc, char** argv, void (*execute)()) {
+    try {
+        require(argc == 1 || argc == 2, "usage: <executable> [case]");
+        std::cout << "host-only case=" << (argc == 2 ? argv[1] : "all") << std::endl;
+        execute();
+        std::cout << "PASS\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL: " << error.what() << '\n';
+        return 1;
+    }
+}
+
+#ifndef CUDAVM_CONFORMANCE_HOST_ONLY
+struct conformance_unavailable : std::runtime_error { using std::runtime_error::runtime_error; };
+void require_capability(bool available, const std::string& reason) {
+    if (!available) throw conformance_unavailable(reason);
+}
 struct conformance_driver_error : std::runtime_error {
     CUresult result;
     conformance_driver_error(CUresult status, const std::string& message)
         : std::runtime_error(message), result(status) {}
 };
-void require(bool condition, const std::string& message) {
-    if (!condition) throw std::runtime_error(message);
-}
 void check_driver(CUresult result, const char* operation) {
     if (result == CUDA_SUCCESS) return;
     const char* name = nullptr;
@@ -83,17 +103,20 @@ conformance_device select_conformance_device(std::string_view backend, void (*pr
     return {};
 }
 
-int run_conformance(int argc, char** argv, void (*execute)()) {
+int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags) {
     try {
         require(argc == 2, "usage: <executable> <backend>");
         const auto device = select_conformance_device(argv[1]);
         if (device.value == -1) return 77;
         std::cout << "backend=" << argv[1] << " device=" << device.name << std::endl;
-        device_context context(device.value);
+        device_context context(device.value, context_flags);
         execute();
         CONFORMANCE_CUDA(cuCtxSynchronize());
         std::cout << "PASS\n";
         return 0;
+    } catch (const conformance_unavailable& error) {
+        std::cout << "SKIP: " << error.what() << '\n';
+        return 77;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;
@@ -259,10 +282,14 @@ int run_conformance(int argc, char** argv, const fixture_data& fixtures,
         }
         std::cout << "PASS\n";
         return 0;
+    } catch (const conformance_unavailable& error) {
+        std::cout << "SKIP: " << error.what() << '\n';
+        return 77;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;
     }
 }
+#endif
 #endif
 }

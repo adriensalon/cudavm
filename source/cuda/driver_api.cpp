@@ -744,7 +744,7 @@ template<class F> CUresult driver_call(F function) noexcept {
     catch (...) { diagnostic_text() = "unknown backend failure"; return CUDA_ERROR_UNKNOWN; }
 }
 bool capture_node(const std::shared_ptr<context>&, CUstream, graph_node);
-void capture_check_stream(const std::shared_ptr<stream_state>&);
+void capture_check_stream(const std::shared_ptr<stream_state>&, bool invalidate_implicit = true);
 bool capture_record(CUevent, CUstream, unsigned);
 bool capture_wait(CUstream, CUevent, unsigned);
 std::function<void()> graph_prepare_semaphores(const graph_node&);

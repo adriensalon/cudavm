@@ -1,5 +1,7 @@
 #pragma once
+#ifndef CUDAVM_CONFORMANCE_HOST_ONLY
 #include <cuda.h>
+#endif
 #include <array>
 #include <cstdint>
 #include <span>
@@ -10,6 +12,14 @@
 
 namespace cudavm {
 void require(bool condition, const std::string& message);
+// Host/compiler contracts share reporting without GPU initialization or Driver
+// references. HOST_ONLY registration selects this subset of the common runner.
+int run_host_conformance(int argc, char** argv, void (*execute)());
+
+#ifndef CUDAVM_CONFORMANCE_HOST_ONLY
+// Only an absent declared device prerequisite is unavailable evidence. API or
+// execution failures on an applicable device must still fail the test.
+void require_capability(bool available, const std::string& reason);
 void check_driver(CUresult result, const char* operation);
 #define CONFORMANCE_CUDA(call) ::cudavm::check_driver((call), #call)
 
@@ -43,7 +53,7 @@ public:
 
 // Format-independent Driver API contracts need a device, but no shader compiler
 // or executable-input probe. Their registration has no importer dimension.
-int run_conformance(int argc, char** argv, void (*execute)());
+int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags = 0);
 
 // Execution slices reuse one oracle unchanged by every importer and loader.
 // Context flags declare prerequisites such as host mapping for the slice itself.
@@ -52,4 +62,5 @@ int run_conformance(int argc, char** argv, const fixture_data& fixtures,
                     unsigned context_flags = 0);
 void expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> expected,
                   const std::string& context);
+#endif
 }

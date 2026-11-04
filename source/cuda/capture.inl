@@ -21,14 +21,16 @@ void capture_fail(const std::shared_ptr<capture_state>& capture, CUresult code, 
     capture->invalidated = true;
     throw failure(code, message);
 }
-void capture_check_stream(const std::shared_ptr<stream_state>& stream) {
+void capture_check_stream(const std::shared_ptr<stream_state>& stream, bool invalidate_implicit) {
     if (stream->capture)
         require(!stream->capture->invalidated, CUDA_ERROR_STREAM_CAPTURE_INVALIDATED, "stream capture was invalidated");
     if (stream->legacy) {
         auto owner = stream->owner.lock();
         for (auto& item : owner->streams) if (auto other = item.lock())
-            if (other->capture && !(other->flags & CU_STREAM_NON_BLOCKING))
-                capture_fail(other->capture, CUDA_ERROR_STREAM_CAPTURE_IMPLICIT, "legacy stream would depend on a capturing stream");
+            if (other->capture && !(other->flags & CU_STREAM_NON_BLOCKING)) {
+                if (invalidate_implicit) other->capture->invalidated = true;
+                throw failure(CUDA_ERROR_STREAM_CAPTURE_IMPLICIT, "legacy stream would depend on a capturing stream");
+            }
     }
 }
 void capture_unsafe(const std::shared_ptr<context>&) {
@@ -150,7 +152,9 @@ void capture_info(CUstream handle, CUstreamCaptureStatus* status, cuuint64_t* id
     require(status && (!edges || dependencies), CUDA_ERROR_INVALID_VALUE, "invalid capture info outputs");
     auto stream = stream_lookup(handle);
     // An invalidated capture is still queryable until EndCapture releases it.
-    if (!stream->capture) capture_check_stream(stream);
+    // Status queries report the legacy stream's implicit dependency without
+    // invalidating the blocking-stream capture (unlike submitting legacy work).
+    if (!stream->capture) capture_check_stream(stream, false);
     auto capture = stream->capture;
     *status = capture ? (capture->invalidated ? CU_STREAM_CAPTURE_STATUS_INVALIDATED : CU_STREAM_CAPTURE_STATUS_ACTIVE) : CU_STREAM_CAPTURE_STATUS_NONE;
     if (capture && !capture->invalidated) {
