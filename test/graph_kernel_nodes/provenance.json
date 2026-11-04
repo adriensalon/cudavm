@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/graph_kernel_nodes/graph_kernel_nodes.ptx -o test/graph_kernel_nodes/graph_kernel_nodes.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "graph_kernel_nodes.cu": "73bc68b2cebd1644880b1c1264dbd43b32025e2edd1ae03507dccc9201853297",
+    "graph_kernel_nodes.ptx": "eb216cb6cd642de0946e12118a0429f6e8a0e47280d8dbe301017623b092dc7d",
+    "graph_kernel_nodes.ll": "665c4335636e7cd6abbd3f50b5c313760b071fb0c30bb7077c4c75a3113bd057",
+    "graph_kernel_nodes.cubin": "e7ea504c335e130bff69c65873d655131c41d9e858076082694e73e94908d750"
+  }
+}

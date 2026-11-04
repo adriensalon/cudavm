@@ -1,0 +1,14 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/graph_replay/graph_replay.ptx -o test/graph_replay/graph_replay.cubin",
+  "reused_from": "test/graph_replay: all four kernel fixtures copied byte-for-byte; no regeneration",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "stream_ordering.cu": "a0c1ef5699e6a76463db38ac9f7675cf6d61ac81df6a0ed1a818f3f652a4925d",
+    "stream_ordering.ptx": "fcf99bd23b21c6d33f58bd7aca04287033449111fc8831cddc03ade4e892bbbd",
+    "stream_ordering.ll": "95eafb9f708120bdbda12f58b196a09497d23f3e6bfe46f2254055445bd3eac1",
+    "stream_ordering.cubin": "d8ba95bb6da7c8407043f4f773cfd0691ff031e650ba69e4c112efb50bc1ce91"
+  }
+}

@@ -51,6 +51,32 @@ inline void inherit_order(command_order& order, const completion& dependency) {
 }
 inline thread_local bool executing_host_function = false;
 
+// A user host function may wait on host-side state. Keep the queue worker free
+// to submit and retire independent streams while retaining its completion.
+class host_function_task : public device_task {
+    std::atomic<bool> ready{false};
+    std::exception_ptr error;
+    std::thread worker;
+public:
+    explicit host_function_task(std::function<void()> function)
+        : worker([this, function = std::move(function)] {
+            struct guard {
+                guard() { executing_host_function = true; }
+                ~guard() { executing_host_function = false; }
+            } scope;
+            try { function(); } catch (...) { error = std::current_exception(); }
+            ready.store(true, std::memory_order_release);
+        }) {}
+    ~host_function_task() { if (worker.joinable()) worker.join(); }
+    bool query() override {
+        if (!ready.load(std::memory_order_acquire)) return false;
+        if (worker.joinable()) worker.join();
+        if (error) std::rethrow_exception(error);
+        return true;
+    }
+    bool yields_to_exclusive() const override { return true; }
+};
+
 class command_queue {
     struct command {
         completion done;

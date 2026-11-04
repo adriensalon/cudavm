@@ -227,12 +227,8 @@ void host_function(CUstream stream, CUhostFn function, void* data) {
     require(function, CUDA_ERROR_INVALID_VALUE, "null host function");
     graph_node node; node.type = CU_GRAPH_NODE_TYPE_HOST; node.host = {function, data};
     if (capture_node(current(), stream, std::move(node))) return;
-    submit_stream(current(), stream, [function, data] {
-        struct guard {
-            guard() { executing_host_function = true; }
-            ~guard() { executing_host_function = false; }
-        } scope;
-        function(data);
+    submit_stream(current(), stream, {}, {}, 0, [function, data] {
+        return std::make_shared<host_function_task>([function, data] { function(data); });
     });
 }
 void stream_callback(CUstream stream, CUstream reported, CUstreamCallback callback, void* data, unsigned flags) {

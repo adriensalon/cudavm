@@ -64,3 +64,9 @@ graph_update/graph_update.ll -text
 graph_kernel_nodes/graph_kernel_nodes.cu -text
 graph_kernel_nodes/graph_kernel_nodes.ptx -text
 graph_kernel_nodes/graph_kernel_nodes.ll -text
+stream_ordering/stream_ordering.cu -text
+stream_ordering/stream_ordering.ptx -text
+stream_ordering/stream_ordering.ll -text
+stream_progress/stream_progress.cu -text
+stream_progress/stream_progress.ptx -text
+stream_progress/stream_progress.ll -text

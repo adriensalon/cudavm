@@ -175,9 +175,8 @@ graph_operation graph_prepare(const graph_node& node, bool use_node_priority = f
             result.contexts.push_back(owner);
         }
         auto p = node.host;
-        result.action = [p] {
-            struct guard { guard() { executing_host_function = true; } ~guard() { executing_host_function = false; } } scope;
-            p.fn(p.userData);
+        result.start = [p](native_queue*) -> device_work {
+            return std::make_shared<host_function_task>([p] { p.fn(p.userData); });
         };
         return result;
     }
@@ -742,7 +741,7 @@ void graph_launch(CUgraphExec handle, CUstream stream, bool upload) {
                         auto node_owner = node.owner.lock();
                         // A native lane belongs to its execution context. Mixed
                         // graphs keep their existing synchronous foreign path.
-                        if (node_owner == owner || node.type == CU_GRAPH_NODE_TYPE_BATCH_MEM_OP)
+                        if (node_owner == owner || node.type == CU_GRAPH_NODE_TYPE_BATCH_MEM_OP || node.type == CU_GRAPH_NODE_TYPE_HOST)
                             start = [operation = operation.start, queue] { return operation(queue.get()); };
                         if (node_owner == owner && operation.native_compatible) {
                             recorder = std::move(operation.start); native_key = std::move(operation.native_key);

@@ -12,7 +12,7 @@ size_t memop_width(CUstreamBatchMemOpType type) {
 CUdeviceptr memop_address(const CUstreamBatchMemOpParams& op) {
     return memop_wait(op.operation) ? op.waitValue.address : memop_write(op.operation) ? op.writeValue.address : 0;
 }
-std::vector<CUstreamBatchMemOpParams> memop_parameters(unsigned count, const CUstreamBatchMemOpParams* params, unsigned flags) {
+std::vector<CUstreamBatchMemOpParams> memop_parameters(unsigned count, const CUstreamBatchMemOpParams* params, unsigned flags, bool allow_no_memory_barrier = true) {
     require(!flags && count < 256 && (!count || params), CUDA_ERROR_INVALID_VALUE, "invalid batch memory operation array or flags");
     std::vector<CUstreamBatchMemOpParams> result(count);
     for (unsigned i = 0; i < count; ++i) {
@@ -24,7 +24,8 @@ std::vector<CUstreamBatchMemOpParams> memop_parameters(unsigned count, const CUs
             if (memop_width(op.operation) == 8) copy.waitValue.value64 = op.waitValue.value64;
             else copy.waitValue.value = op.waitValue.value;
         } else if (memop_write(op.operation)) {
-            require(!(op.writeValue.flags & ~CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER), CUDA_ERROR_INVALID_VALUE, "invalid memory write flags");
+            require(!op.writeValue.flags || (allow_no_memory_barrier && op.writeValue.flags == CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER),
+                    CUDA_ERROR_INVALID_VALUE, "invalid memory write flags");
             copy.writeValue.address = op.writeValue.address; copy.writeValue.flags = op.writeValue.flags;
             if (memop_width(op.operation) == 8) copy.writeValue.value64 = op.writeValue.value64;
             else copy.writeValue.value = op.writeValue.value;
@@ -130,7 +131,7 @@ std::shared_ptr<memop_task> prepare_memops(const graph_node& node, std::vector<s
 void stream_memops(CUstream stream, unsigned count, const CUstreamBatchMemOpParams* params, unsigned flags) {
     auto owner = current(); auto target = stream_lookup(stream, owner); capture_check_stream(target);
     graph_memory_scope scope(bool(target->capture));
-    graph_node node; node.type = CU_GRAPH_NODE_TYPE_BATCH_MEM_OP; node.owner = owner; node.memops = memop_parameters(count, params, flags);
+    graph_node node; node.type = CU_GRAPH_NODE_TYPE_BATCH_MEM_OP; node.owner = owner; node.memops = memop_parameters(count, params, flags, false);
     std::vector<std::shared_ptr<host_entry>> hosts;
     auto task = prepare_memops(node, hosts);
     for (auto& host : hosts) node.host_regions.push_back(host);
