@@ -52,3 +52,15 @@ mapped_host_memory/mapped_host_memory.ll -text
 floating_point_atomics/floating_point_atomics.cu -text
 floating_point_atomics/floating_point_atomics.ptx -text
 floating_point_atomics/floating_point_atomics.ll -text
+graph_replay/graph_replay.cu -text
+graph_replay/graph_replay.ptx -text
+graph_replay/graph_replay.ll -text
+graph_lifetime/graph_lifetime.cu -text
+graph_lifetime/graph_lifetime.ptx -text
+graph_lifetime/graph_lifetime.ll -text
+graph_update/graph_update.cu -text
+graph_update/graph_update.ptx -text
+graph_update/graph_update.ll -text
+graph_kernel_nodes/graph_kernel_nodes.cu -text
+graph_kernel_nodes/graph_kernel_nodes.ptx -text
+graph_kernel_nodes/graph_kernel_nodes.ll -text

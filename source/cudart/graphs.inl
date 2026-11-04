@@ -22,6 +22,15 @@ template<class F> void runtime_graph_query(cudaGraphNode_t* output, size_t* coun
     for (size_t i = 0; i < capacity; ++i) output[i] = graph_cast<cudaGraphNode_t>(nodes[i]);
     *count = written;
 }
+CUDA_MEMCPY3D runtime_graph_copy_3d(const cudaMemcpy3DParms& p) {
+    try { return runtime_copy_3d(p); }
+    catch (const symbol_failure& error) {
+        // Graph APIs report invalid value for descriptor geometry. Preserve
+        // copy-direction errors from the shared converter.
+        if (error.code == cudaErrorInvalidPitchValue) throw symbol_failure(cudaErrorInvalidValue, error.what());
+        throw;
+    }
+}
 CUDA_MEMCPY3D runtime_graph_copy_1d(void* to, const void* from, size_t bytes, cudaMemcpyKind kind) {
     auto types = runtime_copy_types(to, from, kind);
     CUDA_MEMCPY3D p{};

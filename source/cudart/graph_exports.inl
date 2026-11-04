@@ -10,7 +10,7 @@ RUNTIME_API(cudaGraphAddHostNode, (cudaGraphNode_t* output, cudaGraph_t graph, c
     require(output && p, CUDA_ERROR_INVALID_VALUE, "null graph host parameters"); runtime_current(); auto nodes = graph_dependencies(dependencies, count); CUDA_HOST_NODE_PARAMS params{p->fn, p->userData}; CUgraphNode value{};
     check(cuGraphAddHostNode(&value, graph_cast<CUgraph>(graph), nodes.data(), count, &params)); *output = graph_cast<cudaGraphNode_t>(value))
 RUNTIME_API(cudaGraphAddMemcpyNode, (cudaGraphNode_t* output, cudaGraph_t graph, const cudaGraphNode_t* dependencies, size_t count, const cudaMemcpy3DParms* p),
-    require(output && p, CUDA_ERROR_INVALID_VALUE, "null graph copy parameters"); auto owner = runtime_current(); auto nodes = graph_dependencies(dependencies, count); auto params = runtime_copy_3d(*p); CUgraphNode value{};
+    require(output && p, CUDA_ERROR_INVALID_VALUE, "null graph copy parameters"); auto owner = runtime_current(); auto nodes = graph_dependencies(dependencies, count); auto params = runtime_graph_copy_3d(*p); CUgraphNode value{};
     check(cuGraphAddMemcpyNode(&value, graph_cast<CUgraph>(graph), nodes.data(), count, &params, owner)); *output = graph_cast<cudaGraphNode_t>(value))
 RUNTIME_API(cudaGraphAddMemcpyNode1D, (cudaGraphNode_t* output, cudaGraph_t graph, const cudaGraphNode_t* dependencies, size_t count, void* to, const void* from, size_t bytes, cudaMemcpyKind kind),
     require(output, CUDA_ERROR_INVALID_VALUE, "null graph node output"); auto owner = runtime_current(); auto nodes = graph_dependencies(dependencies, count); auto params = runtime_graph_copy_1d(to, from, bytes, kind); CUgraphNode value{};
@@ -30,7 +30,7 @@ RUNTIME_API(cudaGraphHostNodeSetParams, (cudaGraphNode_t handle, const cudaHostN
 RUNTIME_API(cudaGraphMemcpyNodeGetParams, (cudaGraphNode_t handle, cudaMemcpy3DParms* p),
     require(p, CUDA_ERROR_INVALID_VALUE, "null graph copy output"); runtime_current(); CUDA_MEMCPY3D params{}; check(cuGraphMemcpyNodeGetParams(graph_cast<CUgraphNode>(handle), &params)); *p = runtime_graph_copy_params(params))
 RUNTIME_API(cudaGraphMemcpyNodeSetParams, (cudaGraphNode_t handle, const cudaMemcpy3DParms* p),
-    require(p, CUDA_ERROR_INVALID_VALUE, "null graph copy parameters"); runtime_current(); auto params = runtime_copy_3d(*p); check(cuGraphMemcpyNodeSetParams(graph_cast<CUgraphNode>(handle), &params)))
+    require(p, CUDA_ERROR_INVALID_VALUE, "null graph copy parameters"); runtime_current(); auto params = runtime_graph_copy_3d(*p); check(cuGraphMemcpyNodeSetParams(graph_cast<CUgraphNode>(handle), &params)))
 RUNTIME_API(cudaGraphMemcpyNodeSetParams1D, (cudaGraphNode_t handle, void* to, const void* from, size_t bytes, cudaMemcpyKind kind),
     runtime_current(); auto params = runtime_graph_copy_1d(to, from, bytes, kind); check(cuGraphMemcpyNodeSetParams(graph_cast<CUgraphNode>(handle), &params)))
 RUNTIME_API(cudaGraphMemsetNodeGetParams, (cudaGraphNode_t handle, cudaMemsetParams* p),
@@ -77,7 +77,7 @@ RUNTIME_API(cudaGraphNodeGetEnabled, (cudaGraphExec_t handle, cudaGraphNode_t no
 RUNTIME_API(cudaGraphExecHostNodeSetParams, (cudaGraphExec_t handle, cudaGraphNode_t node, const cudaHostNodeParams* p),
     require(p, CUDA_ERROR_INVALID_VALUE, "null graph host parameters"); runtime_current(); CUDA_HOST_NODE_PARAMS params{p->fn, p->userData}; check(cuGraphExecHostNodeSetParams(graph_cast<CUgraphExec>(handle), graph_cast<CUgraphNode>(node), &params)))
 RUNTIME_API(cudaGraphExecMemcpyNodeSetParams, (cudaGraphExec_t handle, cudaGraphNode_t node, const cudaMemcpy3DParms* p),
-    require(p, CUDA_ERROR_INVALID_VALUE, "null graph copy parameters"); auto owner = runtime_current(); auto params = runtime_copy_3d(*p); check(cuGraphExecMemcpyNodeSetParams(graph_cast<CUgraphExec>(handle), graph_cast<CUgraphNode>(node), &params, owner)))
+    require(p, CUDA_ERROR_INVALID_VALUE, "null graph copy parameters"); auto owner = runtime_current(); auto params = runtime_graph_copy_3d(*p); check(cuGraphExecMemcpyNodeSetParams(graph_cast<CUgraphExec>(handle), graph_cast<CUgraphNode>(node), &params, owner)))
 RUNTIME_API(cudaGraphExecMemcpyNodeSetParams1D, (cudaGraphExec_t handle, cudaGraphNode_t node, void* to, const void* from, size_t bytes, cudaMemcpyKind kind),
     auto owner = runtime_current(); auto params = runtime_graph_copy_1d(to, from, bytes, kind); check(cuGraphExecMemcpyNodeSetParams(graph_cast<CUgraphExec>(handle), graph_cast<CUgraphNode>(node), &params, owner)))
 RUNTIME_API(cudaGraphExecMemsetNodeSetParams, (cudaGraphExec_t handle, cudaGraphNode_t node, const cudaMemsetParams* p),

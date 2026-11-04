@@ -19,7 +19,8 @@ DRIVER_API(cuGraphAddMemsetNode, (CUgraphNode* output, CUgraph graph, const CUgr
 DRIVER_API(cuGraphAddKernelNode, (CUgraphNode* output, CUgraph graph, const CUgraphNode* dependencies, size_t count, const CUDA_KERNEL_NODE_PARAMS* p),
     driver_ready(); require(output && p, CUDA_ERROR_INVALID_VALUE, "null graph kernel parameters"); *output = graph_add(graph, dependencies, count, graph_kernel(*p, !p->func && p->ctx ? lookup(p->ctx) : current())))
 DRIVER_API(cuGraphKernelNodeSetParams, (CUgraphNode handle, const CUDA_KERNEL_NODE_PARAMS* p),
-    driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null graph kernel parameters"); auto& node = graph_node_lookup(handle); auto owner = node.owner.lock();
+    driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null graph kernel parameters"); auto& node = graph_node_lookup(handle);
+    require(node.type == CU_GRAPH_NODE_TYPE_KERNEL, CUDA_ERROR_INVALID_VALUE, "not a kernel node"); auto owner = node.owner.lock();
     require(owner && !owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "graph kernel context was destroyed"); graph_replace(node, graph_kernel(*p, owner, node.shape.options)))
 DRIVER_API(cuGraphHostNodeGetParams, (CUgraphNode handle, CUDA_HOST_NODE_PARAMS* p),
     driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null graph host output"); auto& node = graph_node_lookup(handle); require(node.type == CU_GRAPH_NODE_TYPE_HOST, CUDA_ERROR_INVALID_VALUE, "not a host node"); *p = node.host)
@@ -59,8 +60,9 @@ DRIVER_API(cuGraphExecHostNodeSetParams, (CUgraphExec handle, CUgraphNode node, 
 DRIVER_API(cuGraphExecMemcpyNodeSetParams, (CUgraphExec handle, CUgraphNode node, const CUDA_MEMCPY3D* p, CUcontext owner), driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null graph copy parameters"); graph_exec_replace(handle, node, graph_copy(*p, lookup(owner))))
 DRIVER_API(cuGraphExecMemsetNodeSetParams, (CUgraphExec handle, CUgraphNode node, const CUDA_MEMSET_NODE_PARAMS* p, CUcontext owner), driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null graph fill parameters"); graph_exec_replace(handle, node, graph_fill(*p, lookup(owner))))
 DRIVER_API(cuGraphExecKernelNodeSetParams, (CUgraphExec handle, CUgraphNode node, const CUDA_KERNEL_NODE_PARAMS* p),
-    driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null graph kernel parameters"); auto& value = graph_exec_lookup(handle); auto owner = value.nodes[graph_exec_index(value, node)].owner.lock();
-    require(owner && !owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "graph kernel context was destroyed"); graph_exec_replace(handle, node, graph_kernel(*p, owner, value.nodes[graph_exec_index(value, node)].shape.options)))
+    driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null graph kernel parameters"); auto& value = graph_exec_lookup(handle); auto& existing = value.nodes[graph_exec_index(value, node)];
+    require(existing.type == CU_GRAPH_NODE_TYPE_KERNEL, CUDA_ERROR_INVALID_VALUE, "not a kernel node"); auto owner = existing.owner.lock();
+    require(owner && !owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "graph kernel context was destroyed"); graph_exec_replace(handle, node, graph_kernel(*p, owner, existing.shape.options)))
 
 // Preserve the pre-edge-data Driver ABI alongside the pinned header's aliases.
 #undef cuGraphGetEdges
@@ -85,10 +87,13 @@ CUDA_KERNEL_NODE_PARAMS graph_legacy_kernel(const CUDA_KERNEL_NODE_PARAMS_v1& p)
 DRIVER_API(cuGraphAddKernelNode, (CUgraphNode* output, CUgraph graph, const CUgraphNode* dependencies, size_t count, const CUDA_KERNEL_NODE_PARAMS_v1* p),
     driver_ready(); require(output && p, CUDA_ERROR_INVALID_VALUE, "null graph kernel parameters"); *output = graph_add(graph, dependencies, count, graph_kernel(graph_legacy_kernel(*p), current())))
 DRIVER_API(cuGraphKernelNodeSetParams, (CUgraphNode node, const CUDA_KERNEL_NODE_PARAMS_v1* p),
-    driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null graph kernel parameters"); auto& value = graph_node_lookup(node); auto owner = value.owner.lock(); require(owner && !owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "graph kernel context was destroyed"); graph_replace(value, graph_kernel(graph_legacy_kernel(*p), owner, value.shape.options)))
+    driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null graph kernel parameters"); auto& value = graph_node_lookup(node);
+    require(value.type == CU_GRAPH_NODE_TYPE_KERNEL, CUDA_ERROR_INVALID_VALUE, "not a kernel node"); auto owner = value.owner.lock();
+    require(owner && !owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "graph kernel context was destroyed"); graph_replace(value, graph_kernel(graph_legacy_kernel(*p), owner, value.shape.options)))
 DRIVER_API(cuGraphExecKernelNodeSetParams, (CUgraphExec handle, CUgraphNode node, const CUDA_KERNEL_NODE_PARAMS_v1* p),
-    driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null graph kernel parameters"); auto& value = graph_exec_lookup(handle); auto owner = value.nodes[graph_exec_index(value, node)].owner.lock();
-    require(owner && !owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "graph kernel context was destroyed"); graph_exec_replace(handle, node, graph_kernel(graph_legacy_kernel(*p), owner, value.nodes[graph_exec_index(value, node)].shape.options)))
+    driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null graph kernel parameters"); auto& value = graph_exec_lookup(handle); auto& existing = value.nodes[graph_exec_index(value, node)];
+    require(existing.type == CU_GRAPH_NODE_TYPE_KERNEL, CUDA_ERROR_INVALID_VALUE, "not a kernel node"); auto owner = existing.owner.lock();
+    require(owner && !owner->retiring, CUDA_ERROR_INVALID_CONTEXT, "graph kernel context was destroyed"); graph_exec_replace(handle, node, graph_kernel(graph_legacy_kernel(*p), owner, existing.shape.options)))
 #undef cuGraphInstantiate
 DRIVER_API(cuGraphInstantiate, (CUgraphExec* output, CUgraph handle, CUgraphNode* error_node, char* log, size_t capacity),
     driver_ready(); require(output && (!capacity || log), CUDA_ERROR_INVALID_VALUE, "invalid legacy graph instantiation output"); if (error_node) *error_node = nullptr; if (capacity) log[0] = 0; *output = graph_instantiate(handle, 0))

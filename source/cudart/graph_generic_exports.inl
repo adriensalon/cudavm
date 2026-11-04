@@ -59,7 +59,7 @@ struct runtime_generic_node {
             runtime_graph_union_validate(p, p.memcpy);
             require(!p.memcpy.ctx, CUDA_ERROR_NOT_SUPPORTED, "Runtime execution context handles are unavailable");
             params.memcpy.flags = p.memcpy.flags; params.memcpy.reserved = p.memcpy.reserved;
-            params.memcpy.copyCtx = owner; params.memcpy.copyParams = runtime_copy_3d(p.memcpy.copyParams); break;
+            params.memcpy.copyCtx = owner; params.memcpy.copyParams = runtime_graph_copy_3d(p.memcpy.copyParams); break;
         case cudaGraphNodeTypeMemset:
             runtime_graph_union_validate(p, p.memset);
             require(!p.memset.ctx, CUDA_ERROR_NOT_SUPPORTED, "Runtime execution context handles are unavailable");

@@ -36,6 +36,8 @@ public:
     loaded_program(const loaded_program&) = delete;
     loaded_program& operator=(const loaded_program&) = delete;
     CUfunction function(const char* name) const;
+    // Contextless kernel routes apply to library loads; module loads return null.
+    CUkernel library_kernel(const char* name) const;
     CUdeviceptr global(const char* name, size_t expected_size) const;
 };
 

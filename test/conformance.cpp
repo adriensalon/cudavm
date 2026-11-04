@@ -197,6 +197,11 @@ CUfunction loaded_program::function(const char* name) const {
     } else CONFORMANCE_CUDA(cuModuleGetFunction(&result, module, name));
     return result;
 }
+CUkernel loaded_program::library_kernel(const char* name) const {
+    CUkernel result{};
+    if (library) CONFORMANCE_CUDA(cuLibraryGetKernel(&result, library, name));
+    return result;
+}
 CUdeviceptr loaded_program::global(const char* name, size_t expected_size) const {
     CUdeviceptr result = 0;
     size_t size = 0;

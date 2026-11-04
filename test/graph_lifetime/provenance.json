@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/graph_lifetime/graph_lifetime.ptx -o test/graph_lifetime/graph_lifetime.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "graph_lifetime.cu": "780bf37ec188619d49c31b8485761bd9d3e1156d51dc44b49308abbf61e4db65",
+    "graph_lifetime.ptx": "9df459fe7fa51ebe3548ef7f0a34678e1cf8148a650d3eb9d6cbb9090fd147ce",
+    "graph_lifetime.ll": "e20824cae3f87760bcc7205a595b8876da58562b217c7b8ce11251a7b4c6d45c",
+    "graph_lifetime.cubin": "86e1582a07a8182c9992a3e5a9ba571ec2308ebb1920d233f5985c343205ed4d"
+  }
+}
