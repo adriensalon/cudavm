@@ -4,6 +4,7 @@
 namespace cudavm {
 inline constexpr std::string_view dxil_artifact_begin = "// CUDAVM-NATIVE-DXIL-V1-BEGIN\n", dxil_artifact_end = "// CUDAVM-NATIVE-DXIL-V1-END";
 struct dxil_variant { std::array<unsigned,3> block; std::string code; };
+struct dxil_bundle { std::vector<dxil_variant> variants; std::string ir; };
 inline constexpr std::array<std::array<unsigned,3>,33> dxil_block_shapes{{{1,1,1},{2,1,1},{4,1,1},{8,1,1},{16,1,1},{32,1,1},
     {64,1,1},{128,1,1},{256,1,1},{512,1,1},{1024,1,1},{4,2,1},{4,2,2},
     {13,1,1},{45,1,1},{96,1,1},{17,1,1},{31,1,1},{33,1,1},{63,1,1},{8,4,3},{7,5,3},{8,4,4},{8,3,3},
@@ -51,17 +52,22 @@ inline dxil_program_info inspect_dxil_program(std::string_view code) {
     }
     if(!psv || !flags) throw std::runtime_error("missing native DXIL dispatch or feature metadata"); return result;
 }
-inline std::string encode_dxil_variants(const std::vector<dxil_variant>& variants) {
+inline std::string encode_dxil_variants(const std::vector<dxil_variant>& variants, std::string_view ir = {}) {
     if (variants.empty() || variants.size()>64) throw std::runtime_error("invalid native DXIL variant count");
-    std::string bytes("CDXL"); append_dxil_word(bytes,1); append_dxil_word(bytes,uint32_t(variants.size()));
+    std::string bytes("CDXL"); append_dxil_word(bytes,ir.empty()?1:2); append_dxil_word(bytes,uint32_t(variants.size()));
     for (const auto& v:variants) { validate_dxil_container(v.code); for(auto dimension:v.block) append_dxil_word(bytes,dimension); append_dxil_word(bytes,uint32_t(v.code.size())); bytes+=v.code; }
+    if (!ir.empty()) {
+        if (ir.size() > 64*1024*1024 || ir.substr(0,4) != std::string_view("BC\xc0\xde",4)) throw std::runtime_error("invalid native DXIL specialization IR");
+        append_dxil_word(bytes,uint32_t(ir.size())); bytes.append(ir);
+    }
+    if (bytes.size() > 64*1024*1024) throw std::runtime_error("oversized native DXIL bundle");
     return bytes;
 }
-inline std::vector<dxil_variant> decode_dxil_variants(std::string_view bytes) {
+inline dxil_bundle decode_dxil_bundle(std::string_view bytes) {
     if (bytes.size()>64*1024*1024 || bytes.substr(0,4)!="CDXL") throw std::runtime_error("invalid native DXIL bundle");
-    size_t at=4; if(read_dxil_word(bytes,at)!=1) throw std::runtime_error("unsupported native DXIL bundle version");
+    size_t at=4; auto version=read_dxil_word(bytes,at); if(version!=1 && version!=2) throw std::runtime_error("unsupported native DXIL bundle version");
     auto count=read_dxil_word(bytes,at); if(!count || count>64) throw std::runtime_error("invalid native DXIL variant count");
-    std::vector<dxil_variant> result; std::set<std::array<unsigned,3>> selected;
+    dxil_bundle result; std::set<std::array<unsigned,3>> selected;
     for(uint32_t i=0;i<count;++i) {
         dxil_variant v; uint64_t threads=1;
         for(auto& dimension:v.block) { dimension=read_dxil_word(bytes,at); if(!dimension || dimension>1024) throw std::runtime_error("invalid native DXIL block shape"); threads*=dimension; }
@@ -69,10 +75,16 @@ inline std::vector<dxil_variant> decode_dxil_variants(std::string_view bytes) {
         auto size=read_dxil_word(bytes,at); if(size>bytes.size()-at) throw std::runtime_error("truncated native DXIL variant");
         v.code=bytes.substr(at,size); at+=size;
         if(inspect_dxil_program(v.code).block!=v.block) throw std::runtime_error("native DXIL block metadata differs from variant");
-        result.push_back(std::move(v));
+        result.variants.push_back(std::move(v));
+    }
+    if(version==2) {
+        auto size=read_dxil_word(bytes,at);
+        if(size<4 || size>bytes.size()-at || bytes.substr(at,4)!=std::string_view("BC\xc0\xde",4)) throw std::runtime_error("invalid native DXIL specialization IR");
+        result.ir=bytes.substr(at,size); at+=size;
     }
     if(at!=bytes.size()) throw std::runtime_error("extra native DXIL bundle data"); return result;
 }
+inline std::vector<dxil_variant> decode_dxil_variants(std::string_view bytes) { return decode_dxil_bundle(bytes).variants; }
 inline std::string encode_dxil_artifacts(const std::vector<shader_artifact>& entries) {
     auto bytes=cudavm::encode_spirv_artifacts(entries);
     bytes.replace(bytes.find(cudavm::spirv_artifact_end_v2),cudavm::spirv_artifact_end_v2.size(),dxil_artifact_end);

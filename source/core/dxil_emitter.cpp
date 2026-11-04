@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <llvm/AsmParser/Parser.h>
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -15,6 +17,8 @@
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/SourceMgr.h>
+#include <llvm/Support/Error.h>
+#include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/Transforms/Utils/Cloning.h>
@@ -78,17 +82,35 @@ std::string emit_native_dxil(const llvm::Module& input) {
     passes.run(*module);
     std::string bytes(storage.begin(),storage.end()); cudavm::validate_dxil_container(bytes); return bytes;
 }
+std::string emit_native_dxil_bundle(const llvm::Module& input, const std::string& symbol) {
+    auto module=lower_native_dxil(input,symbol);
+    std::string ir; llvm::raw_string_ostream out(ir); llvm::WriteBitcodeToFile(*module,out);
+    std::vector<dxil_variant> variants;
+    for(const auto& shape:dxil_block_shapes) {
+        module->getFunction("main")->addFnAttr("hlsl.numthreads",std::to_string(shape[0])+","+std::to_string(shape[1])+","+std::to_string(shape[2]));
+        variants.push_back({shape,emit_native_dxil(*module)});
+    }
+    return encode_dxil_variants(variants,ir);
+}
+std::string specialize_native_dxil(std::string_view ir, const std::array<unsigned,3>& block) {
+    uint64_t threads=1;
+    for(auto dimension:block) { if(!dimension || dimension>1024) throw std::runtime_error("invalid native DXIL block shape"); threads*=dimension; }
+    if(threads>1024 || block[2]>64) throw std::runtime_error("native DXIL block exceeds compute shader limits");
+    if(ir.size()>64*1024*1024) throw std::runtime_error("oversized native DXIL specialization IR");
+    llvm::LLVMContext context;
+    auto parsed=llvm::parseBitcodeFile(llvm::MemoryBufferRef(llvm::StringRef(ir.data(),ir.size()),"native DXIL specialization"),context);
+    if(!parsed) throw std::runtime_error("invalid native DXIL specialization IR: "+llvm::toString(parsed.takeError()));
+    auto module=std::move(*parsed); auto* entry=module->getFunction("main");
+    if(!entry || !entry->hasFnAttribute("hlsl.numthreads")) throw std::runtime_error("native DXIL specialization has no compute entry");
+    entry->addFnAttr("hlsl.numthreads",std::to_string(block[0])+","+std::to_string(block[1])+","+std::to_string(block[2]));
+    return emit_native_dxil(*module);
+}
 std::string emit_native_dxil_payload(const llvm::Module& input, llvm::json::Array* inventory) {
     std::vector<cudavm::shader_artifact> entries;
     for(const auto& kernel:input) if(!kernel.isDeclaration() && (kernel.hasFnAttribute("cudavm.kernel") || kernel.getCallingConv()==llvm::CallingConv::PTX_Kernel)) {
         cudavm::shader_artifact entry; entry.symbol=kernel.getName().str();
         try {
-            auto module=lower_native_dxil(input,entry.symbol); std::vector<cudavm::dxil_variant> variants;
-            for(const auto& shape:cudavm::dxil_block_shapes) {
-                module->getFunction("main")->addFnAttr("hlsl.numthreads",std::to_string(shape[0])+","+std::to_string(shape[1])+","+std::to_string(shape[2]));
-                variants.push_back({shape,emit_native_dxil(*module)});
-            }
-            entry.code=cudavm::encode_dxil_variants(variants);
+            entry.code=emit_native_dxil_bundle(input,entry.symbol);
         } catch(const std::exception& error) { entry.diagnostic=error.what(); }
         if(inventory) inventory->push_back(llvm::json::Object{{"symbol",entry.symbol},{"available",!entry.code.empty()},
             {"bytes",int64_t(entry.code.size())},{"diagnostic",entry.diagnostic},{"shader_model","6.0"},{"validation_required",true},

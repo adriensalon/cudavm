@@ -4,5 +4,7 @@ namespace cudavm {
 std::unique_ptr<llvm::Module> lower_native_dxil(const llvm::Module&, const std::string& kernel,
     const std::array<unsigned,3>& block = {1,1,1});
 std::string emit_native_dxil(const llvm::Module&);
+std::string emit_native_dxil_bundle(const llvm::Module&, const std::string& kernel);
+std::string specialize_native_dxil(std::string_view ir, const std::array<unsigned,3>& block);
 std::string emit_native_dxil_payload(const llvm::Module&, llvm::json::Array* inventory = nullptr);
 }

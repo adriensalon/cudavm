@@ -52,8 +52,10 @@ public:
 };
 
 // Format-independent Driver API contracts need a device, but no shader compiler
-// or executable-input probe. Their registration has no importer dimension.
-int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags = 0);
+// or executable-input probe. A boundary slice that owns executable input may
+// supply an independent probe; slice failures never trigger device fallback.
+int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags = 0,
+                    void (*probe)() = nullptr);
 
 // Execution slices reuse one oracle unchanged by every importer and loader.
 // Context flags declare prerequisites such as host mapping for the slice itself.

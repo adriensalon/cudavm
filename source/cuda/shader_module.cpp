@@ -33,6 +33,8 @@ struct shader_kernel : kernel {
     cudavm::shader_artifact native;
     cudavm::shader_artifact dxil;
     std::vector<cudavm::dxil_variant> dxil_variants;
+    std::string dxil_ir;
+    size_t dxil_precompiled_count = 0;
     struct variant {
         std::array<unsigned,4> key;
         std::shared_ptr<compute_pipeline> pipeline;
@@ -43,16 +45,24 @@ struct shader_kernel : kernel {
     std::shared_ptr<buffer> arena, args;
     unsigned dynamic_shared_limit;
     int carveout = CU_SHAREDMEM_CARVEOUT_DEFAULT;
-    const std::string& native_code(const launch_shape& shape) const {
+    const std::string& native_code(const launch_shape& shape) {
         if (owner.kind() != cudavmBackendDirectX) return owner.kind() == cudavmBackendOpenCL ? native.opencl_code : native.code;
         for(const auto& variant:dxil_variants) if(std::equal(variant.block.begin(),variant.block.end(),shape.block)) return variant.code;
+        if(!dxil_ir.empty()) {
+            owner.validate_native_dxil_shape(shape);
+            std::array<unsigned,3> block{shape.block[0],shape.block[1],shape.block[2]};
+            auto code = specialize_shader_dxil(dxil_ir,block);
+            require(inspect_dxil_program(code).block == block,CUDA_ERROR_INVALID_IMAGE,"specialized DXIL block metadata differs from launch");
+            if(dxil_variants.size() >= dxil_precompiled_count + 16) dxil_variants.erase(dxil_variants.begin() + dxil_precompiled_count);
+            dxil_variants.push_back({block,std::move(code)}); return dxil_variants.back().code;
+        }
         static const std::string empty; return empty;
     }
     void validate_native_shape(const launch_shape& shape) const {
         if(owner.kind() == cudavmBackendDirectX) owner.validate_native_dxil_shape(shape);
         else owner.validate_native_spirv_shape(shape);
     }
-    void require_native(const launch_shape& shape) const {
+    void require_native(const launch_shape& shape) {
         const auto& bytes = native_code(shape);
         if (owner.kind() == cudavmBackendDirectX) {
             if (bytes.empty()) throw failure(CUDA_ERROR_NOT_SUPPORTED, "native DXIL lowering or block variant unavailable: " + (dxil.code.empty() ? dxil.diagnostic : "CUDA block shape has no emitted DXIL variant"));
@@ -82,8 +92,13 @@ struct shader_kernel : kernel {
         return {owner.execution_resources(), prepare(shape)->resources};
     }
     shader_kernel(session& s, const cudavm::kernel_descriptor& e, const std::vector<uint64_t>& g, const cudavm::shader_artifact& n,const cudavm::shader_artifact& d)
-        : owner(s), entry(e), globals(g), native(n), dxil(d), dxil_variants(d.code.empty()?std::vector<cudavm::dxil_variant>{}:cudavm::decode_dxil_variants(d.code)),
-          dynamic_shared_limit(std::min(32768u, s.shader_limits().shared_bytes) - e.shared_bytes) {}
+        : owner(s), entry(e), globals(g), native(n), dxil(d),
+          dynamic_shared_limit(std::min(32768u, s.shader_limits().shared_bytes) - e.shared_bytes) {
+        if(!d.code.empty()) {
+            auto bundle=decode_dxil_bundle(d.code); dxil_variants=std::move(bundle.variants); dxil_ir=std::move(bundle.ir);
+            dxil_precompiled_count=dxil_variants.size();
+        }
+    }
     int attribute(CUfunction_attribute which) override {
         switch (which) {
         case CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: {

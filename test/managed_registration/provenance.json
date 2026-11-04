@@ -1,0 +1,10 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/managed_registration/managed_registration.ptx -o test/managed_registration/managed_registration.cubin",
+  "ptx": "Independently authored PTX 6.5 with managed/global storage",
+  "sha256": {
+    "managed_registration.ptx": "8ff881c6594d0c0a4b1d13fb4d797b1adbce5a04e8b616d488ddd77ed8729336",
+    "managed_registration.cubin": "c9cbce99b7e4edef4f0c411e405c2ef87a12eefbd969e58700613fab65ca6c7b"
+  }
+}

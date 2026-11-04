@@ -1,4 +1,5 @@
 *.cubin binary
+managed_registration/managed_registration.ptx -text
 # Preserve the exact producer inputs whose byte hashes accompany the cubins.
 kernel_launch/kernel_launch.ptx -text
 shared_memory/shared_memory.cu -text

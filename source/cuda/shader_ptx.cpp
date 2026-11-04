@@ -38,6 +38,18 @@ std::string compile_shader_ptx(std::string_view input, cudavmBackend backend) {
 std::string compile_shader_cubin(std::string_view input, cudavmBackend backend) {
     return compile_image(input, backend, compiler_input_kind::cubin);
 }
+std::string specialize_shader_dxil(std::string_view ir, const std::array<unsigned,3>& block) {
+    auto& compiler = image_compiler();
+    auto specialize = compiler.get<decltype(&cudavm_core_specialize_dxil_v1)>("cudavm_core_specialize_dxil_v1");
+    compiler_dxil_request request{1, ir.data(), ir.size(), {block[0], block[1], block[2]}};
+    std::array<char,8192> diagnostic{}; std::string code;
+    auto output = [](const char* bytes, size_t size, void* user) noexcept {
+        try { static_cast<std::string*>(user)->assign(bytes,size); return true; } catch (...) { return false; }
+    };
+    auto status = specialize(&request,output,&code,diagnostic.data(),diagnostic.size());
+    if(status != compiler_status::success) throw failure(status == compiler_status::out_of_memory ? CUDA_ERROR_OUT_OF_MEMORY : CUDA_ERROR_INVALID_IMAGE,diagnostic.data());
+    return code;
+}
 std::string link_shader_images(std::span<const std::string_view> inputs, cudavmBackend backend) {
     std::vector<std::string> ptx; unsigned target = 0; size_t bytes = 0;
     for (auto input : inputs) {

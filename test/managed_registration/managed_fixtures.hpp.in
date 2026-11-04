@@ -1,0 +1,5 @@
+#pragma once
+namespace cudavm {
+inline constexpr char managed_ptx[] = R"cudavm(@managed_ptx@)cudavm";
+inline constexpr unsigned char managed_cubin[] = {@managed_cubin@};
+}

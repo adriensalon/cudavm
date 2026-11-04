@@ -388,13 +388,7 @@ void emit_compiler_program(const compiler_program& program, const compiler_emit_
     for (const auto& function : module) if (!function.isDeclaration() && (function.hasFnAttribute("cudavm.kernel") || function.getCallingConv() == llvm::CallingConv::PTX_Kernel)) {
         shader_artifact artifact; artifact.symbol = function.getName().str();
         if (request.environment == compiler_environment::directx) {
-            auto lowered = lower_native_dxil(module, artifact.symbol);
-            std::vector<dxil_variant> variants;
-            for (const auto& shape : dxil_block_shapes) {
-                lowered->getFunction("main")->addFnAttr("hlsl.numthreads", std::to_string(shape[0]) + "," + std::to_string(shape[1]) + "," + std::to_string(shape[2]));
-                variants.push_back({shape, emit_native_dxil(*lowered)});
-            }
-            artifact.code = encode_dxil_variants(variants);
+            artifact.code = emit_native_dxil_bundle(module, artifact.symbol);
         } else if (request.environment == compiler_environment::opencl)
             artifact.opencl_code = emit_native_spirv(*lower_native_spirv(module, artifact.symbol, true));
         else artifact.code = emit_native_spirv(*lower_native_spirv(module, artifact.symbol));

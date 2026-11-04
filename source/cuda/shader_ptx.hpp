@@ -6,6 +6,7 @@
 namespace cudavm {
 std::string compile_shader_ptx(std::string_view, cudavmBackend);
 std::string compile_shader_cubin(std::string_view, cudavmBackend);
+std::string specialize_shader_dxil(std::string_view ir, const std::array<unsigned,3>& block);
 std::string link_shader_images(std::span<const std::string_view>, cudavmBackend);
 std::string materialize_program_image(std::string_view, cudavmBackend);
 std::string materialize_fatbin(std::string_view, cudavmBackend, unsigned architecture = 0);

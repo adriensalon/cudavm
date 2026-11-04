@@ -103,10 +103,10 @@ conformance_device select_conformance_device(std::string_view backend, void (*pr
     return {};
 }
 
-int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags) {
+int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags, void (*probe)()) {
     try {
         require(argc == 2, "usage: <executable> <backend>");
-        const auto device = select_conformance_device(argv[1]);
+        const auto device = select_conformance_device(argv[1], probe);
         if (device.value == -1) return 77;
         std::cout << "backend=" << argv[1] << " device=" << device.name << std::endl;
         device_context context(device.value, context_flags);

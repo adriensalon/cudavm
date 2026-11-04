@@ -1,0 +1,6 @@
+#pragma once
+#include <cstddef>
+namespace cudavm {
+inline constexpr char registration_ptx[] = R"cudavm(@registration_ptx@)cudavm";
+inline constexpr unsigned char registration_cubin[] = {@registration_cubin@};
+}

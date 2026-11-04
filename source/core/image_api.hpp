@@ -14,8 +14,16 @@ struct compiler_image_request {
 using compiler_output = bool (*)(const char*, size_t, void*) noexcept;
 using compiler_compile_image = compiler_status (*)(const compiler_image_request*,
     compiler_output, void*, char*, size_t) noexcept;
+struct compiler_dxil_request {
+    uint32_t abi_version;
+    const char* ir;
+    size_t length;
+    uint32_t block[3];
+};
 }
 extern "C" {
 CUDAVM_CORE_API cudavm::compiler_status cudavm_core_compile_image_v1(
     const cudavm::compiler_image_request*, cudavm::compiler_output, void*, char*, size_t) noexcept;
+CUDAVM_CORE_API cudavm::compiler_status cudavm_core_specialize_dxil_v1(
+    const cudavm::compiler_dxil_request*, cudavm::compiler_output, void*, char*, size_t) noexcept;
 }

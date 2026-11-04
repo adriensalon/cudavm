@@ -1,8 +1,30 @@
 #include "image_api.hpp"
+#include "dxil_emitter.hpp"
 #include <algorithm>
 #include <cstring>
 
 using namespace cudavm;
+extern "C" CUDAVM_CORE_API cudavm::compiler_status cudavm_core_specialize_dxil_v1(
+        const cudavm::compiler_dxil_request* request, cudavm::compiler_output output,
+        void* user, char* diagnostic, size_t capacity) noexcept {
+    auto report = [&](const char* text) {
+        if (diagnostic && capacity) {
+            auto size = std::min(std::strlen(text), capacity - 1);
+            std::memcpy(diagnostic, text, size); diagnostic[size] = 0;
+        }
+    };
+    if (diagnostic && capacity) diagnostic[0] = 0;
+    try {
+        if (!request || request->abi_version != 1 || !request->ir || !output) {
+            report("invalid DXIL specialization request"); return compiler_status::invalid;
+        }
+        auto bytes = specialize_native_dxil({request->ir, request->length}, {request->block[0], request->block[1], request->block[2]});
+        if (!output(bytes.data(), bytes.size(), user)) { report("DXIL output allocation failed"); return compiler_status::out_of_memory; }
+        return compiler_status::success;
+    } catch (const std::bad_alloc&) { report("DXIL specialization allocation failed"); return compiler_status::out_of_memory; }
+    catch (const std::exception& error) { report(error.what()); return compiler_status::invalid; }
+    catch (...) { report("unknown DXIL specialization failure"); return compiler_status::invalid; }
+}
 extern "C" CUDAVM_CORE_API cudavm::compiler_status cudavm_core_compile_image_v1(
         const cudavm::compiler_image_request* request, cudavm::compiler_output output,
         void* user, char* diagnostic, size_t capacity) noexcept {
