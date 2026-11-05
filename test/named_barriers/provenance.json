@@ -1,0 +1,15 @@
+{
+  "producer": "NVIDIA ptxas 12.4.131",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O0 test/named_barriers/named_barriers_cubin.ptx -o test/named_barriers/named_barriers.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect; scoped inline PTX barriers",
+  "cubin_profile": "Uniform implicit whole-block named barriers only; aligned PTX is valid because every CTA thread follows the same barrier sequence. Counted/reduction/handoff convergence helpers remain open.",
+  "sha256": {
+    "named_barriers.cu": "0112033dad857d98e89fb8cff3753a1153cc8fccdefbe55f65f2c38a1288c9ca",
+    "named_barriers.ptx": "3a3b2206b3f0beb05a9013ea506a49ad7110baa83d7e223c4428fd76b9ec824d",
+    "named_barriers.ll": "2f839f1a958c2254d02fee70532b90db3fcbaec5461d7cbd9d3ef3cddd9f8e09",
+    "named_barriers.cubin": "f0de3e19e29b40419f8a165bf04d96909230c47f1742feed139d3fac32a1c097",
+    "named_barriers_cubin.ptx": "372a7ab5a3782a2e5cc4d47654b931b0e3f2fdb2e301874a0d6754d0184ab777"
+  }
+}

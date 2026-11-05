@@ -1,0 +1,58 @@
+// Independently authored PTX 6.5; counted groups contain complete warps.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry named_whole(.param .u64 out, .param .u64 in, .param .u64 scratch,
+ .param .u32 rounds, .param .u32 id, .param .u32 pattern) {
+ .shared .align 4 .b8 values[512];
+ .reg .b64 %out,%in,%scratch,%shared,%own,%global,%address;
+ .reg .b32 %lane,%threads,%block,%base,%i,%rounds,%id,%pattern,%round,%input,%value,
+   %peer,%index,%temp,%shared_sum,%global_sum,%votes,%every,%any,%n,%a,%o;
+ .reg .pred %p,%truth,%all,%some;
+ ld.param.u64 %out,[out]; ld.param.u64 %in,[in]; ld.param.u64 %scratch,[scratch];
+ ld.param.u32 %rounds,[rounds]; ld.param.u32 %id,[id]; ld.param.u32 %pattern,[pattern];
+ mov.u32 %lane,%tid.x; mov.u32 %threads,%ntid.x; mov.u32 %block,%ctaid.x;
+ mul.lo.u32 %base,%block,%threads; add.u32 %i,%base,%lane;
+ mad.wide.u32 %in,%i,4,%in; ld.global.u32 %input,[%in];
+ mov.u64 %shared,values; mad.wide.u32 %own,%lane,4,%shared;
+ mad.wide.u32 %global,%i,4,%scratch;
+ mov.u32 %round,0; mov.u32 %shared_sum,0; mov.u32 %global_sum,0;
+ mov.u32 %votes,0; mov.u32 %every,0; mov.u32 %any,0;
+loop:
+ setp.ge.u32 %p,%round,%rounds; @%p bra done;
+ mad.lo.u32 %value,%round,17,%i; xor.b32 %value,%input,%value;
+ st.shared.u32 [%own],%value; add.u32 %value,%value,0x12345; st.global.u32 [%global],%value;
+ setp.eq.u32 %p,%id,0; @%p bra publish_0;
+ setp.eq.u32 %p,%id,1; @%p bra publish_1;
+ setp.eq.u32 %p,%id,7; @%p bra publish_7;
+ bar.sync 15; bra publish_done;
+publish_0:
+ bar.sync 0; bra publish_done;
+publish_1:
+ bar.sync 1; bra publish_done;
+publish_7:
+ bar.sync 7; bra publish_done;
+publish_done:
+ add.u32 %peer,%lane,%round; add.u32 %peer,%peer,1; rem.u32 %peer,%peer,%threads;
+ mad.wide.u32 %address,%peer,4,%shared; ld.shared.u32 %value,[%address];
+ add.u32 %shared_sum,%shared_sum,%value;
+ add.u32 %index,%base,%peer; mad.wide.u32 %address,%index,4,%scratch;
+ ld.global.u32 %value,[%address]; add.u32 %global_sum,%global_sum,%value;
+ setp.eq.u32 %p,%id,0; @%p bra reuse_0;
+ setp.eq.u32 %p,%id,1; @%p bra reuse_1;
+ setp.eq.u32 %p,%id,7; @%p bra reuse_7;
+ bar.sync 15; bra reuse_done;
+reuse_0:
+ bar.sync 0; bra reuse_done;
+reuse_1:
+ bar.sync 1; bra reuse_done;
+reuse_7:
+ bar.sync 7; bra reuse_done;
+reuse_done:
+ add.u32 %round,%round,1; bra loop;
+done:
+ mad.wide.u32 %out,%i,20,%out;
+ st.global.u32 [%out],%shared_sum; st.global.u32 [%out+4],%global_sum;
+ st.global.u32 [%out+8],%votes; st.global.u32 [%out+12],%every; st.global.u32 [%out+16],%any;
+ ret;
+}

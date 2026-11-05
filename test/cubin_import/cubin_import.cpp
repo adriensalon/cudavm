@@ -101,6 +101,11 @@ void execute_cubin_import() {
         cubin_rejection({original.begin(), original.begin() + 63}, NVJITLINK_ERROR_INVALID_INPUT, "cubin");
         auto invalid = original; invalid.push_back(0); cubin_rejection(invalid, NVJITLINK_ERROR_INVALID_INPUT, "size mismatch");
         invalid = original; invalid[48] = 80; cubin_rejection(invalid, NVJITLINK_ERROR_UNRECOGNIZED_INPUT, "SM75");
+        const auto text = cubin_section_header(original, ".text.frame_results");
+        for (uint64_t flags : {uint64_t(6) | (uint64_t(17) << 20), uint64_t(6) | (uint64_t(1) << 19)}) {
+            invalid = original; cubin_put(invalid, text + 8, flags);
+            cubin_rejection(invalid, NVJITLINK_ERROR_UNRECOGNIZED_INPUT, "code section");
+        }
     } else if (cubin_import_case == "registers") {
         const auto at = cubin_instruction(original, 0x3c2), lo = cubin_number(original, at), hi = cubin_number(original, at + 8);
         auto invalid = original; cubin_put(invalid, at, (lo & ~uint64_t(0xff000000)) | uint64_t(12) << 24);

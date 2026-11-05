@@ -271,6 +271,11 @@ std::unique_ptr<llvm::Module> import_nvvm(llvm::LLVMContext& context, std::strin
             nvvm_require(llvm::isa<llvm::UndefValue>(variable.getInitializer()), "NVVM 2.0 shared storage requires undef initialization");
         nvvm_require(variable.getName() != "llvm.global_ctors" && variable.getName() != "llvm.global_dtors", "device initialization requires runtime support");
     }
+    // Import the same bounded scalar synchronization/atomic assembly accepted
+    // from CUDA source. Any assembly that survives normalization is rejected
+    // below, before it can reach a native selector or shader emitter.
+    verify_nvvm(*module);
+    lower_device_synchronization(*module);
     for (auto& function : *module) {
         nvvm_require(!function.isVarArg() && !function.hasPersonalityFn() && !function.hasPrefixData() && !function.hasPrologueData()
             && !function.hasAvailableExternallyLinkage(), "unsupported function ABI");

@@ -250,7 +250,10 @@ std::vector<cubin_kernel> cubin_kernels(const cubin_reader& input) {
             auto name = input.string(strings, size_t(symbols.number(at)));
             cubin_check(cubin_symbol_spelling(name), "unsupported kernel symbol spelling", true);
             const auto& text = input.sections[section];
-            cubin_check(text.type == 1 && (text.flags & ~uint64_t(0x500000)) == 6, "unsupported code section", true);
+            // CUDA 12.4 stores the number of allocated CTA barrier resources
+            // in bits 20..24, including 16 resources for a reference to ID 15.
+            cubin_check(text.type == 1 && (text.flags & ~uint64_t(0x1f00000)) == 6
+                && ((text.flags >> 20) & 31) <= 16, "unsupported code section", true);
             cubin_check(text.name == ".text." + name && symbols.number(at + 8, 8) == 0 && symbols.number(at + 16, 8) == text.size,
                 "unsupported function extent", true);
             cubin_check(text.size && text.size % 16 == 0 && text.size <= 65536, "invalid/excessive SM75 code extent");

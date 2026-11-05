@@ -1533,6 +1533,27 @@ void lower_device_synchronization(llvm::Module& module) {
                 }
                 if(operation=="register") {call->eraseFromParent();continue;}
             }
+            // A named reduction can expose its predicate as an ordinary CUDA
+            // integer while keeping the PTX predicate register inside the asm.
+            if(assembly->hasSideEffects() && call->getType()->isIntegerTy(32) && call->arg_size()==3 &&
+                    std::all_of(call->arg_begin(),call->arg_end(),[](const auto& arg){return arg->getType()->isIntegerTy(32);}) &&
+                    assembly->getConstraintString()=="=r,r,r,r,~{memory}") {
+                const std::string predicate="setp.ne.u32p,$3,0;";
+                for(auto mode:{"popc","and","or"}) {
+                    const bool count=std::string_view(mode)=="popc";
+                    auto expected=count?"{.reg.predp;"+predicate+"barrier.red.popc.u32$0,$1,$2,p;}"
+                        :"{.reg.predp,q;"+predicate+"barrier.red."+mode+".predq,$1,$2,p;selp.u32$0,1,0,q;}";
+                    if(text!=expected)continue;
+                    auto* truth=b.CreateICmpNE(call->getArgOperand(2),b.getInt32(0));
+                    auto callee=module.getOrInsertFunction(std::string("llvm.nvvm.barrier.cta.red.")+mode+".count",
+                        llvm::FunctionType::get(count?b.getInt32Ty():b.getInt1Ty(),{b.getInt32Ty(),b.getInt32Ty(),b.getInt1Ty()},false));
+                    auto* replacement=b.CreateCall(callee,{call->getArgOperand(0),call->getArgOperand(1),truth});
+                    replacement->setConvergent();
+                    call->replaceAllUsesWith(count?static_cast<llvm::Value*>(replacement):b.CreateZExt(replacement,b.getInt32Ty()));
+                    operation="reduction";break;
+                }
+                if(operation=="reduction") {call->eraseFromParent();continue;}
+            }
             if(!call->getType()->isVoidTy())continue;
             if(text=="membar.cta;") operation="llvm.nvvm.membar.cta";
             else if(text=="membar.gl;") operation="llvm.nvvm.membar.gl";
