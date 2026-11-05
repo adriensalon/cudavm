@@ -1,0 +1,4 @@
+#pragma once
+namespace cudavm {
+inline constexpr unsigned char address_nvcc_cubin[]{@address_nvcc_bytes@};
+}

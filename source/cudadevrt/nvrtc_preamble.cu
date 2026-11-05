@@ -51,6 +51,38 @@ extern "C" __device__ void __cudavm_rtc_fence_system();
 __device__ inline void __threadfence_block() {__cudavm_rtc_fence_block();}
 __device__ inline void __threadfence() {__cudavm_rtc_fence_device();}
 __device__ inline void __threadfence_system() {__cudavm_rtc_fence_system();}
+extern "C" __device__ __attribute__((const)) unsigned __cudavm_rtc_is_global(const void*);
+extern "C" __device__ __attribute__((const)) unsigned __cudavm_rtc_is_shared(const void*);
+extern "C" __device__ __attribute__((const)) unsigned __cudavm_rtc_is_local(const void*);
+extern "C" __device__ __attribute__((const)) unsigned __cudavm_rtc_is_constant(const void*);
+__device__ inline __attribute__((const)) unsigned __isGlobal(const void* pointer) {return __cudavm_rtc_is_global(pointer);}
+__device__ inline __attribute__((const)) unsigned __isShared(const void* pointer) {return __cudavm_rtc_is_shared(pointer);}
+__device__ inline __attribute__((const)) unsigned __isLocal(const void* pointer) {return __cudavm_rtc_is_local(pointer);}
+__device__ inline __attribute__((const)) unsigned __isConstant(const void* pointer) {return __cudavm_rtc_is_constant(pointer);}
+__device__ inline size_t __cvta_generic_to_global(const void* pointer) {
+    return (size_t)(void __attribute__((address_space(1)))*)pointer;
+}
+__device__ inline size_t __cvta_generic_to_shared(const void* pointer) {
+    return (size_t)(void __attribute__((address_space(3)))*)pointer;
+}
+__device__ inline size_t __cvta_generic_to_local(const void* pointer) {
+    return (size_t)(void __attribute__((address_space(5)))*)pointer;
+}
+__device__ inline size_t __cvta_generic_to_constant(const void* pointer) {
+    return (size_t)(void __attribute__((address_space(4)))*)pointer;
+}
+__device__ inline void* __cvta_global_to_generic(size_t pointer) {
+    return (void*)(void __attribute__((address_space(1)))*)pointer;
+}
+__device__ inline void* __cvta_shared_to_generic(size_t pointer) {
+    return (void*)(void __attribute__((address_space(3)))*)pointer;
+}
+__device__ inline void* __cvta_local_to_generic(size_t pointer) {
+    return (void*)(void __attribute__((address_space(5)))*)pointer;
+}
+__device__ inline void* __cvta_constant_to_generic(size_t pointer) {
+    return (void*)(void __attribute__((address_space(4)))*)pointer;
+}
 extern "C" __device__ __attribute__((convergent)) int __cudavm_rtc_block_popc(int);
 extern "C" __device__ __attribute__((convergent)) int __cudavm_rtc_block_and(int);
 extern "C" __device__ __attribute__((convergent)) int __cudavm_rtc_block_or(int);

@@ -874,10 +874,20 @@ struct lowering {
                     address = b.CreateOr(address, b.getInt64(space == 3 ? 0xffffffff40000000ull : 0xffffffff80000000ull));
                 return address;
             }
-            if (expression->getOpcode() == llvm::Instruction::Add || expression->getOpcode() == llvm::Instruction::Sub) {
+            if (expression->getOpcode() == llvm::Instruction::Trunc || expression->getOpcode() == llvm::Instruction::ZExt
+                    || expression->getOpcode() == llvm::Instruction::SExt) {
+                const bool sign = expression->getOpcode() == llvm::Instruction::SExt;
+                auto* operand = sign ? signed_value(expression->getOperand(0)) : value(expression->getOperand(0));
+                auto* converted = sign ? b.CreateSExtOrTrunc(operand, type(expression->getType()))
+                    : b.CreateZExtOrTrunc(operand, type(expression->getType()));
+                return canonical(converted, expression->getType());
+            }
+            if (expression->getOpcode() == llvm::Instruction::Add || expression->getOpcode() == llvm::Instruction::Sub
+                    || expression->getOpcode() == llvm::Instruction::And || expression->getOpcode() == llvm::Instruction::Or
+                    || expression->getOpcode() == llvm::Instruction::Xor) {
                 auto* left = b.CreateZExtOrTrunc(value(expression->getOperand(0)), type(expression->getType()));
                 auto* right = b.CreateZExtOrTrunc(value(expression->getOperand(1)), type(expression->getType()));
-                auto* result = expression->getOpcode() == llvm::Instruction::Add ? b.CreateAdd(left, right) : b.CreateSub(left, right);
+                auto* result = b.CreateBinOp(llvm::Instruction::BinaryOps(expression->getOpcode()), left, right);
                 return canonical(result, expression->getType());
             }
             fail(*input, "unsupported constant expression");

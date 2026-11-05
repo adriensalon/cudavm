@@ -56,6 +56,10 @@ public:
 // supply an independent probe; slice failures never trigger device fallback.
 int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags = 0,
                     void (*probe)() = nullptr);
+// Fatal-device witnesses own a disposable CTest process. Report and exit without
+// synchronizing or destroying a faulted context, even when an assertion fails.
+[[noreturn]] void run_isolated_fault_conformance(int argc, char** argv, void (*execute)(),
+                                               void (*probe)() = nullptr);
 
 // Execution slices reuse one oracle unchanged by every importer and loader.
 // Context flags declare prerequisites such as host mapping for the slice itself.

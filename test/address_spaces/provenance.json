@@ -1,0 +1,19 @@
+{
+  "producer": "NVIDIA CUDA 12.4.131 nvcc and ptxas",
+  "architecture": "sm_75",
+  "commands": [
+    "ptxas -arch=sm_75 -O1 test/address_spaces/address_spaces.ptx -o test/address_spaces/address_spaces.cubin",
+    "nvcc -arch=sm_75 -O1 --std=c++17 --allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -ccbin <MSVC-14.44.35207-x64> --ptx test/address_spaces/address_spaces.cu -o test/address_spaces/address_spaces_nvcc.ptx",
+    "ptxas -arch=sm_75 -O1 test/address_spaces/address_spaces_nvcc.ptx -o test/address_spaces/address_spaces_nvcc.cubin"
+  ],
+  "ptx": "Independently authored PTX ISA 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "address_spaces.cu": "7a73af7e7c1cc148f8bc2ddebb71510862d0213f645c162ffe7609cc0c66c943",
+    "address_spaces.ptx": "603446fcefa26395a4cb4a49d6034f40e407307706741b414dbcda573c1ba1c6",
+    "address_spaces.ll": "6bef4b9ff8c0efad60ffe970c856d11ea10b955e3695ef26701cff9bbaaecea1",
+    "address_spaces.cubin": "c86fa7605a48667c8339304be526e92419852676e6df87e04dd4cad9f27ac9c7",
+    "address_spaces_nvcc.ptx": "a8a89e5501ea14c90cfc7c5dba0c1af204d333b42e853a0af1b380079a0a1d16",
+    "address_spaces_nvcc.cubin": "60303d5a393ee1272812d4219681b9d0a4795bd8cfbf78b2f5dae35ba301cfd9"
+  }
+}

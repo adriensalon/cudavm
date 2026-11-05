@@ -1,0 +1,5 @@
+#pragma once
+namespace cudavm {
+inline constexpr unsigned char cubin_import_fixture[]{@cubin_import_bytes@};
+inline constexpr unsigned char cubin_address_fixture[]{@cubin_address_bytes@};
+}

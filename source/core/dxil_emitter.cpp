@@ -22,6 +22,7 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/IPO/AlwaysInliner.h>
 extern "C" void LLVMInitializeDirectXTargetInfo();
 extern "C" void LLVMInitializeDirectXTarget();
 extern "C" void LLVMInitializeDirectXTargetMC();
@@ -43,6 +44,21 @@ struct directx_coherent_resources : llvm::ModulePass {
     }
 };
 char directx_coherent_resources::ID;
+void inline_dxil_storage_helpers(llvm::Module& module) {
+    bool found = false;
+    for (auto name : {"cudavm.load.word", "cudavm.store.word", "cudavm.resolve.address"})
+        if (auto* function = module.getFunction(name); function && !function->isDeclaration()) {
+            function->addFnAttr(llvm::Attribute::AlwaysInline);
+            found = true;
+        }
+    if (!found) return;
+    // Keep CUDA values live across ordered UAV accesses in the entry's SSA
+    // body. Leaving these transport calls for native shader compilation can
+    // corrupt values reused after a store, including object member arguments.
+    llvm::legacy::PassManager passes;
+    passes.add(llvm::createAlwaysInlinerLegacyPass());
+    passes.run(module);
+}
 struct directx_pass_manager : llvm::legacy::PassManager {
     bool coherent_resources=false;
     void add(llvm::Pass* pass) override {
@@ -56,7 +72,9 @@ struct directx_pass_manager : llvm::legacy::PassManager {
 std::unique_ptr<llvm::Module> lower_native_dxil(const llvm::Module& input,const std::string& symbol,const std::array<unsigned,3>& block) {
     uint64_t threads=1; for(auto dimension:block) { if(!dimension || dimension>1024) throw std::runtime_error("invalid native DXIL block shape"); threads*=dimension; }
     if(threads>1024 || block[2]>64) throw std::runtime_error("native DXIL block exceeds compute shader limits");
-    return lower_native_shader(input,symbol,shader_environment::dxil,block);
+    auto module = lower_native_shader(input,symbol,shader_environment::dxil,block);
+    inline_dxil_storage_helpers(*module);
+    return module;
 }
 std::string emit_native_dxil(const llvm::Module& input) {
     if(std::getenv("CUDAVM_TRACE_NATIVE")) std::fprintf(stderr,"native DXIL emit module=%s\n",input.getModuleIdentifier().c_str());
@@ -68,6 +86,8 @@ std::string emit_native_dxil(const llvm::Module& input) {
     llvm::LLVMContext context; llvm::SMDiagnostic diagnostic;
     auto module=llvm::parseAssemblyString(assembly,diagnostic,context);
     if(!module) throw std::runtime_error("native DXIL emission could not clone target IR");
+    // Also normalize retained specialization IR emitted by older producers.
+    inline_dxil_storage_helpers(*module);
     static std::once_flag initialized;
     std::call_once(initialized,[]{ LLVMInitializeDirectXTargetInfo(); LLVMInitializeDirectXTarget(); LLVMInitializeDirectXTargetMC(); LLVMInitializeDirectXAsmPrinter(); });
     std::string error; auto* target=llvm::TargetRegistry::lookupTarget(module->getTargetTriple(),error);

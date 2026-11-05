@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include <cudaProfiler.h>
 #include "driver_api.hpp"
 #include "opengl_graphics.hpp"
 #include "command_queue.hpp"
@@ -819,6 +820,7 @@ using namespace cudavm;
 #include "capture_exports.inl"
 #include "context_exports.inl"
 #include "function_exports.inl"
+#include "profiler_exports.inl"
 #include "launch_exports.inl"
 #include "library_exports.inl"
 

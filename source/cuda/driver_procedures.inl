@@ -234,6 +234,8 @@ DRIVER_PROCEDURE(cuGraphicsUnregisterResource, 3000, cuGraphicsUnregisterResourc
 DRIVER_PROCEDURE(cuImportExternalMemory, 10000, cuImportExternalMemory)
 DRIVER_PROCEDURE(cuImportExternalSemaphore, 10000, cuImportExternalSemaphore)
 DRIVER_PROCEDURE(cuInit, 2000, cuInit)
+DRIVER_PROCEDURE(cuProfilerStart, 4000, cuProfilerStart)
+DRIVER_PROCEDURE(cuProfilerStop, 4000, cuProfilerStop)
 DRIVER_PROCEDURE(cuLaunchHostFunc, 10000, cuLaunchHostFunc)
 DRIVER_PROCEDURE(cuStreamAddCallback, 5000, cuStreamAddCallback)
 DRIVER_PROCEDURE_PTDS(cuStreamAddCallback, 7000, ptsz, cuStreamAddCallback_ptsz)

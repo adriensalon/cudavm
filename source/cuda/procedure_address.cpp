@@ -2,6 +2,8 @@
 #define __CUDA_API_VERSION_INTERNAL
 #include <cuda.h>
 #include <cudaTypedefs.h>
+#include <cudaProfiler.h>
+#include <cudaProfilerTypedefs.h>
 #include <cuda/cudavm_cuda.h>
 #include <string_view>
 

@@ -1,0 +1,54 @@
+// Independently authored PTX 6.5 with private storage at each call level.
+.version 6.5
+.target sm_75
+.address_size 64
+.func (.param .u32 result) frame_leaf(.param .u32 seed) {
+ .local .align 16 .b8 frame[12];
+ .reg .u64 p; .reg .u32 s,a,b,c;
+ ld.param.u32 s,[seed]; mov.u64 p,frame;
+ xor.b32 b,s,0x89abcdef; add.u32 c,s,0x7654321;
+ st.local.u32 [p],s; st.local.u32 [p+4],b; st.local.u32 [p+8],c;
+ ld.local.u32 a,[p]; ld.local.u32 b,[p+4]; ld.local.u32 c,[p+8];
+ mad.lo.u32 a,a,3,b; xor.b32 a,a,c; st.param.u32 [result],a; ret;
+}
+.func (.param .u32 result) frame_middle(.param .u32 seed,.param .u32 rounds) {
+ .local .align 16 .b8 frame[20];
+ .reg .u64 p,q; .reg .u32 s,n,j,r,x,v,h; .reg .pred more;
+ .param .u32 arg,returned;
+ ld.param.u32 s,[seed]; ld.param.u32 n,[rounds]; mov.u64 p,frame; mov.u32 j,0;
+initialize:
+ mad.lo.u32 v,j,0x1020304,s; mad.wide.u32 q,j,4,p; st.local.u32 [q],v;
+ add.u32 j,j,1; setp.lt.u32 more,j,5; @more bra initialize;
+ mov.u32 r,0;
+again:
+ setp.ge.u32 more,r,n; @more bra checksum_start;
+ mad.lo.u32 v,r,7,s; st.param.u32 [arg],v;
+ call (returned),frame_leaf,(arg); ld.param.u32 v,[returned]; add.u32 v,v,r;
+ add.u32 x,s,r; rem.u32 x,x,5; mad.wide.u32 q,x,4,p;
+ ld.local.u32 x,[q]; xor.b32 x,x,v; st.local.u32 [q],x;
+ add.u32 r,r,1; bra again;
+checksum_start:
+ mov.u32 j,0; mov.u32 h,0;
+checksum:
+ mad.wide.u32 q,j,4,p; ld.local.u32 v,[q]; mad.lo.u32 h,h,33,v;
+ add.u32 j,j,1; setp.lt.u32 more,j,5; @more bra checksum;
+ st.param.u32 [result],h; ret;
+}
+.visible .entry frame_results(.param .u64 out,.param .u64 in,.param .u32 count,.param .u32 rounds) {
+ .local .align 16 .b8 caller[12];
+ .reg .u64 output,input,p; .reg .u32 i,block,threads,bound,n,s,a,b,x,y,z; .reg .pred valid;
+ .param .u32 arg_seed,arg_rounds,returned;
+ mov.u32 i,%tid.x; mov.u32 block,%ctaid.x; mov.u32 threads,%ntid.x; mad.lo.u32 i,block,threads,i;
+ ld.param.u32 bound,[count]; setp.ge.u32 valid,i,bound; @valid ret;
+ ld.param.u64 output,[out]; ld.param.u64 input,[in]; ld.param.u32 n,[rounds];
+ mad.wide.u32 input,i,4,input; ld.global.u32 s,[input]; mov.u64 p,caller;
+ add.u32 x,s,17; xor.b32 y,s,0x13579bdf; add.u32 z,i,0xeca86420;
+ st.local.u32 [p],x; st.local.u32 [p+4],y; st.local.u32 [p+8],z;
+ rem.u32 x,i,3; add.u32 x,x,n; st.param.u32 [arg_seed],s; st.param.u32 [arg_rounds],x;
+ call (returned),frame_middle,(arg_seed,arg_rounds); ld.param.u32 a,[returned];
+ xor.b32 x,s,a; add.u32 y,n,2; st.param.u32 [arg_seed],x; st.param.u32 [arg_rounds],y;
+ call (returned),frame_middle,(arg_seed,arg_rounds); ld.param.u32 b,[returned];
+ ld.local.u32 x,[p]; ld.local.u32 y,[p+4]; ld.local.u32 z,[p+8]; mad.wide.u32 output,i,20,output;
+ st.global.u32 [output],a; st.global.u32 [output+4],b; st.global.u32 [output+8],x;
+ st.global.u32 [output+12],y; st.global.u32 [output+16],z; ret;
+}

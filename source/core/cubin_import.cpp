@@ -99,7 +99,10 @@ struct cubin_reader {
                     section.name[12] >= '1' && section.name[12] <= '9';
                 cubin_check(global || constant || section.size == 0, "unsupported allocated storage section", true);
                 if (!section.size) continue;
-                cubin_check((section.type == 1 || (global && section.type == 8)) && section.flags == (global ? 3u : 2u)
+                const bool kernel_constant = constant && section.flags == 0x42 && section.link == 0
+                    && section.info < sections.size() && sections[section.info].name.starts_with(".text.")
+                    && section.name.ends_with(sections[section.info].name.substr(5));
+                cubin_check((section.type == 1 || (global && section.type == 8)) && (section.flags == (global ? 3u : 2u) || kernel_constant)
                     && section.stride == 0, "invalid global/constant storage section");
                 cubin_check(section.alignment && !(section.alignment & (section.alignment - 1)) && section.alignment <= 65536
                     && section.size <= fatbin_limit, "invalid storage extent/alignment");
@@ -657,6 +660,21 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             const char* dimensions[]{"%ntid.x", "%ntid.y", "%ntid.z", "%nctaid.x", "%nctaid.y", "%nctaid.z"};
             return guard + "mov.u32 " + dest + "," + dimensions[offset / 4] + ";\n";
         }
+        // SM75 cvta.shared/local forms add these runtime window bases to a
+        // byte offset. Reconstruct them from the imported storage instead of
+        // using NVIDIA's process-specific addresses from constant bank zero.
+        if (((offset == 0x18 || offset == 0x20) && (size == 4 || size == 8))
+                || ((offset == 0x1c || offset == 0x24) && size == 4)) {
+            const bool shared = offset < 0x20;
+            cubin_check(shared ? kernel.shared_size != 0 : kernel.stack_size || calls,
+                "generic address requires defined shared/local storage", true);
+            auto result = guard + (shared ? "cvt.u64.u32 %bank_address,%shared_base;\n" + guard +
+                "cvta.shared.u64 %bank_address,%bank_address;\n" : "cvta.local.u64 %bank_address,%local_base;\n");
+            if (offset == 0x1c || offset == 0x24) result += guard + "shr.u64 %bank_address,%bank_address,32;\n";
+            result += guard + "cvt.u32.u64 " + dest + ",%bank_address;\n";
+            if (size == 8) result += guard + "shr.u64 %bank_address,%bank_address,32;\n" + guard + "cvt.u32.u64 " + next + ",%bank_address;\n";
+            return result;
+        }
         // cvta.const adds the SM75 runtime's generic constant-space base.
         // Rebind the checked user-constant bank to this imported module's
         // storage, rather than reading runtime-owned bytes from the ELF image.
@@ -703,10 +721,11 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             (void)bank_index(negated);
             return unsigned(lo >> 40 & 0x3fff) * 4;
         };
-        auto bank_word = [&](bool negated = false) {
+        auto bank_word = [&](bool negated = false, bool complemented = false) {
             if (right) fail("unsupported indexed constant-bank operand");
-            output += constant_load("%constant", "", bank_offset(negated), 4, guard, bank_index(negated));
+            output += constant_load("%constant", "", bank_offset(negated || complemented), 4, guard, bank_index(negated || complemented));
             if (negated) output += guard + "sub.u32 %constant,0,%constant;\n";
+            if (complemented) output += guard + "not.b32 %constant,%constant;\n";
             return std::string("%constant");
         };
         auto join = [&](const std::string& low, const std::string& high, const std::string& name) {
@@ -747,7 +766,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             for (unsigned i = 0; i < lanes; ++i) registers += (i ? "," : "") +
                 (first == 255 ? std::string(load ? "%scratch" : "0") : reg(first + i));
             if (lanes > 1) registers = "{" + registers + "}";
-            return std::string(load ? "ld." : "st.") + space + (lanes > 1 ? ".v" + std::to_string(lanes) : "") + "." +
+            return std::string(load ? "ld" : "st") + (space.empty() ? "" : "." + space) + (lanes > 1 ? ".v" + std::to_string(lanes) : "") + "." +
                 (load || kind >= 4 ? types[kind] : kind < 2 ? "u8" : "u16") + " " +
                 (load ? registers + "," + address : address + "," + registers) + ";";
         };
@@ -1084,12 +1103,21 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         } else if (op == 0xc82 && hi == 0x8000000 && !(lo >> 38) && left == 0 && predicate == 7) {
             auto source = uniform(right);
             instruction = "mov.b32 " + uniform(dest, true) + "," + source + ";";
+        } else if (op == 0x3c2 && hi == 0xe0000 && !(lo >> 32) && predicate == 7 && !(lo & 0x8000)) {
+            // R2UR can select a lane when its source is not uniform. Only lift
+            // a proven constant here, including the bounded machine-stack
+            // offset established by the kernel prologue.
+            if (!known[left]) fail("nonconstant register-to-uniform transfer is unsupported");
+            instruction = "mov.b32 " + uniform(dest, true) + "," + std::to_string(*known[left]) + ";";
         } else if (op == 0x802 && hi == 0xf00 && left == 0) {
             instruction = "mov.b32 " + reg(dest) + "," + std::to_string(uint32_t(lo >> 32)) + ";"; constant = uint32_t(lo >> 32);
         } else if (op == 0xa02 && hi == 0xf00 && (lo & 0xf80000ffff000000ull) == 0) {
             unsigned offset = bank_offset();
             if (pc == 0 && !function && predicate == 7 && dest == 1 && offset == 0x28 && !bank_index()) {
-                if (kernel.stack_size || calls) instruction = "mov.u32 %r1," + std::to_string(kernel.stack_size) + ";";
+                if (kernel.stack_size || calls) {
+                    instruction = "mov.u32 %r1," + std::to_string(kernel.stack_size) + ";";
+                    constant = kernel.stack_size;
+                }
             } else output += constant_load(reg(dest), "", offset, 4, guard, bank_index());
         } else if (op == 0xb82 && (hi & ~uint64_t(0xe00)) == 0 && ((hi >> 9) & 7) <= 5 && (lo & 0xf800003f00000000ull) == 0) {
             if (!bank_index() && !known[left]) fail("dynamic constant-bank indexing is unsupported");
@@ -1276,6 +1304,24 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             if ((lo >> 16) || hi != 0x3800000) fail("unsupported yield encoding");
             // A scheduling hint in ptxas polling loops. Continuations already
             // provide lane progress; the hint has no memory-ordering effect.
+        } else if (op == 0x3aa) {
+            // QSPC.E.{G,S,L} Pn,RZ,[Ra] implements isspacep on a generic
+            // address pair. Other destinations and query modes remain rejected.
+            const unsigned target = unsigned(hi >> 17) & 7, space = unsigned(hi >> 8) & 7;
+            if (dest != 255 || (lo >> 32) || left >= 254 || left % 2 || target == 7
+                    || (space != 1 && space != 3 && space != 5) || (hi & ~uint64_t(0xe0700)))
+                fail("unsupported address-space query encoding");
+            join(reg(left), reg(left + 1), "%a");
+            instruction = "isspacep." + std::string(space == 1 ? "global" : space == 3 ? "local" : "shared") +
+                " " + pred(target) + ",%a;";
+        } else if (op == 0x980) {
+            if ((hi & ~uint64_t(0xe00)) != 0x10e100 || left >= 254 || left % 2)
+                fail("unsupported generic load encoding");
+            join(reg(left), reg(left + 1), "%a");
+            const auto displacement = int32_t(lo >> 32);
+            const auto address = "[%a" + std::string(displacement < 0 ? "-" : "+") +
+                std::to_string(displacement < 0 ? -int64_t(displacement) : displacement) + "]";
+            instruction = memory_transfer(true, "", unsigned(hi >> 9) & 7, dest, address);
         } else if (op == 0x381 || op == 0x981 || op == 0x986 || op == 0x386) {
             bool uniform_address = op == 0x981 || op == 0x986, load = op == 0x381 || op == 0x981;
             auto mode = hi & 0xc000000;
@@ -1288,6 +1334,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             bool address_pair = !uniform_address || mode == 0xc000000;
             if (address_pair && left >= 254 && !(uniform_address && left == 255)) fail("unsupported extended address register");
             if (!load && dest != 0) fail("unsupported global store modifier");
+            if (load && !uniform_address && right) fail("unsupported global load modifier");
             if (left == 255) output += guard + "mov.u64 %a,0;\n";
             else if (address_pair) join(reg(left), reg(left + 1), "%a");
             else output += guard + "cvt.u64.u32 %a," + reg(left) + ";\n";
@@ -1297,9 +1344,9 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                 join(uniform(base), uniform(base + 1), "%b");
                 output += guard + "add.u64 %a,%a,%b;\n";
             }
-            // STG puts the source in bits 32..39 and its signed displacement
-            // in bits 40..63; LDG uses the full high word for displacement.
-            auto displacement = load && !uniform_address ? int32_t(lo >> 32) : int32_t(lo >> 32) >> 8;
+            // LDG/STG carry signed 24-bit displacements in bits 40..63.
+            // Generic LD (above) has a different, full 32-bit displacement.
+            auto displacement = int32_t(lo >> 32) >> 8;
             auto address = "[%a" + std::string(displacement < 0 ? "-" : "+") + std::to_string(displacement < 0 ? -int64_t(displacement) : displacement) + "]";
             if (strong) {
                 unsigned width = unsigned(hi >> 9) & 7;
@@ -1328,14 +1375,19 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             auto scale = unsigned(hi >> 14) & 3;
             shared_address(scale ? scale + 1 : 0);
             instruction = memory_transfer(load, "shared", unsigned(hi >> 9) & 7, load ? dest : right, "[%shared_address]");
-        } else if (op == 0x983 || op == 0x387) {
+        } else if (op == 0x983 || op == 0x387 || op == 0x987) {
             bool load = op == 0x983;
-            if ((hi & ~uint64_t(0xe00)) != 0x100000 || (load ? right != 0 : dest != 0) || (!kernel.stack_size && !calls))
+            bool uniform_address = (hi & 0x8000000) != 0;
+            const auto modifiers = uint64_t(0xe00) | (uniform_address && !load ? 63u : 0u);
+            if ((hi & ~modifiers) != (uniform_address ? 0x8100000u : 0x100000u)
+                || (!uniform_address && (op == 0x987 || (load && right != 0)))
+                || (uniform_address && !load && op != 0x987) || (!load && dest != 0) || (!kernel.stack_size && !calls))
                 fail("unsupported local memory encoding");
             // LDL and STL both carry a signed 24-bit displacement in bits
             // 40..63. LDL differs here from the ordinary global-load form.
             auto displacement = int32_t(lo >> 32) >> 8;
-            output += guard + "add.u32 %scratch," + reg(left) + "," + std::to_string(uint32_t(displacement)) + ";\n" +
+            if (uniform_address) output += guard + "add.u32 %scratch," + reg(left) + "," + uniform(load ? right : unsigned(hi) & 63) + ";\n";
+            output += guard + "add.u32 %scratch," + (uniform_address ? "%scratch" : reg(left)) + "," + std::to_string(uint32_t(displacement)) + ";\n" +
                 guard + "cvt.u64.u32 %local_address,%scratch;\n" + guard + "add.u64 %local_address,%local_base,%local_address;\n";
             instruction = memory_transfer(load, "local", unsigned(hi >> 9) & 7, load ? dest : right, "[%local_address]");
         } else if (op == 0x38c || op == 0x38d || op == 0x3a8 || op == 0x9a8 || op == 0x3a9 || op == 0x98e) {
@@ -1452,30 +1504,35 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             }
         } else if ((op == 0x210 || op == 0x810 || op == 0xa10 || op == 0xc10) &&
                    (hi & ~uint64_t(0xe0000)) == (op == 0xc10 ? 0xff1e0ffu : 0x7f1e0ffu) &&
-                   ((hi >> 17) & 7) != 7 && predicate == 7 &&
+                   ((hi >> 17) & 7) != 7 &&
                    (op == 0x210 ? !((lo >> 40) & ~uint64_t(0x800000)) : op != 0xc10 || !(lo >> 40))) {
             // IADD3 Rd, Pn, Ra, +/-Rb/imm32, RZ. A negated register uses
             // a + ~b + 1, retaining the no-borrow carry for the high word.
-            auto source = op == 0xa10 ? bank_word() : op == 0xc10 ? uniform(right) : op == 0x210 ? reg(right) : std::to_string(uint32_t(lo >> 32));
-            output += "cvt.u64.u32 %a," + reg(left) + ";\ncvt.u64.u32 %b," + source + ";\n";
-            if (op == 0x210 && (lo & (uint64_t(1) << 63))) output += "sub.u64 %b,4294967296,%b;\n";
-            output += "add.u64 %a,%a,%b;\nsetp.gt.u64 " + pred(unsigned(hi >> 17) & 7) + ",%a,4294967295;\n";
+            auto source = op == 0xa10 ? bank_word(false, bool(lo >> 63)) : op == 0xc10 ? uniform(right) : op == 0x210 ? reg(right) : std::to_string(uint32_t(lo >> 32));
+            output += guard + "cvt.u64.u32 %a," + reg(left) + ";\n" + guard + "cvt.u64.u32 %b," + source + ";\n";
+            if (op == 0x210 && (lo & (uint64_t(1) << 63))) output += guard + "sub.u64 %b,4294967296,%b;\n";
+            if (op == 0xa10 && (lo & (uint64_t(1) << 63))) output += guard + "add.u64 %b,%b,1;\n";
+            output += guard + "add.u64 %a,%a,%b;\n" + guard + "setp.gt.u64 " + pred(unsigned(hi >> 17) & 7) + ",%a,4294967295;\n";
             instruction = "cvt.u32.u64 " + reg(dest) + ",%a;";
         } else if ((op == 0x210 || op == 0xa10 || op == 0xc10) &&
-                   (hi & ~uint64_t(0x3800000)) == (op == 0xc10 ? 0x87fe4ffu : 0x7fe4ffu) &&
+                   (hi & ~uint64_t(0x781e000)) == (op == 0xc10 ? 0x87e04ffu : 0x7e04ffu) &&
                    (op == 0xa10 || (op == 0x210 ? !((lo >> 40) & ~uint64_t(0x800000)) : !(lo >> 40)))) {
-            // IADD3.X Rd, Ra, Rb/~Rb, RZ, Pn, !PT.
-            auto source = op == 0xa10 ? bank_word() : op == 0xc10 ? uniform(right) : reg(right);
+            // IADD3.X Rd, Ra, Rb/~Rb, RZ, Pn, Pm. Both carry inputs
+            // contribute a zero/one bit, including an inverted predicate.
+            auto source = op == 0xa10 ? bank_word(false, bool(lo >> 63)) : op == 0xc10 ? uniform(right) : reg(right);
             if (op == 0x210 && (lo & (uint64_t(1) << 63))) {
                 output += guard + "not.b32 %tmp0," + source + ";\n"; source = "%tmp0";
             }
-            output += guard + "selp.u32 %scratch,1,0," + pred(unsigned(hi >> 23) & 7) + ";\n" + guard + "add.u32 %scratch,%scratch," + reg(left) + ";\n";
+            auto carry = [&](unsigned field) { return std::string(field & 8 ? "!" : "") + pred(field & 7); };
+            output += guard + "selp.u32 %tmp2,1,0," + carry(unsigned(hi >> 23) & 15) + ";\n" +
+                guard + "selp.u32 %tmp3,1,0," + carry(unsigned(hi >> 13) & 15) + ";\n" +
+                guard + "add.u32 %scratch,%tmp2,%tmp3;\n" + guard + "add.u32 %scratch,%scratch," + reg(left) + ";\n";
             instruction = "add.u32 " + reg(dest) + ",%scratch," + source + ";";
         } else if ((op == 0x210 || op == 0x810 || op == 0xa10 || op == 0xc10) &&
                    (hi & ~uint64_t(0x9ff)) == (op == 0xc10 ? 0xfffe000u : 0x7ffe000u)) {
             if (op == 0x210 && ((lo >> 40) & ~uint64_t(0x800000))) fail("unsupported IADD3 register modifier");
             if (op == 0xc10 && (lo >> 40)) fail("unsupported IADD3 uniform operand modifier");
-            auto source = op == 0xa10 ? bank_word() : op == 0xc10 ? uniform(right) : op == 0x210 ? reg(right) : std::to_string(uint32_t(lo >> 32));
+            auto source = op == 0xa10 ? bank_word(bool(lo >> 63)) : op == 0xc10 ? uniform(right) : op == 0x210 ? reg(right) : std::to_string(uint32_t(lo >> 32));
             if (op == 0x210 && (lo & (uint64_t(1) << 63))) { output += guard + "sub.u32 %tmp0,0," + source + ";\n"; source = "%tmp0"; }
             auto first = reg(left);
             if (hi & 0x100) { output += guard + "sub.u32 %scratch,0," + first + ";\n"; first = "%scratch"; }
@@ -1504,9 +1561,10 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             output += "mul.wide." + std::string(hi & 0x200 ? "s32" : "u32") + " %a," + source + "," + std::to_string(uint32_t(lo >> 32)) + ";\n"
                 "add.u64 %a,%a,%b;\ncvt.u32.u64 " + uniform(dest, true) + ",%a;\nshr.u64 %a,%a,32;\n";
             instruction = "cvt.u32.u64 " + uniform(dest + 1, true) + ",%a;";
-        } else if ((op == 0x224 || op == 0x824) && (hi & ~uint64_t(0x38002ff)) == 0xe0400 && (op == 0x824 || !(lo >> 40))) {
-            auto a = reg(left), c = reg(unsigned(hi) & 255);
-            auto b = op == 0x824 ? std::to_string(uint32_t(lo >> 32)) : reg(right);
+        } else if ((op == 0x224 || op == 0x824 || op == 0x624) && (hi & ~uint64_t(0x38002ff)) == 0xe0400
+                   && (op != 0x224 || !(lo >> 40))) {
+            auto a = reg(left), c = op == 0x624 ? bank_word() : reg(unsigned(hi) & 255);
+            auto b = op == 0x624 ? reg(unsigned(hi) & 255) : op == 0x824 ? std::to_string(uint32_t(lo >> 32)) : reg(right);
             output += guard + "mad.lo.u32 %tmp0," + a + "," + b + "," + c + ";\n" +
                 guard + "selp.u32 %tmp1,1,0," + pred(unsigned(hi >> 23) & 7) + ";\n";
             instruction = "add.u32 " + reg(dest) + ",%tmp0,%tmp1;";
@@ -1523,7 +1581,10 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
             if ((form == 0x200 || form == 0xc00 || form == 0xe00) && (lo >> 40)) fail("unsupported IMAD register modifier");
             if (pc == 0 && !function && predicate == 7 && dest == 1 && left == 255 && form == 0x600 && addend == 255 &&
                     bank_offset() == 0x28 && !bank_index()) {
-                if (kernel.stack_size || calls) instruction = "mov.u32 %r1," + std::to_string(kernel.stack_size) + ";";
+                if (kernel.stack_size || calls) {
+                    instruction = "mov.u32 %r1," + std::to_string(kernel.stack_size) + ";";
+                    constant = kernel.stack_size;
+                }
             } else {
                 auto source = form == 0xa00 ? bank_word() : form == 0x400 ? reg(addend) : form == 0x800 ? std::to_string(uint32_t(lo >> 32)) :
                     form == 0xc00 ? uniform(right) : form == 0x600 || form == 0xe00 ? reg(addend) : reg(right);
@@ -1575,14 +1636,17 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                 }
             }
         } else if (op == 0xa11) {
-            // Checked unsigned index*4/index*8 + bank pointer pair, with P0 carry.
-            bool high = hi == 0xf14ff || hi == 0xf1cff;
-            if ((!high && hi != 0x78010ff && hi != 0x78018ff) || right || predicate != 7)
+            // Bank-based LEA low/high pairs, including the signed-index high
+            // form used to reconstruct a generic shared pointer after a branch.
+            const bool high = hi & 0x400, sign = hi & 0x200;
+            const auto modifiers = uint64_t(0xf800) | (high ? uint64_t(0x3800200) : uint64_t(0xe0000));
+            if ((hi & ~modifiers) != (high ? 0xf04ffu : 0x78000ffu) || right)
                 fail("unsupported LEA modifier");
             const unsigned shift = unsigned(hi >> 11) & 31;
-            output += "cvt.u64.u32 %a," + reg(left) + ";\nshl.b64 %a,%a," + std::to_string(shift) + ";\n";
+            output += guard + std::string(sign ? "cvt.s64.s32 %a," : "cvt.u64.u32 %a,") + reg(left) + ";\n" +
+                guard + "shl.b64 %a,%a," + std::to_string(shift) + ";\n";
             if (high) {
-                output += guard + "shr.u64 %a,%a,32;\n" + guard + "selp.u32 %scratch,1,0,%p0;\n" +
+                output += guard + "shr.u64 %a,%a,32;\n" + guard + "selp.u32 %scratch,1,0," + pred(unsigned(hi >> 23) & 7) + ";\n" +
                     guard + "cvt.u32.u64 %constant,%a;\n" + guard + "add.u32 %scratch,%scratch,%constant;\n";
                 auto source = bank_word();
                 instruction = "add.u32 " + reg(dest) + ",%scratch," + source + ";";
@@ -1590,13 +1654,17 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
                 auto source = bank_word();
                 output += guard + "cvt.u32.u64 %scratch,%a;\n" + guard + "cvt.u64.u32 %a,%scratch;\n" +
                     guard + "cvt.u64.u32 %b," + source + ";\n" + guard + "add.u64 %a,%a,%b;\n";
-                output += guard + "setp.gt.u64 %p0,%a,4294967295;\n";
+                const auto carry = unsigned(hi >> 17) & 7;
+                if (carry != 7) output += guard + "setp.gt.u64 " + pred(carry) + ",%a,4294967295;\n";
                 instruction = "cvt.u32.u64 " + reg(dest) + ",%a;";
             }
-        } else if ((op == 0x211 || op == 0x811) && (hi & ~uint64_t(0xf800)) == 0x78e00ff && (op == 0x811 || !(lo >> 40))) {
+        } else if ((op == 0x211 || op == 0x811 || op == 0xc11)
+                   && (hi & ~uint64_t(0xf800)) == (op == 0xc11 ? 0xf8e00ffu : 0x78e00ffu)
+                   && (op == 0x811 || !(lo >> 40))) {
             unsigned shift = unsigned(hi >> 11) & 31;
             output += guard + "shl.b32 %scratch," + reg(left) + "," + std::to_string(shift) + ";\n";
-            instruction = "add.u32 " + reg(dest) + ",%scratch," + (op == 0x811 ? std::to_string(uint32_t(lo >> 32)) : reg(right)) + ";";
+            instruction = "add.u32 " + reg(dest) + ",%scratch," +
+                (op == 0xc11 ? uniform(right) : op == 0x811 ? std::to_string(uint32_t(lo >> 32)) : reg(right)) + ";";
         } else if ((op == 0x819 || op == 0x899) && left == (op == 0x899 ? 63u : 255u) &&
                    (hi & ~uint64_t(255)) == (op == 0x899 ? 0x8011600u : 0x11600u) && uint32_t(lo >> 32) < 32) {
             unsigned source = unsigned(hi) & 255;
@@ -1707,7 +1775,7 @@ std::string lift_cubin_kernel(const cubin_reader& input, const cubin_kernel& ker
         if (!instruction.empty()) output += guard + instruction + "\n";
         if (dest != 255 && op != 0x386 && op != 0x986 && op != 0x388 && op != 0x387 && op != 0x98e && op != 0xb1d && op != 0x947 && op != 0x944 && op != 0x950 && op != 0x94d && op != 0x918 && op != 0x20c && op != 0x80c && op != 0xa0c && op != 0xc0c && op != 0x20b && op != 0x81c &&
             op != 0xab9 && op != 0x9c3 && op != 0x2a4 && op != 0x899 && op != 0x945 && op != 0x941 && op != 0x355 &&
-            op != 0x992 && op != 0x98f && op != 0x9ab && op != 0x946)
+            op != 0x992 && op != 0x98f && op != 0x9ab && op != 0x946 && op != 0x987 && op != 0x3c2)
             known[dest] = predicate == 7 ? constant : std::nullopt;
     }
     // ptxas pads the section with unreachable NOPs after its exit/stop loop.

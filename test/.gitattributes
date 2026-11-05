@@ -71,3 +71,13 @@ stream_ordering/stream_ordering.ll -text
 stream_progress/stream_progress.cu -text
 stream_progress/stream_progress.ptx -text
 stream_progress/stream_progress.ll -text
+device_stack/device_stack.cu -text
+device_stack/device_stack.ptx -text
+device_stack/device_stack.ll -text
+device_objects/device_objects.cu -text
+device_objects/device_objects.ptx -text
+device_objects/device_objects.ll -text
+address_spaces/address_spaces.cu -text
+address_spaces/address_spaces.ptx -text
+address_spaces/address_spaces.ll -text
+address_spaces/address_spaces_nvcc.ptx -text

@@ -584,6 +584,9 @@ struct session {
     std::mutex pool_execution;
     std::shared_ptr<compute_profile> profile=std::make_shared<compute_profile>();
     virtual ~session() = default;
+    // Without an attached compatible profiling tool these controls have no
+    // effect. Native CUDA overrides this to control its active vendor tool.
+    virtual void set_profiling(bool) {}
     virtual unsigned native_block_limit() const {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "native block resource limit is unavailable");
     }

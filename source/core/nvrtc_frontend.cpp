@@ -323,6 +323,25 @@ nvrtc_output import_cuda_source(llvm::LLVMContext& context, const std::string& s
         barrier->eraseFromParent();
     }
     lower_device_conversions(*module);
+    for (auto space : {"global", "shared", "local", "constant"}) {
+        auto* wrapper = module->getFunction(std::string("__cudavm_rtc_is_") + space);
+        if (!wrapper) continue;
+        auto intrinsic = module->getOrInsertFunction(std::string("llvm.nvvm.isspacep.") +
+            (std::string_view(space) == "constant" ? "const" : space),
+            llvm::FunctionType::get(llvm::Type::getInt1Ty(context), {llvm::PointerType::get(context, 0)}, false));
+        std::vector<llvm::CallInst*> calls;
+        for (auto* user : wrapper->users()) {
+            auto* call = llvm::dyn_cast<llvm::CallInst>(user);
+            if (!call) throw std::runtime_error("taking the address of an address-space predicate is unsupported");
+            calls.push_back(call);
+        }
+        for (auto* call : calls) {
+            llvm::IRBuilder<> builder(call);
+            call->replaceAllUsesWith(builder.CreateZExt(builder.CreateCall(intrinsic, {call->getArgOperand(0)}), builder.getInt32Ty()));
+            call->eraseFromParent();
+        }
+        wrapper->eraseFromParent();
+    }
     // Produce the same generic floating LLVM atomic as the AOT CUDA frontend.
     // Named declarations avoid target builtin enum mismatches in embedded Clang.
     for(auto type : {"float","double"}) {

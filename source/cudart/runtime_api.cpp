@@ -1,4 +1,6 @@
 #include <cudart/cudavm_registration.h>
+#include <cudaProfiler.h>
+#include <cuda_profiler_api.h>
 #include "../cuda/driver_api.hpp"
 #include "../cuda/array_api.hpp"
 #include <cstring>
@@ -356,6 +358,7 @@ using namespace cudavm;
 #include "procedure_address_exports.inl"
 #include "context_exports.inl"
 #include "function_exports.inl"
+#include "profiler_exports.inl"
 extern "C" CUDAVM_CUDART_API cudaError_t cudavmBindKernel(const void* token, const cudavmProgram* program, const char* symbol) {
     return runtime_call([&] { bind_kernel(token, program, symbol); });
 }

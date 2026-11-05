@@ -8,6 +8,7 @@
 #endif
 #endif
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 
 namespace cudavm {
@@ -103,15 +104,19 @@ conformance_device select_conformance_device(std::string_view backend, void (*pr
     return {};
 }
 
-int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags, void (*probe)()) {
+int run_context_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags,
+                            void (*probe)(), bool isolated_fault) {
     try {
         require(argc == 2, "usage: <executable> <backend>");
         const auto device = select_conformance_device(argv[1], probe);
         if (device.value == -1) return 77;
         std::cout << "backend=" << argv[1] << " device=" << device.name << std::endl;
         device_context context(device.value, context_flags);
+        // The process, rather than CUDA teardown, retires this context. Fatal
+        // native faults can make even destruction unsafe or non-progressing.
+        if (isolated_fault) context.value = nullptr;
         execute();
-        CONFORMANCE_CUDA(cuCtxSynchronize());
+        if (!isolated_fault) CONFORMANCE_CUDA(cuCtxSynchronize());
         std::cout << "PASS\n";
         return 0;
     } catch (const conformance_unavailable& error) {
@@ -121,6 +126,17 @@ int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_f
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;
     }
+}
+
+int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags, void (*probe)()) {
+    return run_context_conformance(argc, argv, execute, context_flags, probe, false);
+}
+
+[[noreturn]] void run_isolated_fault_conformance(int argc, char** argv, void (*execute)(), void (*probe)()) {
+    const int status = run_context_conformance(argc, argv, execute, 0, probe, true);
+    std::cout.flush();
+    std::cerr.flush();
+    std::_Exit(status);
 }
 
 #ifdef CUDAVM_CONFORMANCE_EXECUTION

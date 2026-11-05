@@ -1,4 +1,5 @@
 #include "dynamic_library.hpp"
+#include <cudaProfiler.h>
 #include "cuda_graph_capture.hpp"
 #include "ptx_parameters.hpp"
 #include "shader_ptx.hpp"
@@ -773,6 +774,11 @@ struct cuda_session : session {
     std::shared_ptr<cuda_context> context;
     cuda_session(std::shared_ptr<cuda_api> api, CUdevice device, unsigned flags = CU_CTX_MAP_HOST)
         : context(std::make_shared<cuda_context>(std::move(api), device, flags)) {}
+    void set_profiling(bool enabled) override {
+        cuda_context_guard guard(*context);
+        const char* symbol = enabled ? "cuProfilerStart" : "cuProfilerStop";
+        check(context->api->driver.get<decltype(&cuProfilerStart)>(symbol)(), symbol);
+    }
     unsigned image_architecture() const {
         int major = 0, minor = 0;
         check(context->api->attribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, context->device), "cuDeviceGetAttribute");

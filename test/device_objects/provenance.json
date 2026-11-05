@@ -1,0 +1,17 @@
+{
+  "producer": "NVIDIA CUDA 12.4.131 nvcc and ptxas",
+  "architecture": "sm_75",
+  "commands": [
+    "nvcc -arch=sm_75 -O1 --std=c++17 --allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -ccbin <MSVC-14.44.35207-x64> --ptx test/device_objects/device_objects.cu -o test/device_objects/device_objects.ptx",
+    "ptxas -arch=sm_75 -O1 test/device_objects/device_objects.ptx -o test/device_objects/device_objects.cubin"
+  ],
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "device_objects.cu": "e898afd6d8619225ec66d0ca9301919fe6dacca37974a81453bc4da716880fb5",
+    "device_objects.ptx": "860003196e8dfaf4ed464ef7b7103eaa5ce7a6d86e80a7cf1bd5848e21d6e9a4",
+    "device_objects.ll": "c4373b8d7eee4cbe4ceee2d017221b301014d48cfcd1b5c01b637c2446e83ccd",
+    "device_objects.cubin": "84cfaa03e3d1f07aa748be272a9940b60ef5b9da5a4bc23cd38fee5eb2045ffe"
+  },
+  "ptx_normalization": "Change only .version 8.4 to .version 6.5; ptxas validates the baseline instruction/directive profile before producing the cubin.",
+  "original_nvcc_ptx_sha256": "4981747adc29e2c49f42a9f6d27edf2e35cd9aa4a126c5a00e56efcbb7d049e2"
+}
