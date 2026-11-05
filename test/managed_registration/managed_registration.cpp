@@ -1,8 +1,8 @@
 #include "conformance.hpp"
-#include "compiler_registration.hpp"
 #include "managed_fixtures.hpp"
 #include <cuda/cudavm_cuda.h>
 #include <algorithm>
+#include <cstring>
 
 namespace cudavm {
 void managed_runtime(cudaError_t result, const char* operation) {

@@ -1,0 +1,42 @@
+// Independently authored PTX with finite lane work and block-uniform barriers.
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .entry progress_rounds(.param .u64 output, .param .u64 input,
+ .param .u64 tickets, .param .u64 completed, .param .u32 count, .param .u32 seed) {
+ .shared .align 4 .b8 values[256];
+ .reg .u64 out,src,ticket,counter,own,peer_address;
+ .reg .u32 lane,lanes,block,id,n,s,v,round,rounds,steps,step,salt,peer,other,old;
+ .reg .pred more,again,valid,leader,wrap;
+ ld.param.u64 out,[output]; ld.param.u64 src,[input];
+ ld.param.u64 ticket,[tickets]; ld.param.u64 counter,[completed];
+ ld.param.u32 n,[count]; ld.param.u32 s,[seed];
+ mov.u32 lane,%tid.x; mov.u32 lanes,%ntid.x; mov.u32 block,%ctaid.x;
+ mad.lo.u32 id,block,lanes,lane;
+ mad.wide.u32 src,id,4,src; ld.global.u32 v,[src]; xor.b32 v,v,s;
+ add.u32 rounds,block,s; and.b32 rounds,rounds,3; add.u32 rounds,rounds,1;
+ mov.u64 own,values; mad.wide.u32 own,lane,4,own;
+ add.u32 peer,lane,1; setp.eq.u32 wrap,peer,lanes; @wrap mov.u32 peer,0;
+ mov.u64 peer_address,values; mad.wide.u32 peer_address,peer,4,peer_address;
+ mov.u32 round,0;
+round_loop:
+ setp.lt.u32 more,round,rounds; @!more bra finish;
+ add.u32 steps,lane,round; and.b32 steps,steps,3; mov.u32 step,0;
+lane_loop:
+ setp.lt.u32 again,step,steps; @!again bra publish;
+ mad.lo.u32 salt,round,13,step; add.u32 salt,salt,s;
+ xor.b32 v,v,salt; mad.lo.u32 v,v,33,lane;
+ add.u32 step,step,1; bra lane_loop;
+publish:
+ st.shared.u32 [own],v; bar.sync 0;
+ ld.shared.u32 other,[peer_address]; mad.lo.u32 salt,round,17,s;
+ xor.b32 other,other,salt; add.u32 v,v,other; bar.sync 0;
+ add.u32 round,round,1; bra round_loop;
+finish:
+ setp.lt.u32 valid,id,n; @!valid bra ticket_write;
+ mad.wide.u32 out,id,4,out; st.global.u32 [out],v;
+ticket_write:
+ setp.eq.u32 leader,lane,0; @!leader ret;
+ atom.global.add.u32 old,[counter],1;
+ mad.wide.u32 ticket,block,4,ticket; st.global.u32 [ticket],old; ret;
+}

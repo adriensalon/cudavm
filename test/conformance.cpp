@@ -3,18 +3,131 @@
 #include <cuda/cudavm_cuda.h>
 #ifdef CUDAVM_CONFORMANCE_EXECUTION
 #include <nvrtc.h>
+#ifndef CUDAVM_CONFORMANCE_SOURCE_ONLY
 #include <nvvm.h>
 #include <nvJitLink.h>
 #endif
 #endif
+#endif
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <thread>
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <io.h>
+#else
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace cudavm {
+#ifdef CUDAVM_CONFORMANCE_REGISTRATION
+template<class T> void registration_word(std::vector<unsigned char>& bytes, size_t offset, T value) {
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+}
+std::vector<unsigned char> registration_ptx_image(std::string_view source, unsigned major, unsigned minor, unsigned architecture) {
+    constexpr size_t header_bytes = 72;
+    const size_t payload_bytes = (source.size() + 1 + 7) & ~size_t(7);
+    std::vector<unsigned char> image(16 + header_bytes + payload_bytes);
+    registration_word<uint32_t>(image, 0, 0xba55ed50);
+    registration_word<uint16_t>(image, 4, 1); registration_word<uint16_t>(image, 6, 16);
+    registration_word<uint64_t>(image, 8, header_bytes + payload_bytes);
+    registration_word<uint16_t>(image, 16, 1); registration_word<uint16_t>(image, 18, 0x101);
+    registration_word<uint32_t>(image, 20, header_bytes); registration_word<uint64_t>(image, 24, payload_bytes);
+    registration_word<uint32_t>(image, 36, 64); registration_word<uint32_t>(image, 40, (major << 16) | minor);
+    registration_word<uint32_t>(image, 44, architecture);
+#ifdef _WIN32
+    registration_word<uint64_t>(image, 56, 0x41);
+#else
+    registration_word<uint64_t>(image, 56, 0x11);
+#endif
+    std::memcpy(image.data() + 16 + header_bytes, source.data(), source.size());
+    return image;
+}
+#endif
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
+// Start before GPU initialization. DLLs with separate CRTs and native drivers
+// must inherit the redirected output at process creation, not after startup.
+conformance_child_result run_conformance_child(const char* executable, const char* backend, const char* case_name,
+                                               bool capture_stderr) {
+    FILE* file = nullptr;
+#ifdef _WIN32
+    tmpfile_s(&file);
+#else
+    file = std::tmpfile();
+#endif
+    require(file != nullptr, "create child output file");
+    struct file_guard { FILE* value; ~file_guard() { std::fclose(value); } } cleanup{file};
+    int status = 1;
+#ifdef _WIN32
+    std::array<wchar_t, 32768> path{};
+    auto length = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
+    require(length && length < path.size(), "locate conformance executable");
+    auto widen = [](const char* value) { std::wstring result; for (; *value; ++value) result += wchar_t(*value); return result; };
+    std::wstring command = L"\"" + std::wstring(path.data(), length) + L"\" " + widen(backend) + L" " + widen(case_name) + L" --worker";
+    HANDLE output = INVALID_HANDLE_VALUE;
+    require(DuplicateHandle(GetCurrentProcess(), reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(file))),
+        GetCurrentProcess(), &output, 0, TRUE, DUPLICATE_SAME_ACCESS), "create inheritable child output handle");
+    STARTUPINFOW startup{}; startup.cb = sizeof(startup); startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE); startup.hStdOutput = output;
+    startup.hStdError = capture_stderr ? output : GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION process{};
+    const bool created = CreateProcessW(path.data(), command.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+    CloseHandle(output);
+    require(created, "start conformance worker");
+    CloseHandle(process.hThread);
+    const auto waited = WaitForSingleObject(process.hProcess, 270000);
+    if (waited != WAIT_OBJECT_0) {
+        TerminateProcess(process.hProcess, 1); WaitForSingleObject(process.hProcess, 5000);
+        CloseHandle(process.hProcess);
+        throw std::runtime_error("conformance worker exceeded its deadline");
+    }
+    DWORD exit_status = 1;
+    const bool queried = GetExitCodeProcess(process.hProcess, &exit_status);
+    CloseHandle(process.hProcess);
+    require(queried, "read conformance worker status");
+    status = int(exit_status);
+#else
+    const auto child = fork();
+    require(child >= 0, "start conformance worker");
+    if (child == 0) {
+        if (dup2(fileno(file), STDOUT_FILENO) < 0) _exit(126);
+        if (capture_stderr && dup2(fileno(file), STDERR_FILENO) < 0) _exit(126);
+        execlp(executable, executable, backend, case_name, "--worker", static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(270);
+    int raw_status = 0;
+    for (;;) {
+        auto observed = waitpid(child, &raw_status, WNOHANG);
+        if (observed == child) break;
+        if (observed < 0 && errno == EINTR) continue;
+        if (observed < 0 || std::chrono::steady_clock::now() >= deadline) {
+            kill(child, SIGKILL); waitpid(child, &raw_status, 0);
+            throw std::runtime_error("conformance worker failed to complete before its deadline");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    status = WIFEXITED(raw_status) ? WEXITSTATUS(raw_status) : 1;
+#endif
+    require(std::fseek(file, 0, SEEK_END) == 0, "seek child output end");
+    const auto bytes = std::ftell(file);
+    require(bytes >= 0 && std::fseek(file, 0, SEEK_SET) == 0, "seek child output start");
+    std::string output_text(static_cast<size_t>(bytes), '\0');
+    require(std::fread(output_text.data(), 1, output_text.size(), file) == output_text.size(), "read complete child output");
+    return {status, std::move(output_text)};
+}
+
 int run_host_conformance(int argc, char** argv, void (*execute)()) {
     try {
         require(argc == 1 || argc == 2, "usage: <executable> [case]");
@@ -66,7 +179,7 @@ struct conformance_device {
     std::string name;
 };
 
-conformance_device select_conformance_device(std::string_view backend, void (*probe)() = nullptr) {
+conformance_device select_conformance_device(std::string_view backend, void (*probe)() = nullptr, unsigned architecture = 0) {
     const std::array<std::string_view, 5> backends{"cuda", "vulkan", "directx", "opencl", "opengl"};
     const std::array<std::string_view, 5> labels{"CUDA", "Vulkan", "DirectX", "OpenCL", "OpenGL"};
     const auto found = std::find(backends.begin(), backends.end(), backend);
@@ -86,6 +199,16 @@ conformance_device select_conformance_device(std::string_view backend, void (*pr
         CONFORMANCE_CUDA(cuDeviceGet(&candidate, ordinal));
         CONFORMANCE_CUDA(cuDeviceGetName(name, sizeof(name), candidate));
         if (!std::string_view(name).ends_with(suffix)) continue;
+        if (backend == "cuda" && architecture) {
+            int major = 0, minor = 0;
+            CONFORMANCE_CUDA(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, candidate));
+            CONFORMANCE_CUDA(cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, candidate));
+            if (unsigned(major * 10 + minor) < architecture) {
+                std::cout << "unavailable device=" << name << "; requires sm_" << architecture
+                    << ", reports sm_" << major << minor << std::endl;
+                continue;
+            }
+        }
         if (probe) {
             try {
                 device_context context(candidate);
@@ -152,6 +275,7 @@ struct source_program {
         throw std::runtime_error(std::string(nvrtcGetErrorString(result)) + ": " + log);
     }
 };
+#ifndef CUDAVM_CONFORMANCE_SOURCE_ONLY
 struct nvvm_program {
     nvvmProgram value{};
     ~nvvm_program() { if (value) nvvmDestroyProgram(&value); }
@@ -177,7 +301,11 @@ struct link_program {
     }
 };
 
+#endif
 std::vector<char> import_fixture(const fixture_data& fixtures, std::string_view importer) {
+#ifdef CUDAVM_CONFORMANCE_SOURCE_ONLY
+    require(importer == "cu", "this execution profile declares only CUDA source input");
+#endif
     if (importer == "ptx") {
         std::vector<char> bytes(fixtures.ptx.begin(), fixtures.ptx.end());
         bytes.push_back('\0');
@@ -187,7 +315,8 @@ std::vector<char> import_fixture(const fixture_data& fixtures, std::string_view 
     if (importer == "cu") {
         source_program program;
         program.check(nvrtcCreateProgram(&program.value, fixtures.source.data(), "fixture.cu", 0, nullptr, nullptr));
-        const char* options[]{"-arch=sm_75", "--std=c++17"};
+        const auto architecture = "-arch=sm_" + std::to_string(fixtures.architecture);
+        const char* options[]{architecture.c_str(), "--std=c++17"};
         program.check(nvrtcCompileProgram(program.value, 2, options));
         size_t size = 0;
         program.check(nvrtcGetCUBINSize(program.value, &size));
@@ -196,11 +325,13 @@ std::vector<char> import_fixture(const fixture_data& fixtures, std::string_view 
         program.check(nvrtcGetCUBIN(program.value, bytes.data()));
         return bytes;
     }
+#ifndef CUDAVM_CONFORMANCE_SOURCE_ONLY
     require(importer == "nvvm", "unknown importer: " + std::string(importer));
     nvvm_program program;
     program.check(nvvmCreateProgram(&program.value));
     program.check(nvvmAddModuleToProgram(program.value, fixtures.nvvm.data(), fixtures.nvvm.size(), "fixture.ll"));
-    const char* options[]{"-arch=compute_75", "-gen-lto"};
+    const auto architecture = "-arch=compute_" + std::to_string(fixtures.architecture);
+    const char* options[]{architecture.c_str(), "-gen-lto"};
     program.check(nvvmCompileProgram(program.value, 2, options));
     size_t size = 0;
     program.check(nvvmGetCompiledResultSize(program.value, &size));
@@ -208,7 +339,8 @@ std::vector<char> import_fixture(const fixture_data& fixtures, std::string_view 
     std::vector<char> ir(size);
     program.check(nvvmGetCompiledResult(program.value, ir.data()));
     link_program link;
-    const char* link_options[]{"-arch=sm_75", "-lto"};
+    const auto link_architecture = "-arch=sm_" + std::to_string(fixtures.architecture);
+    const char* link_options[]{link_architecture.c_str(), "-lto"};
     link.check(nvJitLinkCreate(&link.value, 2, link_options));
     link.check(nvJitLinkAddData(link.value, NVJITLINK_INPUT_LTOIR, ir.data(), ir.size(), "fixture"));
     link.check(nvJitLinkComplete(link.value));
@@ -217,6 +349,9 @@ std::vector<char> import_fixture(const fixture_data& fixtures, std::string_view 
     std::vector<char> bytes(size);
     link.check(nvJitLinkGetLinkedCubin(link.value, bytes.data()));
     return bytes;
+#else
+    throw std::runtime_error("unknown source execution importer");
+#endif
 }
 
 loaded_program::loaded_program(const void* image, bool use_library) {
@@ -283,7 +418,7 @@ int run_conformance(int argc, char** argv, const fixture_data& fixtures,
         require(argc == 3, "usage: <executable> <backend> <cu|ptx|cubin|nvvm>");
         require(load_repetitions > 0, "at least one loader execution is required");
         const std::string backend = argv[1];
-        const auto device = select_conformance_device(backend, probe_execution);
+        const auto device = select_conformance_device(backend, probe_execution, fixtures.architecture);
         if (device.value == -1) return 77;
         std::cout << "backend=" << backend << " importer=" << argv[2] << " device=" << device.name << std::endl;
         device_context context(device.value, context_flags);

@@ -1,0 +1,13 @@
+{
+  "producer": "NVIDIA CUDA 12.4.131 ptxas",
+  "architecture": "sm_75",
+  "command": "ptxas -arch=sm_75 -O1 test/device_progress/device_progress.ptx -o test/device_progress/device_progress.cubin",
+  "ptx": "Independently authored PTX 6.5",
+  "nvvm": "Independently authored NVVM IR 2.0, LLVM 7 typed-pointer dialect",
+  "sha256": {
+    "device_progress.cu": "58cc4e5fe9655d3046d1c33fe03533833bbc9ece16603c8a41c244eb4383ad0c",
+    "device_progress.ptx": "120d4b465bdd45934a4a1167986a00591edde54d5356b39add71930c5fca9464",
+    "device_progress.ll": "571a7d811fcf8a222dc11c3bf2945dd8a38871857a59b4da7fa6e23b14bced8d",
+    "device_progress.cubin": "48c15a8f4cf6488f4ac47877b7a7ae61862377ff1c03b7d98cb99ba1c14b6cbc"
+  }
+}

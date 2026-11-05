@@ -7,6 +7,7 @@
 #include "nvidia_managed_image.hpp"
 #include "../core/module_descriptor.hpp"
 #include <cctype>
+#include <atomic>
 #include <fstream>
 #include <iterator>
 #include <optional>
@@ -291,8 +292,16 @@ struct cuda_event : native_signal, device_timer {
         }
     }
 };
+struct cuda_completion {
+    std::atomic<CUresult> status{CUDA_ERROR_NOT_READY};
+    static void CUDA_CB publish(CUstream, CUresult status, void* pointer) {
+        std::unique_ptr<std::shared_ptr<cuda_completion>> owner(static_cast<std::shared_ptr<cuda_completion>*>(pointer));
+        (*owner)->status.store(status, std::memory_order_release);
+    }
+};
 struct cuda_task : device_task {
     std::shared_ptr<cuda_event> event;
+    std::shared_ptr<cuda_completion> completion = std::make_shared<cuda_completion>();
     bool recorded = false;
     explicit cuda_task(std::shared_ptr<cuda_context> owner, unsigned flags = CU_EVENT_DISABLE_TIMING)
         : event(std::make_shared<cuda_event>(std::move(owner), flags)) {}
@@ -300,12 +309,20 @@ struct cuda_task : device_task {
     std::shared_ptr<native_signal> signal() const override { return recorded ? event : nullptr; }
     void record(CUstream stream) {
         check(event->context->api->driver.get<decltype(&cuEventRecord)>("cuEventRecord")(event->value, stream), "cuEventRecord"); recorded = true;
+        // Native event polling can consume a device assertion without flushing
+        // its diagnostic. CUDA invokes stream callbacks on errors as well as
+        // success; publish that completion without a blocking scheduler wait.
+        // The callback owns independent state even if the task is retired early.
+        auto* state = new std::shared_ptr<cuda_completion>(completion);
+        const auto result = event->context->api->driver.get<decltype(&cuStreamAddCallback)>("cuStreamAddCallback")(
+            stream, cuda_completion::publish, state, 0);
+        if (result != CUDA_SUCCESS) delete state;
+        check(result, "cuStreamAddCallback for completion");
     }
     bool query() override {
-        cuda_context_guard guard(*event->context);
-        auto result = event->context->api->driver.get<decltype(&cuEventQuery)>("cuEventQuery")(event->value);
+        auto result = completion->status.load(std::memory_order_acquire);
         if (result == CUDA_ERROR_NOT_READY) return false;
-        check(result, "cuEventQuery"); return true;
+        check(result, "native CUDA completion"); return true;
     }
     ~cuda_task() {
         auto& context = *event->context;

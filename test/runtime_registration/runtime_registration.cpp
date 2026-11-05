@@ -1,5 +1,4 @@
 #include "conformance.hpp"
-#include "compiler_registration.hpp"
 #include "registration_fixtures.hpp"
 #include <cuda_runtime_api.h>
 #include <cuda/cudavm_cuda.h>
