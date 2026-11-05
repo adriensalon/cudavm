@@ -81,9 +81,13 @@ cudavm::nvrtc_options parse_options(int count, const char* const* input, std::st
             return std::nullopt;
         };
         if (auto architecture = value("--gpu-architecture", "-arch")) {
-            if (*architecture != "compute_75" && *architecture != "compute_80" && *architecture != "sm_75" && *architecture != "sm_80") invalid(option);
+            auto profile = std::find_if(source_architectures.begin(), source_architectures.end(), [&](int candidate) {
+                const auto number = std::to_string(candidate);
+                return *architecture == "compute_" + number || *architecture == "sm_" + number;
+            });
+            if (profile == source_architectures.end()) invalid(option);
             result.physical = architecture->starts_with("sm_");
-            result.architecture = architecture->ends_with("80") ? "sm_80" : "sm_75";
+            result.architecture = "sm_" + std::to_string(*profile);
         } else if (auto standard = value("--std", "-std")) {
             if (*standard != "c++11" && *standard != "c++14" && *standard != "c++17"
                 && *standard != "c++20" && *standard != "c++23") invalid(option);

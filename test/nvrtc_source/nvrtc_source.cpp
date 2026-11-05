@@ -125,13 +125,16 @@ void source_preprocessor() {
 #endif
 extern "C" __global__ void source_macros(unsigned* output) { *output = SOURCE_VALUE + SOURCE_FLAG; }
 )cuda";
-    for (const auto* architecture : {"compute_75", "compute_80"}) {
+    for (unsigned architecture : {75u, 80u, 90u}) {
         source_program program(source);
-        const auto target = std::string(architecture).ends_with("75") ? "750" : "800";
-        const auto text = program.success({"--gpu-architecture", architecture, "--define-macro", "SOURCE_VALUE=73", "-DSOURCE_FLAG",
-            "-DSOURCE_REMOVED=1", "--undefine-macro=SOURCE_REMOVED", std::string("-DEXPECTED_ARCH=") + target});
-        require(text.find(std::string(".target sm_") + (target == std::string("750") ? "75" : "80")) != std::string::npos, "preprocessor architecture agrees with emitted PTX target");
+        const auto number = std::to_string(architecture);
+        const auto text = program.success({"--gpu-architecture", "compute_" + number, "--define-macro", "SOURCE_VALUE=73", "-DSOURCE_FLAG",
+            "-DSOURCE_REMOVED=1", "--undefine-macro=SOURCE_REMOVED", "-DEXPECTED_ARCH=" + number + "0"});
+        require(text.find(".target sm_" + number) != std::string::npos, "preprocessor architecture agrees with emitted PTX target");
     }
+    source_program physical(source);
+    require(physical.success({"-arch=sm_90", "-DSOURCE_VALUE=73", "-DSOURCE_FLAG", "-DEXPECTED_ARCH=900"})
+        .find(".target sm_90") != std::string::npos, "physical SM90 source macros and PTX agree");
     source_program removed("#ifdef SOURCE_FLAG\n#error short_undefine_failed\n#endif\nextern \"C\" __global__ void source_undefine() {}\n");
     removed.success({"-DSOURCE_FLAG", "-USOURCE_FLAG"});
 }

@@ -1,0 +1,7 @@
+#pragma once
+#include <string_view>
+namespace cudavm {
+inline constexpr char checked_source[] = R"cudavm_fixture(@fixture_cu@)cudavm_fixture";
+inline constexpr unsigned checked_architecture = @fixture_architecture@;
+inline constexpr unsigned checked_minimum_ptx = @fixture_minimum_ptx@;
+}

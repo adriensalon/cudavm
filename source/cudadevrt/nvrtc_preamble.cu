@@ -51,6 +51,15 @@ extern "C" __device__ void __cudavm_rtc_fence_system();
 __device__ inline void __threadfence_block() {__cudavm_rtc_fence_block();}
 __device__ inline void __threadfence() {__cudavm_rtc_fence_device();}
 __device__ inline void __threadfence_system() {__cudavm_rtc_fence_system();}
+// Legacy public pipeline headers parse timed barrier helpers even when callers
+// only use the pipeline's batch operations. Keep native timing operations inline;
+// a shader that reaches them still requires explicit backend lowering.
+__device__ inline long long clock64() {
+    long long cycles; asm volatile("mov.u64 %0, %%clock64;" : "=l"(cycles)); return cycles;
+}
+#if __CUDA_ARCH__ >= 700
+__device__ inline void __nanosleep(unsigned nanoseconds) { asm volatile("nanosleep.u32 %0;" :: "r"(nanoseconds)); }
+#endif
 extern "C" __device__ __attribute__((const)) unsigned __cudavm_rtc_is_global(const void*);
 extern "C" __device__ __attribute__((const)) unsigned __cudavm_rtc_is_shared(const void*);
 extern "C" __device__ __attribute__((const)) unsigned __cudavm_rtc_is_local(const void*);
@@ -148,6 +157,13 @@ __device__ inline unsigned __funnelshift_rc(unsigned lo,unsigned hi,unsigned s) 
 // Use generic Clang atomic builtins, which emit ordinary LLVM atomics without
 // depending on the target-specific NVVM builtin enum or an installed toolkit.
 __device__ inline unsigned atomicAdd(unsigned* p,unsigned v) {return __atomic_fetch_add(p,v,__ATOMIC_RELAXED);}
+// The public SM70/75 arrive/wait helpers require this CTA-scoped overload.
+// Semantic preparation converts the assembly to an ordinary scoped LLVM atomic.
+__device__ inline unsigned atomicAdd_block(unsigned* p,unsigned v) {
+    unsigned previous;
+    asm volatile("atom.add.relaxed.cta.u32 %0, [%1], %2;" : "=r"(previous) : "l"(p), "r"(v) : "memory");
+    return previous;
+}
 __device__ inline unsigned atomicOr(unsigned* p,unsigned v) {return __atomic_fetch_or(p,v,__ATOMIC_RELAXED);}
 __device__ inline unsigned atomicAnd(unsigned* p,unsigned v) {return __atomic_fetch_and(p,v,__ATOMIC_RELAXED);}
 __device__ inline unsigned atomicCAS(unsigned* p,unsigned c,unsigned v) {__atomic_compare_exchange_n(p,&c,v,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED);return c;}

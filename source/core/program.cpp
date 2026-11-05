@@ -374,11 +374,17 @@ void emit_compiler_program(const compiler_program& program, const compiler_emit_
     }
     require_compiler_request(request.environment != compiler_environment::none, "native image requires an emission environment");
     if (request.environment == compiler_environment::all || request.environment == compiler_environment::cuda) {
-        if (portable) result.output = emit_native(module, {native_target::nvptx, architecture, true, {}}).bytes;
+        const bool shaders = request.environment == compiler_environment::all;
+        if (portable) {
+            result.output = emit_native(module, {native_target::nvptx, architecture, shaders, {}}).bytes;
+            if (!shaders) result.output += emit_native_module(module);
+        }
         else {
             result.output = emit_cuda_ir(module, architecture);
-            result.output += emit_native_spirv_payload(module);
-            result.output += emit_native_dxil_payload(module);
+            if (shaders) {
+                result.output += emit_native_spirv_payload(module);
+                result.output += emit_native_dxil_payload(module);
+            }
             result.output += emit_native_module(module);
         }
         return;

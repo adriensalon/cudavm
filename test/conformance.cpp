@@ -316,13 +316,24 @@ std::vector<char> import_fixture(const fixture_data& fixtures, std::string_view 
         source_program program;
         program.check(nvrtcCreateProgram(&program.value, fixtures.source.data(), "fixture.cu", 0, nullptr, nullptr));
         const auto architecture = "-arch=sm_" + std::to_string(fixtures.architecture);
+#ifdef CUDAVM_CONFORMANCE_SOURCE_LTO
+        const char* options[]{architecture.c_str(), "--std=c++17", "-dlto"};
+        program.check(nvrtcCompileProgram(program.value, 3, options));
+        size_t size = 0;
+        program.check(nvrtcGetLTOIRSize(program.value, &size));
+#else
         const char* options[]{architecture.c_str(), "--std=c++17"};
         program.check(nvrtcCompileProgram(program.value, 2, options));
         size_t size = 0;
         program.check(nvrtcGetCUBINSize(program.value, &size));
+#endif
         require(size > 0, "NVRTC returned an empty program");
         std::vector<char> bytes(size);
+#ifdef CUDAVM_CONFORMANCE_SOURCE_LTO
+        program.check(nvrtcGetLTOIR(program.value, bytes.data()));
+#else
         program.check(nvrtcGetCUBIN(program.value, bytes.data()));
+#endif
         return bytes;
     }
 #ifndef CUDAVM_CONFORMANCE_SOURCE_ONLY
