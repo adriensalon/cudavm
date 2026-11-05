@@ -17,10 +17,14 @@ uint32_t texture_integer_border(float color, unsigned bits, bool signed_format, 
     return uint32_t(integer);
 }
 std::shared_ptr<image_object_entry> image_object_lookup(uint64_t handle, bool surface) {
-    auto& objects = image_objects(surface); auto it = objects.find(handle);
-    require(it != objects.end() && !it->second->retiring, CUDA_ERROR_INVALID_VALUE, "invalid image object");
-    require(it->second->owner == current(), CUDA_ERROR_INVALID_CONTEXT, "image object belongs to another context");
-    return it->second;
+    auto& objects = image_objects(surface); auto [first, last] = objects.equal_range(handle);
+    require(first != last, CUDA_ERROR_INVALID_VALUE, "invalid image object");
+    auto owner = current();
+    for (auto it = first; it != last; ++it) if (it->second->owner == owner) {
+        require(!it->second->retiring, CUDA_ERROR_INVALID_VALUE, "image object is retiring");
+        return it->second;
+    }
+    throw failure(CUDA_ERROR_INVALID_CONTEXT, "image object belongs to another context");
 }
 uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXTURE_DESC* texture,
                              const CUDA_RESOURCE_VIEW_DESC* view) {
@@ -137,11 +141,15 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
         global().device_buffers.push_back({owner->device, entry->descriptor});
     }
     auto handle = entry->native->handle;
-    require(handle && !image_objects(surface).contains(handle), CUDA_ERROR_UNKNOWN, "native image object handle collision");
+    require(handle, CUDA_ERROR_UNKNOWN, "native image object handle is null");
+    auto [first, last] = image_objects(surface).equal_range(handle);
+    require(std::none_of(first, last, [&](auto& item) { return item.second->owner == owner; }),
+            CUDA_ERROR_UNKNOWN, "native image object handle collision within a context");
     image_objects(surface).emplace(handle, std::move(entry)); return handle;
 }
 void destroy_image_object(uint64_t handle, bool surface) {
     auto entry = image_object_lookup(handle, surface); capture_unsafe(entry->owner);
     entry->retiring = true; invalidate_native_graphs(); drain_context_work(entry->owner);
-    image_objects(surface).erase(handle);
+    auto& objects = image_objects(surface); auto [first, last] = objects.equal_range(handle);
+    for (auto it = first; it != last; ++it) if (it->second == entry) { objects.erase(it); break; }
 }

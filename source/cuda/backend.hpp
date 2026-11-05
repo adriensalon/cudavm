@@ -125,6 +125,12 @@ struct graph_pool_charge {
         pool->reserved -= bytes; if (mapped) pool->used -= bytes;
     }
 };
+struct virtual_address_reservation {
+    CUdeviceptr address = 0;
+    size_t size = 0;
+    virtual ~virtual_address_reservation() = default;
+    virtual void release() = 0;
+};
 struct buffer {
     size_t size;
     // Pool backing retains its private storage session beyond public contexts.
@@ -138,6 +144,12 @@ struct buffer {
     virtual uint64_t native_address() const { return 0; }
     virtual CUarray cuda_array() const { return nullptr; }
     virtual bool is_managed() const { return false; }
+    virtual void advise(size_t, size_t, CUmem_advise, CUmemLocation) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "managed memory advice is unavailable");
+    }
+    virtual void range_attribute(void*, size_t, CUmem_range_attribute, size_t, size_t) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "managed range queries are unavailable");
+    }
     virtual buffer& storage() { return *this; }
     virtual const buffer& storage() const { return *this; }
     virtual size_t storage_offset() const { return 0; }
@@ -632,6 +644,12 @@ struct session {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "external semaphore handle type is unavailable on this device");
     }
     virtual std::unique_ptr<buffer> allocate(size_t bytes) = 0;
+    virtual size_t allocation_granularity(const CUmemAllocationProp&, CUmemAllocationGranularity_flags) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual allocation granularity is unavailable");
+    }
+    virtual std::unique_ptr<virtual_address_reservation> reserve_virtual_address(size_t, size_t, CUdeviceptr) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual address reservation is unavailable");
+    }
     // Buffer storage implements allocation and byte transfers on shader
     // adapters. It does not imply native image sampling support.
     virtual std::shared_ptr<buffer> allocate_array(const CUDA_ARRAY3D_DESCRIPTOR& d) {

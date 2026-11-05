@@ -69,7 +69,8 @@ struct nvrtc_consumer : clang::ASTConsumer, clang::RecursiveASTVisitor<nvrtc_con
         // Modern CUDA headers normally obtain these definitions from NVIDIA's
         // NVRTC builtins library. Compile their provided source here and retain
         // only used inline definitions, like the AOT CUDA header path.
-        if((file.ends_with("cuda_fp16.hpp") || file.ends_with("cuda_fp16.h"))
+        if((file.ends_with("cuda_fp16.hpp") || file.ends_with("cuda_fp16.h") ||
+            file.ends_with("cuda_bf16.hpp") || file.ends_with("cuda_bf16.h"))
             && function->hasAttr<clang::CUDADeviceAttr>() && function->isThisDeclarationADefinition())
             function->setImplicitlyInline();
         if (function->isImplicit() || !function->doesThisDeclarationHaveABody()

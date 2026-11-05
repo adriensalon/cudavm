@@ -344,6 +344,8 @@ using namespace cudavm;
 #include "host_memory_exports.inl"
 #include "stream_exports.inl"
 #include "async_memory_exports.inl"
+#include "batch_copy_exports.inl"
+#include "managed_advice_exports.inl"
 #include "memory_pool_exports.inl"
 #include "graph_exports.inl"
 #include "graph_memory_exports.inl"

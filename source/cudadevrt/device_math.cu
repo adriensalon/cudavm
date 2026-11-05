@@ -50,6 +50,9 @@ extern "C" __device__ inline float __nv_logf(float x) {return cudavm::math_log(x
 extern "C" __device__ inline float __nv_log10f(float x) {return cudavm::math_log10(x);}
 extern "C" __device__ inline float __nv_tanhf(float x) {return cudavm::math_tanh(x);}
 extern "C" __device__ inline float __nv_fmaf_rn(float x,float y,float z) {return __builtin_elementwise_fma(x,y,z);}
+extern "C" __device__ inline float __fmaf_ieee_rn(float x,float y,float z) {
+    return __builtin_bit_cast(float,__cudavm_native_word_f32_fma(__builtin_bit_cast(unsigned,x),__builtin_bit_cast(unsigned,y),__builtin_bit_cast(unsigned,z)));
+}
 extern "C" __device__ inline float __nv_fsub_rn(float x,float y) {return x-y;}
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_sqrt(float x) {return cudavm::cvMathSqrt(x);}
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_max(float x,float y) {return cudavm::cvMathMax(x,y);}

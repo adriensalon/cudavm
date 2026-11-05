@@ -181,9 +181,12 @@ struct state {
     std::unordered_map<int, primary_record> primary_records;
     std::unordered_map<int, unsigned> primary_flags;
     std::map<CUdeviceptr, allocation> allocations;
+    std::map<CUdeviceptr, std::unique_ptr<virtual_address_reservation>> address_reservations;
     std::unordered_map<CUarray, std::shared_ptr<array_entry>> arrays;
     std::unordered_map<CUmipmappedArray, mipmapped_array_entry> mipmapped_arrays;
-    std::unordered_map<uint64_t, std::shared_ptr<image_object_entry>> textures, surfaces;
+    // Native image handles are context-local and may have the same bits in
+    // independent contexts. Preserve those bits for native kernel arguments.
+    std::unordered_multimap<uint64_t, std::shared_ptr<image_object_entry>> textures, surfaces;
     std::uintptr_t next_array = 0xd000000, next_mipmapped_array = 0xe000000;
     // Extracted registry nodes keep earlier allocation generations until their
     // frees retire. A failed dependency can restore a node without allocation.
@@ -755,6 +758,8 @@ bool capture_graph_launch(const std::shared_ptr<context>&, CUstream, const graph
 #include "image_objects.inl"
 #include "memory.inl"
 #include "async_memory.inl"
+#include "batch_copy.inl"
+#include "managed_advice.inl"
 #include "launch_state.inl"
 #include "stream_attribute_state.inl"
 #include "kernel_launch.inl"
@@ -806,6 +811,9 @@ using namespace cudavm;
 #include "stream_exports.inl"
 #include "memory_operation_exports.inl"
 #include "async_memory_exports.inl"
+#include "batch_copy_exports.inl"
+#include "managed_advice_exports.inl"
+#include "virtual_address_exports.inl"
 #include "memory_pool_exports.inl"
 #include "graph_exports.inl"
 #include "graph_memory_exports.inl"
@@ -927,6 +935,7 @@ extern "C" CUDAVM_API int cudavmShutdown() {
         value.graph_cache.clear(); value.graph_pools.clear();
         value.memory_pools.clear(); value.default_pools.clear(); value.current_pools.clear();
         value.pool_storage.clear(); value.command_domains.clear(); value.device_buffers.clear();
+        value.address_reservations.clear();
         value.provider.reset(); value.devices.clear(); value.initialized = false;
         value.shutting_down = false;
         context_stack().clear(); ++value.epoch;

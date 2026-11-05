@@ -1,3 +1,11 @@
+CUmemcpyAttributes runtime_memcpy_attributes(const cudaMemcpyAttributes& attributes) {
+    CUmemcpyAttributes result{};
+    result.srcAccessOrder = static_cast<CUmemcpySrcAccessOrder>(attributes.srcAccessOrder);
+    result.srcLocHint.type = static_cast<CUmemLocationType>(attributes.srcLocHint.type); result.srcLocHint.id = attributes.srcLocHint.id;
+    result.dstLocHint.type = static_cast<CUmemLocationType>(attributes.dstLocHint.type); result.dstLocHint.id = attributes.dstLocHint.id;
+    result.flags = attributes.flags;
+    return result;
+}
 size_t memory_mul(size_t a, size_t b) {
     require(!a || b <= std::numeric_limits<size_t>::max() / a, CUDA_ERROR_INVALID_VALUE, "memory geometry multiplication overflow");
     return a * b;

@@ -101,7 +101,43 @@ struct cuda_buffer : buffer {
     }
     uint64_t native_address() const override { return address; }
     bool is_managed() const override { return managed; }
+    void advise(size_t offset, size_t bytes, CUmem_advise advice, CUmemLocation location) override {
+        cuda_context_guard guard(*context);
+        auto function = reinterpret_cast<decltype(&cuMemAdvise)>(context->api->driver.find("cuMemAdvise_v2"));
+        if (function) check(function(address + offset, bytes, advice, location), "cuMemAdvise_v2");
+        else {
+            // Older native loaders expose the int-device ABI. Its host/device
+            // subset implements the corresponding location-based facade calls.
+            bool ignored = advice == CU_MEM_ADVISE_SET_READ_MOSTLY || advice == CU_MEM_ADVISE_UNSET_READ_MOSTLY || advice == CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION;
+            require(ignored || location.type == CU_MEM_LOCATION_TYPE_HOST || location.type == CU_MEM_LOCATION_TYPE_DEVICE,
+                    CUDA_ERROR_NOT_SUPPORTED, "this native loader has no NUMA memory advice ABI");
+            using legacy_advice = CUresult (CUDAAPI*)(CUdeviceptr, size_t, CUmem_advise, CUdevice);
+            auto device = ignored || location.type == CU_MEM_LOCATION_TYPE_HOST ? CU_DEVICE_CPU : location.id;
+            check(context->api->driver.get<legacy_advice>("cuMemAdvise")(address + offset, bytes, advice, device), "cuMemAdvise");
+        }
+    }
+    void range_attribute(void* output, size_t output_size, CUmem_range_attribute attribute, size_t offset, size_t bytes) override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemRangeGetAttribute)>("cuMemRangeGetAttribute")
+              (output, output_size, attribute, address + offset, bytes), "cuMemRangeGetAttribute");
+    }
     size_t physical_size() const override { return imported || mapped_host || module || library ? 0 : size; }
+};
+struct cuda_address_reservation : virtual_address_reservation {
+    std::shared_ptr<cuda_context> context;
+    cuda_address_reservation(std::shared_ptr<cuda_context> owner, size_t bytes, size_t alignment, CUdeviceptr hint)
+        : context(std::move(owner)) {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemAddressReserve)>("cuMemAddressReserve")(&address, bytes, alignment, hint, 0), "cuMemAddressReserve");
+        size = bytes;
+    }
+    void release() override {
+        if (!address) return;
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemAddressFree)>("cuMemAddressFree")(address, size), "cuMemAddressFree");
+        address = 0;
+    }
+    ~cuda_address_reservation() { try { release(); } catch (...) {} }
 };
 struct cuda_mipmapped_storage {
     std::shared_ptr<cuda_context> context;
@@ -982,6 +1018,14 @@ struct cuda_session : session {
         cuda_context_guard guard(*context);
         check(context->api->driver.get<decltype(&cuMemAllocManaged)>("cuMemAllocManaged")(&result->address, bytes, flags), "cuMemAllocManaged");
         result->managed = true; return result;
+    }
+    size_t allocation_granularity(const CUmemAllocationProp& properties, CUmemAllocationGranularity_flags option) override {
+        cuda_context_guard guard(*context); size_t result = 0;
+        check(context->api->driver.get<decltype(&cuMemGetAllocationGranularity)>("cuMemGetAllocationGranularity")(&result, &properties, option), "cuMemGetAllocationGranularity");
+        return result;
+    }
+    std::unique_ptr<virtual_address_reservation> reserve_virtual_address(size_t bytes, size_t alignment, CUdeviceptr hint) override {
+        return std::make_unique<cuda_address_reservation>(context, bytes, alignment, hint);
     }
     device_work enqueue_attach(CUdeviceptr pointer, size_t bytes, unsigned flags, native_queue* queue) override {
         return cuda_enqueue(context, queue, [&](CUstream stream) {

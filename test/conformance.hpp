@@ -35,18 +35,19 @@ struct conformance_child_result { int status; std::string output; };
 conformance_child_result run_conformance_child(const char* executable, const char* backend, const char* case_name,
                                                bool capture_stderr = false);
 
+struct fixture_data {
+    std::string_view source, ptx, nvvm;
+    std::span<const unsigned char> cubin;
+    unsigned architecture = 75;
+    unsigned minimum_ptx = 0;
+};
+
 #ifndef CUDAVM_CONFORMANCE_HOST_ONLY
 // Only an absent declared device prerequisite is unavailable evidence. API or
 // execution failures on an applicable device must still fail the test.
 void require_capability(bool available, const std::string& reason);
 void check_driver(CUresult result, const char* operation);
 #define CONFORMANCE_CUDA(call) ::cudavm::check_driver((call), #call)
-
-struct fixture_data {
-    std::string_view source, ptx, nvvm;
-    std::span<const unsigned char> cubin;
-    unsigned architecture = 75;
-};
 
 #ifdef CUDAVM_CONFORMANCE_REGISTRATION
 struct registration_wrapper { uint32_t magic = 0x466243b1, version = 1; const void* image{}; const void* auxiliary{}; };

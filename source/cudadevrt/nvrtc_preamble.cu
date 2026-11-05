@@ -6,6 +6,7 @@
 #define __CUDACC_VER_BUILD__ 1
 #define CUDA_VERSION 13040
 #define __FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__ 1
+#define __FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__ 1
 #if __has_include(<nv/target>)
 #include <nv/target>
 #endif
@@ -140,6 +141,9 @@ __device__ inline float __fsub_rn(float x,float y) {return x-y;}
 // Parsed by the half header's optional transcendental wrappers. A caller using
 // it still needs a device implementation, like other unresolved NVRTC calls.
 extern "C" __device__ float tanhf(float);
+// Bfloat16 fallbacks use the strict, FTZ-independent FMA wrapper supplied by
+// the embedded device math source below.
+extern "C" __device__ float __fmaf_ieee_rn(float, float, float);
 extern "C" __device__ unsigned __nv_byte_perm(unsigned,unsigned,unsigned);
 __device__ inline unsigned __byte_perm(unsigned x,unsigned y,unsigned s) {return __nv_byte_perm(x,y,s);}
 __device__ inline unsigned __funnelshift_l(unsigned lo,unsigned hi,unsigned s) {
@@ -167,6 +171,9 @@ __device__ inline unsigned atomicAdd_block(unsigned* p,unsigned v) {
 __device__ inline unsigned atomicOr(unsigned* p,unsigned v) {return __atomic_fetch_or(p,v,__ATOMIC_RELAXED);}
 __device__ inline unsigned atomicAnd(unsigned* p,unsigned v) {return __atomic_fetch_and(p,v,__ATOMIC_RELAXED);}
 __device__ inline unsigned atomicCAS(unsigned* p,unsigned c,unsigned v) {__atomic_compare_exchange_n(p,&c,v,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED);return c;}
+// The bfloat16 header parses optional subword atomic wrappers. Executing them
+// requires a separately checked subword-atomic implementation.
+__device__ unsigned short atomicCAS(unsigned short*, unsigned short, unsigned short);
 __device__ inline unsigned min(unsigned a,unsigned b) {return a<b?a:b;}
 __device__ inline unsigned max(unsigned a,unsigned b) {return a>b?a:b;}
 __device__ inline int min(int a,int b) {return a<b?a:b;}

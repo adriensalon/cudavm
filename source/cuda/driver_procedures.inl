@@ -1,6 +1,16 @@
 // CUDA API versions and exact entry points from the pinned cudaTypedefs.h
 // (and cudaGLTypedefs.h). Keep distinct ABI revisions as separate entries.
 DRIVER_PROCEDURE(cuArrayCreate, 3020, cuArrayCreate_v2)
+DRIVER_PROCEDURE(cuMemcpyBatchAsync, 13000, cuMemcpyBatchAsync_v2)
+DRIVER_PROCEDURE_PTDS(cuMemcpyBatchAsync, 13000, ptsz, cuMemcpyBatchAsync_v2_ptsz)
+DRIVER_PROCEDURE(cuMemcpyWithAttributesAsync, 13020, cuMemcpyWithAttributesAsync)
+DRIVER_PROCEDURE(cuMemAdvise, 12020, cuMemAdvise_v2)
+DRIVER_PROCEDURE(cuMemRangeGetAttribute, 8000, cuMemRangeGetAttribute)
+DRIVER_PROCEDURE(cuMemRangeGetAttributes, 8000, cuMemRangeGetAttributes)
+DRIVER_PROCEDURE(cuMemGetAllocationGranularity, 10020, cuMemGetAllocationGranularity)
+DRIVER_PROCEDURE(cuMemAddressReserve, 10020, cuMemAddressReserve)
+DRIVER_PROCEDURE(cuMemAddressFree, 10020, cuMemAddressFree)
+DRIVER_PROCEDURE_PTDS(cuMemcpyWithAttributesAsync, 13020, ptsz, cuMemcpyWithAttributesAsync_ptsz)
 DRIVER_PROCEDURE(cuArrayGetDescriptor, 3020, cuArrayGetDescriptor_v2)
 DRIVER_PROCEDURE(cuArray3DCreate, 3020, cuArray3DCreate_v2)
 DRIVER_PROCEDURE(cuArray3DGetDescriptor, 3020, cuArray3DGetDescriptor_v2)

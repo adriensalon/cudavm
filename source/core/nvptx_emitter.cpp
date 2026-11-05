@@ -195,8 +195,8 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
     if (!target) throw std::runtime_error(error);
     llvm::TargetOptions settings;
     // Inline instructions from CUDA headers also impose a PTX dialect floor.
-    // Packed half comparisons need PTX 6.5; the pinned tanh assembly needs
-    // PTX 7.0 even on SM 75. Dynamic alloca needs PTX 7.3 and SM 52.
+    // Packed half comparisons and half absolute value need PTX 6.5; the pinned
+    // tanh assembly needs PTX 7.0 even on SM 75. Dynamic alloca needs PTX 7.3 and SM 52.
     // 128-bit register/move/atomic forms need PTX 8.3 even on SM 90.
     // Never lower a newer architecture's default floor.
     unsigned dialect=0;
@@ -204,7 +204,7 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
         if (auto* allocation=llvm::dyn_cast<llvm::AllocaInst>(&instruction); allocation && !allocation->isStaticAlloca()) dialect=std::max(dialect,73u);
         if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->isInlineAsm()) {
             auto text=llvm::cast<llvm::InlineAsm>(call->getCalledOperand())->getAsmString();
-            if(text.contains(".u32.f16x2"))dialect=std::max(dialect,65u);
+            if(text.contains(".u32.f16x2") || text.contains("abs.f16"))dialect=std::max(dialect,65u);
             if(text.contains("tanh.approx."))dialect=std::max(dialect,70u);
             if(text.contains(".b128"))dialect=std::max(dialect,83u);
         }
