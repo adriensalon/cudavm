@@ -28,6 +28,9 @@
 #include <io.h>
 #else
 #include <csignal>
+#ifndef CUDAVM_CONFORMANCE_HOST_ONLY
+#include <dlfcn.h>
+#endif
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <poll.h>
@@ -403,6 +406,20 @@ struct conformance_driver_error : std::runtime_error {
     conformance_driver_error(CUresult status, const std::string& message)
         : std::runtime_error(message), result(status) {}
 };
+int native_cuda_version() {
+#if defined(_WIN32)
+    auto library = LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    require_capability(library, "native CUDA driver unavailable");
+    auto query = reinterpret_cast<decltype(&cuDriverGetVersion)>(GetProcAddress(library, "cuDriverGetVersion"));
+    int version{}; auto status = query ? query(&version) : CUDA_ERROR_NOT_SUPPORTED; FreeLibrary(library);
+#else
+    auto library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    require_capability(library, "native CUDA driver unavailable");
+    auto query = reinterpret_cast<decltype(&cuDriverGetVersion)>(dlsym(library, "cuDriverGetVersion"));
+    int version{}; auto status = query ? query(&version) : CUDA_ERROR_NOT_SUPPORTED; dlclose(library);
+#endif
+    CONFORMANCE_CUDA(status); return version;
+}
 void check_driver(CUresult result, const char* operation) {
     if (result == CUDA_SUCCESS) return;
     const char* name = nullptr;

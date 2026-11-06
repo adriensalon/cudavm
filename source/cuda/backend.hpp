@@ -191,11 +191,19 @@ struct buffer {
     virtual CUDA_ARRAY_SPARSE_PROPERTIES array_sparse_properties() const {
         throw failure(CUDA_ERROR_INVALID_VALUE, "array is not sparse");
     }
+    virtual CUDA_ARRAY_SPARSE_PROPERTIES mipmapped_sparse_properties() const {
+        throw failure(CUDA_ERROR_INVALID_VALUE, "array has no sparse mipmapped allocation");
+    }
     virtual CUDA_ARRAY_MEMORY_REQUIREMENTS mipmapped_requirements() const {
         throw failure(CUDA_ERROR_INVALID_VALUE, "array has no mipmapped allocation");
     }
     virtual size_t restore_graph() { return size; }
     virtual void trim_graph() { throw failure(CUDA_ERROR_NOT_SUPPORTED, "graph backing cannot be unmapped"); }
+};
+struct array_mapping {
+    CUarrayMapInfo parameters{};
+    std::shared_ptr<buffer> resource;
+    std::shared_ptr<virtual_allocation> physical;
 };
 // Array coordinates exposed to byte-copy APIs address whole storage blocks.
 inline size_t array_element_bytes(const CUDA_ARRAY3D_DESCRIPTOR& d) {
@@ -337,6 +345,18 @@ struct device_task {
     virtual bool yields_to_exclusive() const { return false; }
 };
 using device_work = std::shared_ptr<device_task>;
+struct interprocess_event_record : device_task {
+    // The native record generation is already published. Release its GPU gate
+    // only after preceding facade work has completed on the host scheduler.
+    virtual void publish() = 0;
+};
+struct interprocess_event {
+    virtual ~interprocess_event() = default;
+    virtual CUipcEventHandle export_handle() = 0;
+    virtual std::shared_ptr<interprocess_event_record> record() = 0;
+    virtual device_work snapshot() = 0;
+    virtual bool query() = 0;
+};
 struct native_signal_group : native_signal {
     std::vector<std::shared_ptr<native_signal>> signals;
     bool can_wait(native_queue* queue) const override {
@@ -400,6 +420,7 @@ struct native_graph {
 // Unlike recorded regions, their node and conditional handles must stay stable.
 struct native_graph_definition;
 struct native_graph_executable : native_graph {
+    virtual CUgraphExec device_handle() const { return nullptr; }
     virtual device_work upload(native_queue*) = 0;
     virtual void set_params(CUgraphNode, CUgraphNodeParams&) = 0;
     virtual void set_enabled(CUgraphNode, bool) = 0;
@@ -528,6 +549,18 @@ struct image_object {
     uint64_t handle = 0;
     virtual ~image_object() = default;
 };
+struct image_reference {
+    virtual ~image_reference() = default;
+    virtual void bind_array(buffer&, unsigned) = 0;
+    virtual void set_format(CUarray_format, int) = 0;
+    virtual void format(CUarray_format*, int*) = 0;
+    virtual void set_address_mode(int, CUaddress_mode) = 0;
+    virtual CUaddress_mode address_mode(int) = 0;
+    virtual void set_filter_mode(CUfilter_mode) = 0;
+    virtual CUfilter_mode filter_mode() = 0;
+    virtual void set_flags(unsigned) = 0;
+    virtual unsigned flags() = 0;
+};
 struct kernel_parameter { size_t offset, size; };
 struct compute_pipeline {
     unsigned direct_buffers = 0;
@@ -611,6 +644,9 @@ struct executable {
     virtual std::vector<std::string> kernel_names() const { throw failure(CUDA_ERROR_NOT_SUPPORTED, "module kernel enumeration is unavailable"); }
     virtual std::vector<std::string> global_names() const { return {}; }
     virtual std::unique_ptr<buffer> find_global(const char*) { throw failure(CUDA_ERROR_NOT_FOUND, "global symbol is absent from module"); }
+    virtual std::shared_ptr<image_reference> find_image_reference(const char*, bool) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "module image references are unavailable on this adapter");
+    }
     virtual void bind_globals(std::span<const allocation_binding>) {}
     virtual void unload() = 0;
 };
@@ -696,6 +732,9 @@ struct session {
     virtual std::shared_ptr<virtual_allocation> create_virtual_allocation(size_t, const CUmemAllocationProp&) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual physical allocation is unavailable");
     }
+    virtual device_work enqueue_array_mapping(std::span<const array_mapping>, native_queue*) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "array mapping is unavailable on this adapter");
+    }
     virtual std::shared_ptr<virtual_allocation> import_virtual_allocation(void*, CUmemAllocationHandleType) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual physical memory import is unavailable");
     }
@@ -758,6 +797,12 @@ struct session {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "device graph state requires native CUDA graph services");
     }
     virtual device_work enqueue_marker(native_queue*) { return {}; }
+    virtual std::shared_ptr<interprocess_event> create_interprocess_event(unsigned) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "interprocess events are unavailable on this adapter");
+    }
+    virtual std::shared_ptr<interprocess_event> import_interprocess_event(CUipcEventHandle) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "interprocess event import is unavailable on this adapter");
+    }
     // Values are published before the returned task completes. Timing uses
     // either a native timer pair or ticks with a nonzero clock period.
     virtual device_work enqueue_timestamp(std::shared_ptr<device_timestamp>, native_queue*) { return {}; }

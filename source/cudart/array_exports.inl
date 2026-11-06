@@ -45,6 +45,12 @@ RUNTIME_API(cudaArrayGetSparseProperties, (cudaArraySparseProperties* output, cu
     check(cuArrayGetSparseProperties(&properties, reinterpret_cast<CUarray>(array)));
     *output = {}; output->tileExtent = {properties.tileExtent.width, properties.tileExtent.height, properties.tileExtent.depth};
     output->miptailFirstLevel = properties.miptailFirstLevel; output->miptailSize = properties.miptailSize; output->flags = properties.flags)
+RUNTIME_API(cudaMipmappedArrayGetSparseProperties, (cudaArraySparseProperties* output, cudaMipmappedArray_t array),
+    require(output, CUDA_ERROR_INVALID_VALUE, "null mipmap sparse properties output"); runtime_current();
+    CUDA_ARRAY_SPARSE_PROPERTIES properties{};
+    check(cuMipmappedArrayGetSparseProperties(&properties, reinterpret_cast<CUmipmappedArray>(array)));
+    *output = {}; output->tileExtent = {properties.tileExtent.width, properties.tileExtent.height, properties.tileExtent.depth};
+    output->miptailFirstLevel = properties.miptailFirstLevel; output->miptailSize = properties.miptailSize; output->flags = properties.flags)
 extern "C" CUDAVM_CUDART_API cudaChannelFormatDesc CUDARTAPI cudaCreateChannelDesc(int x,int y,int z,int w,cudaChannelFormatKind kind) { return {x,y,z,w,kind}; }
 RUNTIME_API(cudaMemcpy2DToArray, (cudaArray_t to,size_t x,size_t y,const void* from,size_t pitch,size_t width,size_t height,cudaMemcpyKind kind),
     require(to,CUDA_ERROR_INVALID_VALUE,"null destination array"); runtime_current();

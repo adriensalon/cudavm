@@ -89,7 +89,26 @@ llvm::Value* texture_component(llvm::Value* object, llvm::Value* texel, unsigned
             auto* normalized = llvm::BasicBlock::Create(b.getContext(), "normalized", helper);
             auto* element = llvm::BasicBlock::Create(b.getContext(), "element", helper);
             b.CreateCondBr(b.CreateICmpNE(b.CreateAnd(flags, b.getInt32(4)), b.getInt32(0)), normalized, element);
-            b.SetInsertPoint(element); b.CreateRet(b.CreateSelect(present, integer, missing));
+            b.SetInsertPoint(element);
+            // Decode binary16 texels with integer bits, including subnormals;
+            // shader native half support is not a prerequisite for sampling.
+            auto* fraction = b.CreateAnd(value, b.getInt32(1023));
+            auto* exponent = b.CreateAnd(b.CreateLShr(value, b.getInt32(10)), b.getInt32(31));
+            auto* leading = dxil ? b.CreateSelect(b.CreateICmpEQ(fraction, b.getInt32(0)), b.getInt32(32),
+                b.CreateIntrinsic(b.getInt32Ty(), llvm::Intrinsic::dx_firstbituhigh, {fraction}))
+                : b.CreateIntrinsic(b.getInt32Ty(), llvm::Intrinsic::ctlz, {fraction, b.getFalse()});
+            auto* distance = b.CreateSub(leading, b.getInt32(21));
+            auto* normal = b.CreateOr(b.CreateShl(b.CreateAdd(exponent, b.getInt32(112)), b.getInt32(23)), b.CreateShl(fraction, b.getInt32(13)));
+            auto* subnormal = b.CreateOr(b.CreateShl(b.CreateSub(b.getInt32(113), distance), b.getInt32(23)),
+                b.CreateShl(b.CreateAnd(b.CreateShl(fraction, distance), b.getInt32(1023)), b.getInt32(13)));
+            subnormal = b.CreateSelect(b.CreateICmpEQ(fraction, b.getInt32(0)), b.getInt32(0), subnormal);
+            auto* special = b.CreateOr(b.getInt32(0x7f800000), b.CreateShl(fraction, b.getInt32(13)));
+            auto* half = b.CreateSelect(b.CreateICmpEQ(exponent, b.getInt32(31)), special,
+                b.CreateSelect(b.CreateICmpEQ(exponent, b.getInt32(0)), subnormal, normal));
+            half = b.CreateOr(half, b.CreateShl(b.CreateAnd(value, b.getInt32(0x8000)), b.getInt32(16)));
+            auto* is_half = b.CreateAnd(b.CreateICmpEQ(kind, b.getInt32(0)), b.CreateICmpEQ(bytes, b.getInt32(2)));
+            auto* element_bits = b.CreateSelect(is_half, b.CreateSelect(valid, half, border), integer);
+            b.CreateRet(b.CreateSelect(present, element_bits, missing));
             b.SetInsertPoint(normalized);
             auto* encoded = normalize_texture_integer(integer, bits, signed_format);
             b.CreateRet(b.CreateSelect(present, encoded, missing));

@@ -3,6 +3,7 @@ void graph_native_add(CUgraph, graph_node&);
 void graph_native_replace(const graph_node&, graph_node&);
 bool graph_has_device_nodes(const std::vector<graph_node>&);
 bool graph_has_conditionals(const std::vector<graph_node>&);
+bool graph_validate_device_launch(const std::vector<graph_node>&, const std::shared_ptr<context>&, CUDA_GRAPH_INSTANTIATE_PARAMS*);
 bool graph_native_launch(graph_exec&, const std::shared_ptr<context>&, const std::shared_ptr<stream_state>&, CUstream, bool);
 void graph_native_instantiate(graph_exec&, CUgraph);
 void graph_native_update(graph_exec&, CUgraph, std::vector<graph_node>&);

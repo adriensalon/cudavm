@@ -4,6 +4,10 @@ RUNTIME_API(cudaCreateTextureObject, (cudaTextureObject_t* output, const cudaRes
     if (texture->filterMode == cudaFilterModeLinear || texture->readMode == cudaReadModeNormalizedFloat) {
         CUDA_ARRAY3D_DESCRIPTOR array{};
         if (r.resType == CU_RESOURCE_TYPE_ARRAY) check(cuArray3DGetDescriptor(&array, r.res.array.hArray));
+        else if (r.resType == CU_RESOURCE_TYPE_MIPMAPPED_ARRAY) {
+            CUarray level{}; check(cuMipmappedArrayGetLevel(&level, r.res.mipmap.hMipmappedArray, 0));
+            check(cuArray3DGetDescriptor(&array, level));
+        }
         else array.Format = r.resType == CU_RESOURCE_TYPE_LINEAR ? r.res.linear.format : r.res.pitch2D.format;
         bool integer32 = array.Format == CU_AD_FORMAT_SIGNED_INT32 || array.Format == CU_AD_FORMAT_UNSIGNED_INT32;
         if (texture->filterMode == cudaFilterModeLinear) symbol_require(array.Format == CU_AD_FORMAT_FLOAT || array.Format == CU_AD_FORMAT_HALF ||

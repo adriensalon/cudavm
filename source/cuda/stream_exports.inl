@@ -22,6 +22,17 @@ DRIVER_API(cuEventRecordWithFlags, (CUevent event, CUstream stream, unsigned fla
 DRIVER_API(cuEventQuery, (CUevent event), driver_ready(); event_status(event, false))
 DRIVER_API(cuEventSynchronize, (CUevent event), driver_ready(); event_status(event, true))
 DRIVER_API(cuEventDestroy, (CUevent event), driver_ready(); event_lookup(event); global().events.erase(event))
+DRIVER_API(cuIpcGetEventHandle, (CUipcEventHandle* output, CUevent handle),
+    driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null IPC event handle output"); auto& event = event_lookup(handle);
+    require(event.interprocess && !event.imported, CUDA_ERROR_INVALID_HANDLE, "event was not created for IPC export");
+    auto owner = event.owner.lock(); auto native = event.interprocess;
+    *output = context_configuration(owner, [&] { return native->export_handle(); }))
+DRIVER_API(cuIpcOpenEventHandle, (CUevent* output, CUipcEventHandle record),
+    driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null IPC event import output"); auto owner = current();
+    auto native = context_configuration(owner, [&] { return owner->native->import_interprocess_event(record); });
+    auto handle = reinterpret_cast<CUevent>(global().next_event); global().next_event += 0x100;
+    event_state event{owner, CU_EVENT_DISABLE_TIMING, {}, {}, {}}; event.interprocess = std::move(native); event.imported = true;
+    global().events.emplace(handle, std::move(event)); *output = handle)
 DRIVER_API(cuEventElapsedTime, (float* output, CUevent start, CUevent end), driver_ready(); event_elapsed(output, start, end))
 DRIVER_API(cuLaunchHostFunc, (CUstream stream, CUhostFn function, void* data), driver_ready(); host_function(stream, function, data))
 DRIVER_API(cuStreamAddCallback, (CUstream stream, CUstreamCallback callback, void* data, unsigned flags), driver_ready(); stream_callback(stream, stream, callback, data, flags))

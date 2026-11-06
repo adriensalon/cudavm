@@ -48,4 +48,16 @@ DRIVER_API(cuMipmappedArrayGetMemoryRequirements, (CUDA_ARRAY_MEMORY_REQUIREMENT
         result.size += requirements.size; result.alignment = std::max(result.alignment, requirements.alignment);
     }
     *output = result)
+DRIVER_API(cuMipmappedArrayGetSparseProperties, (CUDA_ARRAY_SPARSE_PROPERTIES* output, CUmipmappedArray handle),
+    driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null mipmap sparse properties output");
+    auto owner = current(); auto found = global().mipmapped_arrays.find(handle);
+    require(found != global().mipmapped_arrays.end() && !found->second.retiring, CUDA_ERROR_INVALID_HANDLE, "invalid mipmapped array");
+    require(found->second.owner == owner, CUDA_ERROR_INVALID_CONTEXT, "mipmapped array belongs to a different context");
+    auto first = array_lookup(found->second.levels.front(), owner);
+    require(first->descriptor.Flags & CUDA_ARRAY3D_SPARSE, CUDA_ERROR_INVALID_VALUE, "mipmap is not sparse");
+    *output = native_call(owner, [&] { return first->native->mipmapped_sparse_properties(); }))
 DRIVER_API(cuMipmappedArrayDestroy, (CUmipmappedArray handle), driver_ready(); destroy_mipmapped_array(handle))
+DRIVER_API(cuMemMapArrayAsync, (CUarrayMapInfo* mappings, unsigned count, CUstream stream),
+    driver_ready(); map_arrays(mappings, count, stream))
+DRIVER_API(cuMemMapArrayAsync_ptsz, (CUarrayMapInfo* mappings, unsigned count, CUstream stream),
+    driver_ready(); map_arrays(mappings, count, stream ? stream : CU_STREAM_PER_THREAD))

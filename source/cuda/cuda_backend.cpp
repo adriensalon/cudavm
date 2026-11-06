@@ -75,6 +75,11 @@ struct cuda_ipc_mapping {
     bool promoted = false;
 };
 struct cuda_allocation_range { CUdeviceptr address; size_t size; };
+struct cuda_ipc_gate_page {
+    void* host{};
+    CUdeviceptr device{};
+    uint64_t available = UINT64_MAX;
+};
 struct cuda_context {
     std::shared_ptr<cuda_api> api;
     CUcontext value = nullptr;
@@ -83,12 +88,22 @@ struct cuda_context {
     std::unordered_map<CUdeviceptr, std::weak_ptr<cuda_ipc_mapping>> ipc_mappings;
     std::mutex allocation_mutex;
     std::unordered_map<const void*, cuda_allocation_range> allocations;
+    std::mutex ipc_gate_mutex;
+    std::vector<cuda_ipc_gate_page> ipc_gate_pages;
     explicit cuda_context(std::shared_ptr<cuda_api> input, CUdevice device, unsigned flags) : api(std::move(input)), device(device) {
         check(api->create(&value, flags, device), "cuCtxCreate_v2");
         CUcontext popped = nullptr;
         check(api->pop(&popped), "cuCtxPopCurrent_v2");
     }
-    ~cuda_context() { if (value) api->destroy(value); }
+    ~cuda_context() {
+        if (!value) return;
+        if (!ipc_gate_pages.empty() && api->push(value) == CUDA_SUCCESS) {
+            for (const auto& page : ipc_gate_pages) if (page.host)
+                api->driver.get<decltype(&cuMemFreeHost)>("cuMemFreeHost")(page.host);
+            CUcontext previous{}; api->pop(&previous);
+        }
+        api->destroy(value);
+    }
 };
 struct cuda_context_guard {
     cuda_context& context;
@@ -421,9 +436,60 @@ struct cuda_virtual_mapping : cuda_buffer {
         address = 0; // Reserved VA must never reach cuda_buffer's cuMemFree path.
     }
 };
+struct cuda_array_mapping_reference {
+    CUarraySparseSubresourceType type{};
+    unsigned level{}, layer{};
+    std::array<uint64_t, 3> lower{}, upper{};
+    std::shared_ptr<virtual_allocation> physical;
+};
+cuda_array_mapping_reference cuda_mapping_reference(const array_mapping& mapping) {
+    const auto& p = mapping.parameters;
+    cuda_array_mapping_reference result; result.type = p.subresourceType; result.physical = mapping.physical;
+    if (p.subresourceType == CU_ARRAY_SPARSE_SUBRESOURCE_TYPE_MIPTAIL) {
+        const auto& s = p.subresource.miptail;
+        result.layer = s.layer; result.lower = {s.offset, 0, 0}; result.upper = {s.offset + s.size, 1, 1};
+    } else {
+        const auto& s = p.subresource.sparseLevel;
+        result.level = s.level; result.layer = s.layer; result.lower = {s.offsetX, s.offsetY, s.offsetZ};
+        result.upper = {uint64_t(s.offsetX) + s.extentWidth, uint64_t(s.offsetY) + s.extentHeight, uint64_t(s.offsetZ) + s.extentDepth};
+    }
+    return result;
+}
+void cuda_unmap_references(std::vector<cuda_array_mapping_reference>& references, const cuda_array_mapping_reference& removed) {
+    std::vector<cuda_array_mapping_reference> retained;
+    for (auto region : references) {
+        bool intersects = region.type == removed.type && region.level == removed.level && region.layer == removed.layer;
+        for (unsigned axis = 0; axis < 3; ++axis)
+            intersects = intersects && region.lower[axis] < removed.upper[axis] && removed.lower[axis] < region.upper[axis];
+        if (!intersects) { retained.push_back(std::move(region)); continue; }
+        // Subtract the intersection as up to six disjoint boxes. Partial unmaps
+        // retain backing only for the mapped remainder, including mip-tail spans.
+        for (unsigned axis = 0; axis < 3; ++axis) {
+            const auto lower = std::max(region.lower[axis], removed.lower[axis]);
+            const auto upper = std::min(region.upper[axis], removed.upper[axis]);
+            if (region.lower[axis] < lower) {
+                auto piece = region; piece.upper[axis] = lower; retained.push_back(std::move(piece));
+            }
+            if (upper < region.upper[axis]) {
+                auto piece = region; piece.lower[axis] = upper; retained.push_back(std::move(piece));
+            }
+            region.lower[axis] = lower; region.upper[axis] = upper;
+        }
+    }
+    references = std::move(retained);
+}
+struct cuda_array_mapping_task : device_task {
+    std::vector<std::vector<cuda_array_mapping_reference>> previous;
+    // Destroy the native fence (which waits on early retirement) before releasing
+    // backing removed by an asynchronous unmap.
+    device_work pending;
+    bool query() override { return pending->query(); }
+    std::shared_ptr<native_signal> signal() const override { return pending->signal(); }
+};
 struct cuda_mipmapped_storage {
     std::shared_ptr<cuda_context> context;
     CUmipmappedArray value = nullptr;
+    std::vector<cuda_array_mapping_reference> mappings;
     explicit cuda_mipmapped_storage(std::shared_ptr<cuda_context> owner) : context(std::move(owner)) {}
     ~cuda_mipmapped_storage() {
         if (value && context->api->push(context->value) == CUDA_SUCCESS) {
@@ -437,6 +503,7 @@ struct cuda_array_buffer : cuda_buffer {
     CUarray cuda_array() const override { return value; }
     CUDA_ARRAY3D_DESCRIPTOR descriptor{};
     std::shared_ptr<cuda_mipmapped_storage> mipmapped;
+    std::vector<cuda_array_mapping_reference> mappings;
     cuda_array_buffer(std::shared_ptr<cuda_context> owner, const CUDA_ARRAY3D_DESCRIPTOR& d)
         : cuda_buffer(std::move(owner), array_storage_bytes(d), 0, {}), descriptor(d) {}
     size_t physical_size() const override {
@@ -454,6 +521,14 @@ struct cuda_array_buffer : cuda_buffer {
         CUDA_ARRAY_SPARSE_PROPERTIES result{};
         check(context->api->driver.get<decltype(&cuArrayGetSparseProperties)>("cuArrayGetSparseProperties")(
             &result, value), "cuArrayGetSparseProperties");
+        return result;
+    }
+    CUDA_ARRAY_SPARSE_PROPERTIES mipmapped_sparse_properties() const override {
+        require(bool(mipmapped), CUDA_ERROR_INVALID_VALUE, "array has no mipmapped allocation");
+        cuda_context_guard guard(*context);
+        CUDA_ARRAY_SPARSE_PROPERTIES result{};
+        check(context->api->driver.get<decltype(&cuMipmappedArrayGetSparseProperties)>("cuMipmappedArrayGetSparseProperties")(
+            &result, mipmapped->value), "cuMipmappedArrayGetSparseProperties");
         return result;
     }
     CUDA_ARRAY_MEMORY_REQUIREMENTS mipmapped_requirements() const override {
@@ -768,6 +843,115 @@ struct cuda_host : host_allocation {
         return value;
     }
 };
+struct cuda_ipc_gate {
+    std::shared_ptr<cuda_context> context;
+    size_t page{};
+    unsigned slot{};
+    unsigned* address{};
+    CUdeviceptr device{};
+    ~cuda_ipc_gate() {
+        if (address) { std::lock_guard lock(context->ipc_gate_mutex); context->ipc_gate_pages[page].available |= uint64_t(1) << slot; }
+    }
+};
+std::shared_ptr<cuda_ipc_gate> acquire_ipc_gate(const std::shared_ptr<cuda_context>& context) {
+    auto result = std::make_shared<cuda_ipc_gate>(); result->context = context;
+    std::lock_guard lock(context->ipc_gate_mutex);
+    auto& pages = context->ipc_gate_pages;
+    size_t index = 0;
+    while (index < pages.size() && !pages[index].available) ++index;
+    if (index == pages.size()) {
+        pages.reserve(pages.size() + 1);
+        cuda_context_guard guard(*context); void* host{};
+        check(context->api->driver.get<decltype(&cuMemHostAlloc)>("cuMemHostAlloc")(&host, 4096,
+            CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE), "cuMemHostAlloc IPC gate page");
+        pages.push_back({host, 0, 0}); // The context owns the page even if mapping fails.
+        check(context->api->driver.get<decltype(&cuMemHostGetDevicePointer)>("cuMemHostGetDevicePointer_v2")(
+            &pages.back().device, host, 0), "cuMemHostGetDevicePointer IPC gate page");
+        pages.back().available = UINT64_MAX;
+    }
+    auto& page = pages[index]; unsigned slot = 0;
+    while (!(page.available & (uint64_t(1) << slot))) ++slot;
+    page.available &= ~(uint64_t(1) << slot);
+    result->page = index; result->slot = slot;
+    result->address = reinterpret_cast<unsigned*>(static_cast<std::byte*>(page.host) + slot * 64);
+    result->device = page.device + slot * 64; std::construct_at(result->address, 0u); return result;
+}
+struct cuda_ipc_event;
+struct cuda_ipc_event_task : interprocess_event_record {
+    std::shared_ptr<cuda_context> context;
+    std::shared_ptr<cuda_ipc_event> owner;
+    std::shared_ptr<cuda_queue> queue;
+    std::shared_ptr<cuda_ipc_gate> gate;
+    device_work pending;
+    void publish() override {
+        if (gate) std::atomic_ref<unsigned>(*gate->address).store(1, std::memory_order_release);
+    }
+    ~cuda_ipc_event_task() {
+        publish();
+        if (pending) pending.reset();
+        else if (gate && queue && context->api->push(context->value) == CUDA_SUCCESS) {
+            context->api->driver.get<decltype(&cuStreamSynchronize)>("cuStreamSynchronize")(queue->value);
+            CUcontext previous{}; context->api->pop(&previous);
+        }
+    }
+    bool query() override { return pending->query(); }
+    std::shared_ptr<native_signal> signal() const override { return pending->signal(); }
+};
+struct cuda_ipc_event : interprocess_event, std::enable_shared_from_this<cuda_ipc_event> {
+    std::shared_ptr<cuda_context> context;
+    CUevent value{};
+    cuda_ipc_event(std::shared_ptr<cuda_context> owner, unsigned flags) : context(std::move(owner)) {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuEventCreate)>("cuEventCreate")(&value, flags), "cuEventCreate interprocess");
+    }
+    cuda_ipc_event(std::shared_ptr<cuda_context> owner, CUipcEventHandle handle) : context(std::move(owner)) {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuIpcOpenEventHandle)>("cuIpcOpenEventHandle")(&value, handle), "cuIpcOpenEventHandle");
+    }
+    ~cuda_ipc_event() {
+        if (value && context->api->push(context->value) == CUDA_SUCCESS) {
+            context->api->driver.get<decltype(&cuEventDestroy)>("cuEventDestroy_v2")(value);
+            CUcontext previous{}; context->api->pop(&previous);
+        }
+    }
+    CUipcEventHandle export_handle() override {
+        cuda_context_guard guard(*context); CUipcEventHandle result{};
+        check(context->api->driver.get<decltype(&cuIpcGetEventHandle)>("cuIpcGetEventHandle")(&result, value), "cuIpcGetEventHandle"); return result;
+    }
+    std::shared_ptr<cuda_ipc_event_task> task() {
+        auto result = std::make_shared<cuda_ipc_event_task>(); result->context = context; result->owner = shared_from_this();
+        // Separate lanes keep a newer blocked record from delaying an already
+        // accepted snapshot of an older generation.
+        result->queue = std::make_shared<cuda_queue>(context, 0); return result;
+    }
+    std::shared_ptr<interprocess_event_record> record() override {
+        auto result = task();
+        // Host frees can synchronize unrelated native streams. Reuse gate slots
+        // until context retirement rather than freeing them on the queue worker.
+        result->gate = acquire_ipc_gate(context);
+        cuda_context_guard guard(*context);
+        auto& driver = context->api->driver;
+        auto wait = reinterpret_cast<decltype(&cuStreamWaitValue32)>(driver.find("cuStreamWaitValue32_v2"));
+        if (!wait) wait = reinterpret_cast<decltype(&cuStreamWaitValue32)>(driver.find("cuStreamWaitValue32"));
+        require(wait, CUDA_ERROR_NOT_SUPPORTED, "native stream memory waits are required for IPC publication");
+        auto done = std::make_shared<cuda_task>(context);
+        check(wait(result->queue->value, result->gate->device, 1, CU_STREAM_WAIT_VALUE_EQ), "cuStreamWaitValue32 IPC publication");
+        check(driver.get<decltype(&cuEventRecord)>("cuEventRecord")(value, result->queue->value), "cuEventRecord IPC publication");
+        done->record(result->queue->value); result->pending = std::move(done); return result;
+    }
+    device_work snapshot() override {
+        auto result = task(); cuda_context_guard guard(*context);
+        auto done = std::make_shared<cuda_task>(context);
+        check(context->api->driver.get<decltype(&cuStreamWaitEvent)>("cuStreamWaitEvent")(result->queue->value, value, 0), "cuStreamWaitEvent IPC snapshot");
+        done->record(result->queue->value); result->pending = std::move(done); return result;
+    }
+    bool query() override {
+        cuda_context_guard guard(*context);
+        auto result = context->api->driver.get<decltype(&cuEventQuery)>("cuEventQuery")(value);
+        if (result == CUDA_ERROR_NOT_READY) return false;
+        check(result, "cuEventQuery IPC"); return true;
+    }
+};
 struct cuda_semaphore : external_semaphore {
     std::shared_ptr<cuda_context> context;
     CUexternalSemaphore value = nullptr;
@@ -865,6 +1049,55 @@ struct cuda_kernel : kernel {
     void validate_configuration(const launch_shape&) override;
     void submit(const launch_shape&, CUstream, void**, void**);
 };
+struct cuda_image_reference : image_reference {
+    std::shared_ptr<cuda_context> context;
+    CUtexref texture{};
+    CUsurfref surface{};
+    cuda_image_reference(std::shared_ptr<cuda_context> owner, CUmodule module, const char* name, bool is_surface)
+        : context(std::move(owner)) {
+        cuda_context_guard guard(*context);
+        if (is_surface) check(context->api->driver.get<decltype(&cuModuleGetSurfRef)>("cuModuleGetSurfRef")(&surface, module, name), "cuModuleGetSurfRef");
+        else check(context->api->driver.get<decltype(&cuModuleGetTexRef)>("cuModuleGetTexRef")(&texture, module, name), "cuModuleGetTexRef");
+    }
+    void bind_array(buffer& storage, unsigned flags) override {
+        cuda_context_guard guard(*context);
+        require(storage.cuda_array(), CUDA_ERROR_INVALID_VALUE, "reference binding requires a native array");
+        if (surface) check(context->api->driver.get<decltype(&cuSurfRefSetArray)>("cuSurfRefSetArray")(surface, storage.cuda_array(), flags), "cuSurfRefSetArray");
+        else check(context->api->driver.get<decltype(&cuTexRefSetArray)>("cuTexRefSetArray")(texture, storage.cuda_array(), flags), "cuTexRefSetArray");
+    }
+    void set_format(CUarray_format format, int channels) override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuTexRefSetFormat)>("cuTexRefSetFormat")(texture, format, channels), "cuTexRefSetFormat");
+    }
+    void format(CUarray_format* format, int* channels) override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuTexRefGetFormat)>("cuTexRefGetFormat")(format, channels, texture), "cuTexRefGetFormat");
+    }
+    void set_address_mode(int dimension, CUaddress_mode mode) override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuTexRefSetAddressMode)>("cuTexRefSetAddressMode")(texture, dimension, mode), "cuTexRefSetAddressMode");
+    }
+    CUaddress_mode address_mode(int dimension) override {
+        cuda_context_guard guard(*context); CUaddress_mode result{};
+        check(context->api->driver.get<decltype(&cuTexRefGetAddressMode)>("cuTexRefGetAddressMode")(&result, texture, dimension), "cuTexRefGetAddressMode"); return result;
+    }
+    void set_filter_mode(CUfilter_mode mode) override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuTexRefSetFilterMode)>("cuTexRefSetFilterMode")(texture, mode), "cuTexRefSetFilterMode");
+    }
+    CUfilter_mode filter_mode() override {
+        cuda_context_guard guard(*context); CUfilter_mode result{};
+        check(context->api->driver.get<decltype(&cuTexRefGetFilterMode)>("cuTexRefGetFilterMode")(&result, texture), "cuTexRefGetFilterMode"); return result;
+    }
+    void set_flags(unsigned flags) override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuTexRefSetFlags)>("cuTexRefSetFlags")(texture, flags), "cuTexRefSetFlags");
+    }
+    unsigned flags() override {
+        cuda_context_guard guard(*context); unsigned result{};
+        check(context->api->driver.get<decltype(&cuTexRefGetFlags)>("cuTexRefGetFlags")(&result, texture), "cuTexRefGetFlags"); return result;
+    }
+};
 struct cuda_module : executable, std::enable_shared_from_this<cuda_module> {
     std::shared_ptr<cuda_context> context;
     CUmodule value = nullptr;
@@ -934,6 +1167,9 @@ struct cuda_module : executable, std::enable_shared_from_this<cuda_module> {
         unsigned managed = 0;
         check(context->api->driver.get<decltype(&cuPointerGetAttribute)>("cuPointerGetAttribute")(&managed, CU_POINTER_ATTRIBUTE_IS_MANAGED, pointer), "cuPointerGetAttribute");
         result->managed = managed != 0; return result;
+    }
+    std::shared_ptr<image_reference> find_image_reference(const char* name, bool surface) override {
+        return std::make_shared<cuda_image_reference>(context, value, name, surface);
     }
     void unload() override {
         require(!library, CUDA_ERROR_NOT_PERMITTED, "library modules are unloaded with their library");
@@ -1268,6 +1504,11 @@ struct cuda_session : session {
             require(array && array->value, CUDA_ERROR_NOT_SUPPORTED, "this array layout requires a texture adapter");
             resource.res.array.hArray = array->value;
         }
+        else if (resource.resType == CU_RESOURCE_TYPE_MIPMAPPED_ARRAY) {
+            auto* array = dynamic_cast<cuda_array_buffer*>(&storage);
+            require(array && array->mipmapped, CUDA_ERROR_INVALID_VALUE, "texture has no native mipmapped array");
+            resource.res.mipmap.hMipmappedArray = array->mipmapped->value;
+        }
         else if (resource.resType == CU_RESOURCE_TYPE_LINEAR) resource.res.linear.devPtr = storage.native_address() + offset;
         else resource.res.pitch2D.devPtr = storage.native_address() + offset;
         cuda_context_guard guard(*context);
@@ -1341,6 +1582,54 @@ struct cuda_session : session {
     std::shared_ptr<virtual_allocation> create_virtual_allocation(size_t bytes, const CUmemAllocationProp& properties) override {
         return std::make_shared<cuda_virtual_allocation>(context, bytes, properties);
     }
+    device_work enqueue_array_mapping(std::span<const array_mapping> mappings, native_queue* queue) override {
+        require(context->device >= 0 && context->device < 32, CUDA_ERROR_INVALID_DEVICE, "native array mapping device exceeds the device mask");
+        std::vector<CUarrayMapInfo> native;
+        struct array_mapping_update {
+            std::vector<cuda_array_mapping_reference>* target;
+            std::vector<cuda_array_mapping_reference> next;
+        };
+        std::vector<array_mapping_update> updates;
+        auto task = std::make_shared<cuda_array_mapping_task>();
+        native.reserve(mappings.size());
+        for (const auto& mapping : mappings) {
+            auto info = mapping.parameters;
+            auto& resource = static_cast<cuda_array_buffer&>(*mapping.resource);
+            if (info.resourceType == CU_RESOURCE_TYPE_ARRAY) info.resource.array = resource.value;
+            else info.resource.mipmap = resource.mipmapped->value;
+            if (mapping.physical) {
+                auto& physical = static_cast<cuda_virtual_allocation&>(*mapping.physical);
+                require(physical.handles.size() == 1, CUDA_ERROR_INVALID_VALUE, "array backing requires one tile-pool allocation");
+                info.memHandle.memHandle = physical.handles.front();
+            }
+            info.deviceBitMask = 1u << context->device;
+            native.push_back(info);
+            auto& references = resource.mipmapped ? resource.mipmapped->mappings : resource.mappings;
+            auto found = std::find_if(updates.begin(), updates.end(), [&](const auto& item) { return item.target == &references; });
+            if (found == updates.end()) {
+                updates.push_back({&references, references}); found = std::prev(updates.end());
+            }
+            cuda_array_mapping_reference region;
+            if (resource.descriptor.Flags & CUDA_ARRAY3D_DEFERRED_MAPPING) {
+                region.physical = mapping.physical;
+                region.type = CU_ARRAY_SPARSE_SUBRESOURCE_TYPE_SPARSE_LEVEL;
+                region.level = region.layer = 0; region.lower = {0, 0, 0}; region.upper = {1, 1, 1};
+            } else region = cuda_mapping_reference(mapping);
+            if (mapping.physical) found->next.push_back(std::move(region));
+            else cuda_unmap_references(found->next, region);
+        }
+        task->previous.resize(updates.size());
+        task->pending = cuda_enqueue(context, queue, [&](CUstream stream) {
+            check(context->api->driver.get<decltype(&cuMemMapArrayAsync)>("cuMemMapArrayAsync")(
+                native.data(), unsigned(native.size()), stream), "cuMemMapArrayAsync");
+            for (size_t i = 0; i < updates.size(); ++i) {
+                auto& change = updates[i];
+                task->previous[i].swap(*change.target);
+                change.target->swap(change.next);
+            }
+        });
+        return task;
+    }
     std::shared_ptr<virtual_allocation> import_virtual_allocation(void* handle, CUmemAllocationHandleType type) override {
         return std::make_shared<cuda_virtual_allocation>(context, handle, type);
     }
@@ -1402,6 +1691,12 @@ struct cuda_session : session {
     std::shared_ptr<native_queue> create_queue(int priority) override { return std::make_shared<cuda_queue>(context, priority); }
     device_work enqueue_marker(native_queue* queue) override {
         return cuda_enqueue(context, queue, [](CUstream) {});
+    }
+    std::shared_ptr<interprocess_event> create_interprocess_event(unsigned flags) override {
+        return std::make_shared<cuda_ipc_event>(context, flags);
+    }
+    std::shared_ptr<interprocess_event> import_interprocess_event(CUipcEventHandle handle) override {
+        return std::make_shared<cuda_ipc_event>(context, handle);
     }
     device_work enqueue_timestamp(std::shared_ptr<device_timestamp> timestamp, native_queue* queue) override {
         cuda_context_guard guard(*context);

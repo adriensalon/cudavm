@@ -93,6 +93,8 @@ struct event_state {
     std::vector<CUgraphNode> capture_dependencies;
     std::vector<CUgraphEdgeData> capture_edges;
     std::shared_ptr<device_timestamp> timestamp;
+    std::shared_ptr<interprocess_event> interprocess{};
+    bool imported = false;
 };
 #include "memory_pool_state.inl"
 struct virtual_allocation_state {
@@ -152,6 +154,13 @@ struct mipmapped_array_entry { std::shared_ptr<context> owner; std::vector<CUarr
 struct semaphore_entry { std::shared_ptr<context> owner; std::shared_ptr<external_semaphore> native; CUexternalSemaphoreHandleType type; };
 struct graphics_entry { std::shared_ptr<context> owner; unsigned object, flags; CUdeviceptr mapped = 0; };
 struct global_symbol { CUdeviceptr address; size_t bytes; };
+struct module_image_reference {
+    std::string name;
+    bool surface;
+    std::shared_ptr<image_reference> native;
+    CUarray array = nullptr;
+    std::shared_ptr<buffer> backing{};
+};
 struct module_entry {
     std::shared_ptr<context> owner;
     std::shared_ptr<executable> native;
@@ -159,6 +168,7 @@ struct module_entry {
     std::unordered_map<std::string, global_symbol> globals;
     CUlibrary library = nullptr;
     bool retiring = false;
+    std::map<std::uintptr_t, module_image_reference> image_references{};
 };
 struct function_entry {
     CUmodule module;
@@ -254,6 +264,7 @@ struct state {
     std::uintptr_t next_graph = 0x6000000, next_graph_node = 0x7000000, next_graph_exec = 0x8000000;
     uint64_t next_graph_id = 1;
     std::uintptr_t next_user_object = 0x9000000;
+    std::uintptr_t next_image_reference = 0xb000000;
     // Buffers must be destroyed before native sessions and the backend loader.
     ~state() { graph_execs.clear(); graph_nodes.clear(); graphs.clear(); graph_live.clear(); graph_cache.clear(); user_objects.clear(); functions.clear(); modules.clear(); textures.clear(); surfaces.clear(); arrays.clear(); mipmapped_arrays.clear(); allocations.clear(); hosts.clear(); graphics.clear(); memories.clear(); semaphores.clear(); primaries.clear(); contexts.clear(); }
 };
@@ -794,12 +805,14 @@ bool capture_graph_launch(const std::shared_ptr<context>&, CUstream, const graph
 #include "streams.inl"
 #include "arrays.inl"
 #include "image_objects.inl"
+#include "image_references.inl"
 #include "memory.inl"
 #include "async_memory.inl"
 #include "batch_copy.inl"
 #include "decompression_state.inl"
 #include "managed_advice.inl"
 #include "virtual_memory_state.inl"
+#include "sparse_arrays.inl"
 #include "launch_state.inl"
 #include "stream_attribute_state.inl"
 #include "kernel_launch.inl"
@@ -857,6 +870,7 @@ using namespace cudavm;
 #include "decompression_exports.inl"
 #include "managed_advice_exports.inl"
 #include "virtual_address_exports.inl"
+#include "image_reference_exports.inl"
 #include "memory_pool_exports.inl"
 #include "ipc_exports.inl"
 #include "graph_exports.inl"

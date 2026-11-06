@@ -1,8 +1,8 @@
 CUDA_RESOURCE_DESC runtime_image_resource(const cudaResourceDesc& resource) {
     require(resource.resType >= cudaResourceTypeArray && resource.resType <= cudaResourceTypePitch2D, CUDA_ERROR_INVALID_VALUE, "invalid Runtime image resource type");
-    require(resource.resType != cudaResourceTypeMipmappedArray, CUDA_ERROR_NOT_SUPPORTED, "mipmapped texture resources are unavailable");
     CUDA_RESOURCE_DESC result{}; result.resType = static_cast<CUresourcetype>(resource.resType);
     if (resource.resType == cudaResourceTypeArray) result.res.array.hArray = reinterpret_cast<CUarray>(resource.res.array.array);
+    else if (resource.resType == cudaResourceTypeMipmappedArray) result.res.mipmap.hMipmappedArray = reinterpret_cast<CUmipmappedArray>(resource.res.mipmap.mipmap);
     else if (resource.resType == cudaResourceTypeLinear) {
         auto d = runtime_array_descriptor(resource.res.linear.desc, {1, 0, 0}, 0);
         result.res.linear = {reinterpret_cast<CUdeviceptr>(resource.res.linear.devPtr), d.Format, d.NumChannels, resource.res.linear.sizeInBytes};
@@ -15,6 +15,7 @@ CUDA_RESOURCE_DESC runtime_image_resource(const cudaResourceDesc& resource) {
 cudaResourceDesc runtime_image_resource(const CUDA_RESOURCE_DESC& resource) {
     cudaResourceDesc result{}; result.resType = static_cast<cudaResourceType>(resource.resType);
     if (resource.resType == CU_RESOURCE_TYPE_ARRAY) result.res.array.array = reinterpret_cast<cudaArray_t>(resource.res.array.hArray);
+    else if (resource.resType == CU_RESOURCE_TYPE_MIPMAPPED_ARRAY) result.res.mipmap.mipmap = reinterpret_cast<cudaMipmappedArray_t>(resource.res.mipmap.hMipmappedArray);
     else {
         bool linear = resource.resType == CU_RESOURCE_TYPE_LINEAR;
         CUDA_ARRAY3D_DESCRIPTOR d{}; d.Format = linear ? resource.res.linear.format : resource.res.pitch2D.format;

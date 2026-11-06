@@ -16,6 +16,31 @@ bool graph_has_conditionals(const std::vector<graph_node>& nodes) {
     }
     return false;
 }
+bool graph_validate_device_launch(const std::vector<graph_node>& nodes, const std::shared_ptr<context>& owner,
+                                 CUDA_GRAPH_INSTANTIATE_PARAMS* info) {
+    bool executable = false;
+    for (const auto& node : nodes) {
+        auto reject = [&](CUgraphInstantiateResult result, const char* message) {
+            if (info) { info->result_out = result; info->hErrNode_out = node.handle; }
+            throw failure(CUDA_ERROR_INVALID_VALUE, message);
+        };
+        if (auto context = node.owner.lock(); context && context != owner)
+            reject(CUDA_GRAPH_INSTANTIATE_MULTIPLE_CTXS_NOT_SUPPORTED, "device graph nodes must share the instantiation context");
+        switch (node.type) {
+        case CU_GRAPH_NODE_TYPE_KERNEL:
+        case CU_GRAPH_NODE_TYPE_MEMSET: executable = true; break;
+        case CU_GRAPH_NODE_TYPE_MEMCPY:
+            if (node.copy.srcMemoryType == CU_MEMORYTYPE_ARRAY || node.copy.dstMemoryType == CU_MEMORYTYPE_ARRAY)
+                reject(CUDA_GRAPH_INSTANTIATE_NODE_OPERATION_NOT_SUPPORTED, "device graphs cannot copy CUDA arrays");
+            executable = true; break;
+        case CU_GRAPH_NODE_TYPE_GRAPH:
+            executable |= graph_validate_device_launch(*node.child_nodes, owner, info); break;
+        default:
+            reject(CUDA_GRAPH_INSTANTIATE_NODE_OPERATION_NOT_SUPPORTED, "unsupported device graph node type");
+        }
+    }
+    return executable;
+}
 CUgraphNodeParams graph_native_parameters(graph_node& node, const std::shared_ptr<context>& owner) {
     require(node.owner.expired() || node.owner.lock() == owner, CUDA_ERROR_INVALID_CONTEXT, "native graph nodes must share their execution context");
     auto params = graph_node_parameters(node);
@@ -180,7 +205,7 @@ void graph_native_replace(const graph_node& existing, graph_node& replacement) {
     }
 }
 void graph_native_instantiate(graph_exec& value, CUgraph graph) {
-    if (!graph_has_device_nodes(value.nodes) && !graph_has_conditionals(value.nodes)) return;
+    if (!graph_has_device_nodes(value.nodes) && !graph_has_conditionals(value.nodes) && !(value.flags & CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH)) return;
     auto native = graph_native_materialize(graph, value.owner.lock());
     value.nodes = graph_snapshot(graph); value.native = native->instantiate(value.flags & ~CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
     std::function<void(CUgraph)> collect = [&](CUgraph g) {

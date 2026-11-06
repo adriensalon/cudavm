@@ -162,11 +162,28 @@ event_state& event_lookup(CUevent handle) {
 CUevent create_event(unsigned flags) {
     require(!(flags & ~(CU_EVENT_BLOCKING_SYNC | CU_EVENT_DISABLE_TIMING | CU_EVENT_INTERPROCESS)), CUDA_ERROR_INVALID_VALUE, "invalid event flags");
     require(!(flags & CU_EVENT_INTERPROCESS) || (flags & CU_EVENT_DISABLE_TIMING), CUDA_ERROR_INVALID_VALUE, "interprocess events require disabled timing");
-    require(!(flags & CU_EVENT_INTERPROCESS), CUDA_ERROR_NOT_SUPPORTED, "interprocess events are not implemented");
+    auto owner = current(); std::shared_ptr<interprocess_event> interprocess;
+    if (flags & CU_EVENT_INTERPROCESS) {
+        require(global().provider->attribute(owner->device, CU_DEVICE_ATTRIBUTE_IPC_EVENT_SUPPORTED) != 0,
+            CUDA_ERROR_NOT_SUPPORTED, "interprocess events require advertised device support");
+        interprocess = context_configuration(owner, [&] { return owner->native->create_interprocess_event(flags); });
+    }
     auto handle = reinterpret_cast<CUevent>(global().next_event); global().next_event += 0x100;
-    global().events.emplace(handle, event_state{current(), flags, {}, {}, {}}); return handle;
+    event_state event{owner, flags, {}, {}, {}}; event.interprocess = std::move(interprocess);
+    global().events.emplace(handle, std::move(event)); return handle;
 }
 void record_event(CUevent handle, CUstream stream, unsigned flags) {
+    if (auto interprocess = event_lookup(handle).interprocess) {
+        require(!flags, CUDA_ERROR_INVALID_VALUE, "IPC record flags require a separate graph profile");
+        auto owner = current(); auto target = stream_lookup(stream, owner); capture_check_stream(target);
+        require(event_lookup(handle).owner.lock() == owner, CUDA_ERROR_INVALID_HANDLE, "event and stream contexts differ");
+        auto publication = context_configuration(owner, [&] { return interprocess->record(); });
+        // This CPU publication must wait for completed dependencies. Native-lane
+        // speculation would release the private GPU gate before producer work.
+        auto record = submit_stream(owner, stream, {}, {}, 0, [publication] { publication->publish(); return publication; });
+        auto& event = event_lookup(handle); event.record = std::move(record); event.timestamp.reset();
+        return;
+    }
     if (capture_record(handle, stream, flags)) return;
     require(flags == 0, CUDA_ERROR_INVALID_VALUE, "external event records require stream capture");
     auto& event = event_lookup(handle); auto owner = current();
@@ -181,6 +198,20 @@ void record_event(CUevent handle, CUstream stream, unsigned flags) {
     event.capture.reset(); event.capture_dependencies.clear(); event.capture_edges.clear();
 }
 void wait_event(CUstream stream, CUevent handle, unsigned flags) {
+    if (auto interprocess = event_lookup(handle).interprocess) {
+        require(!flags, CUDA_ERROR_INVALID_VALUE, "IPC wait flags require a separate graph profile");
+        auto owner = current(); auto target = stream_lookup(stream, owner); capture_check_stream(target);
+        auto event_owner = event_lookup(handle).owner.lock();
+        auto group = std::make_shared<device_group>();
+        group->tasks.reserve(2);
+        group->tasks.push_back(context_configuration(event_owner, [&] { return interprocess->snapshot(); }));
+        auto lane = stream_native(owner, target);
+        submit_stream(owner, stream, {}, {}, 0, [owner, lane, group] {
+            std::lock_guard lock(owner->execution);
+            group->tasks.push_back(owner->native->enqueue_marker(lane.get())); return group;
+        }, false, {}, lane);
+        return;
+    }
     if (capture_wait(stream, handle, flags)) return;
     require(flags == 0, CUDA_ERROR_INVALID_VALUE, "external event waits require stream capture");
     auto record = event_lookup(handle).record;
@@ -197,6 +228,13 @@ void event_status(CUevent handle, bool wait) {
     }
     auto& event = event_lookup(handle);
     auto owner = event.owner.lock(); owner->native->check_device_fault();
+    if (auto interprocess = event.interprocess) {
+        if (wait) {
+            auto snapshot = context_configuration(owner, [&] { return interprocess->snapshot(); });
+            observe_context_errors(owner, [&] { driver_wait([&] { wait_device(snapshot); }); }); pool_synchronize();
+        } else require(context_configuration(owner, [&] { return interprocess->query(); }), CUDA_ERROR_NOT_READY, "interprocess event is incomplete");
+        return;
+    }
     auto done = event.record;
     auto schedule = event.flags & CU_EVENT_BLOCKING_SYNC ? unsigned(CU_CTX_SCHED_BLOCKING_SYNC) : context_schedule(event.owner.lock());
     observe_context_errors(owner, [&] { if (done) { if (wait) driver_wait([&] { done->wait(schedule); }); else done->query(); } });

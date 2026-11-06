@@ -33,12 +33,18 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
     require(resource.resType >= CU_RESOURCE_TYPE_ARRAY && resource.resType <= CU_RESOURCE_TYPE_PITCH2D,
             CUDA_ERROR_INVALID_VALUE, "invalid image resource type");
     if (surface) require(resource.resType == CU_RESOURCE_TYPE_ARRAY, CUDA_ERROR_INVALID_VALUE, "surfaces require an array");
-    require(resource.resType != CU_RESOURCE_TYPE_MIPMAPPED_ARRAY, CUDA_ERROR_NOT_SUPPORTED, "mipmapped texture resources are unavailable");
     auto entry = std::make_shared<image_object_entry>(); entry->owner = owner; entry->resource = resource;
     CUDA_ARRAY3D_DESCRIPTOR d{}; size_t pitch = 0, offset = 0; CUdeviceptr image_address = 0;
     bool linear = resource.resType == CU_RESOURCE_TYPE_LINEAR;
-    if (resource.resType == CU_RESOURCE_TYPE_ARRAY) {
-        entry->array = array_lookup(resource.res.array.hArray, owner);
+    if (resource.resType == CU_RESOURCE_TYPE_ARRAY || resource.resType == CU_RESOURCE_TYPE_MIPMAPPED_ARRAY) {
+        if (resource.resType == CU_RESOURCE_TYPE_MIPMAPPED_ARRAY) {
+            require(owner->native->kind() == cudavmBackendCuda, CUDA_ERROR_NOT_SUPPORTED, "shader mipmapped sampling is unavailable");
+            require(texture && (texture->flags & CU_TRSF_NORMALIZED_COORDINATES), CUDA_ERROR_INVALID_VALUE, "mipmapped sampling requires normalized coordinates");
+            auto found = global().mipmapped_arrays.find(resource.res.mipmap.hMipmappedArray);
+            require(found != global().mipmapped_arrays.end() && !found->second.retiring, CUDA_ERROR_INVALID_HANDLE, "invalid texture mipmapped array");
+            require(found->second.owner == owner, CUDA_ERROR_INVALID_CONTEXT, "texture mipmap belongs to another context");
+            entry->array = array_lookup(found->second.levels.front(), owner);
+        } else entry->array = array_lookup(resource.res.array.hArray, owner);
         d = entry->array->descriptor; entry->backing = entry->array->native;
         require(!(d.Flags & CUDA_ARRAY3D_DEFERRED_MAPPING), CUDA_ERROR_INVALID_VALUE, "array backing has not been mapped");
         entry->backing_address = image_address = entry->array->image_address;
@@ -98,11 +104,11 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
         require(d.Width <= UINT32_MAX && d.Height <= UINT32_MAX && (linear || pitch <= UINT32_MAX),
             CUDA_ERROR_NOT_SUPPORTED, "image dimensions or row pitch exceed shader descriptor capacity");
         if (!surface) {
-            require((d.Format == CU_AD_FORMAT_FLOAT || d.Format == CU_AD_FORMAT_SIGNED_INT8 || d.Format == CU_AD_FORMAT_UNSIGNED_INT8 ||
+            require((d.Format == CU_AD_FORMAT_FLOAT || d.Format == CU_AD_FORMAT_HALF || d.Format == CU_AD_FORMAT_SIGNED_INT8 || d.Format == CU_AD_FORMAT_UNSIGNED_INT8 ||
                 d.Format == CU_AD_FORMAT_SIGNED_INT16 || d.Format == CU_AD_FORMAT_UNSIGNED_INT16 ||
                 d.Format == CU_AD_FORMAT_SIGNED_INT32 || d.Format == CU_AD_FORMAT_UNSIGNED_INT32) &&
                 !(texture->flags & ~(CU_TRSF_READ_AS_INTEGER | CU_TRSF_NORMALIZED_COORDINATES)),
-                CUDA_ERROR_NOT_SUPPORTED, "shader textures require float or 8/16/32-bit integer elements");
+                CUDA_ERROR_NOT_SUPPORTED, "shader textures require half/float or 8/16/32-bit integer elements");
             require(!view, CUDA_ERROR_NOT_SUPPORTED, "shader texture resource views are unavailable");
         }
         entry->native = std::make_shared<image_object>();
@@ -110,7 +116,7 @@ uint64_t create_image_object(const CUDA_RESOURCE_DESC& resource, const CUDA_TEXT
         descriptor[16] = uint32_t(pitch);
         descriptor[12] = d.NumChannels; descriptor[13] = uint32_t(array_element_bytes(d));
         descriptor[14] = descriptor[13] / d.NumChannels;
-        descriptor[15] = d.Format == CU_AD_FORMAT_FLOAT ? 0u :
+        descriptor[15] = d.Format == CU_AD_FORMAT_FLOAT || d.Format == CU_AD_FORMAT_HALF ? 0u :
             (d.Format == CU_AD_FORMAT_SIGNED_INT8 || d.Format == CU_AD_FORMAT_SIGNED_INT16 || d.Format == CU_AD_FORMAT_SIGNED_INT32) ? 2u : 1u;
         if (texture) {
             bool normalized_integer = descriptor[15] && descriptor[14] < 4 && !(texture->flags & CU_TRSF_READ_AS_INTEGER);

@@ -163,6 +163,7 @@ graph_operation graph_prepare(const graph_node& node, bool use_node_priority = f
     }
     if (node.type == CU_GRAPH_NODE_TYPE_EVENT_RECORD || node.type == CU_GRAPH_NODE_TYPE_WAIT_EVENT) {
         auto& event = event_lookup(node.event); auto owner = node.owner.lock();
+        require(!event.interprocess, CUDA_ERROR_NOT_SUPPORTED, "graph IPC event nodes require a separate implementation");
         require(owner && !owner->retiring && event.owner.lock() == owner, CUDA_ERROR_INVALID_HANDLE, "graph event context was destroyed or changed");
         result.contexts.push_back(owner);
         result.action = [] {}; return result;
@@ -455,15 +456,21 @@ CUgraphNode graph_move_child(CUgraph parent, const CUgraphNode* dependencies, si
     return result;
 }
 graph_node graph_event(CUevent event, CUgraphNodeType type) {
-    auto& value = event_lookup(event); graph_node node; node.type = type; node.event = event; node.owner = value.owner;
+    auto& value = event_lookup(event);
+    require(!value.interprocess, CUDA_ERROR_NOT_SUPPORTED, "graph IPC event nodes require a separate implementation");
+    graph_node node; node.type = type; node.event = event; node.owner = value.owner;
     return node;
 }
 CUgraphExec graph_instantiate(CUgraph graph, unsigned long long flags, CUDA_GRAPH_INSTANTIATE_PARAMS* info = nullptr) {
     require(!graph_lookup(graph).conditional_body, CUDA_ERROR_INVALID_VALUE, "conditional body graphs cannot be independently instantiated");
     require(!graph_lookup(graph).moved, CUDA_ERROR_INVALID_VALUE, "moved child graphs cannot be independently instantiated");
     require(!(flags & ~15ull), CUDA_ERROR_INVALID_VALUE, "unknown graph instantiation flags");
-    require(!(flags & ~static_cast<unsigned long long>(CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY | CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)), CUDA_ERROR_NOT_SUPPORTED, "graph instantiation flag is not implemented");
+    require(!(flags & ~static_cast<unsigned long long>(CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY | CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH | CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH)), CUDA_ERROR_NOT_SUPPORTED, "graph instantiation flag is not implemented");
+    require((flags & (CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH | CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH)) !=
+        (CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH | CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH), CUDA_ERROR_INVALID_VALUE, "device launch and automatic graph frees cannot be combined");
     auto owner = current(); auto nodes = graph_snapshot(graph, info);
+    if (flags & CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH)
+        require(graph_validate_device_launch(nodes, owner, info), CUDA_ERROR_INVALID_VALUE, "device graphs must contain a kernel, copy or fill");
     bool memory_graph = graph_has_memory(nodes);
     // An executable also instantiates the owned child tree. Moving a child
     // retains its earlier leases, including already queued replay snapshots.
@@ -488,6 +495,10 @@ CUgraphExec graph_instantiate(CUgraph graph, unsigned long long flags, CUDA_GRAP
     value.objects = graph_lookup(graph).objects;
     graph_native_instantiate(value, graph);
     auto handle = graph_handle<CUgraphExec>(global().next_graph_exec);
+    if (flags & CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH) {
+        handle = value.native->device_handle();
+        require(handle && !global().graph_execs.contains(handle), CUDA_ERROR_INVALID_HANDLE, "native device graph handle is unavailable or already registered");
+    }
     auto instance = value.memory_instance;
     for (auto description : descriptions) {
         auto& instances = graph_lookup(description).instances;
@@ -593,9 +604,9 @@ void graph_update(CUgraphExec handle, CUgraph graph, CUgraphExecUpdateResultInfo
     require(info, CUDA_ERROR_INVALID_VALUE, "null graph update result"); *info = {CU_GRAPH_EXEC_UPDATE_ERROR, nullptr, nullptr};
     require(!graph_lookup(graph).moved, CUDA_ERROR_INVALID_VALUE, "moved child graphs cannot be executable update sources");
     auto& value = graph_exec_lookup(handle); auto nodes = graph_snapshot(graph);
-    if (graph_has_device_nodes(value.nodes) || graph_has_device_nodes(nodes)) {
+    if (graph_has_device_nodes(value.nodes) || graph_has_device_nodes(nodes) || (value.flags & CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH)) {
         info->result = CU_GRAPH_EXEC_UPDATE_ERROR_NOT_SUPPORTED;
-        throw failure(CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE, "device-updatable graphs cannot be whole-graph updated");
+        throw failure(CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE, "whole updates of device-state graphs require stable native executable identity");
     }
     std::vector<CUgraph> descriptions;
     const bool memory_graph = graph_has_memory(nodes);

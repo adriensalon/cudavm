@@ -12,6 +12,7 @@ struct cuda_graph_executable : native_graph_executable {
             CUcontext previous{}; context->api->pop(&previous);
         }
     }
+    CUgraphExec device_handle() const override { return value; }
     device_work enqueue(native_queue* queue) override {
         return cuda_enqueue(context, queue, [&](CUstream stream) {
             check(context->api->driver.get<decltype(&cuGraphLaunch)>("cuGraphLaunch")(value, stream), "cuGraphLaunch device state");
@@ -69,8 +70,34 @@ struct cuda_graph_definition : native_graph_definition, std::enable_shared_from_
         auto& driver = context->api->driver;
         // v2 adds edge data; v3 changes child ownership and other 13.4 fields.
         auto add = reinterpret_cast<decltype(&cuGraphAddNode)>(driver.find("cuGraphAddNode_v3"));
-        if (!add) add = driver.get<decltype(add)>("cuGraphAddNode_v2");
-        check(add(&node, value, dependencies.data(), data.data(), dependencies.size(), &converted), "cuGraphAddNode device state");
+        if (!add) add = reinterpret_cast<decltype(add)>(driver.find("cuGraphAddNode_v2"));
+        if (add) check(add(&node, value, dependencies.data(), data.data(), dependencies.size(), &converted), "cuGraphAddNode device state");
+        else {
+            // Device-launch graphs predate the generic node API. Preserve the
+            // typed route on those drivers; nondefault edges need the newer API.
+            for (const auto& edge : data) require(!edge.from_port && !edge.to_port && !edge.type,
+                CUDA_ERROR_NOT_SUPPORTED, "native generic graph API is required for nondefault edges");
+            auto deps = dependencies.data(); auto count = dependencies.size();
+            switch (converted.type) {
+            case CU_GRAPH_NODE_TYPE_KERNEL: {
+                CUDA_KERNEL_NODE_PARAMS kernel{}; std::memcpy(&kernel, &converted.kernel, sizeof(kernel));
+                auto create = reinterpret_cast<decltype(&cuGraphAddKernelNode)>(driver.find("cuGraphAddKernelNode_v2"));
+                if (!create) create = driver.get<decltype(create)>("cuGraphAddKernelNode");
+                check(create(&node, value, deps, count, &kernel), "cuGraphAddKernelNode device state"); break;
+            }
+            case CU_GRAPH_NODE_TYPE_MEMCPY:
+                check(driver.get<decltype(&cuGraphAddMemcpyNode)>("cuGraphAddMemcpyNode")(&node, value, deps, count, &converted.memcpy.copyParams, context->value), "cuGraphAddMemcpyNode device state"); break;
+            case CU_GRAPH_NODE_TYPE_MEMSET: {
+                CUDA_MEMSET_NODE_PARAMS fill{}; std::memcpy(&fill, &converted.memset, sizeof(fill));
+                check(driver.get<decltype(&cuGraphAddMemsetNode)>("cuGraphAddMemsetNode")(&node, value, deps, count, &fill, context->value), "cuGraphAddMemsetNode device state"); break;
+            }
+            case CU_GRAPH_NODE_TYPE_GRAPH:
+                check(driver.get<decltype(&cuGraphAddChildGraphNode)>("cuGraphAddChildGraphNode")(&node, value, deps, count, converted.graph.graph), "cuGraphAddChildGraphNode device state"); break;
+            case CU_GRAPH_NODE_TYPE_EMPTY:
+                check(driver.get<decltype(&cuGraphAddEmptyNode)>("cuGraphAddEmptyNode")(&node, value, deps, count), "cuGraphAddEmptyNode device state"); break;
+            default: throw failure(CUDA_ERROR_NOT_SUPPORTED, "native generic graph API is required for this node type");
+            }
+        }
         if (params.type == CU_GRAPH_NODE_TYPE_CONDITIONAL) params.conditional.phGraph_out = converted.conditional.phGraph_out;
         return node;
     }

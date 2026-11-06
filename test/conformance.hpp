@@ -5,6 +5,8 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -71,6 +73,8 @@ struct fixture_data {
 // Only an absent declared device prerequisite is unavailable evidence. API or
 // execution failures on an applicable device must still fail the test.
 void require_capability(bool available, const std::string& reason);
+// Query native service availability independently of the pinned facade version.
+int native_cuda_version();
 void check_driver(CUresult result, const char* operation);
 #define CONFORMANCE_CUDA(call) ::cudavm::check_driver((call), #call)
 
@@ -192,5 +196,101 @@ inline void require_virtual_memory() {
     CONFORMANCE_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device));
     require_capability(supported != 0, "virtual memory requires advertised VMM support");
 }
+
+inline void image_runtime(cudaError_t status) {
+    require(status == cudaSuccess, std::string("image Runtime: ") + cudaGetErrorString(status));
+}
+// Shared allocation/descriptor mechanics; each slice constructs its own pixels,
+// coordinates and expected results independently of the device instructions.
+struct image_test_storage {
+    CUarray array{};
+    CUdeviceptr pointer{};
+    CUresourcetype type;
+    CUarray_format format;
+    unsigned width, height, channels, bits;
+    cudaChannelFormatKind kind;
+    size_t pitch;
+    std::vector<unsigned char> bytes;
+    image_test_storage(CUresourcetype resource_type, CUarray_format component_format,
+        cudaChannelFormatKind component_kind, unsigned component_bits, unsigned component_count,
+        unsigned columns, unsigned rows, bool runtime, unsigned array_flags = 0)
+        : type(resource_type), format(component_format), width(columns), height(rows), channels(component_count),
+          bits(component_bits), kind(component_kind), pitch(size_t(width) * channels * bits / 8) {
+        if (type == CU_RESOURCE_TYPE_ARRAY) {
+            if (runtime) {
+                auto channel = channel_descriptor(); cudaArray_t result{};
+                image_runtime(cudaMallocArray(&result, &channel, width, height,
+                    array_flags & CUDA_ARRAY3D_SURFACE_LDST ? cudaArraySurfaceLoadStore : 0)); array = reinterpret_cast<CUarray>(result);
+            } else {
+                CUDA_ARRAY3D_DESCRIPTOR descriptor{width, height, 0, format, channels, array_flags};
+                CONFORMANCE_CUDA(cuArray3DCreate(&array, &descriptor));
+            }
+        } else if (type == CU_RESOURCE_TYPE_PITCH2D) {
+            CONFORMANCE_CUDA(cuMemAllocPitch(&pointer, &pitch, pitch, height, 16));
+        } else CONFORMANCE_CUDA(cuMemAlloc(&pointer, pitch * height));
+        bytes.assign(pitch * height, 0xa7);
+    }
+    ~image_test_storage() { if (array) cuArrayDestroy(array); if (pointer) cuMemFree(pointer); }
+    image_test_storage(const image_test_storage&) = delete;
+    cudaChannelFormatDesc channel_descriptor() const {
+        return {int(bits), channels >= 2 ? int(bits) : 0, channels == 4 ? int(bits) : 0, channels == 4 ? int(bits) : 0, kind};
+    }
+    CUDA_RESOURCE_DESC driver_descriptor() const {
+        CUDA_RESOURCE_DESC result{}; result.resType = type;
+        if (array) result.res.array.hArray = array;
+        else if (type == CU_RESOURCE_TYPE_LINEAR) result.res.linear = {pointer, format, channels, bytes.size()};
+        else result.res.pitch2D = {pointer, format, channels, width, height, pitch};
+        return result;
+    }
+    cudaResourceDesc runtime_descriptor() const {
+        cudaResourceDesc result{}; result.resType = static_cast<cudaResourceType>(type);
+        if (array) result.res.array.array = reinterpret_cast<cudaArray_t>(array);
+        else if (type == CU_RESOURCE_TYPE_LINEAR) result.res.linear = {reinterpret_cast<void*>(uintptr_t(pointer)), channel_descriptor(), bytes.size()};
+        else result.res.pitch2D = {reinterpret_cast<void*>(uintptr_t(pointer)), channel_descriptor(), width, height, pitch};
+        return result;
+    }
+    void transfer(std::vector<unsigned char>& host, bool upload) const {
+        if (pointer) {
+            if (upload) CONFORMANCE_CUDA(cuMemcpyHtoD(pointer, host.data(), host.size()));
+            else CONFORMANCE_CUDA(cuMemcpyDtoH(host.data(), pointer, host.size()));
+        } else {
+            CUDA_MEMCPY2D copy{}; copy.WidthInBytes = pitch; copy.Height = height;
+            copy.srcMemoryType = upload ? CU_MEMORYTYPE_HOST : CU_MEMORYTYPE_ARRAY;
+            copy.dstMemoryType = upload ? CU_MEMORYTYPE_ARRAY : CU_MEMORYTYPE_HOST;
+            copy.srcHost = host.data(); copy.dstHost = host.data(); copy.srcArray = array; copy.dstArray = array;
+            copy.srcPitch = copy.dstPitch = pitch; CONFORMANCE_CUDA(cuMemcpy2D(&copy));
+        }
+    }
+    void upload() { transfer(bytes, true); }
+    void verify() const {
+        std::vector<unsigned char> actual(bytes.size(), 0x63); transfer(actual, false);
+        require(actual == bytes, "image reads preserve every backing byte and pitched padding");
+    }
+};
+struct image_test_texture {
+    CUtexObject value{};
+    image_test_texture(const image_test_storage& storage, bool runtime, CUaddress_mode address = CU_TR_ADDRESS_MODE_CLAMP,
+        CUfilter_mode filter = CU_TR_FILTER_MODE_POINT, bool normalized_coordinates = false, bool normalized_read = false,
+        std::array<float, 4> border = {}) {
+        if (runtime) {
+            auto resource = storage.runtime_descriptor(); cudaTextureDesc sampler{};
+            for (auto& mode : sampler.addressMode) mode = static_cast<cudaTextureAddressMode>(address);
+            sampler.filterMode = static_cast<cudaTextureFilterMode>(filter);
+            sampler.readMode = normalized_read ? cudaReadModeNormalizedFloat : cudaReadModeElementType;
+            sampler.normalizedCoords = normalized_coordinates; sampler.maxAnisotropy = 1;
+            std::copy(border.begin(), border.end(), sampler.borderColor);
+            cudaTextureObject_t result{}; image_runtime(cudaCreateTextureObject(&result, &resource, &sampler, nullptr)); value = result;
+        } else {
+            auto resource = storage.driver_descriptor(); CUDA_TEXTURE_DESC sampler{};
+            for (auto& mode : sampler.addressMode) mode = address;
+            sampler.filterMode = filter; sampler.maxAnisotropy = 1;
+            sampler.flags = (normalized_coordinates ? CU_TRSF_NORMALIZED_COORDINATES : 0) | (normalized_read ? 0 : CU_TRSF_READ_AS_INTEGER);
+            std::copy(border.begin(), border.end(), sampler.borderColor);
+            CONFORMANCE_CUDA(cuTexObjectCreate(&value, &resource, &sampler, nullptr));
+        }
+    }
+    ~image_test_texture() { if (value) cuTexObjectDestroy(value); }
+    image_test_texture(const image_test_texture&) = delete;
+};
 #endif
 }
