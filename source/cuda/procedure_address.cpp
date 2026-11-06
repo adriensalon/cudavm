@@ -54,17 +54,21 @@ extern "C" CUDAVM_CUDA_API CUresult CUDAAPI cuGetProcAddress_v2(
         return CUDA_ERROR_INVALID_VALUE;
     const cudavm::driver_procedure* legacy = nullptr;
     const cudavm::driver_procedure* per_thread = nullptr;
-    bool known = false;
+    bool known = false, per_thread_known = false;
     for (const auto& entry : cudavm::driver_procedures) {
         if (entry.name != symbol) continue;
         known = true;
+        per_thread_known = per_thread_known || entry.per_thread;
         if (entry.version > version) continue;
         auto*& selected = entry.per_thread ? per_thread : legacy;
         if (!selected || entry.version > selected->version) selected = &entry;
     }
     auto* selected = legacy;
-    if ((flags & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM) && per_thread &&
-        (!legacy || per_thread->version >= legacy->version)) selected = per_thread;
+    if ((flags & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM) && per_thread_known) {
+        // A stream-sensitive API needs a matching per-thread revision. An
+        // earlier legacy ABI cannot silently supply different stream semantics.
+        selected = per_thread && (!legacy || per_thread->version >= legacy->version) ? per_thread : nullptr;
+    }
     *output = selected ? selected->address : nullptr;
     if (status) *status = selected ? CU_GET_PROC_ADDRESS_SUCCESS : known ?
         CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT : CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;

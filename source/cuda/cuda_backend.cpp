@@ -48,6 +48,7 @@ struct cuda_api {
     decltype(&cuModuleGetGlobal) global = driver.get<decltype(global)>("cuModuleGetGlobal_v2");
     decltype(&cuLaunchKernel) launch = driver.get<decltype(launch)>("cuLaunchKernel");
     decltype(&cuFuncGetParamInfo) parameter_info = nullptr;
+    decltype(&cuMemBatchDecompressAsync) decompress = nullptr;
     cuda_api() {
         parameter_info = reinterpret_cast<decltype(parameter_info)>(driver.find("cuFuncGetParamInfo"));
         if (!parameter_info) {
@@ -59,13 +60,29 @@ struct cuda_api {
             if (resolve && resolve("cuFuncGetParamInfo", &address, 12040, 0) == CUDA_SUCCESS)
                 parameter_info = reinterpret_cast<decltype(parameter_info)>(address);
         }
+        decompress = reinterpret_cast<decltype(decompress)>(driver.find("cuMemBatchDecompressAsync"));
+        if (!decompress) {
+            using resolver_type = CUresult (CUDAAPI*)(const char*, void**, int, cuuint64_t);
+            auto resolve = reinterpret_cast<resolver_type>(driver.find("cuGetProcAddress")); void* address{};
+            if (resolve && resolve("cuMemBatchDecompressAsync", &address, 12060, 0) == CUDA_SUCCESS)
+                decompress = reinterpret_cast<decltype(decompress)>(address);
+        }
     }
 };
+struct cuda_ipc_mapping {
+    CUdeviceptr address{};
+    size_t size{};
+    bool promoted = false;
+};
+struct cuda_allocation_range { CUdeviceptr address; size_t size; };
 struct cuda_context {
     std::shared_ptr<cuda_api> api;
     CUcontext value = nullptr;
     CUdevice device;
     uint64_t graph_generation = 0;
+    std::unordered_map<CUdeviceptr, std::weak_ptr<cuda_ipc_mapping>> ipc_mappings;
+    std::mutex allocation_mutex;
+    std::unordered_map<const void*, cuda_allocation_range> allocations;
     explicit cuda_context(std::shared_ptr<cuda_api> input, CUdevice device, unsigned flags) : api(std::move(input)), device(device) {
         check(api->create(&value, flags, device), "cuCtxCreate_v2");
         CUcontext popped = nullptr;
@@ -85,14 +102,27 @@ struct cuda_buffer : buffer {
     std::shared_ptr<executable> module;
     std::shared_ptr<host_allocation> mapped_host;
     std::shared_ptr<device_library> library;
+    std::shared_ptr<native_memory_pool> pool;
     bool managed = false;
+    bool ipc_exported = false;
+    CUipcMemHandle ipc_handle{};
+    std::shared_ptr<cuda_ipc_mapping> ipc_mapping;
     cuda_buffer(std::shared_ptr<cuda_context> input, size_t bytes, CUdeviceptr pointer, std::shared_ptr<external_memory> memory)
-        : buffer(bytes), context(std::move(input)), address(pointer), imported(std::move(memory)) {}
+        : buffer(bytes), context(std::move(input)), address(pointer), imported(std::move(memory)) { track_allocation(); }
     cuda_buffer(std::shared_ptr<cuda_context> input, size_t size) : buffer(size), context(std::move(input)) {
         cuda_context_guard guard(*context);
         check(context->api->allocate(&address, size), "cuMemAlloc_v2");
+        try { track_allocation(); } catch (...) { context->api->free(address); address = 0; throw; }
+    }
+    void track_allocation() {
+#ifdef _WIN32
+        if (address && size) { std::lock_guard lock(context->allocation_mutex); context->allocations.emplace(this, cuda_allocation_range{address, size}); }
+#endif
     }
     ~cuda_buffer() {
+#ifdef _WIN32
+        { std::lock_guard lock(context->allocation_mutex); context->allocations.erase(this); }
+#endif
         if (address && !module && !mapped_host && !library && context->api->push(context->value) == CUDA_SUCCESS) {
             context->api->free(address);
             CUcontext previous = nullptr;
@@ -101,6 +131,61 @@ struct cuda_buffer : buffer {
     }
     uint64_t native_address() const override { return address; }
     bool is_managed() const override { return managed; }
+    bool hw_decompress_capable() const override {
+        cuda_context_guard guard(*context); unsigned value{};
+        auto result = context->api->driver.get<decltype(&cuPointerGetAttribute)>("cuPointerGetAttribute")
+            (&value, CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE, address);
+        if (result == CUDA_ERROR_INVALID_VALUE) return false; // Older native drivers do not know this attribute.
+        check(result, "cuPointerGetAttribute hardware decompression capability"); return value != 0;
+    }
+    bool ipc_capable() const override {
+        cuda_context_guard guard(*context); unsigned value{};
+        check(context->api->driver.get<decltype(&cuPointerGetAttribute)>("cuPointerGetAttribute")
+              (&value, CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE, address), "cuPointerGetAttribute IPC capability");
+        return value != 0;
+    }
+    CUipcMemHandle export_ipc() override {
+        if (ipc_exported) return ipc_handle;
+        cuda_context_guard guard(*context);
+#ifdef _WIN32
+        // Windows promotes the entire native mapping, including neighboring
+        // suballocations, while discarding its contents. Preserve that mapping
+        // once. Live exports share promotion state so later exports never
+        // snapshot/restore backing that another process may already be using.
+        CUdeviceptr base{}; size_t bytes{};
+        auto query = context->api->driver.get<decltype(&cuPointerGetAttribute)>("cuPointerGetAttribute");
+        check(query(&base, CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR, address), "cuPointerGetAttribute IPC promotion base");
+        check(query(&bytes, CU_POINTER_ATTRIBUTE_MAPPING_SIZE, address), "cuPointerGetAttribute IPC promotion size");
+        require(base <= address && address - base < bytes && size <= bytes - size_t(address - base),
+                CUDA_ERROR_INVALID_VALUE, "native IPC promotion range excludes the allocation");
+        std::erase_if(context->ipc_mappings, [](auto& entry) { return entry.second.expired(); });
+        auto& weak = context->ipc_mappings[base]; ipc_mapping = weak.lock();
+        if (!ipc_mapping) { ipc_mapping = std::make_shared<cuda_ipc_mapping>(cuda_ipc_mapping{base, bytes}); weak = ipc_mapping; }
+        require(ipc_mapping->size == bytes, CUDA_ERROR_INVALID_VALUE, "native IPC promotion mapping changed");
+        std::unique_lock allocations_lock(context->allocation_mutex);
+        struct preserved_range { cuda_allocation_range range; std::vector<std::byte> contents; };
+        std::vector<preserved_range> preserved;
+        if (!ipc_mapping->promoted) {
+            // Unallocated holes in the mapping are not valid copy ranges.
+            for (const auto& [identity, range] : context->allocations) if (range.address >= base && range.address - base < bytes) {
+                require(range.size <= bytes - size_t(range.address - base), CUDA_ERROR_INVALID_VALUE, "allocation crosses native IPC mapping");
+                auto& saved = preserved.emplace_back(preserved_range{range, std::vector<std::byte>(range.size)});
+                check(context->api->read(saved.contents.data(), range.address, range.size), "cuMemcpyDtoH_v2 before IPC promotion");
+            }
+        }
+#endif
+        auto result = context->api->driver.get<decltype(&cuIpcGetMemHandle)>("cuIpcGetMemHandle")(&ipc_handle, address);
+#ifdef _WIN32
+        if (!ipc_mapping->promoted) {
+            for (const auto& saved : preserved)
+                check(context->api->write(saved.range.address, saved.contents.data(), saved.range.size), "cuMemcpyHtoD_v2 after IPC promotion");
+            check(context->api->sync(), "cuCtxSynchronize after IPC promotion");
+        }
+        if (result == CUDA_SUCCESS) ipc_mapping->promoted = true;
+#endif
+        check(result, "cuIpcGetMemHandle"); ipc_exported = true;
+        return ipc_handle;
+    }
     void advise(size_t offset, size_t bytes, CUmem_advise advice, CUmemLocation location) override {
         cuda_context_guard guard(*context);
         auto function = reinterpret_cast<decltype(&cuMemAdvise)>(context->api->driver.find("cuMemAdvise_v2"));
@@ -122,6 +207,111 @@ struct cuda_buffer : buffer {
               (output, output_size, attribute, address + offset, bytes), "cuMemRangeGetAttribute");
     }
     size_t physical_size() const override { return imported || mapped_host || module || library ? 0 : size; }
+};
+struct cuda_ipc_buffer : cuda_buffer {
+    cuda_ipc_buffer(std::shared_ptr<cuda_context> owner, CUipcMemHandle handle, unsigned flags, bool legacy)
+        : cuda_buffer(std::move(owner), 0, 0, {}) {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuIpcOpenMemHandle)>(legacy ? "cuIpcOpenMemHandle" : "cuIpcOpenMemHandle_v2")
+              (&address, handle, flags), "cuIpcOpenMemHandle");
+        try {
+            CUdeviceptr base{}; size_t bytes{};
+            auto query = context->api->driver.get<decltype(&cuPointerGetAttribute)>("cuPointerGetAttribute");
+            check(query(&base, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, address), "cuPointerGetAttribute IPC range start");
+            check(query(&bytes, CU_POINTER_ATTRIBUTE_RANGE_SIZE, address), "cuPointerGetAttribute IPC range size");
+            require(base <= address && address - base < bytes, CUDA_ERROR_INVALID_VALUE, "invalid native IPC range");
+            size = bytes - size_t(address - base);
+        } catch (...) {
+            context->api->driver.get<decltype(&cuIpcCloseMemHandle)>("cuIpcCloseMemHandle")(address);
+            address = 0; throw;
+        }
+    }
+    ~cuda_ipc_buffer() {
+        if (address && context->api->push(context->value) == CUDA_SUCCESS) {
+            context->api->driver.get<decltype(&cuIpcCloseMemHandle)>("cuIpcCloseMemHandle")(address);
+            CUcontext previous{}; context->api->pop(&previous);
+        }
+        address = 0; // The base destructor must never free an imported allocation.
+    }
+    void close_ipc() override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuIpcCloseMemHandle)>("cuIpcCloseMemHandle")(address), "cuIpcCloseMemHandle");
+        address = 0;
+    }
+    size_t physical_size() const override { return 0; }
+};
+struct cuda_memory_pool : native_memory_pool, std::enable_shared_from_this<cuda_memory_pool> {
+    std::shared_ptr<cuda_context> context;
+    CUmemoryPool value{};
+    cuda_memory_pool(std::shared_ptr<cuda_context> owner, const CUmemPoolProps& properties) : context(std::move(owner)) {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemPoolCreate)>("cuMemPoolCreate")(&value, &properties), "cuMemPoolCreate");
+    }
+    cuda_memory_pool(std::shared_ptr<cuda_context> owner, void* handle, CUmemAllocationHandleType type) : context(std::move(owner)) {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemPoolImportFromShareableHandle)>("cuMemPoolImportFromShareableHandle")(&value, handle, type, 0), "cuMemPoolImportFromShareableHandle");
+    }
+    ~cuda_memory_pool() {
+        if (value && context->api->push(context->value) == CUDA_SUCCESS) {
+            context->api->driver.get<decltype(&cuMemPoolDestroy)>("cuMemPoolDestroy")(value);
+            CUcontext previous{}; context->api->pop(&previous);
+        }
+    }
+    std::unique_ptr<buffer> own(CUdeviceptr pointer, size_t bytes) {
+        auto owner = shared_from_this();
+        try {
+            auto result = std::make_unique<cuda_buffer>(context, bytes, pointer, std::shared_ptr<external_memory>{});
+            result->pool = std::move(owner); return result;
+        } catch (...) { context->api->free(pointer); throw; }
+    }
+    std::unique_ptr<buffer> allocate(size_t bytes) override {
+        cuda_context_guard guard(*context); CUstream stream{}; CUdeviceptr pointer{};
+        auto destroy = context->api->driver.get<decltype(&cuStreamDestroy)>("cuStreamDestroy_v2");
+        check(context->api->driver.get<decltype(&cuStreamCreate)>("cuStreamCreate")(&stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate pool allocation");
+        try {
+            check(context->api->driver.get<decltype(&cuMemAllocFromPoolAsync)>("cuMemAllocFromPoolAsync")(&pointer, bytes, value, stream), "cuMemAllocFromPoolAsync");
+            // Only the private allocation stream is completed. Facade stream
+            // dependencies remain queued, including preceding host gates.
+            check(context->api->driver.get<decltype(&cuStreamSynchronize)>("cuStreamSynchronize")(stream), "cuStreamSynchronize pool allocation");
+        } catch (...) { if (pointer) context->api->free(pointer); destroy(stream); throw; }
+        destroy(stream); return own(pointer, bytes);
+    }
+    std::unique_ptr<buffer> import_pointer(CUmemPoolPtrExportData& data, int& device) override {
+        cuda_context_guard guard(*context); CUdeviceptr pointer{}; size_t bytes{};
+        check(context->api->driver.get<decltype(&cuMemPoolImportPointer)>("cuMemPoolImportPointer")(&pointer, value, &data), "cuMemPoolImportPointer");
+        try {
+            auto query = context->api->driver.get<decltype(&cuPointerGetAttribute)>("cuPointerGetAttribute");
+            check(query(&bytes, CU_POINTER_ATTRIBUTE_RANGE_SIZE, pointer), "cuPointerGetAttribute imported pool size");
+            check(query(&device, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, pointer), "cuPointerGetAttribute imported pool device");
+            require(bytes, CUDA_ERROR_UNKNOWN, "native imported pool pointer has no extent");
+        } catch (...) { context->api->free(pointer); throw; }
+        return own(pointer, bytes);
+    }
+    void export_pointer(CUmemPoolPtrExportData& data, CUdeviceptr pointer) override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemPoolExportPointer)>("cuMemPoolExportPointer")(&data, pointer), "cuMemPoolExportPointer");
+    }
+    void export_handle(void* output, CUmemAllocationHandleType type) override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemPoolExportToShareableHandle)>("cuMemPoolExportToShareableHandle")(output, value, type, 0), "cuMemPoolExportToShareableHandle");
+    }
+    void attribute(CUmemPool_attribute attr, void* output, bool set) override {
+        cuda_context_guard guard(*context);
+        if (set) check(context->api->driver.get<decltype(&cuMemPoolSetAttribute)>("cuMemPoolSetAttribute")(value, attr, output), "cuMemPoolSetAttribute");
+        else check(context->api->driver.get<decltype(&cuMemPoolGetAttribute)>("cuMemPoolGetAttribute")(value, attr, output), "cuMemPoolGetAttribute");
+    }
+    void set_access(std::span<const CUmemAccessDesc> descriptions) override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemPoolSetAccess)>("cuMemPoolSetAccess")(value, descriptions.data(), descriptions.size()), "cuMemPoolSetAccess");
+    }
+    CUmemAccess_flags access(CUmemLocation location) override {
+        cuda_context_guard guard(*context); CUmemAccess_flags flags{};
+        check(context->api->driver.get<decltype(&cuMemPoolGetAccess)>("cuMemPoolGetAccess")(&flags, value, &location), "cuMemPoolGetAccess"); return flags;
+    }
+    void trim(size_t bytes) override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemPoolTrimTo)>("cuMemPoolTrimTo")(value, bytes), "cuMemPoolTrimTo");
+    }
 };
 struct cuda_address_reservation : virtual_address_reservation {
     std::shared_ptr<cuda_context> context;
@@ -917,6 +1107,18 @@ void cuda_kernel::validate_configuration(const launch_shape& shape) {
 struct cuda_session : session {
     uint64_t graph_generation() const override { return context->graph_generation; }
     std::shared_ptr<cuda_context> context;
+    void enable_peer(session& other) override {
+        auto* peer = dynamic_cast<cuda_session*>(&other);
+        require(peer && peer->context->api == context->api, CUDA_ERROR_PEER_ACCESS_UNSUPPORTED, "peer belongs to another native adapter");
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuCtxEnablePeerAccess)>("cuCtxEnablePeerAccess")(peer->context->value, 0), "cuCtxEnablePeerAccess");
+    }
+    void disable_peer(session& other) override {
+        auto* peer = dynamic_cast<cuda_session*>(&other);
+        require(peer && peer->context->api == context->api, CUDA_ERROR_PEER_ACCESS_NOT_ENABLED, "peer belongs to another native adapter");
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuCtxDisablePeerAccess)>("cuCtxDisablePeerAccess")(peer->context->value), "cuCtxDisablePeerAccess");
+    }
     cuda_session(std::shared_ptr<cuda_api> api, CUdevice device, unsigned flags = CU_CTX_MAP_HOST)
         : context(std::make_shared<cuda_context>(std::move(api), device, flags)) {}
     void set_profiling(bool enabled) override {
@@ -1026,6 +1228,23 @@ struct cuda_session : session {
         return std::make_shared<cuda_semaphore>(context, d);
     }
     std::unique_ptr<buffer> allocate(size_t size) override { return std::make_unique<cuda_buffer>(context, size); }
+    device_work enqueue_decompress(std::span<const CUmemDecompressParams> parameters, native_queue* queue) override {
+        require(context->api->decompress, CUDA_ERROR_NOT_SUPPORTED, "native memory decompression entry is unavailable");
+        std::vector<CUmemDecompressParams> records(parameters.begin(), parameters.end());
+        return cuda_enqueue(context, queue, [&](CUstream stream) {
+            size_t index = std::numeric_limits<size_t>::max();
+            check(context->api->decompress(records.data(), records.size(), 0, &index, stream), "cuMemBatchDecompressAsync");
+        });
+    }
+    std::unique_ptr<buffer> import_ipc(CUipcMemHandle handle, unsigned flags, bool legacy) override {
+        return std::make_unique<cuda_ipc_buffer>(context, handle, flags, legacy);
+    }
+    std::shared_ptr<native_memory_pool> create_memory_pool(const CUmemPoolProps& properties) override {
+        return std::make_shared<cuda_memory_pool>(context, properties);
+    }
+    std::shared_ptr<native_memory_pool> import_memory_pool(void* handle, CUmemAllocationHandleType type) override {
+        return std::make_shared<cuda_memory_pool>(context, handle, type);
+    }
     std::shared_ptr<buffer> allocate_array(const CUDA_ARRAY3D_DESCRIPTOR& d) override {
         const auto format = array_format_properties(d.Format);
         const bool buffer_layout = format.planes > 1
@@ -1532,8 +1751,34 @@ struct cuda_backend : backend {
         CUdevice device{};
         int result = 0;
         check(api->device(&device, ordinal), "cuDeviceGet");
-        check(api->attribute(&result, attribute, device), "cuDeviceGetAttribute");
+        auto status = api->attribute(&result, attribute, device);
+        if (status == CUDA_ERROR_INVALID_VALUE && (attribute == CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK ||
+                attribute == CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_MAXIMUM_LENGTH)) return 0;
+        check(status, "cuDeviceGetAttribute");
         return result;
+    }
+    int can_access_peer(int ordinal, int peer) override {
+        CUdevice a{}, b{}; int result{};
+        check(api->device(&a, ordinal), "cuDeviceGet"); check(api->device(&b, peer), "cuDeviceGet");
+        check(api->driver.get<decltype(&cuDeviceCanAccessPeer)>("cuDeviceCanAccessPeer")(&result, a, b), "cuDeviceCanAccessPeer"); return result;
+    }
+    int peer_attribute(int ordinal, int peer, CUdevice_P2PAttribute attribute) override {
+        CUdevice a{}, b{}; int result{};
+        check(api->device(&a, ordinal), "cuDeviceGet"); check(api->device(&b, peer), "cuDeviceGet");
+        check(api->driver.get<decltype(&cuDeviceGetP2PAttribute)>("cuDeviceGetP2PAttribute")(&result, attribute, a, b), "cuDeviceGetP2PAttribute"); return result;
+    }
+    std::vector<unsigned> peer_atomic_capabilities(int ordinal, int peer, std::span<const CUatomicOperation> operations) override {
+        CUdevice a{}, b{}; check(api->device(&a, ordinal), "cuDeviceGet"); check(api->device(&b, peer), "cuDeviceGet");
+        auto function = reinterpret_cast<decltype(&cuDeviceGetP2PAtomicCapabilities)>(api->driver.find("cuDeviceGetP2PAtomicCapabilities"));
+        if (!function) {
+            using resolver = CUresult (CUDAAPI*)(const char*, void**, int, cuuint64_t);
+            auto resolve = reinterpret_cast<resolver>(api->driver.find("cuGetProcAddress")); void* address{};
+            if (resolve && resolve("cuDeviceGetP2PAtomicCapabilities", &address, 13000, 0) == CUDA_SUCCESS)
+                function = reinterpret_cast<decltype(function)>(address);
+        }
+        require(function, CUDA_ERROR_NOT_SUPPORTED, "native loader has no per-operation peer atomic capability query");
+        std::vector<unsigned> result(operations.size());
+        check(function(result.data(), operations.data(), unsigned(operations.size()), a, b), "cuDeviceGetP2PAtomicCapabilities"); return result;
     }
     std::array<char, 16> device_uuid(int ordinal, bool instance) override {
         CUdevice device{}; check(api->device(&device, ordinal), "cuDeviceGet"); CUuuid uuid{};

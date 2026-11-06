@@ -226,10 +226,11 @@ void copy_unified(CUdeviceptr to, CUdeviceptr from, size_t bytes, const std::sha
     copy_boxes(destination, source, bytes);
 }
 size_t pointer_attribute_size(CUpointer_attribute attribute) {
-    require(attribute >= CU_POINTER_ATTRIBUTE_CONTEXT && attribute <= CU_POINTER_ATTRIBUTE_MEMORY_BLOCK_ID,
+    require(attribute >= CU_POINTER_ATTRIBUTE_CONTEXT && attribute <= CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL,
             CUDA_ERROR_INVALID_VALUE, "invalid pointer attribute kind");
     switch (attribute) {
     case CU_POINTER_ATTRIBUTE_CONTEXT: return sizeof(CUcontext);
+    case CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE: return sizeof(bool);
     case CU_POINTER_ATTRIBUTE_DEVICE_POINTER:
     case CU_POINTER_ATTRIBUTE_RANGE_START_ADDR:
     case CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR: return sizeof(CUdeviceptr);
@@ -241,6 +242,7 @@ size_t pointer_attribute_size(CUpointer_attribute attribute) {
     case CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL: return sizeof(int);
     case CU_POINTER_ATTRIBUTE_MEMORY_TYPE:
     case CU_POINTER_ATTRIBUTE_IS_MANAGED:
+    case CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE:
     case CU_POINTER_ATTRIBUTE_MAPPED:
     case CU_POINTER_ATTRIBUTE_SYNC_MEMOPS: return sizeof(unsigned);
     case CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE: return sizeof(CUmemoryPool);
@@ -288,6 +290,8 @@ void pointer_attribute(void* output, CUpointer_attribute attribute, CUdeviceptr 
         if (entry.native->is_managed()) { *static_cast<void**>(output) = reinterpret_cast<void*>(uintptr_t(pointer)); break; }
         require(bulk, CUDA_ERROR_INVALID_VALUE, "device allocation has no host pointer alias"); *static_cast<void**>(output) = nullptr; break;
     case CU_POINTER_ATTRIBUTE_IS_MANAGED: *static_cast<unsigned*>(output) = entry.native->is_managed(); break;
+    case CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE: *static_cast<bool*>(output) = entry.native->storage().hw_decompress_capable(); break;
+    case CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE: *static_cast<unsigned*>(output) = entry.native->ipc_capable(); break;
     case CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL: *static_cast<int*>(output) = entry.owner->device; break;
     case CU_POINTER_ATTRIBUTE_RANGE_START_ADDR:
     case CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR: *static_cast<CUdeviceptr*>(output) = it->first; break;

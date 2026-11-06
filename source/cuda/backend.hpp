@@ -27,6 +27,19 @@
 namespace cudavm {
 struct session;
 struct buffer;
+// Exportable pools own actual adapter objects. Opaque pointer records and OS
+// handles cross this boundary without application payload staging.
+struct native_memory_pool {
+    virtual ~native_memory_pool() = default;
+    virtual std::unique_ptr<buffer> allocate(size_t) = 0;
+    virtual std::unique_ptr<buffer> import_pointer(CUmemPoolPtrExportData&, int&) = 0;
+    virtual void export_pointer(CUmemPoolPtrExportData&, CUdeviceptr) = 0;
+    virtual void export_handle(void*, CUmemAllocationHandleType) = 0;
+    virtual void attribute(CUmemPool_attribute, void*, bool) = 0;
+    virtual void set_access(std::span<const CUmemAccessDesc>) = 0;
+    virtual CUmemAccess_flags access(CUmemLocation) = 0;
+    virtual void trim(size_t) = 0;
+};
 struct virtual_allocation {
     size_t size;
     explicit virtual_allocation(size_t bytes) : size(bytes) {}
@@ -151,6 +164,14 @@ struct buffer {
     virtual uint64_t native_address() const { return 0; }
     virtual CUarray cuda_array() const { return nullptr; }
     virtual bool is_managed() const { return false; }
+    virtual bool ipc_capable() const { return false; }
+    virtual bool hw_decompress_capable() const { return false; }
+    virtual CUipcMemHandle export_ipc() {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "memory IPC export is unavailable");
+    }
+    virtual void close_ipc() {
+        throw failure(CUDA_ERROR_INVALID_VALUE, "buffer is not an IPC import");
+    }
     virtual void advise(size_t, size_t, CUmem_advise, CUmemLocation) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "managed memory advice is unavailable");
     }
@@ -603,6 +624,12 @@ struct session {
     std::mutex pool_execution;
     std::shared_ptr<compute_profile> profile=std::make_shared<compute_profile>();
     virtual ~session() = default;
+    virtual void enable_peer(session&) {
+        throw failure(CUDA_ERROR_PEER_ACCESS_UNSUPPORTED, "direct peer access is unavailable between these sessions");
+    }
+    virtual void disable_peer(session&) {
+        throw failure(CUDA_ERROR_PEER_ACCESS_NOT_ENABLED, "direct peer access is not enabled");
+    }
     // Without an attached compatible profiling tool these controls have no
     // effect. Native CUDA overrides this to control its active vendor tool.
     virtual void set_profiling(bool) {}
@@ -651,6 +678,15 @@ struct session {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "external semaphore handle type is unavailable on this device");
     }
     virtual std::unique_ptr<buffer> allocate(size_t bytes) = 0;
+    virtual std::unique_ptr<buffer> import_ipc(CUipcMemHandle, unsigned, bool) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "memory IPC import is unavailable");
+    }
+    virtual std::shared_ptr<native_memory_pool> create_memory_pool(const CUmemPoolProps&) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "shareable memory pools are unavailable on this adapter");
+    }
+    virtual std::shared_ptr<native_memory_pool> import_memory_pool(void*, CUmemAllocationHandleType) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "memory pool import is unavailable on this adapter");
+    }
     virtual size_t allocation_granularity(const CUmemAllocationProp&, CUmemAllocationGranularity_flags) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual allocation granularity is unavailable");
     }
@@ -703,6 +739,9 @@ struct session {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "native managed memory prefetch is unavailable");
     }
     virtual std::unique_ptr<buffer> allocate_pool(size_t bytes) { return allocate(bytes); }
+    virtual device_work enqueue_decompress(std::span<const CUmemDecompressParams>, native_queue*) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "hardware memory decompression is unavailable");
+    }
     virtual void memory_info(size_t&, size_t&) { throw failure(CUDA_ERROR_NOT_SUPPORTED, "native memory query is unavailable"); }
     // Copy eligibility is independent of shader word alignment and slot limits.
     virtual bool can_copy_direct(const buffer&) const { return false; }
@@ -864,6 +903,14 @@ struct backend {
     virtual ~backend() = default;
     virtual cudavmBackend device_kind(int) const { return cudavmBackendCuda; }
     virtual int native_device(int device) const { return device; }
+    virtual int can_access_peer(int, int) { return 0; }
+    virtual int peer_attribute(int, int, CUdevice_P2PAttribute attribute) {
+        require(attribute != CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK, CUDA_ERROR_NOT_SUPPORTED, "peer link performance is unavailable on this adapter");
+        return 0;
+    }
+    virtual std::vector<unsigned> peer_atomic_capabilities(int, int, std::span<const CUatomicOperation> operations) {
+        return std::vector<unsigned>(operations.size(), 0);
+    }
     virtual std::string link_registered_images(std::span<const std::string_view>, int) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "native NVIDIA device linking is unavailable");
     }

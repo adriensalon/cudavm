@@ -52,10 +52,10 @@ cudaChannelFormatDesc runtime_channel_descriptor(const CUDA_ARRAY3D_DESCRIPTOR& 
 CUDA_ARRAY3D_DESCRIPTOR runtime_array_info(cudaArray_const_t array) {
     CUDA_ARRAY3D_DESCRIPTOR d{}; check(cuArray3DGetDescriptor(&d, reinterpret_cast<CUarray>(const_cast<cudaArray*>(array)))); return d;
 }
-size_t runtime_array_element(cudaArray_const_t array) {
-    const auto d = runtime_array_info(array);
+size_t runtime_array_element(const CUDA_ARRAY3D_DESCRIPTOR& d) {
     const auto properties = array_format_properties(d.Format);
     require(properties.valid && properties.planes == 1, CUDA_ERROR_INVALID_VALUE,
         "multiplanar transfers require a plane array");
     return properties.block_bytes ? properties.block_bytes : properties.component_bits / 8 * d.NumChannels;
 }
+size_t runtime_array_element(cudaArray_const_t array) { return runtime_array_element(runtime_array_info(array)); }

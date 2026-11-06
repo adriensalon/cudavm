@@ -435,7 +435,7 @@ conformance_device select_conformance_device(std::string_view backend, void (*pr
     const std::array<std::string_view, 5> backends{"cuda", "vulkan", "directx", "opencl", "opengl"};
     const std::array<std::string_view, 5> labels{"CUDA", "Vulkan", "DirectX", "OpenCL", "OpenGL"};
     const auto found = std::find(backends.begin(), backends.end(), backend);
-    require(found != backends.end(), "unknown backend: " + std::string(backend));
+    require(backend == "any" || found != backends.end(), "unknown backend: " + std::string(backend));
     const auto status = cuInit(0);
     if (status == CUDA_ERROR_NO_DEVICE || status == CUDA_ERROR_SYSTEM_DRIVER_MISMATCH) {
         std::cout << "SKIP: " << backend << " device/driver unavailable\n";
@@ -444,7 +444,7 @@ conformance_device select_conformance_device(std::string_view backend, void (*pr
     CONFORMANCE_CUDA(status);
     int count = 0;
     CONFORMANCE_CUDA(cuDeviceGetCount(&count));
-    const auto suffix = " (" + std::string(labels[found - backends.begin()]) + ")";
+    const auto suffix = backend == "any" ? std::string{} : " (" + std::string(labels[found - backends.begin()]) + ")";
     for (int ordinal = 0; ordinal < count; ++ordinal) {
         CUdevice candidate{};
         char name[256]{};
@@ -617,6 +617,8 @@ std::vector<char> import_fixture(const fixture_data& fixtures, std::string_view 
 #endif
 }
 
+#endif // CUDAVM_CONFORMANCE_EXECUTION
+// Public module/library loading also serves compiler-independent API fixtures.
 loaded_program::loaded_program(const void* image, bool use_library) {
     if (use_library) CONFORMANCE_CUDA(cuLibraryLoadData(&library, image, nullptr, nullptr, 0, nullptr, nullptr, 0));
     else CONFORMANCE_CUDA(cuModuleLoadData(&module, image));
@@ -648,6 +650,7 @@ CUdeviceptr loaded_program::global(const char* name, size_t expected_size) const
     return result;
 }
 
+#ifdef CUDAVM_CONFORMANCE_EXECUTION
 // Availability is checked independently of the slice's input and features.
 // Enumerating an OpenCL endpoint does not imply SPIR-V ingestion.
 void probe_execution() {

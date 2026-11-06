@@ -8,15 +8,29 @@ void pool_location(const CUmemLocation& location, CUmemAllocationType type) {
             CUDA_ERROR_NOT_SUPPORTED, "memory pools require pinned device storage");
     valid_device(location.id);
 }
-CUmemoryPool pool_create(const CUmemPoolProps& props, bool builtin = false) {
-    pool_location(props.location, props.allocType);
-    require(props.handleTypes == CU_MEM_HANDLE_TYPE_NONE && !props.usage && !props.gpuDirectRDMACapable,
-            CUDA_ERROR_NOT_SUPPORTED, "exported pools and allocation hints are unavailable");
-    require(!props.win32SecurityAttributes && std::all_of(std::begin(props.reserved), std::end(props.reserved), [](auto byte) { return byte == 0; }),
-            CUDA_ERROR_INVALID_VALUE, "nonzero pool security or reserved fields");
-    auto pool = std::make_shared<memory_pool>(); pool->props = props; pool->builtin = builtin;
+std::shared_ptr<context> pool_storage_context(int device);
+CUmemoryPool pool_publish(const std::shared_ptr<memory_pool>& pool) {
     pool->handle = reinterpret_cast<CUmemoryPool>(global().next_pool); global().next_pool += 0x100;
     global().memory_pools.emplace(pool->handle, pool); return pool->handle;
+}
+CUmemoryPool pool_create(const CUmemPoolProps& props, bool builtin = false) {
+    pool_location(props.location, props.allocType);
+    require(!(props.usage & ~CU_MEM_POOL_CREATE_USAGE_HW_DECOMPRESS) && !props.gpuDirectRDMACapable,
+            CUDA_ERROR_NOT_SUPPORTED, "pool allocation hints are unavailable");
+    if (props.usage) require(global().provider->attribute(props.location.id, CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK) != 0,
+            CUDA_ERROR_NOT_SUPPORTED, "hardware-decompression pools require advertised device support");
+    require(std::all_of(std::begin(props.reserved), std::end(props.reserved), [](auto byte) { return byte == 0; }),
+            CUDA_ERROR_INVALID_VALUE, "nonzero pool reserved fields");
+    auto pool = std::make_shared<memory_pool>(); pool->props = props; pool->builtin = builtin;
+    require(!props.win32SecurityAttributes || props.handleTypes != CU_MEM_HANDLE_TYPE_NONE,
+            CUDA_ERROR_INVALID_VALUE, "security attributes require an exportable pool");
+    if (props.handleTypes != CU_MEM_HANDLE_TYPE_NONE || props.usage) {
+        auto storage = pool_storage_context(props.location.id); auto native = props;
+        native.location.id = native_device(props.location.id);
+        pool->native = storage->native->create_memory_pool(native);
+        pool->props.win32SecurityAttributes = nullptr; // Creation consumes metadata, never its pointer.
+    }
+    return pool_publish(pool);
 }
 CUmemoryPool pool_default(int device) {
     valid_device(device);
@@ -33,10 +47,12 @@ CUmemoryPool pool_current(int device) {
 }
 void pool_set_current(int device, CUmemoryPool handle) {
     valid_device(device); auto pool = pool_lookup(handle);
+    require(!pool->imported, CUDA_ERROR_INVALID_VALUE, "imported pools cannot become device allocation pools");
     require(pool->props.location.id == device, CUDA_ERROR_INVALID_VALUE, "pool belongs to another device");
     global().current_pools.insert_or_assign(device, handle);
 }
 void pool_trim(const std::shared_ptr<memory_pool>& pool, uint64_t keep) {
+    if (pool->native) { pool->native->trim(size_t(std::min<uint64_t>(keep, SIZE_MAX))); return; }
     for (auto it = pool->blocks.begin(); it != pool->blocks.end();) {
         bool idle = true; size_t views = 0;
         for (auto& weak : it->slices) if (auto slice = weak.lock()) {
@@ -70,7 +86,7 @@ void pool_destroy(CUmemoryPool handle) {
 }
 void pool_release(allocation& entry, CUdeviceptr address, bool cache) {
     auto pool = entry.pool; auto bytes = entry.native->size;
-    if (cache && !pool->destroyed) pool->cache.push_back({entry.owner, entry.native, address, entry.free_stream_id, entry.async_free});
+    if (cache && !pool->destroyed && !pool->native) pool->cache.push_back({entry.owner, entry.native, address, entry.free_stream_id, entry.async_free});
     pool->used -= bytes;
 }
 bool pool_overlap(const buffer& a, const buffer& b) {
@@ -181,10 +197,20 @@ std::shared_ptr<context> pool_storage_context(int device) {
 }
 void pool_synchronize() {
     collect_pool_memory();
-    for (auto& [handle, pool] : global().memory_pools) pool_trim(pool, pool->threshold);
+    for (auto& [handle, pool] : global().memory_pools) if (!pool->imported) pool_trim(pool, pool->threshold);
 }
 void pool_attribute(const std::shared_ptr<memory_pool>& pool, CUmemPool_attribute attr, void* value, bool set) {
     require(value, CUDA_ERROR_INVALID_VALUE, "null memory pool attribute value");
+    if (pool->native && (pool->imported || attr <= CU_MEMPOOL_ATTR_USED_MEM_HIGH || attr == CU_MEMPOOL_ATTR_HW_DECOMPRESS_ENABLED)) {
+        pool->native->attribute(attr, value, set);
+        if (attr == CU_MEMPOOL_ATTR_LOCATION_ID && !set) {
+            int device; std::memcpy(&device, value, sizeof(device)); device = managed_logical_device(device);
+            require(device >= 0, CUDA_ERROR_INVALID_DEVICE, "imported pool device is not visible");
+            std::memcpy(value, &device, sizeof(device));
+        }
+        if (attr == CU_MEMPOOL_ATTR_RELEASE_THRESHOLD && set) std::memcpy(&pool->threshold, value, sizeof(pool->threshold));
+        return;
+    }
     int* policy = nullptr;
     switch (attr) {
     case CU_MEMPOOL_ATTR_REUSE_FOLLOW_EVENT_DEPENDENCIES: policy = &pool->reuse_events; break;
@@ -227,13 +253,66 @@ void pool_attribute(const std::shared_ptr<memory_pool>& pool, CUmemPool_attribut
 }
 void pool_set_access(const std::shared_ptr<memory_pool>& pool, const CUmemAccessDesc* descriptions, size_t count) {
     require(!count || descriptions, CUDA_ERROR_INVALID_VALUE, "null pool access array");
+    std::vector<CUmemAccessDesc> native;
     for (size_t i = 0; i < count; ++i) {
         auto& p = descriptions[i]; pool_location(p.location, CU_MEM_ALLOCATION_TYPE_PINNED);
         require(p.flags == CU_MEM_ACCESS_FLAGS_PROT_NONE || p.flags == CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
                 CUDA_ERROR_INVALID_VALUE, "invalid memory pool access flags");
+        if (pool->native) {
+            require(device_kind(p.location.id) == cudavmBackendCuda, CUDA_ERROR_NOT_SUPPORTED, "pool access location belongs to another adapter");
+            auto descriptor = p; descriptor.location.id = native_device(p.location.id); native.push_back(descriptor); continue;
+        }
         require(p.location.id == pool->props.location.id && p.flags == CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
                 CUDA_ERROR_NOT_SUPPORTED, "peer pool access and owner access removal are unavailable");
     }
+    if (pool->native) pool->native->set_access(native);
+}
+CUmemAccess_flags pool_access(const std::shared_ptr<memory_pool>& pool, CUmemLocation location) {
+    pool_location(location, CU_MEM_ALLOCATION_TYPE_PINNED);
+    if (!pool->native) return location.id == pool->props.location.id ? CU_MEM_ACCESS_FLAGS_PROT_READWRITE : CU_MEM_ACCESS_FLAGS_PROT_NONE;
+    require(device_kind(location.id) == cudavmBackendCuda, CUDA_ERROR_NOT_SUPPORTED, "pool access location belongs to another adapter");
+    location.id = native_device(location.id); return pool->native->access(location);
+}
+bool pool_handle_type(CUmemAllocationHandleType type) {
+    return type == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR || type == CU_MEM_HANDLE_TYPE_WIN32 ||
+        type == CU_MEM_HANDLE_TYPE_WIN32_KMT || type == CU_MEM_HANDLE_TYPE_FABRIC;
+}
+void pool_export(void* output, CUmemoryPool handle, CUmemAllocationHandleType type, unsigned long long flags) {
+    require(output && !flags && pool_handle_type(type), CUDA_ERROR_INVALID_VALUE, "invalid pool export arguments");
+    auto pool = pool_lookup(handle);
+    require(pool->native && (pool->imported || (pool->props.handleTypes & type)), CUDA_ERROR_INVALID_VALUE, "pool is not exportable with this handle type");
+    pool->native->export_handle(output, type);
+}
+void pool_import(CUmemoryPool* output, void* handle, CUmemAllocationHandleType type, unsigned long long flags) {
+    require(output && !flags && pool_handle_type(type), CUDA_ERROR_INVALID_VALUE, "invalid pool import arguments");
+    // Like VMM controls, pool import can run without a public current context.
+    auto storage = pool_storage_context(cuda_device());
+    auto pool = std::make_shared<memory_pool>(); pool->imported = true;
+    pool->props.allocType = CU_MEM_ALLOCATION_TYPE_PINNED; pool->props.location = {CU_MEM_LOCATION_TYPE_DEVICE, -1};
+    pool->native = storage->native->import_memory_pool(handle, type);
+    *output = pool_publish(pool);
+}
+void pool_export_pointer(CUmemPoolPtrExportData* output, CUdeviceptr pointer) {
+    require(output, CUDA_ERROR_INVALID_VALUE, "null pool pointer export output");
+    auto found = global().allocations.find(pointer);
+    require(found != global().allocations.end() && found->second.pool && !found->second.async_free,
+            CUDA_ERROR_INVALID_VALUE, "pool pointer export requires a live allocation base");
+    auto pool = found->second.pool;
+    require(pool->native && !pool->imported, CUDA_ERROR_INVALID_VALUE, "allocation does not belong to an exportable pool");
+    CUmemPoolPtrExportData data{}; pool->native->export_pointer(data, pointer); *output = data;
+}
+void pool_import_pointer(CUdeviceptr* output, CUmemoryPool handle, CUmemPoolPtrExportData* data) {
+    require(output && data, CUDA_ERROR_INVALID_VALUE, "missing pool pointer import output or record");
+    auto pool = pool_lookup(handle);
+    require(pool->native && pool->imported, CUDA_ERROR_INVALID_VALUE, "pointer import requires an imported pool");
+    auto copy = *data; int device = -1; auto native = pool->native->import_pointer(copy, device);
+    device = managed_logical_device(device);
+    require(device >= 0, CUDA_ERROR_INVALID_DEVICE, "imported pool pointer device is not visible");
+    require(pool->props.location.id == -1 || pool->props.location.id == device, CUDA_ERROR_INVALID_DEVICE, "imported pointer device differs from its pool");
+    auto bytes = native->size; auto storage = pool_storage_context(device); native->pool_session = storage->native;
+    auto address = add_allocation(storage, std::move(native));
+    pool->props.location.id = device; global().allocations.at(address).pool = pool;
+    pool->used += bytes; pool->used_high = std::max(pool->used_high, pool->used); *output = address;
 }
 bool pool_reusable(const std::shared_ptr<memory_pool>& pool, unsigned long long free_stream,
                    const completion& free, const std::shared_ptr<stream_state>& stream,
@@ -312,6 +391,7 @@ pool_range_plan pool_find_range(const std::shared_ptr<memory_pool>& pool, size_t
 }
 CUdeviceptr pool_allocate(size_t bytes, const std::shared_ptr<memory_pool>& pool, CUstream handle) {
     auto stream = stream_lookup(handle); auto owner = stream->owner.lock(); capture_check_stream(stream);
+    require(!pool->imported, CUDA_ERROR_INVALID_VALUE, "imported pools cannot create allocations");
     require(pool->props.location.id == owner->device, CUDA_ERROR_NOT_SUPPORTED, "foreign-device pool allocation is unavailable");
     if (!bytes) return 0;
     if (stream->capture) {
@@ -323,6 +403,16 @@ CUdeviceptr pool_allocate(size_t bytes, const std::shared_ptr<memory_pool>& pool
         frontier.assign(1, node); edges.assign(1, CUgraphEdgeData{}); return p.dptr;
     }
     auto storage = pool_storage_context(pool->props.location.id);
+    if (pool->native) {
+        std::unique_ptr<buffer> native;
+        { std::lock_guard lock(storage->native->pool_execution); native = pool->native->allocate(bytes); }
+        native->pool_session = storage->native;
+        auto address = add_allocation(storage, std::move(native));
+        try { submit_stream(owner, handle, [] {}); }
+        catch (...) { global().allocations.erase(address); throw; }
+        global().allocations.at(address).pool = pool;
+        pool->used += bytes; pool->used_high = std::max(pool->used_high, pool->used); return address;
+    }
     command_order order;
     for (auto& dependency : stream_dependencies(owner, stream)) inherit_order(order, dependency);
     auto cached = std::find_if(pool->cache.begin(), pool->cache.end(), [&](auto& block) {
@@ -447,7 +537,7 @@ void pool_free(CUdeviceptr pointer, CUstream handle) {
         auto done = submit_stream(owner, handle, [memory, native] { memory->live = false; });
         memory->planned_live = false; memory->transition = done; return;
     }
-    require(!entry.async_free && !entry.graph_owned && !entry.graphics && !entry.external && !entry.module && !entry.library && entry.host.expired(),
+    require(!entry.async_free && !entry.graph_owned && !entry.graphics && !entry.external && !entry.module && !entry.library && !entry.ipc && entry.host.expired(),
             CUDA_ERROR_INVALID_VALUE, "allocation cannot be freed asynchronously");
     auto native = entry.native;
     entry.async_free = submit_stream(owner, handle, [native] {}); entry.free_stream_id = stream->id;

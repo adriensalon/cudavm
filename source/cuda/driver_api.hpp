@@ -24,6 +24,7 @@ CUDAVM_CUDA_API int cudavmDriverIsDevicePointer(CUdeviceptr);
 CUDAVM_CUDA_API int cudavmDriverIsManagedPointer(CUdeviceptr);
 CUDAVM_CUDA_API int cudavmDriverIsHostPointer(CUdeviceptr);
 CUDAVM_CUDA_API int cudavmDriverPhysicalDevice(int device);
+CUDAVM_CUDA_API CUresult cudavmDriverArrayInfo(CUarray, CUcontext*, int*, CUDA_ARRAY3D_DESCRIPTOR*);
 CUDAVM_CUDA_API const char* cudavmDriverDiagnostic();
 CUDAVM_CUDA_API void cudavmDriverSetDiagnostic(const char*);
 CUDAVM_CUDA_API int cudavmDriverInHostFunction();

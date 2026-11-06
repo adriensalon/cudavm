@@ -4,7 +4,8 @@
 struct memory_pool {
     CUmemoryPool handle = nullptr;
     CUmemPoolProps props{};
-    bool builtin = false, destroyed = false;
+    bool builtin = false, destroyed = false, imported = false;
+    std::shared_ptr<native_memory_pool> native;
     int reuse_events = 1, reuse_opportunistic = 1, reuse_internal = 1;
     uint64_t threshold = 0, used = 0, used_high = 0;
     std::shared_ptr<pool_backing_stats> backing = std::make_shared<pool_backing_stats>();

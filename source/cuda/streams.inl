@@ -43,6 +43,7 @@ std::shared_ptr<stream_state> stream_lookup(CUstream handle, std::shared_ptr<con
 }
 std::vector<completion> stream_dependencies(const std::shared_ptr<context>& owner, const std::shared_ptr<stream_state>& stream) {
     std::vector<completion> result;
+    if (owner->peer_copy_barrier) result.push_back(owner->peer_copy_barrier);
     if (stream->tail) result.push_back(stream->tail);
     std::erase_if(owner->streams, [](const auto& item) { return item.expired(); });
     if (stream->legacy) {
@@ -74,12 +75,11 @@ completion submit_stream(const std::shared_ptr<context>& owner, CUstream handle,
     order[stream->id] = stream->sequence + 1;
     if (owner->transport_tail) dependencies.push_back(owner->transport_tail);
     dependencies.insert(dependencies.end(), additional.begin(), additional.end());
-    // Managed pointers can be reached through device globals and nested records.
-    // Conservatively track every visible managed owner before submission, so
-    // free, context retirement and library unload also wait for foreign queues.
+    // Managed and enabled peer pointers can be reached through nested records.
+    // Track their owners so free and retirement also wait for foreign queues.
     std::vector<std::shared_ptr<context>> managed_owners;
-    for (auto& [address, entry] : global().allocations) if (entry.native->is_managed() && entry.owner != owner) {
-        require(!entry.owner->retiring && (!entry.library || !global().libraries.at(entry.library)->retiring), CUDA_ERROR_INVALID_VALUE, "managed storage is retiring");
+    for (auto& [address, entry] : global().allocations) if (entry.owner != owner && (entry.native->is_managed() || peer_access_enabled(owner, entry.owner))) {
+        require(!entry.owner->retiring && (!entry.library || !global().libraries.at(entry.library)->retiring), CUDA_ERROR_INVALID_VALUE, "foreign storage is retiring");
         if (std::find(managed_owners.begin(), managed_owners.end(), entry.owner) == managed_owners.end()) managed_owners.push_back(entry.owner);
     }
     for (auto& target : managed_owners) {

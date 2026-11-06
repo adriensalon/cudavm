@@ -14,11 +14,16 @@ RUNTIME_API(cudaDeviceGetByPCIBusId, (int* output, const char* text),
 RUNTIME_API(cudaDeviceCanAccessPeer, (int* output, int device, int peer),
     require(output, CUDA_ERROR_INVALID_VALUE, "null peer access output"); check(cuInit(0)); check(cuDeviceCanAccessPeer(output, device, peer)))
 RUNTIME_API(cudaDeviceEnablePeerAccess, (int peer, unsigned flags),
-    require(!flags, CUDA_ERROR_INVALID_VALUE, "peer access flags must be zero"); auto owner = runtime_current();
+    require(!flags, CUDA_ERROR_INVALID_VALUE, "peer access flags must be zero"); runtime_current();
     CUdevice device = 0; check(cuCtxGetDevice(&device)); CUdevice native = 0; check(cuDeviceGet(&native, peer));
-    require(device != peer, CUDA_ERROR_INVALID_DEVICE, "peer equals current device"); (void)owner;
-    require(false, CUDA_ERROR_PEER_ACCESS_UNSUPPORTED, "direct peer access is unavailable"))
+    require(device != peer, CUDA_ERROR_INVALID_DEVICE, "peer equals current device");
+    check(cuCtxEnablePeerAccess(retain_primary(peer), flags)))
 RUNTIME_API(cudaDeviceDisablePeerAccess, (int peer),
     runtime_current(); CUdevice device = 0; check(cuCtxGetDevice(&device)); CUdevice native = 0; check(cuDeviceGet(&native, peer));
     require(device != peer, CUDA_ERROR_INVALID_DEVICE, "peer equals current device");
-    require(false, CUDA_ERROR_PEER_ACCESS_NOT_ENABLED, "peer access is not enabled"))
+    check(cuCtxDisablePeerAccess(retain_primary(peer))))
+RUNTIME_API(cudaDeviceGetP2PAttribute, (int* output, cudaDeviceP2PAttr attribute, int source, int target), check(cuInit(0)); check(cuDeviceGetP2PAttribute(output, static_cast<CUdevice_P2PAttribute>(attribute), source, target)))
+RUNTIME_API(cudaDeviceGetP2PAtomicCapabilities, (unsigned* output, const cudaAtomicOperation* operations, unsigned count, int source, int target),
+    require(output && operations && count, CUDA_ERROR_INVALID_VALUE, "missing peer atomic capability array or empty count"); check(cuInit(0));
+    std::vector<CUatomicOperation> native; native.reserve(count); for (unsigned i = 0; i < count; ++i) native.push_back(static_cast<CUatomicOperation>(operations[i]));
+    check(cuDeviceGetP2PAtomicCapabilities(output, native.data(), count, source, target)))

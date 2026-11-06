@@ -40,6 +40,12 @@ RUNTIME_API(cudaMemcpy3DPeer, (const cudaMemcpy3DPeerParms* p),
     require(p, CUDA_ERROR_INVALID_VALUE, "null 3D peer descriptor"); runtime_current(); auto descriptor = runtime_peer_3d(*p);
     if (!p->extent.width || !p->extent.height || !p->extent.depth) return;
     check(runtime_driver_wait([&] { return cuMemcpy3DPeer(&descriptor); })))
+RUNTIME_API(cudaMemcpy3DPeer_ptds, (const cudaMemcpy3DPeerParms* p),
+    require(p, CUDA_ERROR_INVALID_VALUE, "null 3D peer descriptor"); runtime_current(); auto descriptor = runtime_peer_3d(*p);
+    if (!p->extent.width || !p->extent.height || !p->extent.depth) return;
+    void* address{}; check(cuGetProcAddress("cuMemcpy3DPeer", &address, 7000, CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM, nullptr));
+    auto copy = reinterpret_cast<CUresult (CUDAAPI*)(const CUDA_MEMCPY3D_PEER*)>(address);
+    check(runtime_driver_wait([&] { return copy(&descriptor); })))
 RUNTIME_API(cudaMemset2D, (void* pointer, size_t pitch, int value, size_t width, size_t height),
     runtime_current(); if (width && height) memory_pitch(pitch, width);
     check(runtime_driver_wait([&] { return cuMemsetD2D8(reinterpret_cast<std::uintptr_t>(pointer), pitch, static_cast<unsigned char>(value), width, height); })))

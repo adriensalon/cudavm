@@ -96,17 +96,63 @@ void async_peer_boxes(const memory_box& to, const memory_box& from, size_t width
     for (auto& endpoint : foreign) endpoint->foreign_work.push_back(done);
 }
 void async_peer_linear(CUdeviceptr to, CUcontext to_context, CUdeviceptr from, CUcontext from_context, size_t bytes, CUstream stream) {
-    auto to_owner = lookup(to_context), from_owner = lookup(from_context), owner = current();
+    auto to_owner = lookup(to_context), from_owner = lookup(from_context), owner = stream_lookup(stream)->owner.lock();
     auto source = memory_endpoint(CU_MEMORYTYPE_DEVICE, nullptr, from, bytes, 0, 0, 0, 0, bytes, 1, 1, from_owner, false);
     auto destination = memory_endpoint(CU_MEMORYTYPE_DEVICE, nullptr, to, bytes, 0, 0, 0, 0, bytes, 1, 1, to_owner, false);
     async_peer_boxes(destination, source, bytes, stream, owner);
 }
 void async_peer_3d(const CUDA_MEMCPY3D_PEER& p, CUstream stream) {
     require(!p.srcLOD && !p.dstLOD, CUDA_ERROR_INVALID_VALUE, "copy LOD must be zero");
-    auto to_owner = lookup(p.dstContext), from_owner = lookup(p.srcContext), owner = current();
+    auto to_owner = lookup(p.dstContext), from_owner = lookup(p.srcContext), owner = stream_lookup(stream)->owner.lock();
     auto source = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth, from_owner, true, p.srcArray);
     auto destination = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth, to_owner, true, p.dstArray);
     async_peer_boxes(destination, source, p.WidthInBytes, stream, owner);
+}
+void ordered_peer_boxes(const memory_box& to, const memory_box& from, size_t width, CUstream stream) {
+    auto owner = current();
+    if (!width || !to.rows || !to.depth) return;
+    memory_disjoint(to, from, width);
+    std::vector<std::shared_ptr<context>> participants{owner};
+    for (auto& endpoint : {to.owner, from.owner})
+        if (std::find(participants.begin(), participants.end(), endpoint) == participants.end()) participants.push_back(endpoint);
+    std::vector<completion> dependencies;
+    for (auto& endpoint : participants) {
+        capture_unsafe(endpoint);
+        if (endpoint->peer_copy_barrier) dependencies.push_back(endpoint->peer_copy_barrier);
+        for (auto& weak : endpoint->streams) if (auto lane = weak.lock()) if (lane->tail) dependencies.push_back(lane->tail);
+        std::erase_if(endpoint->foreign_work, [](auto& weak) { return weak.expired(); });
+        for (auto& weak : endpoint->foreign_work) if (auto work = weak.lock()) dependencies.push_back(std::move(work));
+        endpoint->foreign_work.reserve(endpoint->foreign_work.size() + 1);
+    }
+    auto hosts = prepare_async_hosts(to, from);
+    auto queue = stream_native(owner, stream_lookup(stream, owner));
+    auto done = submit_stream(owner, stream, {}, std::move(dependencies), 0, [to, from, width, queue, owner] {
+        return enqueue_copy_boxes(to, from, width, queue.get(), owner);
+    });
+    // Publish every future dependency before releasing the registry mutex.
+    // Draining endpoints one at a time would admit intervening work too early.
+    for (auto& endpoint : participants) {
+        endpoint->peer_copy_barrier = done;
+        // submit_stream already tracks visible managed/peer owners. Avoid a
+        // duplicate append beyond the capacity reserved before submission.
+        if (endpoint != owner && std::none_of(endpoint->foreign_work.begin(), endpoint->foreign_work.end(), [&](auto& weak) { return weak.lock() == done; }))
+            endpoint->foreign_work.push_back(done);
+    }
+    for (auto& host : hosts) host_track(host, done);
+    if (!to.device_storage() || !from.device_storage()) driver_wait([&] { done->wait(context_schedule(owner)); });
+}
+void ordered_peer_linear(CUdeviceptr to, CUcontext to_context, CUdeviceptr from, CUcontext from_context, size_t bytes, CUstream stream) {
+    auto to_owner = lookup(to_context), from_owner = lookup(from_context);
+    auto source = memory_endpoint(CU_MEMORYTYPE_DEVICE, nullptr, from, bytes, 0, 0, 0, 0, bytes, 1, 1, from_owner, false);
+    auto destination = memory_endpoint(CU_MEMORYTYPE_DEVICE, nullptr, to, bytes, 0, 0, 0, 0, bytes, 1, 1, to_owner, false);
+    ordered_peer_boxes(destination, source, bytes, stream);
+}
+void ordered_peer_3d(const CUDA_MEMCPY3D_PEER& p, CUstream stream) {
+    require(!p.srcLOD && !p.dstLOD, CUDA_ERROR_INVALID_VALUE, "copy LOD must be zero");
+    auto to_owner = lookup(p.dstContext), from_owner = lookup(p.srcContext);
+    auto source = memory_endpoint(p.srcMemoryType, p.srcHost, p.srcDevice, p.srcPitch, p.srcHeight, p.srcXInBytes, p.srcY, p.srcZ, p.WidthInBytes, p.Height, p.Depth, from_owner, true, p.srcArray);
+    auto destination = memory_endpoint(p.dstMemoryType, p.dstHost, p.dstDevice, p.dstPitch, p.dstHeight, p.dstXInBytes, p.dstY, p.dstZ, p.WidthInBytes, p.Height, p.Depth, to_owner, true, p.dstArray);
+    ordered_peer_boxes(destination, source, p.WidthInBytes, stream);
 }
 template<class T> void async_fill_box(CUdeviceptr pointer, size_t pitch, size_t slice_height, T value,
                                      size_t width, size_t height, size_t depth, CUstream stream, const std::shared_ptr<context>& owner) {

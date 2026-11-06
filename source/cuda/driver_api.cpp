@@ -62,8 +62,14 @@ struct context {
     std::vector<std::weak_ptr<stream_state>> streams;
     // Commands executed on another context can still own this context's buffers.
     std::vector<std::weak_ptr<command_completion>> foreign_work;
+    std::unordered_map<CUcontext, std::weak_ptr<context>> peers;
     completion transport_tail; // Scalar shader transport snapshots all bindings.
+    completion peer_copy_barrier; // Plain peer copies serialize all participating contexts.
 };
+bool peer_access_enabled(const std::shared_ptr<context>& owner, const std::shared_ptr<context>& peer) {
+    auto found = owner->peers.find(peer->handle);
+    return found != owner->peers.end() && found->second.lock() == peer && !peer->retiring;
+}
 struct stream_state {
     std::weak_ptr<context> owner;
     unsigned flags = 0;
@@ -95,6 +101,11 @@ struct virtual_allocation_state {
     CUmemGenericAllocationHandle handle{};
     size_t granularity{}, references = 1;
 };
+struct ipc_memory_state {
+    // Every successful native open owns one reference, even when v2 returns
+    // an address that is already registered in this importing context.
+    std::vector<std::shared_ptr<buffer>> references;
+};
 struct allocation {
     std::shared_ptr<context> owner;
     std::shared_ptr<buffer> native;
@@ -112,6 +123,7 @@ struct allocation {
     unsigned long long free_stream_id = 0;
     CUlibrary library = nullptr;
     std::shared_ptr<virtual_allocation_state> virtual_memory;
+    std::shared_ptr<ipc_memory_state> ipc;
 };
 struct memory_entry { std::shared_ptr<context> owner; std::shared_ptr<external_memory> native; uint64_t size; };
 struct array_entry {
@@ -459,6 +471,17 @@ void destroy(const std::shared_ptr<context>& owner, bool pop_current = true) {
     owner->retiring = true;
     invalidate_native_graphs();
     retire_context(owner);
+    // Public peer identities never keep a context alive. Accepted foreign work
+    // has completed before its incoming native mappings are retired.
+    for (auto& [handle, accessor] : global().contexts) {
+        if (accessor == owner || !accessor->peers.contains(owner->handle)) continue;
+        try { accessor->native->disable_peer(*owner->native); } catch (...) {} // Faulted contexts still retire.
+        accessor->peers.erase(owner->handle);
+    }
+    for (auto& [handle, weak] : owner->peers) if (auto peer = weak.lock()) {
+        try { owner->native->disable_peer(*peer->native); } catch (...) {}
+    }
+    owner->peers.clear();
     if (owner->primary) retire_primary_hosts(owner);
     pool_retire_context(owner);
     std::erase_if(global().streams, [&](auto& item) { return item.second->owner.lock() == owner; });
@@ -631,6 +654,7 @@ CUdeviceptr allocate(const std::shared_ptr<context>& owner, size_t bytes) {
 using allocation_it = std::map<CUdeviceptr, allocation>::iterator;
 bool allocation_visible(const allocation& entry, const std::shared_ptr<context>& owner) {
     return entry.owner == owner || entry.native->is_managed() ||
+        peer_access_enabled(owner, entry.owner) ||
         (entry.virtual_memory && owner->native->kind() == cudavmBackendCuda) ||
         (entry.pool && entry.pool->props.location.id == owner->device);
 }
@@ -694,11 +718,12 @@ void release(CUdeviceptr pointer, const std::shared_ptr<context>& owner) {
     require(!it->second.library, CUDA_ERROR_INVALID_VALUE, "library managed globals are released by library unload");
     require(it->second.host.expired(), CUDA_ERROR_INVALID_VALUE, "mapped host aliases are released by host free/unregister");
     require(!it->second.virtual_memory, CUDA_ERROR_INVALID_VALUE, "virtual mappings are released by cuMemUnmap");
+    require(!it->second.ipc, CUDA_ERROR_INVALID_VALUE, "IPC mappings are released by cuIpcCloseMemHandle");
     auto memory = it->second.graph_memory.lock();
     if (it->second.graph_owned) require(memory && memory->planned_live && !memory->internal_free(), CUDA_ERROR_INVALID_VALUE, "graph allocation cannot be freed outside its owning graph");
     auto expected = it->second.native;
     auto storage_owner = it->second.owner;
-    synchronize_context(expected->is_managed() ? storage_owner : owner);
+    synchronize_context(expected->is_managed() || peer_access_enabled(owner, storage_owner) ? storage_owner : owner);
     it = global().allocations.find(pointer);
     require(it != global().allocations.end() && it->second.native == expected, CUDA_ERROR_INVALID_VALUE, "allocation changed while waiting for free");
     invalidate_native_graphs();
@@ -772,6 +797,7 @@ bool capture_graph_launch(const std::shared_ptr<context>&, CUstream, const graph
 #include "memory.inl"
 #include "async_memory.inl"
 #include "batch_copy.inl"
+#include "decompression_state.inl"
 #include "managed_advice.inl"
 #include "virtual_memory_state.inl"
 #include "launch_state.inl"
@@ -788,6 +814,7 @@ bool capture_graph_launch(const std::shared_ptr<context>&, CUstream, const graph
 #include "graph_instantiation.inl"
 #include "capture.inl"
 #include "memory_pools.inl"
+#include "ipc_state.inl"
 const char* error_name(CUresult error) {
     switch (error) {
 #define DRIVER_ERROR(value, description) case value: return #value;
@@ -817,6 +844,7 @@ using namespace cudavm;
 #define DRIVER_API(name, parameters, ...) extern "C" CUDAVM_API CUresult CUDAAPI name parameters { return driver_call([&] { __VA_ARGS__; }); }
 
 #include "interop_exports.inl"
+#include "peer_access_state.inl"
 #include "device_exports.inl"
 #include "memory_exports.inl"
 #include "array_exports.inl"
@@ -826,9 +854,11 @@ using namespace cudavm;
 #include "memory_operation_exports.inl"
 #include "async_memory_exports.inl"
 #include "batch_copy_exports.inl"
+#include "decompression_exports.inl"
 #include "managed_advice_exports.inl"
 #include "virtual_address_exports.inl"
 #include "memory_pool_exports.inl"
+#include "ipc_exports.inl"
 #include "graph_exports.inl"
 #include "graph_memory_exports.inl"
 #include "graph_memory_operation_exports.inl"
@@ -963,7 +993,7 @@ DRIVER_API(cuDeviceGetCount, (int* count), driver_ready(); require(count, CUDA_E
 DRIVER_API(cuDeviceGet, (CUdevice* device, int ordinal), driver_ready(); require(device, CUDA_ERROR_INVALID_VALUE, "null device output"); valid_device(ordinal); *device = ordinal)
 DRIVER_API(cuDeviceGetAttribute, (int* output, CUdevice_attribute attribute, CUdevice device), driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null device attribute output"); valid_device(device);
     *output = attribute == CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS || attribute == CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE_NOR ? 1 :
-    attribute == CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES || attribute == CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES ||
+    attribute == CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES || (attribute == CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES && device_kind(device) != cudavmBackendCuda) ||
     attribute == CU_DEVICE_ATTRIBUTE_HOST_MEMORY_POOLS_SUPPORTED || attribute == CU_DEVICE_ATTRIBUTE_HOST_NUMA_MEMORY_POOLS_SUPPORTED ? 0 :
     device_kind(device) != cudavmBackendCuda && (attribute == CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH || attribute == CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH) ? 0 :
     device_kind(device) != cudavmBackendCuda && (attribute == CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY || attribute == CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS ||
@@ -1011,6 +1041,14 @@ DRIVER_API(cuGetErrorName, (CUresult error, const char** output), require(output
 DRIVER_API(cuGetErrorString, (CUresult error, const char** output), require(output, CUDA_ERROR_INVALID_VALUE, "null error string output"); *output = error_string(error); require(*output, CUDA_ERROR_INVALID_VALUE, "unrecognized error code"))
 
 // Driver-owned metadata probes: no initialization and no Runtime behavior.
+extern "C" CUDAVM_CUDA_API CUresult cudavmDriverArrayInfo(CUarray handle, CUcontext* context, int* device, CUDA_ARRAY3D_DESCRIPTOR* descriptor) {
+    return driver_call([&] {
+        driver_ready(); require(context && device && descriptor, CUDA_ERROR_INVALID_VALUE, "missing array metadata output");
+        auto found = global().arrays.find(handle);
+        require(found != global().arrays.end() && !found->second->retiring && !found->second->owner->retiring, CUDA_ERROR_INVALID_HANDLE, "invalid or retired peer array");
+        auto& entry = *found->second; *context = entry.owner->handle; *device = entry.owner->device; *descriptor = entry.descriptor;
+    });
+}
 extern "C" CUDAVM_CUDA_API uint64_t cudavmDriverEpoch() {
     std::lock_guard lock(global().mutex); return global().epoch;
 }

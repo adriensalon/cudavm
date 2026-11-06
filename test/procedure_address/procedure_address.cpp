@@ -55,6 +55,10 @@ void procedure_uninitialized() {
     require(cuDeviceGetCount(&count) == CUDA_ERROR_NOT_INITIALIZED, "procedure lookup does not initialize Driver");
 }
 void procedure_discovery() {
+    for (bool runtime : {false, true}) {
+        const auto [address, status] = procedure_query("cuMemcpyPeer", 6999, CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM, runtime);
+        require(!address && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "per-thread introduction does not fall back to legacy semantics");
+    }
     procedure_uninitialized();
     for (bool runtime : {false, true}) for (cuuint64_t flags : {cuuint64_t{0}, cuuint64_t{1}, cuuint64_t{2}}) {
         const auto version = procedure_resolve<PFN_cuDriverGetVersion_v2020>("cuDriverGetVersion", 2020, flags, runtime);

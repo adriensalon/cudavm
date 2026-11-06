@@ -24,11 +24,8 @@ DRIVER_API(cuMemcpy2D, (const CUDA_MEMCPY2D* p), driver_ready(); require(p, CUDA
 DRIVER_API(cuMemcpy2DUnaligned, (const CUDA_MEMCPY2D* p), driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null 2D copy descriptor"); copy_2d(*p, current()))
 DRIVER_API(cuMemcpy3D, (const CUDA_MEMCPY3D* p), driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null 3D copy descriptor"); auto owner = current(); copy_3d(*p, owner, owner))
 DRIVER_API(cuMemcpyPeer, (CUdeviceptr to, CUcontext to_context, CUdeviceptr from, CUcontext from_context, size_t bytes),
-    driver_ready(); auto to_owner = lookup(to_context), from_owner = lookup(from_context); current();
-    auto source = memory_endpoint(CU_MEMORYTYPE_DEVICE, nullptr, from, bytes, 0, 0, 0, 0, bytes, 1, 1, from_owner, false);
-    auto destination = memory_endpoint(CU_MEMORYTYPE_DEVICE, nullptr, to, bytes, 0, 0, 0, 0, bytes, 1, 1, to_owner, false);
-    copy_boxes(destination, source, bytes))
-DRIVER_API(cuMemcpy3DPeer, (const CUDA_MEMCPY3D_PEER* p), driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null peer copy descriptor"); current(); copy_3d(*p, lookup(p->dstContext), lookup(p->srcContext)))
+    driver_ready(); ordered_peer_linear(to, to_context, from, from_context, bytes, nullptr))
+DRIVER_API(cuMemcpy3DPeer, (const CUDA_MEMCPY3D_PEER* p), driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null peer copy descriptor"); ordered_peer_3d(*p, nullptr))
 DRIVER_API(cuMemsetD2D8, (CUdeviceptr to, size_t pitch, unsigned char value, size_t width, size_t height), driver_ready(); fill_box(to, pitch, 0, value, width, height, 1, current()))
 DRIVER_API(cuMemsetD2D16, (CUdeviceptr to, size_t pitch, unsigned short value, size_t width, size_t height), driver_ready(); fill_box(to, pitch, 0, value, width, height, 1, current()))
 DRIVER_API(cuMemsetD2D32, (CUdeviceptr to, size_t pitch, unsigned value, size_t width, size_t height), driver_ready(); fill_box(to, pitch, 0, value, width, height, 1, current()))

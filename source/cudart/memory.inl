@@ -102,20 +102,32 @@ CUcontext runtime_peer_context(const void* pointer, int device) {
 }
 CUDA_MEMCPY3D_PEER runtime_peer_3d(const cudaMemcpy3DPeerParms& p) {
     require(!(p.srcArray && p.srcPtr.ptr) && !(p.dstArray && p.dstPtr.ptr), CUDA_ERROR_INVALID_VALUE, "multiple peer endpoints");
-    require(!p.srcArray && !p.dstArray, CUDA_ERROR_NOT_SUPPORTED, "CUDA array transfers are not implemented");
     CUdevice device = 0; check(cuDeviceGet(&device, p.srcDevice)); check(cuDeviceGet(&device, p.dstDevice));
     if (!p.extent.width || !p.extent.height || !p.extent.depth) return {};
-    auto from_owner = runtime_peer_context(p.srcPtr.ptr, p.srcDevice), to_owner = runtime_peer_context(p.dstPtr.ptr, p.dstDevice);
-    memory_pitch(p.srcPtr.pitch, p.extent.width, p.srcPos.x, p.srcDevice);
-    memory_pitch(p.dstPtr.pitch, p.extent.width, p.dstPos.x, p.dstDevice);
+    auto endpoint = [&](cudaArray_t array, const void* pointer, int device, size_t& element) {
+        if (!array) return runtime_peer_context(pointer, device);
+        CUcontext owner{}; int ordinal{}; CUDA_ARRAY3D_DESCRIPTOR descriptor{};
+        check(cudavmDriverArrayInfo(reinterpret_cast<CUarray>(array), &owner, &ordinal, &descriptor));
+        require(ordinal == device, CUDA_ERROR_INVALID_DEVICE, "peer array belongs to a different device");
+        element = runtime_array_element(descriptor); return owner;
+    };
+    size_t source_element = 0, destination_element = 0;
+    auto from_owner = endpoint(p.srcArray, p.srcPtr.ptr, p.srcDevice, source_element);
+    auto to_owner = endpoint(p.dstArray, p.dstPtr.ptr, p.dstDevice, destination_element);
+    require(!source_element || !destination_element || source_element == destination_element, CUDA_ERROR_INVALID_VALUE, "peer array elements differ in size");
+    auto element = std::max({size_t(1), source_element, destination_element}); auto width = memory_mul(p.extent.width, element);
+    if (!p.srcArray) memory_pitch(p.srcPtr.pitch, width, p.srcPos.x, p.srcDevice);
+    if (!p.dstArray) memory_pitch(p.dstPtr.pitch, width, p.dstPos.x, p.dstDevice);
     CUDA_MEMCPY3D_PEER result{};
-    result.srcMemoryType = result.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    result.srcMemoryType = p.srcArray ? CU_MEMORYTYPE_ARRAY : CU_MEMORYTYPE_DEVICE;
+    result.dstMemoryType = p.dstArray ? CU_MEMORYTYPE_ARRAY : CU_MEMORYTYPE_DEVICE;
+    result.srcArray = reinterpret_cast<CUarray>(p.srcArray); result.dstArray = reinterpret_cast<CUarray>(p.dstArray);
     result.srcDevice = reinterpret_cast<std::uintptr_t>(p.srcPtr.ptr); result.srcContext = from_owner;
     result.srcPitch = p.srcPtr.pitch; result.srcHeight = p.srcPtr.ysize;
-    result.srcXInBytes = p.srcPos.x; result.srcY = p.srcPos.y; result.srcZ = p.srcPos.z;
+    result.srcXInBytes = p.srcArray ? memory_mul(p.srcPos.x, element) : p.srcPos.x; result.srcY = p.srcPos.y; result.srcZ = p.srcPos.z;
     result.dstDevice = reinterpret_cast<std::uintptr_t>(p.dstPtr.ptr); result.dstContext = to_owner;
     result.dstPitch = p.dstPtr.pitch; result.dstHeight = p.dstPtr.ysize;
-    result.dstXInBytes = p.dstPos.x; result.dstY = p.dstPos.y; result.dstZ = p.dstPos.z;
-    result.WidthInBytes = p.extent.width; result.Height = p.extent.height; result.Depth = p.extent.depth;
+    result.dstXInBytes = p.dstArray ? memory_mul(p.dstPos.x, element) : p.dstPos.x; result.dstY = p.dstPos.y; result.dstZ = p.dstPos.z;
+    result.WidthInBytes = width; result.Height = p.extent.height; result.Depth = p.extent.depth;
     return result;
 }

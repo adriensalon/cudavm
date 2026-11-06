@@ -41,6 +41,8 @@ std::optional<std::string> backend_environment(const char* name) {
 }
 int shader_device_attribute(const shader_resource_limits& limits, CUdevice_attribute which) {
     switch (which) {
+    case CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK:
+    case CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_MAXIMUM_LENGTH: return 0;
     case CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: return int(std::min(1024u, limits.threads));
     case CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X: case CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y: case CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z:
         return int(std::min(1024u, limits.block[which - CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X]));

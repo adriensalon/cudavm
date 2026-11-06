@@ -76,6 +76,18 @@ struct device_inventory : backend {
     device_luid_info device_luid(int device) override { auto& d = at(device); return d.provider->device_luid(d.ordinal); }
     pci_address device_pci(int device) override { auto& d = at(device); return d.provider->device_pci(d.ordinal); }
     int attribute(int device, CUdevice_attribute which) override { auto& d = at(device); return d.provider->attribute(d.ordinal, which); }
+    int can_access_peer(int device, int peer) override {
+        auto& a = at(device); auto& b = at(peer);
+        return a.provider == b.provider ? a.provider->can_access_peer(a.ordinal, b.ordinal) : 0;
+    }
+    int peer_attribute(int device, int peer, CUdevice_P2PAttribute attribute) override {
+        auto& a = at(device); auto& b = at(peer);
+        return a.provider == b.provider ? a.provider->peer_attribute(a.ordinal, b.ordinal, attribute) : backend::peer_attribute(device, peer, attribute);
+    }
+    std::vector<unsigned> peer_atomic_capabilities(int device, int peer, std::span<const CUatomicOperation> operations) override {
+        auto& a = at(device); auto& b = at(peer);
+        return a.provider == b.provider ? a.provider->peer_atomic_capabilities(a.ordinal, b.ordinal, operations) : backend::peer_atomic_capabilities(device, peer, operations);
+    }
     shader_resource_limits shader_limits(int device) override { auto& d = at(device); return d.provider->shader_limits(d.ordinal); }
     std::string link_registered_images(std::span<const std::string_view> images, int device) override {
         auto& d = at(device); return d.provider->link_registered_images(images, d.ordinal);

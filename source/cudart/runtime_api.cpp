@@ -347,6 +347,7 @@ using namespace cudavm;
 #include "batch_copy_exports.inl"
 #include "managed_advice_exports.inl"
 #include "memory_pool_exports.inl"
+#include "ipc_exports.inl"
 #include "graph_exports.inl"
 #include "graph_memory_exports.inl"
 #include "graph_advanced_exports.inl"

@@ -15,11 +15,10 @@ DRIVER_API(cuDeviceGetPCIBusId, (char* output, int length, CUdevice device), dri
     std::memcpy(output, text, std::min<size_t>(length, size_t(bytes) + 1)); require(length > bytes, CUDA_ERROR_INVALID_VALUE, "PCI bus output is too small"))
 DRIVER_API(cuDeviceGetByPCIBusId, (CUdevice* output, const char* text), driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null PCI device output"); *output = device_from_pci(text))
 DRIVER_API(cuDeviceCanAccessPeer, (int* output, CUdevice device, CUdevice peer),
-    driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null peer access output"); valid_device(device); valid_device(peer); *output = 0)
+    driver_ready(); require(output, CUDA_ERROR_INVALID_VALUE, "null peer access output"); valid_device(device); valid_device(peer); *output = global().provider->can_access_peer(device, peer))
 DRIVER_API(cuCtxEnablePeerAccess, (CUcontext peer, unsigned flags),
-    driver_ready(); auto owner = current(); auto other = lookup(peer);
-    require(!flags, CUDA_ERROR_INVALID_VALUE, "peer access flags must be zero"); require(owner != other, CUDA_ERROR_INVALID_CONTEXT, "peer context equals current context");
-    throw failure(CUDA_ERROR_PEER_ACCESS_UNSUPPORTED, "direct peer access is unavailable between these contexts"))
+    driver_ready(); peer_enable(peer, flags))
 DRIVER_API(cuCtxDisablePeerAccess, (CUcontext peer),
-    driver_ready(); auto owner = current(); auto other = lookup(peer); require(owner != other, CUDA_ERROR_INVALID_CONTEXT, "peer context equals current context");
-    throw failure(CUDA_ERROR_PEER_ACCESS_NOT_ENABLED, "peer access is not enabled"))
+    driver_ready(); peer_disable(peer))
+DRIVER_API(cuDeviceGetP2PAttribute, (int* output, CUdevice_P2PAttribute attribute, CUdevice source, CUdevice target), driver_ready(); peer_attribute(output, attribute, source, target))
+DRIVER_API(cuDeviceGetP2PAtomicCapabilities, (unsigned* output, const CUatomicOperation* operations, unsigned count, CUdevice source, CUdevice target), driver_ready(); peer_atomic_capabilities(output, operations, count, source, target))

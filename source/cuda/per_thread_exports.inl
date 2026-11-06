@@ -110,9 +110,9 @@ DRIVER_API(cuMemcpy2DUnaligned_v2_ptds, (const CUDA_MEMCPY2D* p),
 DRIVER_API(cuMemcpy3D_v2_ptds, (const CUDA_MEMCPY3D* p),
     driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null 3D copy descriptor"); async_copy_3d(*p, CU_STREAM_PER_THREAD, current()); stream_status(CU_STREAM_PER_THREAD, true))
 DRIVER_API(cuMemcpyPeer_ptds, (CUdeviceptr to, CUcontext to_context, CUdeviceptr from, CUcontext from_context, size_t bytes),
-    driver_ready(); async_peer_linear(to, to_context, from, from_context, bytes, CU_STREAM_PER_THREAD); stream_status(CU_STREAM_PER_THREAD, true))
+    driver_ready(); ordered_peer_linear(to, to_context, from, from_context, bytes, CU_STREAM_PER_THREAD))
 DRIVER_API(cuMemcpy3DPeer_ptds, (const CUDA_MEMCPY3D_PEER* p),
-    driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null peer copy descriptor"); async_peer_3d(*p, CU_STREAM_PER_THREAD); stream_status(CU_STREAM_PER_THREAD, true))
+    driver_ready(); require(p, CUDA_ERROR_INVALID_VALUE, "null peer copy descriptor"); ordered_peer_3d(*p, CU_STREAM_PER_THREAD))
 DRIVER_API(cuMemsetD8_v2_ptds, (CUdeviceptr to, unsigned char pattern, size_t count),
     driver_ready(); async_fill_linear(to, pattern, count, CU_STREAM_PER_THREAD); stream_status(CU_STREAM_PER_THREAD, true))
 DRIVER_API(cuMemsetD2D8_v2_ptds, (CUdeviceptr to, size_t pitch, unsigned char value, size_t width, size_t height),
