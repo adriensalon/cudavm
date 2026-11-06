@@ -1,6 +1,6 @@
+#define NVJITLINK_NO_INLINE
 #include "conformance.hpp"
 #include "cubin_fixture.hpp"
-#define NVJITLINK_NO_INLINE
 #include <nvJitLink.h>
 #include <algorithm>
 

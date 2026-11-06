@@ -135,6 +135,16 @@ bool same_storage_type(llvm::Type* a, llvm::Type* b) {
     }
     return false;
 }
+bool same_function_type(llvm::FunctionType* a, llvm::FunctionType* b) {
+    // Imported TUs can give equivalent records distinct LLVM type identities.
+    // Compare their ABI shape before LLVM coalesces those types during linking.
+    if (a == b) return true;
+    if (a->isVarArg() != b->isVarArg() || a->getNumParams() != b->getNumParams()
+        || !same_storage_type(a->getReturnType(), b->getReturnType())) return false;
+    for (unsigned i = 0; i < a->getNumParams(); ++i)
+        if (!same_storage_type(a->getParamType(i), b->getParamType(i))) return false;
+    return true;
+}
 const llvm::Function* alias_target(const llvm::GlobalAlias& alias, bool final_link) {
     auto fail = [&](const char* reason) -> const llvm::Function* {
         throw std::runtime_error("unsupported device function alias " + alias.getName().str() + ": " + reason);
@@ -251,7 +261,7 @@ bool same_alias_abi(const llvm::Function& a, const llvm::Function& b) {
         || (a.isDeclaration() && a.getCallingConv() == llvm::CallingConv::C && kernel(b))
         || (b.isDeclaration() && b.getCallingConv() == llvm::CallingConv::C && kernel(a));
     return a.getAddressSpace() == b.getAddressSpace()
-        && a.getFunctionType() == b.getFunctionType() && convention
+        && same_function_type(a.getFunctionType(), b.getFunctionType()) && convention
         && same_alias_attributes(a.getAttributes(), b.getAttributes(), a.arg_size());
 }
 void freeze_weak_alias_targets(llvm::Module& module) {

@@ -142,7 +142,7 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
     }
     case compiler_input_kind::source: {
         auto* source = request.source;
-        require_compiler_request(source && source->abi_version == 1 && source->source && source->name && source->relocatable <= 1
+        require_compiler_request(source && (source->abi_version == 1 || source->abi_version == 2) && source->source && source->name && source->relocatable <= 1
             && (!source->header_count || source->headers), "invalid compiler source request");
         nvrtc_options settings;
         if (source->standard) settings.standard = source->standard;
@@ -151,6 +151,13 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
         append_compiler_option_strings(source->include_count, source->includes, settings.includes);
         append_compiler_option_strings(source->define_count, source->defines, settings.defines);
         append_compiler_option_strings(source->undefine_count, source->undefines, settings.undefines);
+        if (source->abi_version == 2) {
+            const auto& ordered = *reinterpret_cast<const compiler_source_request_v2*>(source);
+            append_compiler_option_strings(ordered.macro_count, ordered.macros, settings.macros);
+            for (const auto& macro : settings.macros)
+                require_compiler_request(macro.size() > 2 && (macro.starts_with("-D") || macro.starts_with("-U")),
+                    "invalid compiler macro operation");
+        }
         std::vector<std::pair<std::string, std::string>> headers;
         for (size_t i = 0; i < source->header_count; ++i) {
             require_compiler_request(source->headers[i].name && source->headers[i].contents, "invalid compiler source header");

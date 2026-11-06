@@ -6,7 +6,7 @@ namespace cudavm {
 struct nvrtc_options {
     std::string standard = "c++17", architecture = "sm_75";
     bool relocatable = false;
-    std::vector<std::string> includes, defines, undefines;
+    std::vector<std::string> includes, defines, undefines, macros;
 };
 struct nvrtc_output {
     std::unique_ptr<llvm::Module> module;

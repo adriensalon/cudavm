@@ -1,4 +1,10 @@
 #pragma once
+#ifdef CUDAVM_CONFORMANCE_NVRTC
+#include <nvrtc.h>
+#endif
+#ifdef CUDAVM_CONFORMANCE_NVJITLINK
+#include <nvJitLink.h>
+#endif
 #ifndef CUDAVM_CONFORMANCE_HOST_ONLY
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -35,6 +41,49 @@ void require(bool condition, const std::string& message);
 // Host/compiler contracts share reporting without GPU initialization or Driver
 // references. HOST_ONLY registration selects this subset of the common runner.
 int run_host_conformance(int argc, char** argv, void (*execute)());
+
+#if defined(CUDAVM_CONFORMANCE_NVRTC) || defined(CUDAVM_CONFORMANCE_NVJITLINK)
+template<class Size, class Get> std::vector<unsigned char> compiler_fixture_bytes(Size query, Get retrieve) {
+    struct { size_t before = 0x5917ab3d; size_t value{}; size_t after = 0x93bd175a; } size;
+    query(&size.value);
+    require(size.before == 0x5917ab3d && size.after == 0x93bd175a, "compiler binary size output guards");
+    require(size.value > 0 && size.value < 64 * 1024 * 1024, "compiler fixture binary extent is nonempty and bounded");
+    std::vector<unsigned char> bytes(size.value + 32, 0x97);
+    retrieve(bytes.data() + 16);
+    for (size_t i = 0; i < bytes.size(); ++i) if (i < 16 || i >= size.value + 16)
+        require(bytes[i] == 0x97, "compiler binary retrieval exact extent guards");
+    return {bytes.begin() + 16, bytes.end() - 16};
+}
+#endif
+// Compiler helpers own handles and exact output extents. Each slice retains
+// its sources, options and semantic oracle. CMake enables only linked APIs.
+#ifdef CUDAVM_CONFORMANCE_NVRTC
+struct compiler_fixture_program {
+    nvrtcProgram value{};
+    compiler_fixture_program(const std::string& source, const char* name);
+    ~compiler_fixture_program();
+    compiler_fixture_program(const compiler_fixture_program&) = delete;
+    compiler_fixture_program& operator=(const compiler_fixture_program&) = delete;
+    static void check(nvrtcResult result);
+    nvrtcResult compile(const std::vector<std::string>& options = {}) const;
+    std::string text(bool log = false) const;
+    std::string success(const std::vector<std::string>& options = {}) const;
+    std::vector<unsigned char> lto() const;
+};
+#endif
+#ifdef CUDAVM_CONFORMANCE_NVJITLINK
+struct linker_fixture_program {
+    nvJitLinkHandle value{};
+    explicit linker_fixture_program(const std::vector<std::string>& options = {"-arch=sm_75", "-lto", "-O0"});
+    ~linker_fixture_program();
+    linker_fixture_program(const linker_fixture_program&) = delete;
+    linker_fixture_program& operator=(const linker_fixture_program&) = delete;
+    void check(nvJitLinkResult status, const char* operation) const;
+    void add(const std::vector<unsigned char>& image, const char* name, nvJitLinkInputType kind = NVJITLINK_INPUT_LTOIR) const;
+    void complete() const;
+    std::vector<unsigned char> image() const;
+};
+#endif
 
 struct conformance_child_result { int status; std::string output; };
 // Run the same executable with <backend> <case> --worker and inherited stdout
@@ -102,6 +151,7 @@ public:
     loaded_program(const loaded_program&) = delete;
     loaded_program& operator=(const loaded_program&) = delete;
     CUfunction function(const char* name) const;
+    bool contains_function(const char* name) const;
     // Contextless kernel routes apply to library loads; module loads return null.
     CUkernel library_kernel(const char* name) const;
     CUdeviceptr global(const char* name, size_t expected_size) const;
@@ -112,6 +162,9 @@ public:
 // supply an independent probe; slice failures never trigger device fallback.
 int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags = 0,
                     void (*probe)() = nullptr);
+// Compiler/linker boundary slices can reuse the same independent execution
+// prerequisite as embedded-input slices, without adding unrelated fixtures.
+void probe_execution();
 // Fatal-device witnesses own a disposable CTest process. Report and exit without
 // synchronizing or destroying a faulted context, even when an assertion fails.
 [[noreturn]] void run_isolated_fault_conformance(int argc, char** argv, void (*execute)(),

@@ -19,7 +19,7 @@ namespace {
 struct nvrtc_options {
     std::string standard = "c++17", architecture = "sm_75";
     bool relocatable = false, physical = false, lto = false;
-    std::vector<std::string> includes, defines, undefines;
+    std::vector<std::string> includes, macros;
 };
 struct program {
     std::mutex mutex;
@@ -97,10 +97,10 @@ cudavm::nvrtc_options parse_options(int count, const char* const* input, std::st
             result.includes.push_back(*include);
         } else if (auto define = value("--define-macro", "-D", true)) {
             if (define->empty()) invalid(option);
-            result.defines.push_back(*define);
+            result.macros.push_back("-D" + *define);
         } else if (auto undefine = value("--undefine-macro", "-U", true)) {
             if (undefine->empty()) invalid(option);
-            result.undefines.push_back(*undefine);
+            result.macros.push_back("-U" + *undefine);
         } else if (auto relocatable = value("--relocatable-device-code", "-rdc")) {
             if (*relocatable != "true" && *relocatable != "false") invalid(option);
             result.relocatable = *relocatable == "true";
@@ -187,13 +187,13 @@ extern "C" CUDAVM_NVRTC_API nvrtcResult nvrtcCompileProgram(nvrtcProgram handle,
             for (const auto& [name, contents] : value.headers)
                 headers.push_back({name.c_str(), contents.c_str()});
             auto expressions = pointers(value.expressions);
-            auto includes = pointers(settings.includes), defines = pointers(settings.defines), undefines = pointers(settings.undefines);
-            compiler_source_request request{1, value.source.c_str(), value.name.c_str(),
+            auto includes = pointers(settings.includes), macros = pointers(settings.macros);
+            compiler_source_request_v2 request{{2, value.source.c_str(), value.name.c_str(),
                 settings.standard.c_str(), settings.architecture.c_str(), unsigned(settings.relocatable),
                 headers.size(), headers.data(), expressions.size(), expressions.data(),
-                includes.size(), includes.data(), defines.size(), defines.data(), undefines.size(), undefines.data()};
+                includes.size(), includes.data(), 0, nullptr, 0, nullptr}, macros.size(), macros.data()};
             compiler_input_request input;
-            input.kind = compiler_input_kind::source; input.source = &request;
+            input.kind = compiler_input_kind::source; input.source = &request.base;
             compiler_program* program = nullptr;
             compiler_result* result = nullptr;
             auto status = cudavm_core_program_import_v1(&input, &program, &result);

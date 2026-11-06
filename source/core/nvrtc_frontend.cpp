@@ -278,6 +278,7 @@ nvrtc_output import_cuda_source(llvm::LLVMContext& context, const std::string& s
     for (const auto& include : settings.includes) args.insert(args.end(), {"-I", include});
     for (const auto& define : settings.defines) args.push_back("-D" + define);
     for (const auto& undefine : settings.undefines) args.push_back("-U" + undefine);
+    args.insert(args.end(), settings.macros.begin(), settings.macros.end());
     std::vector<const char*> pointers;
     for (const auto& argument : args) pointers.push_back(argument.c_str());
     // Frontend consumers and diagnostic printers can retain these references

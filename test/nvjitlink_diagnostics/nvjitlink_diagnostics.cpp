@@ -1,5 +1,5 @@
-#include "conformance.hpp"
 #define NVJITLINK_NO_INLINE
+#include "conformance.hpp"
 #include <nvJitLink.h>
 #include <algorithm>
 #include <utility>

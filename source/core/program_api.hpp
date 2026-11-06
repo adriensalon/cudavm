@@ -22,6 +22,13 @@ struct compiler_source_request {
     size_t undefine_count;
     const char* const* undefines;
 };
+// V2 preserves interleaved macro definitions/removals. Each normalized entry is
+// -D<definition> or -U<name>, applied after the V1 macro arrays in caller order.
+struct compiler_source_request_v2 {
+    compiler_source_request base;
+    size_t macro_count;
+    const char* const* macros;
+};
 struct compiler_program;
 struct compiler_input_request {
     uint32_t abi_version = 1;

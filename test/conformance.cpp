@@ -69,6 +69,72 @@ std::vector<unsigned char> registration_ptx_image(std::string_view source, unsig
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
+#ifdef CUDAVM_CONFORMANCE_NVRTC
+compiler_fixture_program::compiler_fixture_program(const std::string& source, const char* name) {
+    check(nvrtcCreateProgram(&value, source.c_str(), name, 0, nullptr, nullptr));
+}
+compiler_fixture_program::~compiler_fixture_program() { if (value) nvrtcDestroyProgram(&value); }
+void compiler_fixture_program::check(nvrtcResult result) {
+    require(result == NVRTC_SUCCESS, std::string("compiler fixture API: ") + nvrtcGetErrorString(result));
+}
+nvrtcResult compiler_fixture_program::compile(const std::vector<std::string>& options) const {
+    std::vector<const char*> pointers;
+    for (const auto& option : options) pointers.push_back(option.c_str());
+    return nvrtcCompileProgram(value, int(pointers.size()), pointers.data());
+}
+std::string compiler_fixture_program::text(bool log) const {
+    struct { size_t before = 0x17593bad; size_t value{}; size_t after = 0xa739e521; } size;
+    check(log ? nvrtcGetProgramLogSize(value, &size.value) : nvrtcGetPTXSize(value, &size.value));
+    require(size.before == 0x17593bad && size.after == 0xa739e521, "compiler text size output guards");
+    require(size.value > 0 && size.value < 64 * 1024 * 1024, "compiler text extent includes NUL and is bounded");
+    std::vector<char> bytes(size.value + 32, char(0x63));
+    check(log ? nvrtcGetProgramLog(value, bytes.data() + 16) : nvrtcGetPTX(value, bytes.data() + 16));
+    for (size_t i = 0; i < bytes.size(); ++i) if (i < 16 || i >= size.value + 16)
+        require(bytes[i] == char(0x63), "compiler text retrieval exact extent guards");
+    require(bytes[size.value + 15] == 0
+        && std::find(bytes.begin() + 16, bytes.begin() + size.value + 15, '\0') == bytes.begin() + size.value + 15,
+        "compiler text has exactly its reported terminal NUL");
+    return {bytes.begin() + 16, bytes.begin() + size.value + 15};
+}
+std::string compiler_fixture_program::success(const std::vector<std::string>& options) const {
+    const auto result = compile(options);
+    require(result == NVRTC_SUCCESS, std::string(nvrtcGetErrorString(result)) + ": " + text(true));
+    return text();
+}
+std::vector<unsigned char> compiler_fixture_program::lto() const {
+    return compiler_fixture_bytes([&](size_t* size) { check(nvrtcGetLTOIRSize(value, size)); },
+        [&](unsigned char* bytes) { check(nvrtcGetLTOIR(value, reinterpret_cast<char*>(bytes))); });
+}
+#endif
+#ifdef CUDAVM_CONFORMANCE_NVJITLINK
+linker_fixture_program::linker_fixture_program(const std::vector<std::string>& options) {
+    std::vector<const char*> pointers;
+    for (const auto& option : options) pointers.push_back(option.c_str());
+    const auto status = nvJitLinkCreate(&value, uint32_t(pointers.size()), pointers.data());
+    try { check(status, "create"); }
+    catch (...) { if (value) nvJitLinkDestroy(&value); throw; }
+}
+linker_fixture_program::~linker_fixture_program() { if (value) nvJitLinkDestroy(&value); }
+void linker_fixture_program::check(nvJitLinkResult status, const char* operation) const {
+    if (status == NVJITLINK_SUCCESS) return;
+    size_t size{};
+    std::string diagnostic;
+    if (value && nvJitLinkGetErrorLogSize(value, &size) == NVJITLINK_SUCCESS && size && size < 64 * 1024 * 1024) {
+        std::vector<char> log(size);
+        if (nvJitLinkGetErrorLog(value, log.data()) == NVJITLINK_SUCCESS)
+            diagnostic.assign(log.begin(), std::find(log.begin(), log.end(), '\0'));
+    }
+    throw std::runtime_error(std::string("linker fixture ") + operation + ": " + std::to_string(status) + "; " + diagnostic);
+}
+void linker_fixture_program::add(const std::vector<unsigned char>& image, const char* name, nvJitLinkInputType kind) const {
+    check(nvJitLinkAddData(value, kind, image.data(), image.size(), name), "add data");
+}
+void linker_fixture_program::complete() const { check(nvJitLinkComplete(value), "complete"); }
+std::vector<unsigned char> linker_fixture_program::image() const {
+    return compiler_fixture_bytes([&](size_t* size) { check(nvJitLinkGetLinkedCubinSize(value, size), "binary size"); },
+        [&](unsigned char* bytes) { check(nvJitLinkGetLinkedCubin(value, bytes), "binary retrieval"); });
+}
+#endif
 // Start before GPU initialization. DLLs with separate CRTs and native drivers
 // must inherit the redirected output at process creation, not after startup.
 conformance_child_result run_conformance_child(const char* executable, const char* backend, const char* case_name,
@@ -658,6 +724,22 @@ CUkernel loaded_program::library_kernel(const char* name) const {
     if (library) CONFORMANCE_CUDA(cuLibraryGetKernel(&result, library, name));
     return result;
 }
+bool loaded_program::contains_function(const char* name) const {
+    if (library) {
+        CUkernel result{};
+        const auto status = cuLibraryGetKernel(&result, library, name);
+        if (status == CUDA_ERROR_NOT_FOUND) return false;
+        CONFORMANCE_CUDA(status);
+        require(result != nullptr, "kernel presence lookup publishes a handle");
+    } else {
+        CUfunction result{};
+        const auto status = cuModuleGetFunction(&result, module, name);
+        if (status == CUDA_ERROR_NOT_FOUND) return false;
+        CONFORMANCE_CUDA(status);
+        require(result != nullptr, "function presence lookup publishes a handle");
+    }
+    return true;
+}
 CUdeviceptr loaded_program::global(const char* name, size_t expected_size) const {
     CUdeviceptr result = 0;
     size_t size = 0;
@@ -667,7 +749,6 @@ CUdeviceptr loaded_program::global(const char* name, size_t expected_size) const
     return result;
 }
 
-#ifdef CUDAVM_CONFORMANCE_EXECUTION
 // Availability is checked independently of the slice's input and features.
 // Enumerating an OpenCL endpoint does not imply SPIR-V ingestion.
 void probe_execution() {
@@ -695,6 +776,7 @@ void probe_execution() {
     require(actual == 0x43564d31, "backend availability probe produced an incorrect result");
 }
 
+#ifdef CUDAVM_CONFORMANCE_EXECUTION
 int run_conformance(int argc, char** argv, const fixture_data& fixtures,
                     void (*execute)(const loaded_program&), unsigned load_repetitions, unsigned context_flags) {
     try {
