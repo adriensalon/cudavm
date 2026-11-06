@@ -139,6 +139,98 @@ struct cuda_address_reservation : virtual_address_reservation {
     }
     ~cuda_address_reservation() { try { release(); } catch (...) {} }
 };
+struct cuda_virtual_allocation : virtual_allocation {
+    std::shared_ptr<cuda_context> context;
+    std::vector<CUmemGenericAllocationHandle> handles;
+    size_t chunk_size{};
+    cuda_virtual_allocation(std::shared_ptr<cuda_context> owner, void* handle, CUmemAllocationHandleType type)
+        : virtual_allocation(std::numeric_limits<size_t>::max()), context(std::move(owner)),
+          handles(1), chunk_size(std::numeric_limits<size_t>::max()) {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemImportFromShareableHandle)>("cuMemImportFromShareableHandle")(
+            handles.data(), handle, type), "cuMemImportFromShareableHandle");
+        // Imported extents are not supplied by this ABI. Native cuMemMap checks
+        // the requested extent against the imported physical allocation.
+    }
+    cuda_virtual_allocation(std::shared_ptr<cuda_context> owner, size_t bytes, const CUmemAllocationProp& properties)
+        : virtual_allocation(bytes), context(std::move(owner)) {
+        cuda_context_guard guard(*context);
+        auto& driver = context->api->driver;
+        chunk_size = bytes;
+        if (!properties.requestedHandleTypes && !properties.allocFlags.usage &&
+            !properties.allocFlags.compressionType && !properties.allocFlags.gpuDirectRDMACapable) {
+            check(driver.get<decltype(&cuMemGetAllocationGranularity)>("cuMemGetAllocationGranularity")(
+                &chunk_size, &properties, CU_MEM_ALLOC_GRANULARITY_MINIMUM), "cuMemGetAllocationGranularity");
+        }
+        require(chunk_size && bytes % chunk_size == 0, CUDA_ERROR_INVALID_VALUE, "invalid physical backing granularity");
+        handles.reserve(bytes / chunk_size);
+        try {
+            for (size_t offset = 0; offset < bytes; offset += chunk_size) {
+                CUmemGenericAllocationHandle handle{};
+                check(driver.get<decltype(&cuMemCreate)>("cuMemCreate")(&handle, chunk_size, &properties, 0), "cuMemCreate");
+                handles.push_back(handle);
+            }
+        } catch (...) {
+            for (auto handle : handles) driver.get<decltype(&cuMemRelease)>("cuMemRelease")(handle);
+            throw;
+        }
+    }
+    CUmemAllocationProp properties() override {
+        cuda_context_guard guard(*context); CUmemAllocationProp result{};
+        check(context->api->driver.get<decltype(&cuMemGetAllocationPropertiesFromHandle)>("cuMemGetAllocationPropertiesFromHandle")(&result, handles.front()), "cuMemGetAllocationPropertiesFromHandle");
+        return result;
+    }
+    void export_handle(void* output, CUmemAllocationHandleType type) override {
+        require(handles.size() == 1, CUDA_ERROR_INVALID_VALUE, "physical allocation was not created for OS sharing");
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemExportToShareableHandle)>("cuMemExportToShareableHandle")(
+            output, handles.front(), type, 0), "cuMemExportToShareableHandle");
+    }
+    ~cuda_virtual_allocation() {
+        if (context->api->push(context->value) == CUDA_SUCCESS) {
+            for (auto handle : handles) context->api->driver.get<decltype(&cuMemRelease)>("cuMemRelease")(handle);
+            CUcontext previous{}; context->api->pop(&previous);
+        }
+    }
+};
+struct cuda_virtual_mapping : cuda_buffer {
+    std::shared_ptr<cuda_virtual_allocation> physical;
+    bool mapped = false;
+    cuda_virtual_mapping(std::shared_ptr<cuda_context> owner, CUdeviceptr pointer, size_t bytes,
+                         std::shared_ptr<cuda_virtual_allocation> backing)
+        : cuda_buffer(std::move(owner), bytes, pointer, {}), physical(std::move(backing)) {
+        size_t mapped_bytes = 0;
+        try {
+            cuda_context_guard guard(*context);
+            // Native loaders can require a complete physical handle per map.
+            // Granularity-sized private handles preserve real prefix aliases.
+            for (size_t index = 0; mapped_bytes < size; ++index) {
+                const auto extent = std::min(physical->chunk_size, size - mapped_bytes);
+                check(context->api->driver.get<decltype(&cuMemMap)>("cuMemMap")(
+                    address + mapped_bytes, extent, 0, physical->handles.at(index), 0), "cuMemMap");
+                mapped_bytes += extent;
+            }
+            mapped = true;
+        } catch (...) {
+            if (mapped_bytes && context->api->push(context->value) == CUDA_SUCCESS) {
+                context->api->driver.get<decltype(&cuMemUnmap)>("cuMemUnmap")(address, mapped_bytes);
+                CUcontext previous{}; context->api->pop(&previous);
+            }
+            address = 0; throw;
+        }
+    }
+    void unmap() {
+        if (!mapped) return;
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemUnmap)>("cuMemUnmap")(address, size), "cuMemUnmap");
+        mapped = false;
+    }
+    size_t physical_size() const override { return 0; } // The physical handle owns the charge.
+    ~cuda_virtual_mapping() {
+        try { unmap(); } catch (...) {}
+        address = 0; // Reserved VA must never reach cuda_buffer's cuMemFree path.
+    }
+};
 struct cuda_mipmapped_storage {
     std::shared_ptr<cuda_context> context;
     CUmipmappedArray value = nullptr;
@@ -1027,9 +1119,43 @@ struct cuda_session : session {
     std::unique_ptr<virtual_address_reservation> reserve_virtual_address(size_t bytes, size_t alignment, CUdeviceptr hint) override {
         return std::make_unique<cuda_address_reservation>(context, bytes, alignment, hint);
     }
+    std::shared_ptr<virtual_allocation> create_virtual_allocation(size_t bytes, const CUmemAllocationProp& properties) override {
+        return std::make_shared<cuda_virtual_allocation>(context, bytes, properties);
+    }
+    std::shared_ptr<virtual_allocation> import_virtual_allocation(void* handle, CUmemAllocationHandleType type) override {
+        return std::make_shared<cuda_virtual_allocation>(context, handle, type);
+    }
+    std::unique_ptr<buffer> map_virtual(CUdeviceptr pointer, size_t bytes, std::shared_ptr<virtual_allocation> physical) override {
+        auto backing = std::dynamic_pointer_cast<cuda_virtual_allocation>(physical);
+        require(bool(backing), CUDA_ERROR_INVALID_VALUE, "physical memory belongs to another adapter");
+        return std::make_unique<cuda_virtual_mapping>(context, pointer, bytes, std::move(backing));
+    }
+    void unmap_virtual(buffer& storage) override { static_cast<cuda_virtual_mapping&>(storage).unmap(); }
+    void set_virtual_access(CUdeviceptr pointer, size_t bytes, std::span<const CUmemAccessDesc> access) override {
+        cuda_context_guard guard(*context);
+        check(context->api->driver.get<decltype(&cuMemSetAccess)>("cuMemSetAccess")(pointer, bytes, access.data(), access.size()), "cuMemSetAccess");
+    }
+    unsigned long long virtual_access(CUdeviceptr pointer, CUmemLocation location) override {
+        cuda_context_guard guard(*context); unsigned long long result{};
+        check(context->api->driver.get<decltype(&cuMemGetAccess)>("cuMemGetAccess")(&result, &location, pointer), "cuMemGetAccess");
+        return result;
+    }
     device_work enqueue_attach(CUdeviceptr pointer, size_t bytes, unsigned flags, native_queue* queue) override {
         return cuda_enqueue(context, queue, [&](CUstream stream) {
             check(context->api->driver.get<decltype(&cuStreamAttachMemAsync)>("cuStreamAttachMemAsync")(stream, pointer, bytes, flags), "cuStreamAttachMemAsync");
+        });
+    }
+    device_work enqueue_prefetch(CUdeviceptr pointer, size_t bytes, CUmemLocation location, native_queue* queue) override {
+        return cuda_enqueue(context, queue, [&](CUstream stream) {
+            auto function = reinterpret_cast<decltype(&cuMemPrefetchAsync)>(context->api->driver.find("cuMemPrefetchAsync_v2"));
+            if (function) check(function(pointer, bytes, location, 0, stream), "cuMemPrefetchAsync_v2");
+            else {
+                require(location.type == CU_MEM_LOCATION_TYPE_DEVICE || location.type == CU_MEM_LOCATION_TYPE_HOST,
+                        CUDA_ERROR_NOT_SUPPORTED, "NUMA prefetch requires the native location ABI");
+                using legacy_prefetch = CUresult (CUDAAPI*)(CUdeviceptr, size_t, CUdevice, CUstream);
+                const int device = location.type == CU_MEM_LOCATION_TYPE_HOST ? CU_DEVICE_CPU : location.id;
+                check(context->api->driver.get<legacy_prefetch>("cuMemPrefetchAsync")(pointer, bytes, device, stream), "cuMemPrefetchAsync");
+            }
         });
     }
     std::unique_ptr<buffer> allocate_pool(size_t size) override {

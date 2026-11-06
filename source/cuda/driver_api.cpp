@@ -89,6 +89,12 @@ struct event_state {
     std::shared_ptr<device_timestamp> timestamp;
 };
 #include "memory_pool_state.inl"
+struct virtual_allocation_state {
+    std::shared_ptr<virtual_allocation> native;
+    CUmemAllocationProp properties{};
+    CUmemGenericAllocationHandle handle{};
+    size_t granularity{}, references = 1;
+};
 struct allocation {
     std::shared_ptr<context> owner;
     std::shared_ptr<buffer> native;
@@ -105,6 +111,7 @@ struct allocation {
     completion async_free;
     unsigned long long free_stream_id = 0;
     CUlibrary library = nullptr;
+    std::shared_ptr<virtual_allocation_state> virtual_memory;
 };
 struct memory_entry { std::shared_ptr<context> owner; std::shared_ptr<external_memory> native; uint64_t size; };
 struct array_entry {
@@ -182,6 +189,9 @@ struct state {
     std::unordered_map<int, unsigned> primary_flags;
     std::map<CUdeviceptr, allocation> allocations;
     std::map<CUdeviceptr, std::unique_ptr<virtual_address_reservation>> address_reservations;
+    std::unordered_map<CUmemGenericAllocationHandle, std::shared_ptr<virtual_allocation_state>> virtual_allocations;
+    std::unordered_map<int, std::shared_ptr<context>> virtual_storage;
+    CUmemGenericAllocationHandle next_virtual_allocation = 0x100000000ull;
     std::unordered_map<CUarray, std::shared_ptr<array_entry>> arrays;
     std::unordered_map<CUmipmappedArray, mipmapped_array_entry> mipmapped_arrays;
     // Native image handles are context-local and may have the same bits in
@@ -468,7 +478,7 @@ void destroy(const std::shared_ptr<context>& owner, bool pop_current = true) {
     std::erase_if(global().graph_cache, [&](auto& item) { return item.owner == owner; });
     auto& allocations = global().allocations;
     for (auto it = allocations.begin(); it != allocations.end();)
-        if (it->second.owner == owner) it = allocations.erase(it); else ++it;
+        if (it->second.owner == owner && !it->second.virtual_memory) it = allocations.erase(it); else ++it;
     std::erase_if(global().graphics, [&](auto& item) { return item.second.owner == owner; });
     std::erase_if(global().memories, [&](auto& item) { return item.second.owner == owner; });
     std::erase_if(global().semaphores, [&](auto& item) { return item.second.owner == owner; });
@@ -620,7 +630,9 @@ CUdeviceptr allocate(const std::shared_ptr<context>& owner, size_t bytes) {
 }
 using allocation_it = std::map<CUdeviceptr, allocation>::iterator;
 bool allocation_visible(const allocation& entry, const std::shared_ptr<context>& owner) {
-    return entry.owner == owner || entry.native->is_managed() || (entry.pool && entry.pool->props.location.id == owner->device);
+    return entry.owner == owner || entry.native->is_managed() ||
+        (entry.virtual_memory && owner->native->kind() == cudavmBackendCuda) ||
+        (entry.pool && entry.pool->props.location.id == owner->device);
 }
 allocation_it containing(CUdeviceptr pointer) {
     auto& allocations = global().allocations;
@@ -681,6 +693,7 @@ void release(CUdeviceptr pointer, const std::shared_ptr<context>& owner) {
     require(!it->second.module, CUDA_ERROR_INVALID_VALUE, "module globals are released by module unload");
     require(!it->second.library, CUDA_ERROR_INVALID_VALUE, "library managed globals are released by library unload");
     require(it->second.host.expired(), CUDA_ERROR_INVALID_VALUE, "mapped host aliases are released by host free/unregister");
+    require(!it->second.virtual_memory, CUDA_ERROR_INVALID_VALUE, "virtual mappings are released by cuMemUnmap");
     auto memory = it->second.graph_memory.lock();
     if (it->second.graph_owned) require(memory && memory->planned_live && !memory->internal_free(), CUDA_ERROR_INVALID_VALUE, "graph allocation cannot be freed outside its owning graph");
     auto expected = it->second.native;
@@ -760,6 +773,7 @@ bool capture_graph_launch(const std::shared_ptr<context>&, CUstream, const graph
 #include "async_memory.inl"
 #include "batch_copy.inl"
 #include "managed_advice.inl"
+#include "virtual_memory_state.inl"
 #include "launch_state.inl"
 #include "stream_attribute_state.inl"
 #include "kernel_launch.inl"
@@ -936,6 +950,8 @@ extern "C" CUDAVM_API int cudavmShutdown() {
         value.memory_pools.clear(); value.default_pools.clear(); value.current_pools.clear();
         value.pool_storage.clear(); value.command_domains.clear(); value.device_buffers.clear();
         value.address_reservations.clear();
+        value.virtual_allocations.clear();
+        value.virtual_storage.clear();
         value.provider.reset(); value.devices.clear(); value.initialized = false;
         value.shutting_down = false;
         context_stack().clear(); ++value.epoch;

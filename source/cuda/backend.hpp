@@ -27,6 +27,13 @@
 namespace cudavm {
 struct session;
 struct buffer;
+struct virtual_allocation {
+    size_t size;
+    explicit virtual_allocation(size_t bytes) : size(bytes) {}
+    virtual ~virtual_allocation() = default;
+    virtual CUmemAllocationProp properties() = 0;
+    virtual void export_handle(void*, CUmemAllocationHandleType) = 0;
+};
 size_t shader_service_limit(session&, CUlimit);
 void set_shader_service_limit(session&, CUlimit, size_t);
 void prepare_shader_services(session&, uint32_t);
@@ -650,6 +657,24 @@ struct session {
     virtual std::unique_ptr<virtual_address_reservation> reserve_virtual_address(size_t, size_t, CUdeviceptr) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual address reservation is unavailable");
     }
+    virtual std::shared_ptr<virtual_allocation> create_virtual_allocation(size_t, const CUmemAllocationProp&) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual physical allocation is unavailable");
+    }
+    virtual std::shared_ptr<virtual_allocation> import_virtual_allocation(void*, CUmemAllocationHandleType) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual physical memory import is unavailable");
+    }
+    virtual std::unique_ptr<buffer> map_virtual(CUdeviceptr, size_t, std::shared_ptr<virtual_allocation>) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual memory mapping is unavailable");
+    }
+    virtual void unmap_virtual(buffer&) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual memory unmapping is unavailable");
+    }
+    virtual void set_virtual_access(CUdeviceptr, size_t, std::span<const CUmemAccessDesc>) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual memory access configuration is unavailable");
+    }
+    virtual unsigned long long virtual_access(CUdeviceptr, CUmemLocation) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "virtual memory access query is unavailable");
+    }
     // Buffer storage implements allocation and byte transfers on shader
     // adapters. It does not imply native image sampling support.
     virtual std::shared_ptr<buffer> allocate_array(const CUDA_ARRAY3D_DESCRIPTOR& d) {
@@ -673,6 +698,9 @@ struct session {
     }
     virtual device_work enqueue_attach(CUdeviceptr, size_t, unsigned, native_queue*) {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "native managed/pageable stream association is unavailable");
+    }
+    virtual device_work enqueue_prefetch(CUdeviceptr, size_t, CUmemLocation, native_queue*) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "native managed memory prefetch is unavailable");
     }
     virtual std::unique_ptr<buffer> allocate_pool(size_t bytes) { return allocate(bytes); }
     virtual void memory_info(size_t&, size_t&) { throw failure(CUDA_ERROR_NOT_SUPPORTED, "native memory query is unavailable"); }

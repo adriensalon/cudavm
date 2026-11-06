@@ -361,8 +361,13 @@ cudavm_add_conformance_slice(host_registration API_ONLY COMPONENTS cudart CASES 
 cudavm_add_conformance_slice(mapped_host_memory COMPONENTS cudart FAMILY_CHECKS M02.host M02.system)
 cudavm_add_conformance_slice(managed_memory FIXTURE kernel_launch COMPONENTS cudart FAMILY_CHECKS M02.managed M02.lifetime)
 cudavm_add_conformance_slice(managed_advice API_ONLY COMPONENTS cudart CASES read_mostly preferred accessed_by queries validation device FAMILY_CHECKS M02.advice)
+cudavm_add_conformance_slice(managed_prefetch API_ONLY COMPONENTS cudart CASES ordering dependencies ranges validation HOST_CASES discovery FAMILY_CHECKS M02.prefetch)
+cudavm_add_conformance_slice(managed_concurrent_access SOURCE_ONLY SOURCE_CHECK SOURCE_LTO MINIMUM_PTX 60 THREADS COMPONENTS cudart BACKENDS cuda PROFILES disjoint handoff FAMILY_CHECKS M02.managed M02.system)
 # This native reservation profile leaves shader VMM and its feature query open.
 cudavm_add_conformance_slice(virtual_addressing API_ONLY BACKENDS cuda CASES granularity reservations validation FAMILY_CHECKS M03.address M03.granularity)
+cudavm_add_conformance_slice(virtual_memory_aliases API_ONLY BACKENDS cuda COMPONENTS cudart CASES aliases submaps remap released contexts contextless ordering validation HOST_CASES discovery FAMILY_CHECKS M03.alias M03.remap)
+cudavm_add_conformance_slice(virtual_memory_access API_ONLY BACKENDS cuda COMPONENTS cudart CASES states aliases spans validation contextless none_read_module none_read_library none_write_module none_write_library readonly_write_module readonly_write_library HOST_CASES discovery FAMILY_CHECKS M03.access)
+cudavm_add_conformance_slice(virtual_memory_handles API_ONLY THREADS BACKENDS cuda COMPONENTS cudart CASES metadata retains resurrection threading roundtrip validation sharing exporter_exit HOST_CASES discovery FAMILY_CHECKS M03.handle)
 cudavm_add_conformance_slice(pointer_attributes API_ONLY COMPONENTS cudart CASES device host ownership lifetime validation FAMILY_CHECKS M05.classification)
 cudavm_add_conformance_slice(default_copy_direction API_ONLY COMPONENTS cudart CASES synchronous asynchronous registered mapped managed chain validation FAMILY_CHECKS M05.default_copy)
 cudavm_add_conformance_slice(context_stack API_ONLY THREADS CASES transitions empty threading transfer validation FAMILY_CHECKS H01.stack H01.threading)

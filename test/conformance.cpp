@@ -2,7 +2,6 @@
 #ifdef CUDAVM_CONFORMANCE_SOURCE_CHECK
 #include "fixtures.hpp"
 #include <nvrtc.h>
-#include <charconv>
 #endif
 #ifndef CUDAVM_CONFORMANCE_HOST_ONLY
 #include <cuda/cudavm_cuda.h>
@@ -15,6 +14,7 @@
 #endif
 #endif
 #include <algorithm>
+#include <charconv>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -29,7 +29,13 @@
 #else
 #include <csignal>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <poll.h>
+#include <fcntl.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #endif
 
 namespace cudavm {
@@ -131,6 +137,203 @@ conformance_child_result run_conformance_child(const char* executable, const cha
     std::string output_text(static_cast<size_t>(bytes), '\0');
     require(std::fread(output_text.data(), 1, output_text.size(), file) == output_text.size(), "read complete child output");
     return {status, std::move(output_text)};
+}
+
+uintptr_t peer_integer(std::string_view text) {
+    uintptr_t result{}; const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
+    require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size(), "valid inherited peer handle");
+    return result;
+}
+struct conformance_peer::state {
+    bool owner = false, waited = false;
+    int status = -1;
+#ifdef _WIN32
+    HANDLE input = INVALID_HANDLE_VALUE, output = INVALID_HANDLE_VALUE, process = nullptr, job = nullptr;
+    ~state() {
+        if (owner && process && !waited) { TerminateProcess(process, 1); WaitForSingleObject(process, 5000); }
+        if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
+        if (output != INVALID_HANDLE_VALUE && output != input) CloseHandle(output);
+        if (process) CloseHandle(process);
+        if (job) CloseHandle(job);
+    }
+#else
+    int input = -1, output = -1;
+    pid_t process = -1;
+    ~state() {
+        if (owner && process > 0 && !waited) {
+            int raw{}; pid_t observed;
+            do { observed = waitpid(process, &raw, WNOHANG); } while (observed < 0 && errno == EINTR);
+            if (observed == 0) { kill(process, SIGKILL); while (waitpid(process, &raw, 0) < 0 && errno == EINTR) {} }
+        }
+        if (input >= 0) close(input);
+        if (output >= 0 && output != input) close(output);
+    }
+#endif
+};
+conformance_peer::conformance_peer(std::unique_ptr<state> value) : storage(std::move(value)) {}
+conformance_peer::~conformance_peer() = default;
+conformance_peer::conformance_peer(conformance_peer&&) noexcept = default;
+conformance_peer::conformance_peer(const char* executable, const char* backend, const char* case_name)
+    : storage(std::make_unique<state>()) {
+    for (auto token : {std::string_view(backend), std::string_view(case_name)})
+        require(!token.empty() && token.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") == token.npos,
+            "peer backend/case is one plain identifier");
+#ifdef _WIN32
+    (void)executable;
+    struct handle_guard { HANDLE value = INVALID_HANDLE_VALUE; ~handle_guard() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); } } child_read, child_write, partner, diagnostic, thread;
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    require(CreatePipe(&storage->input, &child_write.value, &security, 4096), "create peer response pipe");
+    require(CreatePipe(&child_read.value, &storage->output, &security, 4096), "create peer request pipe");
+    require(SetHandleInformation(storage->input, HANDLE_FLAG_INHERIT, 0) && SetHandleInformation(storage->output, HANDLE_FLAG_INHERIT, 0), "keep parent pipe ends private");
+    require(DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &partner.value,
+        PROCESS_DUP_HANDLE | SYNCHRONIZE, TRUE, 0), "create restricted parent process capability");
+    require(DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE), GetCurrentProcess(), &diagnostic.value,
+        0, TRUE, DUPLICATE_SAME_ACCESS), "inherit peer diagnostics");
+    std::array<HANDLE, 4> inherited{child_read.value, child_write.value, partner.value, diagnostic.value};
+    SIZE_T attribute_bytes{}; InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_bytes);
+    std::vector<std::byte> attributes(attribute_bytes);
+    auto* attribute_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+    require(InitializeProcThreadAttributeList(attribute_list, 1, 0, &attribute_bytes), "initialize peer handle allowlist");
+    struct attribute_guard { LPPROC_THREAD_ATTRIBUTE_LIST value; ~attribute_guard() { DeleteProcThreadAttributeList(value); } } cleanup{attribute_list};
+    require(UpdateProcThreadAttribute(attribute_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited.data(), sizeof(inherited), nullptr, nullptr), "restrict peer inherited handles");
+    std::array<wchar_t, 32768> path{}; const auto length = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
+    require(length && length < path.size(), "locate peer executable");
+    auto widen = [](const char* value) { std::wstring result; for (; *value; ++value) result += wchar_t(*value); return result; };
+    std::wstring command = L"\"" + std::wstring(path.data(), length) + L"\" " + widen(backend) + L" " + widen(case_name) + L" --peer " +
+        std::to_wstring(reinterpret_cast<uintptr_t>(child_read.value)) + L" " + std::to_wstring(reinterpret_cast<uintptr_t>(child_write.value)) + L" " + std::to_wstring(reinterpret_cast<uintptr_t>(partner.value));
+    storage->job = CreateJobObjectW(nullptr, nullptr); require(storage->job != nullptr, "create owned peer job");
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{}; limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    require(SetInformationJobObject(storage->job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)), "retire peer when its owner exits");
+    STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.lpAttributeList = attribute_list;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES; startup.StartupInfo.hStdInput = child_read.value;
+    startup.StartupInfo.hStdOutput = startup.StartupInfo.hStdError = diagnostic.value;
+    PROCESS_INFORMATION process{};
+    require(CreateProcessW(path.data(), command.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &startup.StartupInfo, &process), "start independent peer process");
+    storage->process = process.hProcess; storage->owner = true; thread.value = process.hThread;
+    require(AssignProcessToJobObject(storage->job, storage->process), "bind peer to owned job");
+    require(ResumeThread(thread.value) != DWORD(-1), "run independent peer process");
+#else
+    int channel[2]{}; require(socketpair(AF_UNIX, SOCK_STREAM, 0, channel) == 0, "create peer socket pair");
+    storage->input = storage->output = channel[0];
+    struct descriptor_guard { int value; ~descriptor_guard() { close(value); } } child_channel{channel[1]};
+    require(fcntl(channel[0], F_SETFD, FD_CLOEXEC) == 0 && fcntl(channel[1], F_SETFD, 0) == 0, "set peer descriptor inheritance");
+    const auto descriptor = std::to_string(channel[1]); const auto parent = getpid();
+    std::array<char*, 8> arguments{const_cast<char*>(executable), const_cast<char*>(backend), const_cast<char*>(case_name),
+        const_cast<char*>("--peer"), const_cast<char*>(descriptor.c_str()), const_cast<char*>(descriptor.c_str()), const_cast<char*>("0"), nullptr};
+    const auto child = fork(); require(child >= 0, "start independent peer process");
+    if (child == 0) {
+#ifdef __linux__
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent) _exit(126);
+#endif
+        close(channel[0]); execv(executable, arguments.data()); _exit(127);
+    }
+    storage->process = child; storage->owner = true;
+#endif
+}
+conformance_peer conformance_peer::connect(std::string_view read, std::string_view write, std::string_view partner) {
+    auto value = std::make_unique<state>();
+#ifdef _WIN32
+    value->input = reinterpret_cast<HANDLE>(peer_integer(read)); value->output = reinterpret_cast<HANDLE>(peer_integer(write));
+    value->process = reinterpret_cast<HANDLE>(peer_integer(partner));
+#else
+    value->input = int(peer_integer(read)); value->output = int(peer_integer(write)); (void)partner;
+#endif
+    return conformance_peer(std::move(value));
+}
+void conformance_peer::send(std::span<const std::byte> bytes) {
+    require(bytes.size() <= 1024, "peer control message is bounded");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!bytes.empty()) {
+#ifdef _WIN32
+        DWORD written{}; require(WriteFile(storage->output, bytes.data(), DWORD(bytes.size()), &written, nullptr) && written, "write peer control bytes");
+#else
+        auto written = ::send(storage->output, bytes.data(), bytes.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            require(std::chrono::steady_clock::now() < deadline, "peer write deadline");
+            pollfd descriptor{storage->output, POLLOUT, 0}; poll(&descriptor, 1, 10); continue;
+        }
+        require(written > 0, "write peer control bytes");
+#endif
+        bytes = bytes.subspan(size_t(written));
+        require(std::chrono::steady_clock::now() < deadline, "peer write completion deadline");
+    }
+}
+void conformance_peer::receive(std::span<std::byte> bytes) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!bytes.empty()) {
+        require(std::chrono::steady_clock::now() < deadline, "peer read deadline");
+#ifdef _WIN32
+        DWORD available{}; require(PeekNamedPipe(storage->input, nullptr, 0, nullptr, &available, nullptr), "inspect peer control pipe");
+        if (!available) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+        DWORD received{}; require(ReadFile(storage->input, bytes.data(), DWORD(std::min<size_t>(bytes.size(), available)), &received, nullptr) && received, "read peer control bytes");
+#else
+        pollfd descriptor{storage->input, POLLIN, 0}; const auto ready = poll(&descriptor, 1, 10);
+        if (ready < 0 && errno == EINTR) continue;
+        require(ready >= 0, "poll peer control bytes"); if (!ready) continue;
+        auto received = recv(storage->input, bytes.data(), bytes.size(), MSG_DONTWAIT);
+        if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        require(received > 0, "read peer control bytes");
+#endif
+        bytes = bytes.subspan(size_t(received));
+    }
+}
+void conformance_peer::send_handle(uintptr_t handle) {
+#ifdef _WIN32
+    HANDLE transferred{};
+    require(DuplicateHandle(GetCurrentProcess(), reinterpret_cast<HANDLE>(handle), storage->process, &transferred, 0, FALSE, DUPLICATE_SAME_ACCESS), "transfer real OS handle to peer");
+    const auto value = reinterpret_cast<uintptr_t>(transferred); send(std::as_bytes(std::span(&value, 1)));
+#else
+    std::byte marker{0x71}; iovec data{&marker, 1}; alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(sizeof(int))> control{};
+    msghdr message{}; message.msg_iov = &data; message.msg_iovlen = 1; message.msg_control = control.data(); message.msg_controllen = control.size();
+    auto* header = CMSG_FIRSTHDR(&message); header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(sizeof(int));
+    const int descriptor = int(handle); std::memcpy(CMSG_DATA(header), &descriptor, sizeof(descriptor));
+    require(sendmsg(storage->output, &message, MSG_NOSIGNAL) == 1, "transfer real OS descriptor to peer");
+#endif
+}
+uintptr_t conformance_peer::receive_handle() {
+#ifdef _WIN32
+    uintptr_t value{}; receive(std::as_writable_bytes(std::span(&value, 1))); return value;
+#else
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    for (;;) {
+        require(std::chrono::steady_clock::now() < deadline, "peer descriptor read deadline");
+        pollfd descriptor{storage->input, POLLIN, 0}; const auto ready = poll(&descriptor, 1, 10);
+        if (ready < 0 && errno == EINTR) continue;
+        require(ready >= 0, "poll peer descriptor"); if (!ready) continue;
+        std::byte marker{}; iovec data{&marker, 1}; alignas(cmsghdr) std::array<unsigned char, CMSG_SPACE(sizeof(int))> control{};
+        msghdr message{}; message.msg_iov = &data; message.msg_iovlen = 1; message.msg_control = control.data(); message.msg_controllen = control.size();
+        const auto received = recvmsg(storage->input, &message, MSG_CMSG_CLOEXEC);
+        if (received < 0 && errno == EINTR) continue;
+        auto* header = CMSG_FIRSTHDR(&message);
+        int result = -1;
+        if (received > 0 && header && header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS && header->cmsg_len >= CMSG_LEN(sizeof(int)))
+            std::memcpy(&result, CMSG_DATA(header), sizeof(result));
+        const bool valid = received == 1 && marker == std::byte{0x71} && !(message.msg_flags & MSG_CTRUNC) &&
+            result >= 0 && header->cmsg_len == CMSG_LEN(sizeof(int));
+        if (!valid && result >= 0) close(result);
+        require(valid, "receive one complete real peer descriptor"); return uintptr_t(result);
+    }
+#endif
+}
+int conformance_peer::wait() {
+    require(storage->owner, "only the owner waits for its peer process");
+    if (storage->waited) return storage->status;
+#ifdef _WIN32
+    require(WaitForSingleObject(storage->process, 30000) == WAIT_OBJECT_0, "peer process completion deadline");
+    DWORD status{}; require(GetExitCodeProcess(storage->process, &status), "read peer process exit status"); storage->status = int(status);
+#else
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30); int status{};
+    for (;;) {
+        const auto observed = waitpid(storage->process, &status, WNOHANG);
+        if (observed == storage->process) break;
+        if (observed < 0 && errno == EINTR) continue;
+        require(observed >= 0 && std::chrono::steady_clock::now() < deadline, "peer process completion deadline");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    storage->status = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+#endif
+    storage->waited = true; return storage->status;
 }
 
 int run_host_conformance(int argc, char** argv, void (*execute)()) {

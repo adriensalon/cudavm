@@ -4,6 +4,28 @@ region managed_advice_range(CUdeviceptr pointer, size_t bytes) {
     require(range.value->native->is_managed(), CUDA_ERROR_INVALID_VALUE, "range must belong to managed memory");
     return range;
 }
+void managed_prefetch(CUdeviceptr pointer, size_t bytes, CUmemLocation location, unsigned flags, CUstream stream) {
+    require(!flags, CUDA_ERROR_INVALID_VALUE, "prefetch flags must be zero");
+    require(location.type == CU_MEM_LOCATION_TYPE_DEVICE || location.type == CU_MEM_LOCATION_TYPE_HOST ||
+            location.type == CU_MEM_LOCATION_TYPE_HOST_NUMA || location.type == CU_MEM_LOCATION_TYPE_HOST_NUMA_CURRENT,
+            CUDA_ERROR_INVALID_VALUE, "invalid prefetch location");
+    auto target = stream_lookup(stream, current()); auto owner = target->owner.lock();
+    auto range = managed_advice_range(pointer, bytes);
+    if (location.type == CU_MEM_LOCATION_TYPE_DEVICE) {
+        valid_device(location.id);
+        require(device_kind(location.id) == cudavmBackendCuda &&
+                global().provider->attribute(location.id, CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS),
+                CUDA_ERROR_INVALID_DEVICE, "prefetch destination requires concurrent managed access");
+        location.id = native_device(location.id);
+    }
+    require(global().provider->attribute(owner->device, CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS),
+            CUDA_ERROR_INVALID_DEVICE, "prefetch stream requires concurrent managed access");
+    auto storage = range.value->native;
+    auto queue = stream_native(owner, target);
+    submit_stream(owner, stream, {}, {}, 0, [owner, pointer, bytes, location, storage, queue] {
+        return owner->native->enqueue_prefetch(pointer, bytes, location, queue.get());
+    });
+}
 int managed_logical_device(int ordinal) {
     if (ordinal < 0) return ordinal;
     for (size_t i = 0; i < global().devices.size(); ++i)
