@@ -328,6 +328,31 @@ template<class Format> uint64_t elementary_root(uint64_t bits, bool reciprocal) 
     const auto order = compare(midpoint);
     return sign | (order < 0 || (order == 0 && (low & 1)) ? high : low);
 }
+// Bracket 1/sqrt(x) using exact candidate^2*x products. This avoids rounding
+// an intermediate square root or reciprocal through any other format.
+template<class Format> uint64_t elementary_rsqrt(uint64_t bits) {
+    if (Format::is_nan(bits)) return Format::nan;
+    if (Format::is_zero(bits)) return (bits & Format::sign) | Format::infinity;
+    if (bits & Format::sign) return Format::nan;
+    if (Format::is_infinite(bits)) return 0;
+    const auto source = Format::decode(bits);
+    const numerical_dyadic one{numerical_integer(1), 0, false};
+    auto compare = [&](const numerical_dyadic& candidate) {
+        return elementary_compare({candidate.magnitude.times(candidate.magnitude).times(source.magnitude),
+            candidate.scale * 2 + source.scale, false}, one);
+    };
+    uint64_t low = 0, high = Format::infinity;
+    while (high - low > 1) {
+        const auto middle = low + (high - low) / 2;
+        if (compare(Format::decode(middle)) <= 0) low = middle;
+        else high = middle;
+    }
+    const auto lower = Format::decode(low);
+    if (compare(lower) == 0) return low;
+    auto midpoint = numerical_sum(lower, Format::decode(high), 0); --midpoint.scale;
+    const auto order = compare(midpoint);
+    return order < 0 || (order == 0 && (low & 1)) ? high : low;
+}
 // Exact rational division oracle: compare destination values and their
 // midpoints after multiplication by the positive divisor, without division
 // through another floating-point format or a device implementation helper.
@@ -354,6 +379,20 @@ template<class Format> uint64_t numerical_divide(uint64_t a, uint64_t b) {
     auto midpoint = numerical_sum(lower, upper, 0); --midpoint.scale;
     const auto order = compare(midpoint);
     return sign | (order < 0 || (order == 0 && (low & 1)) ? high : low);
+}
+// Packed 16-bit numerical slices own scalar semantics and apply them to each
+// lane separately. Packing happens only after all expected scalar bits exist.
+template<size_t Fields, class Oracle>
+std::array<uint32_t, Fields> numerical_packed16_rows(const std::array<uint32_t, 3>& input, Oracle oracle) {
+    std::array<uint32_t, Fields> result{};
+    for (unsigned shift : {0u, 16u}) {
+        std::array<uint32_t, 3> lane{};
+        for (size_t i = 0; i < input.size(); ++i) lane[i] = (input[i] >> shift) & 0xffffu;
+        const auto expected = oracle(lane);
+        static_assert(std::tuple_size_v<decltype(expected)> == Fields);
+        for (size_t i = 0; i < Fields; ++i) result[i] |= uint32_t(expected[i]) << shift;
+    }
+    return result;
 }
 template<class Word, unsigned Fraction, unsigned Exponent>
 std::vector<std::array<Word, 3>> elementary_inputs() {

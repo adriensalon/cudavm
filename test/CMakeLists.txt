@@ -605,6 +605,8 @@ cudavm_add_conformance_slice(global_symbols FAMILY_CHECKS M01.symbols D01.storag
 cudavm_add_conformance_slice(numeric_representations FAMILY_CHECKS D05.representation)
 cudavm_add_conformance_slice(half_conversion SOURCE_ONLY SOURCE_CHECK FAMILY_CHECKS D05.rounding D05.representation)
 cudavm_add_conformance_slice(half_arithmetic SOURCE_ONLY SOURCE_CHECK SOURCE_LTO PROFILES add_subtract multiply fused saturation operators divide FAMILY_CHECKS D05.rounding D05.accuracy)
+cudavm_add_conformance_slice(half_math SOURCE_ONLY SOURCE_CHECK SOURCE_LTO PROFILES rounding sqrt reciprocal rsqrt FAMILY_CHECKS D05.accuracy D05.special)
+cudavm_add_conformance_slice(half2_operations SOURCE_ONLY SOURCE_CHECK SOURCE_LTO PROFILES representation widen narrow arithmetic fused saturation divide divide_operator divide_assign operators comparisons predicates FAMILY_CHECKS D05.representation D05.rounding D05.accuracy)
 cudavm_add_conformance_slice(half_comparison SOURCE_ONLY SOURCE_CHECK MINIMUM_PTX 65 FAMILY_CHECKS D05.special D05.accuracy)
 cudavm_add_conformance_slice(bfloat16_conversion SOURCE_ONLY SOURCE_CHECK FAMILY_CHECKS D05.rounding D05.representation)
 cudavm_add_conformance_slice(bfloat16_comparison SOURCE_ONLY SOURCE_CHECK FAMILY_CHECKS D05.special D05.accuracy)
