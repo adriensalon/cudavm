@@ -216,6 +216,10 @@ nvrtc_output import_cuda_source(llvm::LLVMContext& context, const std::string& s
             {"result", "int"}, {"symbol", "__nv_" + symbol}, {"arguments", std::string(real) + " x"},
             {"name", name}, {"linkage", ""}, {"call", "x"}});
     }
+    for (auto name : {"floor", "ceil", "trunc", "round", "rint", "nearbyint", "sqrt"})
+        rtc_preamble += render_device_source("device_wrapper.cu.in", {
+            {"result", "double"}, {"symbol", "__nv_" + std::string(name)}, {"arguments", "double x"},
+            {"name", name}, {"linkage", "extern \"C\" "}, {"call", "x"}});
     for (auto name : {"fmin", "fmax", "fabs", "copysign"}) {
         bool unary = std::string_view(name) == "fabs";
         rtc_preamble += render_device_source("device_wrapper.cu.in", {

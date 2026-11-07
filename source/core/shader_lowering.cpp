@@ -148,7 +148,7 @@ void scalar_math(llvm::Module& module) {
         // callers select normal-range operands; strict FP32 callers select
         // cvFloatDivide. Constant inlining removes the unused route.
         auto parent=instruction->getFunction()->getName();
-        bool bounded_division=parent.starts_with("_ZN6cudavm14math_log2_modeEfj") || parent.starts_with("_ZN6cudavm14math_tanh_modeEfj") || parent.starts_with("_ZN6cudavm20math_reciprocal_modeEfj");
+        bool bounded_division=parent.starts_with("_ZN6cudavm14math_log2_modeEfj") || parent.starts_with("_ZN6cudavm19math_logarithm_modeEfjj") || parent.starts_with("_ZN6cudavm14math_tanh_modeEfj") || parent.starts_with("_ZN6cudavm20math_reciprocal_modeEfj");
         if (divide && !divide->isDeclaration() && !bounded_division && instruction->getOpcode() == llvm::Instruction::FDiv && instruction->getType()->isFloatTy())
             replacement = builder.CreateCall(divide,{instruction->getOperand(0),instruction->getOperand(1)});
         if (compare && !compare->isDeclaration()) if (auto* operation = llvm::dyn_cast<llvm::FCmpInst>(instruction); operation && operation->getOperand(0)->getType()->isFloatTy())

@@ -248,7 +248,17 @@ CV_MATH_FN float math_exponential(float x,uint base) {
     uint q=m>>shift,rem=m&((1u<<shift)-1u),mid=1u<<(shift-1u);
     return CV_FLOAT(q+uint(rem>mid || (rem==mid && (q&1u))));
 }
-CV_MATH_FN float math_log2_mode(float x,uint native_division) {
+// Dekker's product residual for the bounded normal operands in logarithm
+// reduction. Split into twelve-bit pieces so shader targets need no general
+// exact-FMA fallback for each correction term. Contraction must stay disabled.
+CV_MATH_FN float math_product_error(float a,float b,float product) {
+    CV_MATH_CONTRACT
+    float split_a=a*4097.0f,split_b=b*4097.0f;
+    float high_a=split_a-(split_a-a),high_b=split_b-(split_b-b);
+    float low_a=a-high_a,low_b=b-high_b;
+    return ((high_a*high_b-product)+high_a*low_b+low_a*high_b)+low_a*low_b;
+}
+CV_MATH_FN float math_logarithm_mode(float x,uint base,uint native_division) {
     CV_MATH_CONTRACT
     uint bits=CV_BITS(x),ax=bits&0x7fffffffu;
     if(ax>0x7f800000u)return CV_FLOAT(bits|0x00400000u);
@@ -259,17 +269,38 @@ CV_MATH_FN float math_log2_mode(float x,uint native_division) {
     if(ax<0x800000u) {uint shift=CV_MATH_CLZ(m)-8u;e=-126-int(shift);m=(m<<shift)&0x7fffffu;}
     float a=CV_FLOAT(m|0x3f800000u);
     if(a>1.4142135623730951f){a=a*0.5f;++e;}
-    float z=native_division?(a-1.0f)/(a+1.0f):cvFloatDivide(a-1.0f,a+1.0f),t=z*z;
-    float p=1.0f+t*(0.3333333333333333f+t*(0.2f+t*(0.14285714285714285f+t*(0.1111111111111111f+t*(0.09090909090909091f+t*0.07692307692307692f)))));
+    // a-1 is exact by Sterbenz. Retain the rounding error of a+1 and of
+    // the quotient before evaluating the atanh series. Losing either term
+    // can move near-one logarithms beyond their one-ULP public bound.
+    float numerator=a-1.0f,denominator=a+1.0f;
+    float denominator_low=a-(denominator-1.0f);
+    float z=native_division?numerator/denominator:cvFloatDivide(numerator,denominator),t=z*z;
+    float product=z*denominator;
+    float residual=((numerator-product)-math_product_error(z,denominator,product))-z*denominator_low;
+    float z_low=native_division?residual/denominator:cvFloatDivide(residual,denominator);
+    float p=0.3333333333333333f+t*(0.2f+t*(0.14285714285714285f+t*(0.1111111111111111f+
+        t*(0.09090909090909091f+t*(0.07692307692307692f+t*(0.06666666666666667f+t*0.058823529411764705f))))));
+    float tail=z*t*p+z_low*(1.0f+t*(1.0f+t*(1.0f+t)));
+    float factor=base==0u?2.0f:base==1u?2.885390043258667f:0.8685889840126038f;
+    float factor_low=base==0u?0.0f:base==1u?3.851925982503526e-8f:-2.020610022261756e-8f;
+    float high=z*factor;
+    float low=math_product_error(z,factor,high)+(tail*factor+z*factor_low);
     float ef=cvMathScaled(uint(e<0?-e:e),0);if(e<0)ef=-ef;
-    return ef+(z*p)*2.8853900817779268f;
+    float scale=base==0u?0.6931471824645996f:base==1u?1.0f:0.3010300099849701f;
+    float scale_low=base==0u?-1.904654299957768e-9f:base==1u?0.0f:-1.432098889111308e-8f;
+    float exponent_high=ef*scale;
+    low+=math_product_error(ef,scale,exponent_high)+ef*scale_low;
+    float sum=exponent_high+high;
+    // |exponent_high| >= |high| whenever e != 0; for e == 0 the error is zero.
+    return sum+(((exponent_high-sum)+high)+low);
 }
+CV_MATH_FN float math_log2_mode(float x,uint native_division) {return math_logarithm_mode(x,1u,native_division);}
 CV_MATH_FN float math_log2(float x) {return math_log2_mode(x,0u);}
 CV_MATH_FN float math_exp2(float x) {return math_exponential(x,0u);}
 CV_MATH_FN float math_exp(float x) {return math_exponential(x,1u);}
 CV_MATH_FN float math_exp10(float x) {return math_exponential(x,2u);}
-CV_MATH_FN float math_log(float x) {return math_log2(x)*0.6931471805599453f;}
-CV_MATH_FN float math_log10(float x) {return math_log2(x)*0.3010299956639812f;}
+CV_MATH_FN float math_log(float x) {return math_logarithm_mode(x,0u,0u);}
+CV_MATH_FN float math_log10(float x) {return math_logarithm_mode(x,2u,0u);}
 CV_MATH_FN float math_tanh_mode(float x,uint native_division) {
     CV_MATH_CONTRACT
     uint bits=CV_BITS(x),ax=bits&0x7fffffffu;

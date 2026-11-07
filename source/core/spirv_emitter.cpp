@@ -2,6 +2,7 @@
 #include "shader_lowering.hpp"
 #include "spirv_artifact.hpp"
 #include <map>
+#include <set>
 #include <cstdio>
 #include <cstdlib>
 #include <llvm/IR/Module.h>
@@ -42,11 +43,20 @@ std::string emit_native_spirv(const llvm::Module& input) {
     std::map<uint32_t, std::pair<uint32_t, uint32_t>> constants;
     std::vector<uint32_t> added;
     size_t first_function = code.size(),first_type=code.size();
-    std::vector<uint32_t> coherent;
+    std::vector<uint32_t> decorations;
+    std::set<uint32_t> no_contraction;
     if(!opencl) for(size_t i=5;i<code.size();i+=code[i]>>16) {
         auto opcode=code[i]&0xffffu;
         if(opcode>=19 && opcode<=39 && first_type==code.size())first_type=i;
-        if(opcode==59 && (code[i+3]==2 || code[i+3]==12))coherent.insert(coherent.end(),{(3u<<16)|71u,code[i+2],23u});
+        if(opcode==59 && (code[i+3]==2 || code[i+3]==12))decorations.insert(decorations.end(),{(3u<<16)|71u,code[i+2],23u});
+        if(opcode==71 && code[i+2]==42)no_contraction.insert(code[i+1]);
+        // Separate native add/subtract/multiply instructions retain their
+        // rounding boundaries, including compensated numerical helpers.
+        // GLSL ingestion needs explicit NoContraction (precise) decorations;
+        // an absent fast-math flag alone does not preserve those boundaries.
+        // Explicit fused operations remain extended Fma instructions.
+        if((opcode==129 || opcode==131 || opcode==133) && no_contraction.insert(code[i+2]).second)
+            decorations.insert(decorations.end(),{(3u<<16)|71u,code[i+2],42u});
     }
     for (size_t i = 5; i < code.size(); i += code[i] >> 16) {
         auto count = code[i] >> 16, opcode = code[i] & 0xffffu;
@@ -68,9 +78,10 @@ std::string emit_native_spirv(const llvm::Module& input) {
         }
     }
     code.insert(code.begin() + first_function, added.begin(), added.end());
-    // GLSL450 resource accesses participating in the device mutex/fence
-    // protocol must bypass non-coherent per-invocation caches.
-    if(!coherent.empty())code.insert(code.begin()+first_type,coherent.begin(),coherent.end());
+    // Keep resource-coherence and rounding decorations in the annotation
+    // section before declarations. Mutex/fence accesses bypass non-coherent
+    // per-invocation caches in GLSL450 consumers.
+    if(!decorations.empty())code.insert(code.begin()+first_type,decorations.begin(),decorations.end());
     bytes.assign(reinterpret_cast<const char*>(code.data()), code.size() * 4);
     return bytes;
 }

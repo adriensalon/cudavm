@@ -270,6 +270,114 @@ template<unsigned Fraction, unsigned Exponent> struct numerical_format {
 using numerical_binary32 = numerical_format<23, 8>;
 using numerical_binary64 = numerical_format<52, 11>;
 
+// Compare exact nonnegative dyadics; elementary references deliberately use
+// bracketing and integer products rather than a device root/division algorithm.
+inline int elementary_compare(const numerical_dyadic& a, const numerical_dyadic& b) {
+    const int scale = std::min(a.scale, b.scale);
+    return a.magnitude.shifted(unsigned(a.scale - scale)).compare(b.magnitude.shifted(unsigned(b.scale - scale)));
+}
+template<class Format> uint64_t elementary_integral(uint64_t bits, unsigned mode) {
+    if (Format::is_nan(bits)) return Format::nan;
+    if (Format::is_infinite(bits)) return bits;
+    auto value = Format::decode(bits);
+    if (value.scale >= 0 || !value.magnitude.width()) return bits;
+    const auto shift = unsigned(-value.scale);
+    auto retained = value.magnitude.window(shift);
+    const bool halfway = value.magnitude.bit(shift - 1), lower = value.magnitude.below(shift - 1);
+    const bool increment = mode == 0 ? halfway && (lower || (retained & 1))
+        : mode == 4 ? halfway : (halfway || lower) && ((mode == 2 && value.negative) || (mode == 3 && !value.negative));
+    return Format::encode({numerical_integer(retained + increment), 0, value.negative}, 0);
+}
+template<class Format> std::array<uint64_t, 6> elementary_rounding(uint64_t bits) {
+    return {elementary_integral<Format>(bits, 2), elementary_integral<Format>(bits, 3),
+        elementary_integral<Format>(bits, 1), elementary_integral<Format>(bits, 4),
+        elementary_integral<Format>(bits, 0), elementary_integral<Format>(bits, 0)};
+}
+// Find the two adjacent destination values enclosing sqrt(x) or 1/x. Compare
+// the exact squared midpoint or midpoint product to choose nearest-even.
+// The conceptual value after maximum finite is 2^(bias+1), for overflow ties.
+template<class Format> uint64_t elementary_root(uint64_t bits, bool reciprocal) {
+    if (Format::is_nan(bits)) return Format::nan;
+    const auto magnitude = bits & (Format::sign - 1), sign = bits & Format::sign;
+    if (reciprocal) {
+        if (!magnitude) return sign | Format::infinity;
+        if (Format::is_infinite(bits)) return sign;
+    } else {
+        if (!magnitude) return bits;
+        if (sign) return Format::nan;
+        if (Format::is_infinite(bits)) return bits;
+    }
+    const auto source = Format::decode(magnitude);
+    const numerical_dyadic one{numerical_integer(1), 0, false};
+    auto compare = [&](const numerical_dyadic& candidate) {
+        numerical_dyadic product{candidate.magnitude.times(reciprocal ? source.magnitude : candidate.magnitude),
+            candidate.scale + (reciprocal ? source.scale : candidate.scale), false};
+        return elementary_compare(product, reciprocal ? one : source);
+    };
+    uint64_t low = 0, high = Format::infinity;
+    while (high - low > 1) {
+        const auto middle = low + (high - low) / 2;
+        if (compare(Format::decode(middle)) <= 0) low = middle;
+        else high = middle;
+    }
+    const auto lower = Format::decode(low);
+    if (compare(lower) == 0) return sign | low;
+    const auto upper = high == Format::infinity ? numerical_dyadic{numerical_integer(1), Format::bias + 1, false}
+        : Format::decode(high);
+    auto midpoint = numerical_sum(lower, upper, 0); --midpoint.scale;
+    const auto order = compare(midpoint);
+    return sign | (order < 0 || (order == 0 && (low & 1)) ? high : low);
+}
+// Exact rational division oracle: compare destination values and their
+// midpoints after multiplication by the positive divisor, without division
+// through another floating-point format or a device implementation helper.
+template<class Format> uint64_t numerical_divide(uint64_t a, uint64_t b) {
+    const auto sign = (a ^ b) & Format::sign;
+    if (Format::is_nan(a) || Format::is_nan(b) || (Format::is_zero(a) && Format::is_zero(b))
+        || (Format::is_infinite(a) && Format::is_infinite(b))) return Format::nan;
+    if (Format::is_infinite(a) || Format::is_zero(b)) return sign | Format::infinity;
+    if (Format::is_zero(a) || Format::is_infinite(b)) return sign;
+    const auto numerator = Format::decode(a & (Format::sign - 1)), divisor = Format::decode(b & (Format::sign - 1));
+    auto compare = [&](const numerical_dyadic& candidate) {
+        return elementary_compare({candidate.magnitude.times(divisor.magnitude), candidate.scale + divisor.scale, false}, numerator);
+    };
+    uint64_t low = 0, high = Format::infinity;
+    while (high - low > 1) {
+        const auto middle = low + (high - low) / 2;
+        if (compare(Format::decode(middle)) <= 0) low = middle;
+        else high = middle;
+    }
+    const auto lower = Format::decode(low);
+    if (compare(lower) == 0) return sign | low;
+    const auto upper = high == Format::infinity ? numerical_dyadic{numerical_integer(1), Format::bias + 1, false}
+        : Format::decode(high);
+    auto midpoint = numerical_sum(lower, upper, 0); --midpoint.scale;
+    const auto order = compare(midpoint);
+    return sign | (order < 0 || (order == 0 && (low & 1)) ? high : low);
+}
+template<class Word, unsigned Fraction, unsigned Exponent>
+std::vector<std::array<Word, 3>> elementary_inputs() {
+    using format = numerical_format<Fraction, Exponent>;
+    std::vector<std::array<Word, 3>> result;
+    const uint64_t fraction_mask = (uint64_t(1) << Fraction) - 1;
+    for (uint64_t exponent = 0; exponent < (uint64_t(1) << Exponent); ++exponent)
+        for (uint64_t fraction : {uint64_t(0), uint64_t(1), uint64_t(2), fraction_mask / 2, fraction_mask / 2 + 1, fraction_mask - 1, fraction_mask})
+            for (uint64_t sign : {uint64_t(0), format::sign}) result.push_back({Word(sign | (exponent << Fraction) | fraction), 0, 0});
+    // Neighboring encodings of exact half-integers distinguish ties-even from
+    // ties-away and preserve the sign when the result rounds to zero.
+    for (unsigned integer = 0; integer < 129; ++integer) {
+        const auto halfway = format::encode({numerical_integer(integer * 2 + 1), -1, false}, 0);
+        for (auto value : {halfway - 1, halfway, halfway + 1})
+            for (auto sign : {uint64_t(0), format::sign}) result.push_back({Word(value | sign), 0, 0});
+    }
+    uint64_t state = 0x751c3a9b692df4e1ull;
+    for (unsigned i = 0; i < 4097; ++i) {
+        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+        result.push_back({Word(state), 0, 0});
+    }
+    return result;
+}
+
 inline numerical_dyadic numerical_integer_value(uint64_t bits, unsigned width, bool signed_value) {
     const uint64_t mask = width == 64 ? UINT64_MAX : (uint64_t(1) << width) - 1;
     bits &= mask;

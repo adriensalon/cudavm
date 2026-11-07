@@ -13,6 +13,13 @@ extern "C" __device__ inline double __nv_fabs(double x) {return __builtin_bit_ca
 extern "C" __device__ inline double __nv_copysign(double x,double y) {return __builtin_bit_cast(double,(__builtin_bit_cast(unsigned long long,x)&0x7fffffffffffffffull)|(__builtin_bit_cast(unsigned long long,y)&0x8000000000000000ull));}
 extern "C" __device__ inline double __nv_fmin(double x,double y) {return __builtin_bit_cast(double,__cudavm_native_word_f64_minmax(__builtin_bit_cast(unsigned long long,x),__builtin_bit_cast(unsigned long long,y),0));}
 extern "C" __device__ inline double __nv_fmax(double x,double y) {return __builtin_bit_cast(double,__cudavm_native_word_f64_minmax(__builtin_bit_cast(unsigned long long,x),__builtin_bit_cast(unsigned long long,y),1));}
+extern "C" __device__ inline double __nv_floor(double x) {return __builtin_bit_cast(double,__cudavm_native_word_f64_integral(__builtin_bit_cast(unsigned long long,x),2));}
+extern "C" __device__ inline double __nv_ceil(double x) {return __builtin_bit_cast(double,__cudavm_native_word_f64_integral(__builtin_bit_cast(unsigned long long,x),3));}
+extern "C" __device__ inline double __nv_trunc(double x) {return __builtin_bit_cast(double,__cudavm_native_word_f64_integral(__builtin_bit_cast(unsigned long long,x),1));}
+extern "C" __device__ inline double __nv_round(double x) {return __builtin_bit_cast(double,__cudavm_native_word_f64_integral(__builtin_bit_cast(unsigned long long,x),4));}
+extern "C" __device__ inline double __nv_rint(double x) {return __builtin_bit_cast(double,__cudavm_native_word_f64_integral(__builtin_bit_cast(unsigned long long,x),0));}
+extern "C" __device__ inline double __nv_nearbyint(double x) {return __nv_rint(x);}
+extern "C" __device__ inline double __nv_sqrt(double x) {return __builtin_elementwise_sqrt(x);}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_umulhi32(unsigned a,unsigned b) {return cudavm::cvMulHi(a,b);}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_smulhi32(unsigned a,unsigned b) {return cudavm::cvSMulHi32(a,b);}
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_umulhi64(unsigned long long a,unsigned long long b) {
@@ -78,8 +85,8 @@ extern "C" __device__ __attribute__((used)) inline float __cudavm_native_flush(f
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_sin(float x) {return cudavm::math_half_trig(x,0); }
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_cos(float x) {return cudavm::math_half_trig(x,1); }
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_log2(float x) {return cudavm::math_log2_mode(x,1); }
-extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_log(float x) {return cudavm::math_log2_mode(x,1)*0.6931471805599453f; }
-extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_log10(float x) {return cudavm::math_log2_mode(x,1)*0.3010299956639812f; }
+extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_log(float x) {return cudavm::math_logarithm_mode(x,0,1); }
+extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_log10(float x) {return cudavm::math_logarithm_mode(x,2,1); }
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_tanh(float x) {return cudavm::math_tanh_mode(x,1); }
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_rcp(float x) {return cudavm::math_reciprocal_mode(x,1); }
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_half_sqrt(float x) {unsigned b=__builtin_bit_cast(unsigned,x),a=b&0x7fffffffu; if(!a || b==0x7f800000u)return x; if(a>0x7f800000u)return __builtin_bit_cast(float,b|0x00400000u); if(b&0x80000000u)return __builtin_bit_cast(float,0x7fc00000u); return __builtin_elementwise_sqrt(x); }

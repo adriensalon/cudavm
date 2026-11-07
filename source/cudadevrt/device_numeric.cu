@@ -671,18 +671,19 @@ __device__ static inline cv64 split(unsigned long long x){return cvMake(unsigned
 __device__ static inline unsigned long long join(cv64 x){return (unsigned long long)(x.lo)|((unsigned long long)(x.hi)<<32);}
 }
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_integral(unsigned long long bits,unsigned mode) {
+    // Modes are nearest-even, zero, down, up and nearest-away (0 through 4).
     auto sign=bits&0x8000000000000000ull, magnitude=bits&0x7fffffffffffffffull;
     unsigned exponent=unsigned(magnitude>>52);
     if(exponent>=1075u || magnitude==0ull)return bits;
     if(exponent<1023u) {
-        bool increment=mode==0u?magnitude>0x3fe0000000000000ull:mode==2u?sign!=0ull:mode==3u?sign==0ull:false;
+        bool increment=mode==0u?magnitude>0x3fe0000000000000ull:mode==4u?magnitude>=0x3fe0000000000000ull:mode==2u?sign!=0ull:mode==3u?sign==0ull:false;
         return sign|(increment?0x3ff0000000000000ull:0ull);
     }
     unsigned shift=1075u-exponent;
     auto fraction=magnitude&((1ull<<shift)-1ull), retained=magnitude>>shift;
     if(fraction==0ull)return bits;
     auto halfway=1ull<<(shift-1u);
-    bool increment=mode==0u?(fraction>halfway || (fraction==halfway && (retained&1ull))):mode==2u?sign!=0ull:mode==3u?sign==0ull:false;
+    bool increment=mode==0u?(fraction>halfway || (fraction==halfway && (retained&1ull))):mode==4u?fraction>=halfway:mode==2u?sign!=0ull:mode==3u?sign==0ull:false;
     return sign|((retained+unsigned(increment))<<shift);
 }
 extern "C" __device__ __attribute__((used)) inline unsigned long long __cudavm_native_word_f64_add(unsigned long long a,unsigned long long b){using namespace cudavm;return join(cvDoubleAdd(split(a),split(b)));}
