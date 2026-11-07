@@ -1,4 +1,9 @@
 *.cubin binary
+nvvm_import/nvvm_import.bc binary
+nvvm_import/nvvm_import.ll -text
+fatbinary_import/*.fatbin binary
+fatbinary_import/input-70.ptx -text
+fatbinary_import/input-75.ptx -text
 managed_registration/managed_registration.ptx -text
 # Preserve the exact producer inputs whose byte hashes accompany the cubins.
 kernel_launch/kernel_launch.ptx -text

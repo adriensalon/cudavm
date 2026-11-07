@@ -1,0 +1,5 @@
+#pragma once
+namespace cudavm {
+inline constexpr unsigned char fatbinary_plain[]{@fatbinary_plain_bytes@};
+inline constexpr unsigned char fatbinary_compressed[]{@fatbinary_compressed_bytes@};
+}

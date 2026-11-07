@@ -1,0 +1,7 @@
+#pragma once
+#include <string_view>
+#include <span>
+namespace cudavm {
+inline constexpr std::string_view nvvm_import_source = R"nvvm_fixture(@nvvm_import_text@)nvvm_fixture";
+inline constexpr unsigned char nvvm_import_bitcode[]{@nvvm_import_bytes@};
+}

@@ -1,0 +1,5 @@
+#pragma once
+#include <string_view>
+namespace cudavm {
+inline constexpr std::string_view program_image_nvvm = R"nvvm_image(@program_image_nvvm_text@)nvvm_image";
+}

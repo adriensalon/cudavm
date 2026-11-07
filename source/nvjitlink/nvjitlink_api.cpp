@@ -114,18 +114,18 @@ void nvjitlink_add(nvjitlink_program& program, nvJitLinkInputType type, const vo
     case NVJITLINK_INPUT_NONE: nvjitlink_fail(program, NVJITLINK_ERROR_INVALID_INPUT, "input type NONE is invalid");
     default: nvjitlink_fail(program, NVJITLINK_ERROR_UNRECOGNIZED_INPUT, "this container input type is not implemented");
     }
+    std::string label = name && *name ? name : "nvJitLink.input." + std::to_string(program.inputs.size());
     if ((type == NVJITLINK_INPUT_ANY || type == NVJITLINK_INPUT_FATBIN) && has_fatbin(std::string_view(static_cast<const char*>(data), size))) {
         std::vector<fatbin_record> records;
         try { records = decode_fatbin({static_cast<const char*>(data), size}); }
         catch (const nvidia_container_error& error) {
-            nvjitlink_fail(program, error.unsupported ? NVJITLINK_ERROR_UNRECOGNIZED_INPUT : NVJITLINK_ERROR_INVALID_INPUT, error.what());
+            nvjitlink_fail(program, error.unsupported ? NVJITLINK_ERROR_UNRECOGNIZED_INPUT : NVJITLINK_ERROR_INVALID_INPUT, label + ": " + error.what());
         }
-        catch (const std::exception& error) { nvjitlink_fail(program, NVJITLINK_ERROR_INVALID_INPUT, error.what()); }
+        catch (const std::exception& error) { nvjitlink_fail(program, NVJITLINK_ERROR_INVALID_INPUT, label + ": " + error.what()); }
         auto* selected = select_fatbin(records, unsigned(std::stoul(program.options.architecture.substr(3))), true);
         if (selected && selected->kind == fatbin_kind::ltoir && !program.options.lto)
             nvjitlink_fail(program, NVJITLINK_ERROR_LTO_NOT_ENABLED, "fatbinary LTOIR inputs require -lto");
     }
-    std::string label = name && *name ? name : "nvJitLink.input." + std::to_string(program.inputs.size());
     // The core owns a copy of the input IR before this call returns. Labels are
     // copied as well; neither caller buffers nor open files back the link state.
     compiler_input_request_v3 request;

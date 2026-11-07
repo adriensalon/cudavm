@@ -37,6 +37,9 @@ void link_device_numeric_ir(llvm::Module& module) {
     if(!compiler.ExecuteAction(action))throw std::runtime_error("numeric source compilation failed: "+log);
     auto numeric=action.takeModule();
     if(!numeric)throw std::runtime_error("numeric frontend produced no IR");
+    // Helper compilation must not adopt a target for normalized portable IR.
+    // Retained PTX Compiler images must keep the same ABI as raw PTX inputs.
+    numeric->setTargetTriple(module.getTargetTriple());
     numeric->setDataLayout(module.getDataLayout());
     if(llvm::Linker::linkModules(module,std::move(numeric)))throw std::runtime_error("numeric source linking failed");
     module.getOrInsertNamedMetadata("cudavm.numeric.helpers");

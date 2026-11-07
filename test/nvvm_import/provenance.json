@@ -1,0 +1,9 @@
+{
+  "producer": "LLVM llvm-as 22.1.4",
+  "profile": "Independently authored NVVM IR 2.0; current LLVM opaque-pointer bitcode control, not NVIDIA LLVM 7 producer evidence",
+  "command": "llvm-as nvvm_import.ll -o nvvm_import.bc",
+  "sha256": {
+    "nvvm_import.ll": "b3835fc28eeef590c1ad79028cf6dc076bd14ce5769cdb9eba8e25c2c86d853e",
+    "nvvm_import.bc": "93148b1fbe30a70c884b215f0cf98de67a7302287094d1fce478e8608e321077"
+  }
+}

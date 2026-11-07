@@ -1,0 +1,6 @@
+#pragma once
+#include <string_view>
+namespace cudavm {
+inline constexpr std::string_view module_loading_source = R"module_fixture(@module_loading_cu@)module_fixture";
+inline constexpr std::string_view module_loading_ptx = R"module_fixture(@module_loading_ptx@)module_fixture";
+}

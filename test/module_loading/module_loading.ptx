@@ -1,0 +1,23 @@
+.version 6.5
+.target sm_75
+.address_size 64
+.visible .global .align 4 .u32 module_seed = 13;
+.visible .const .align 4 .u32 module_bias = 29;
+.visible .entry module_alpha(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .reg .b32 %i,%block,%width,%count,%value,%seed; .reg .b64 %out,%in; .reg .pred %p;
+ mov.u32 %i,%tid.x; mov.u32 %block,%ctaid.x; mov.u32 %width,%ntid.x;
+ mad.lo.u32 %i,%block,%width,%i; ld.param.u32 %count,[count]; setp.ge.u32 %p,%i,%count; @%p ret;
+ ld.param.u64 %out,[out]; ld.param.u64 %in,[in]; mad.wide.u32 %in,%i,4,%in;
+ ld.global.u32 %value,[%in]; ld.global.u32 %seed,[module_seed];
+ mad.lo.u32 %value,%value,3,%seed; add.u32 %value,%value,%i;
+ mad.wide.u32 %out,%i,4,%out; st.global.u32 [%out],%value; ret;
+}
+.visible .entry module_beta(.param .u64 out, .param .u64 in, .param .u32 count) {
+ .reg .b32 %i,%block,%width,%count,%value,%seed,%bias; .reg .b64 %out,%in; .reg .pred %p;
+ mov.u32 %i,%tid.x; mov.u32 %block,%ctaid.x; mov.u32 %width,%ntid.x;
+ mad.lo.u32 %i,%block,%width,%i; ld.param.u32 %count,[count]; setp.ge.u32 %p,%i,%count; @%p ret;
+ ld.param.u64 %out,[out]; ld.param.u64 %in,[in]; mad.wide.u32 %in,%i,4,%in;
+ ld.global.u32 %value,[%in]; ld.global.u32 %seed,[module_seed]; ld.const.u32 %bias,[module_bias];
+ xor.b32 %value,%value,%bias; add.u32 %value,%value,%seed;
+ mad.wide.u32 %out,%i,4,%out; st.global.u32 [%out],%value; ret;
+}

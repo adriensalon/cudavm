@@ -27,6 +27,9 @@ int main() {
         check(sdk_c_contract() == 0, "independent C header/link contract");
         CUcontext context{};
         check(cuCtxGetCurrent(&context) == CUDA_ERROR_NOT_INITIALIZED, "SDK calls begin without Driver initialization");
+        CUmodule module{};
+        check(cuModuleLoadFatBinary(&module, nullptr) == CUDA_ERROR_NOT_INITIALIZED && !module,
+            "installed fatbinary loader export preserves uninitialized Driver state");
         struct { unsigned before = 0x12345678; int value = 0; unsigned after = 0x87654321; } driver, runtime;
         check(cuDriverGetVersion(&driver.value) == CUDA_SUCCESS && driver.value == CUDA_VERSION, "installed Driver header/library version");
         check(cudaRuntimeGetVersion(&runtime.value) == cudaSuccess && runtime.value == CUDART_VERSION, "installed Runtime header/library version");
