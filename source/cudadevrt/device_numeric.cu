@@ -484,21 +484,63 @@ CV_FN cv64 cvDoubleMultiply(cv64 a,cv64 b,uint mode=0u) {
 // Four little-endian words leave room for carry and three final rounding bits.
 struct double_wide_words { uint words[4]; };
 CV_FN double_wide_words double_wide_from(cv64 value) { double_wide_words r={{value.lo,value.hi,0u,0u}};return r; }
-CV_FN uint double_wide_bit(double_wide_words a,uint bit) {return bit<128u?(a.words[bit/32u]>>(bit%32u))&1u:0u;}
+CV_FN uint double_wide_word(double_wide_words a,uint index) {
+    if(index==0u)return a.words[0];if(index==1u)return a.words[1];
+    if(index==2u)return a.words[2];if(index==3u)return a.words[3];return 0u;
+}
+CV_FN uint double_wide_bit(double_wide_words a,uint bit) {return (double_wide_word(a,bit/32u)>>(bit%32u))&1u;}
 CV_FN double_wide_words double_wide_shift(double_wide_words a,int shift) {
     double_wide_words r={{0u,0u,0u,0u}};
-    for(uint bit=0u;bit<128u;++bit) {int source=int(bit)-shift;if(source>=0 && source<128)r.words[bit/32u]|=double_wide_bit(a,uint(source))<<(bit%32u);}
-    if(shift<0) {uint discarded=0u;for(uint bit=0u;bit<128u;++bit)if(bit<uint(-shift))discarded|=double_wide_bit(a,bit);r.words[0]|=discarded;}
+    // Keep each shift in four words. Bit-at-a-time loops over dynamic array
+    // indices expand heavily in native shader compilers, especially after FMA
+    // inlining. Right shifts retain one sticky bit for all discarded bits.
+    if(shift==0)return a;
+    if(shift>=128)return r;
+    if(shift<=-128) {r.words[0]=(a.words[0]|a.words[1]|a.words[2]|a.words[3])!=0u?1u:0u;return r;}
+    uint distance=uint(shift<0?-shift:shift),whole=distance/32u,part=distance%32u;
+    // Constant field indices let aggregate scalarization keep the four words
+    // in registers, rather than expanding dynamic private-array accesses.
+#define CUDAVM_WIDE_SHIFT_WORD(I) \
+    if(shift>0) {uint source=uint(I)-whole; \
+        r.words[I]=double_wide_word(a,source)<<part; \
+        if(part!=0u)r.words[I]|=double_wide_word(a,source-1u)>>(32u-part); \
+    } else {uint source=uint(I)+whole; \
+        r.words[I]=double_wide_word(a,source)>>part; \
+        if(part!=0u)r.words[I]|=double_wide_word(a,source+1u)<<(32u-part);}
+    CUDAVM_WIDE_SHIFT_WORD(0)
+    CUDAVM_WIDE_SHIFT_WORD(1)
+    CUDAVM_WIDE_SHIFT_WORD(2)
+    CUDAVM_WIDE_SHIFT_WORD(3)
+#undef CUDAVM_WIDE_SHIFT_WORD
+    if(shift<0) {
+        uint discarded=(whole>0u?a.words[0]:0u)|(whole>1u?a.words[1]:0u)|(whole>2u?a.words[2]:0u);
+        if(part!=0u)discarded|=double_wide_word(a,whole)&((1u<<part)-1u);
+        r.words[0]|=discarded!=0u?1u:0u;
+    }
     return r;
 }
-CV_FN int double_wide_top(double_wide_words a) {for(int bit=127;bit>=0;--bit)if(double_wide_bit(a,uint(bit))!=0u)return bit;return -1;}
+CV_FN int double_wide_top(double_wide_words a) {
+    if(a.words[3]!=0u)return 127-int(cvClz32(a.words[3]));
+    if(a.words[2]!=0u)return 95-int(cvClz32(a.words[2]));
+    if(a.words[1]!=0u)return 63-int(cvClz32(a.words[1]));
+    return a.words[0]!=0u?31-int(cvClz32(a.words[0])):-1;
+}
 CV_FN uint double_wide_less(double_wide_words a,double_wide_words b) {
-    for(int i=3;i>=0;--i)if(a.words[i]!=b.words[i])return a.words[i]<b.words[i]?1u:0u;return 0u;
+    if(a.words[3]!=b.words[3])return a.words[3]<b.words[3]?1u:0u;
+    if(a.words[2]!=b.words[2])return a.words[2]<b.words[2]?1u:0u;
+    if(a.words[1]!=b.words[1])return a.words[1]<b.words[1]?1u:0u;
+    return a.words[0]<b.words[0]?1u:0u;
 }
 CV_FN double_wide_words double_wide_sum(double_wide_words a,double_wide_words b,uint subtract) {
     double_wide_words r;uint carry=subtract;
-    for(uint i=0u;i<4u;++i) {uint y=subtract!=0u?~b.words[i]:b.words[i],sum=a.words[i]+y;
-        uint next=sum+carry;carry=(sum<a.words[i] || next<sum)?1u:0u;r.words[i]=next;}
+#define CUDAVM_WIDE_SUM_WORD(I) \
+    {uint y=subtract!=0u?~b.words[I]:b.words[I],sum=a.words[I]+y; \
+        uint next=sum+carry;carry=(sum<a.words[I] || next<sum)?1u:0u;r.words[I]=next;}
+    CUDAVM_WIDE_SUM_WORD(0)
+    CUDAVM_WIDE_SUM_WORD(1)
+    CUDAVM_WIDE_SUM_WORD(2)
+    CUDAVM_WIDE_SUM_WORD(3)
+#undef CUDAVM_WIDE_SUM_WORD
     return r;
 }
 CV_FN cv64 double_wide_round(double_wide_words value,int exponent,uint sign,uint mode) {
@@ -516,7 +558,9 @@ CV_FN cv64 double_fma(cv64 a,cv64 b,cv64 c,uint mode) {
         return cvMake(0u,sign|0x7ff00000u);
     }
     if(cx.hi==0x7ff00000u)return c;
-    if(az!=0u || bz!=0u)return cvDoubleAdd(cvMake(0u,sign),c,mode);
+    // A zero product only needs the signed-zero tie rule. Inlining a general
+    // binary64 addition here needlessly duplicates its full normalization CFG.
+    if(az!=0u || bz!=0u)return cz==0u?c:cvMake(0u,sign==cs?sign:mode==2u?0x80000000u:0u);
     cv64 x=cvDoubleSignificand(a),y=cvDoubleSignificand(b);
     cv64 low=cvMul(cvMake(x.lo,0u),cvMake(y.lo,0u)),high=cvMul(cvMake(x.hi,0u),cvMake(y.hi,0u));
     cv64 cross=cvMul(cvMake(x.lo,0u),cvMake(y.hi,0u)),sum=cvAdd(low,cvMake(0u,cross.lo));
@@ -526,15 +570,18 @@ CV_FN cv64 double_fma(cv64 a,cv64 b,cv64 c,uint mode) {
     double_wide_words product={{low.lo,low.hi,high.lo,high.hi}};
     int top=double_wide_top(product),exponent=cvDoubleExponent(a)+cvDoubleExponent(b)-2046+top-104;
     product=double_wide_shift(product,120-top);
-    if(cz!=0u)return double_wide_round(product,exponent,sign,mode);
-    int ce=cvDoubleExponent(c)-1023,common=exponent>ce?exponent:ce;
-    double_wide_words addend=double_wide_shift(double_wide_from(cvDoubleSignificand(c)),68);
-    product=double_wide_shift(product,exponent-common);addend=double_wide_shift(addend,ce-common);
-    if(sign==cs)return double_wide_round(double_wide_sum(product,addend,0u),common,sign,mode);
-    if(double_wide_less(product,addend)!=0u)return double_wide_round(double_wide_sum(addend,product,1u),common,cs,mode);
-    auto difference=double_wide_sum(product,addend,1u);
-    if(double_wide_top(difference)<0)return cvMake(0u,mode==2u?0x80000000u:0u);
-    return double_wide_round(difference,common,sign,mode);
+    int common=exponent;
+    if(cz==0u) {
+        int ce=cvDoubleExponent(c)-1023;common=exponent>ce?exponent:ce;
+        double_wide_words addend=double_wide_shift(double_wide_from(cvDoubleSignificand(c)),68);
+        product=double_wide_shift(product,exponent-common);addend=double_wide_shift(addend,ce-common);
+        if(sign==cs)product=double_wide_sum(product,addend,0u);
+        else if(double_wide_less(product,addend)!=0u) {product=double_wide_sum(addend,product,1u);sign=cs;}
+        else product=double_wide_sum(product,addend,1u);
+    }
+    if(double_wide_top(product)<0)return cvMake(0u,mode==2u?0x80000000u:0u);
+    // One normalization/rounding region bounds the shader compiler's work.
+    return double_wide_round(product,common,sign,mode);
 }
 CV_FN cv64 double_sqrt(cv64 a,uint mode) {
     if(cvDoubleIsNaN(a)!=0u)return cvMake(0u,0x7ff80000u);

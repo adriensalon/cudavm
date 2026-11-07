@@ -1,5 +1,6 @@
 #include "device_numeric.cu"
 #include "device_half.cu"
+#include "device_arithmetic.cu"
 extern "C" __device__ inline int __nv_isnanf(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)>0x7f800000u;}
 extern "C" __device__ inline int __nv_isinff(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)==0x7f800000u;}
 extern "C" __device__ inline int __nv_finitef(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)<0x7f800000u;}
@@ -49,7 +50,6 @@ extern "C" __device__ inline float __nv_log2f(float x) {return cudavm::math_log2
 extern "C" __device__ inline float __nv_logf(float x) {return cudavm::math_log(x);}
 extern "C" __device__ inline float __nv_log10f(float x) {return cudavm::math_log10(x);}
 extern "C" __device__ inline float __nv_tanhf(float x) {return cudavm::math_tanh(x);}
-extern "C" __device__ inline float __nv_fmaf_rn(float x,float y,float z) {return __builtin_elementwise_fma(x,y,z);}
 extern "C" __device__ inline float __nv_fmaf_ieee_rn(float x,float y,float z) {
     return __builtin_bit_cast(float,__cudavm_native_word_f32_fma(__builtin_bit_cast(unsigned,x),__builtin_bit_cast(unsigned,y),__builtin_bit_cast(unsigned,z)));
 }
@@ -57,7 +57,6 @@ extern "C" __device__ inline float __nv_fmaf_ieee_rn(float x,float y,float z) {
 // Clang's AOT wrapper already defines the public spelling through __nv_ above.
 extern "C" __device__ inline float __fmaf_ieee_rn(float x,float y,float z) {return __nv_fmaf_ieee_rn(x,y,z);}
 #endif
-extern "C" __device__ inline float __nv_fsub_rn(float x,float y) {return x-y;}
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_sqrt(float x) {return cudavm::cvMathSqrt(x);}
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_max(float x,float y) {return cudavm::cvMathMax(x,y);}
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_min(float x,float y) {return cudavm::cvMathMin(x,y);}

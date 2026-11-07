@@ -118,6 +118,231 @@ struct fixture_data {
     unsigned minimum_ptx = 0;
 };
 
+// Independent exact dyadic arithmetic for numerical fixtures. No host floating
+// operations, compiler internals, CUDA helpers or shader implementations are used.
+// Limbs are little endian; addition and multiplication retain every exact bit.
+struct numerical_integer {
+    std::vector<uint32_t> words;
+    explicit numerical_integer(uint64_t value = 0) {
+        if (value) words.push_back(uint32_t(value));
+        if (value >> 32) words.push_back(uint32_t(value >> 32));
+    }
+    void trim() { while (!words.empty() && !words.back()) words.pop_back(); }
+    unsigned width() const { return words.empty() ? 0 : unsigned((words.size() - 1) * 32 + 32 - std::countl_zero(words.back())); }
+    bool bit(unsigned position) const { return position / 32 < words.size() && ((words[position / 32] >> (position % 32)) & 1); }
+    bool below(unsigned position) const {
+        const auto whole = std::min(size_t(position / 32), words.size());
+        for (size_t i = 0; i < whole; ++i) if (words[i]) return true;
+        return whole < words.size() && position % 32 && (words[whole] & ((uint32_t(1) << (position % 32)) - 1));
+    }
+    uint64_t window(unsigned position) const {
+        uint64_t result = 0;
+        for (unsigned i = 0; i < 64; ++i) if (bit(position + i)) result |= uint64_t(1) << i;
+        return result;
+    }
+    numerical_integer shifted(unsigned shift) const {
+        numerical_integer result;
+        if (words.empty()) return result;
+        result.words.resize(words.size() + shift / 32 + 1);
+        for (size_t i = 0; i < words.size(); ++i) {
+            const uint64_t value = uint64_t(words[i]) << (shift % 32);
+            result.words[i + shift / 32] |= uint32_t(value);
+            result.words[i + shift / 32 + 1] |= uint32_t(value >> 32);
+        }
+        result.trim(); return result;
+    }
+    int compare(const numerical_integer& other) const {
+        if (words.size() != other.words.size()) return words.size() < other.words.size() ? -1 : 1;
+        for (size_t i = words.size(); i; --i) if (words[i - 1] != other.words[i - 1]) return words[i - 1] < other.words[i - 1] ? -1 : 1;
+        return 0;
+    }
+    numerical_integer plus(const numerical_integer& other) const {
+        numerical_integer result; result.words.resize(std::max(words.size(), other.words.size()) + 1);
+        uint64_t carry = 0;
+        for (size_t i = 0; i < result.words.size(); ++i) {
+            carry += (i < words.size() ? uint64_t(words[i]) : 0) + (i < other.words.size() ? uint64_t(other.words[i]) : 0);
+            result.words[i] = uint32_t(carry); carry >>= 32;
+        }
+        result.trim(); return result;
+    }
+    numerical_integer minus(const numerical_integer& other) const {
+        numerical_integer result; result.words.resize(words.size());
+        uint64_t borrow = 0;
+        for (size_t i = 0; i < words.size(); ++i) {
+            const uint64_t right = (i < other.words.size() ? uint64_t(other.words[i]) : 0) + borrow;
+            result.words[i] = uint32_t(uint64_t(words[i]) - right); borrow = uint64_t(words[i]) < right;
+        }
+        result.trim(); return result;
+    }
+    numerical_integer times(const numerical_integer& other) const {
+        numerical_integer result; result.words.resize(words.size() + other.words.size());
+        for (size_t i = 0; i < words.size(); ++i) {
+            uint64_t carry = 0;
+            for (size_t j = 0; j < other.words.size(); ++j) {
+                const uint64_t value = uint64_t(words[i]) * other.words[j] + result.words[i + j] + carry;
+                result.words[i + j] = uint32_t(value); carry = value >> 32;
+            }
+            result.words[i + other.words.size()] = uint32_t(carry);
+        }
+        result.trim(); return result;
+    }
+};
+struct numerical_dyadic {
+    numerical_integer magnitude;
+    int scale = 0;
+    bool negative = false;
+};
+// Rounding indices match the public suffix order rn, rz, rd, ru.
+inline numerical_dyadic numerical_sum(numerical_dyadic a, numerical_dyadic b, unsigned rounding) {
+    const int scale = std::min(a.scale, b.scale);
+    auto left = a.magnitude.shifted(unsigned(a.scale - scale)), right = b.magnitude.shifted(unsigned(b.scale - scale));
+    if (a.negative == b.negative) return {left.plus(right), scale, a.negative};
+    const auto order = left.compare(right);
+    if (!order) return {numerical_integer{}, scale, rounding == 2};
+    return order > 0 ? numerical_dyadic{left.minus(right), scale, a.negative} : numerical_dyadic{right.minus(left), scale, b.negative};
+}
+template<unsigned Fraction, unsigned Exponent> struct numerical_format {
+    static constexpr int bias = (1 << (Exponent - 1)) - 1;
+    static constexpr uint64_t sign = uint64_t(1) << (Fraction + Exponent);
+    static constexpr uint64_t infinity = ((uint64_t(1) << Exponent) - 1) << Fraction;
+    static constexpr uint64_t nan = infinity | (uint64_t(1) << (Fraction - 1));
+    static bool is_nan(uint64_t bits) { return (bits & (sign - 1)) > infinity; }
+    static bool is_infinite(uint64_t bits) { return (bits & (sign - 1)) == infinity; }
+    static bool is_zero(uint64_t bits) { return !(bits & (sign - 1)); }
+    static numerical_dyadic decode(uint64_t bits) {
+        const auto exponent = unsigned((bits & infinity) >> Fraction);
+        const uint64_t fraction = bits & ((uint64_t(1) << Fraction) - 1);
+        return {numerical_integer(fraction | (exponent ? uint64_t(1) << Fraction : 0)),
+            (exponent ? int(exponent) - bias : 1 - bias) - int(Fraction), (bits & sign) != 0};
+    }
+    static uint64_t overflow(bool negative, unsigned rounding) {
+        const bool up = !rounding || (rounding == 2 && negative) || (rounding == 3 && !negative);
+        return (negative ? sign : 0) | (up ? infinity : infinity - 1);
+    }
+    static uint64_t encode(const numerical_dyadic& value, unsigned rounding) {
+        const auto width = value.magnitude.width();
+        const auto signed_bits = value.negative ? sign : 0;
+        if (!width) return signed_bits;
+        const int highest = int(width) - 1 + value.scale;
+        if (highest > bias) return overflow(value.negative, rounding);
+        int unit = std::max(highest - int(Fraction), 1 - bias - int(Fraction));
+        const int shift = unit - value.scale;
+        uint64_t retained;
+        bool remainder = false, halfway = false, lower = false;
+        if (shift > 0) {
+            retained = value.magnitude.window(unsigned(shift));
+            halfway = value.magnitude.bit(unsigned(shift - 1)); lower = value.magnitude.below(unsigned(shift - 1));
+            remainder = halfway || lower;
+        } else retained = value.magnitude.window(0) << unsigned(-shift);
+        const bool increment = rounding == 0 ? halfway && (lower || (retained & 1))
+            : remainder && ((rounding == 2 && value.negative) || (rounding == 3 && !value.negative));
+        retained += increment;
+        if (retained == (uint64_t(1) << (Fraction + 1))) { retained >>= 1; ++unit; }
+        if (retained < (uint64_t(1) << Fraction)) return signed_bits | retained;
+        const int exponent = unit + int(Fraction) + bias;
+        if (exponent >= (1 << Exponent) - 1) return overflow(value.negative, rounding);
+        return signed_bits | (uint64_t(exponent) << Fraction) | (retained - (uint64_t(1) << Fraction));
+    }
+    static uint64_t add(uint64_t a, uint64_t b, unsigned rounding) {
+        if (is_nan(a) || is_nan(b)) return nan;
+        if (is_infinite(a) || is_infinite(b)) return is_infinite(a) && is_infinite(b) && ((a ^ b) & sign) ? nan : is_infinite(a) ? a : b;
+        return encode(numerical_sum(decode(a), decode(b), rounding), rounding);
+    }
+    static uint64_t multiply(uint64_t a, uint64_t b, unsigned rounding) {
+        if (is_nan(a) || is_nan(b)) return nan;
+        if (is_infinite(a) || is_infinite(b)) return is_zero(a) || is_zero(b) ? nan : ((a ^ b) & sign) | infinity;
+        auto left = decode(a), right = decode(b);
+        return encode({left.magnitude.times(right.magnitude), left.scale + right.scale, left.negative != right.negative}, rounding);
+    }
+    static uint64_t fused(uint64_t a, uint64_t b, uint64_t c, unsigned rounding) {
+        if (is_nan(a) || is_nan(b) || is_nan(c)) return nan;
+        if (is_infinite(a) || is_infinite(b)) {
+            if (is_zero(a) || is_zero(b)) return nan;
+            const auto product = ((a ^ b) & sign) | infinity;
+            return is_infinite(c) && ((product ^ c) & sign) ? nan : product;
+        }
+        if (is_infinite(c)) return c;
+        const auto left = decode(a), right = decode(b);
+        return encode(numerical_sum({left.magnitude.times(right.magnitude), left.scale + right.scale,
+            left.negative != right.negative}, decode(c), rounding), rounding);
+    }
+};
+using numerical_binary32 = numerical_format<23, 8>;
+using numerical_binary64 = numerical_format<52, 11>;
+
+inline numerical_dyadic numerical_integer_value(uint64_t bits, unsigned width, bool signed_value) {
+    const uint64_t mask = width == 64 ? UINT64_MAX : (uint64_t(1) << width) - 1;
+    bits &= mask;
+    const bool negative = signed_value && ((bits >> (width - 1)) & 1);
+    return {numerical_integer(negative ? (0 - bits) & mask : bits), 0, negative};
+}
+// Inputs for an asserted floating-to-integer result are finite and lie inside
+// the original integer domain. This conservative rule avoids depending on an
+// unspecified out-of-range conversion, even when rounding might return zero.
+template<class Format> unsigned numerical_integer_domains(uint64_t bits) {
+    const auto magnitude = bits & (Format::sign - 1);
+    if (magnitude >= Format::infinity) return 0;
+    const bool negative = (bits & Format::sign) != 0;
+    const auto value = Format::decode(bits);
+    unsigned mask = 0;
+    for (unsigned group = 0; group < 4; ++group) {
+        const unsigned width = group < 2 ? 32 : 64;
+        const bool sign = !(group & 1);
+        const uint64_t limit = sign ? (uint64_t(1) << (width - 1)) - unsigned(!negative)
+            : width == 64 ? UINT64_MAX : (uint64_t(1) << width) - 1;
+        const auto order = value.scale < 0 ? value.magnitude.compare(numerical_integer(limit).shifted(unsigned(-value.scale)))
+            : value.magnitude.shifted(unsigned(value.scale)).compare(numerical_integer(limit));
+        const bool valid = order <= 0 && (sign || !negative || !magnitude);
+        if (valid) mask |= 1u << group;
+    }
+    return mask;
+}
+template<class Format> uint64_t numerical_to_integer(uint64_t bits, unsigned rounding) {
+    const auto value = Format::decode(bits);
+    uint64_t magnitude;
+    bool halfway = false, lower = false;
+    if (value.scale < 0) {
+        const auto shift = unsigned(-value.scale);
+        magnitude = value.magnitude.window(shift);
+        halfway = value.magnitude.bit(shift - 1); lower = value.magnitude.below(shift - 1);
+    } else magnitude = value.magnitude.window(0) << unsigned(value.scale);
+    const bool increment = !rounding ? halfway && (lower || (magnitude & 1))
+        : (halfway || lower) && ((rounding == 2 && value.negative) || (rounding == 3 && !value.negative));
+    magnitude += increment;
+    return value.negative ? 0 - magnitude : magnitude;
+}
+inline std::vector<std::array<uint64_t, 3>> numerical_integer_inputs() {
+    std::vector<std::array<uint64_t, 3>> inputs;
+    for (unsigned bit = 0; bit < 64; ++bit) for (uint64_t distance = 0; distance < 5; ++distance) {
+        const uint64_t power = uint64_t(1) << bit;
+        for (auto value : {power - distance, power + distance}) {
+            inputs.push_back({value, 0, 0}); inputs.push_back({0 - value, 0, 0});
+        }
+    }
+    uint64_t state = 0x5917c3ab8d6f2031ull;
+    for (unsigned i = 0; i < 4097; ++i) {
+        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+        inputs.push_back({state, 0, 0});
+    }
+    return inputs;
+}
+template<class Format, unsigned Fraction, unsigned Exponent>
+std::vector<std::array<uint64_t, 3>> numerical_real_conversion_inputs() {
+    std::vector<std::array<uint64_t, 3>> inputs;
+    auto append = [&](uint64_t bits) { inputs.push_back({bits, numerical_integer_domains<Format>(bits), 0}); };
+    for (unsigned exponent = 0; exponent < (1u << Exponent); ++exponent)
+        for (uint64_t fraction : {uint64_t(0), uint64_t(1), (uint64_t(1) << (Fraction - 1)) - 1,
+            uint64_t(1) << (Fraction - 1), (uint64_t(1) << Fraction) - 2, (uint64_t(1) << Fraction) - 1})
+            for (uint64_t sign : {uint64_t(0), Format::sign}) append(sign | (uint64_t(exponent) << Fraction) | fraction);
+    for (unsigned integer = 0; integer < 513; ++integer) {
+        const auto halfway = Format::encode({numerical_integer(integer * 2 + 1), -1, false}, 0);
+        for (auto bits : {halfway - 1, halfway, halfway + 1}) { append(bits); append(bits | Format::sign); }
+    }
+    return inputs;
+}
+
+template<class Word> inline constexpr Word numerical_output_guard = Word(0x9b3d715ac6e8294full);
+
 #ifndef CUDAVM_CONFORMANCE_HOST_ONLY
 // Only an absent declared device prerequisite is unavailable evidence. API or
 // execution failures on an applicable device must still fail the test.
@@ -177,6 +402,45 @@ int run_conformance(int argc, char** argv, const fixture_data& fixtures,
                     unsigned context_flags = 0);
 void expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> expected,
                   const std::string& context);
+
+// Shared storage/launch checks; the owning slice supplies its independent rows
+// and the only permitted equivalences for numerical results.
+template<class Word, size_t Fields, class Oracle, class Equivalent>
+void execute_numerical_rows(const loaded_program& program, const char* kernel,
+    const std::vector<std::array<Word, 3>>& values, Oracle oracle, Equivalent equivalent) {
+    constexpr unsigned guards = 12;
+    const Word guard = numerical_output_guard<Word>;
+    const auto capacity = unsigned(values.size());
+    std::vector<Word> input(size_t(capacity) * 3 + guards * 2, guard), preserved(input.size());
+    std::vector<Word> initial((size_t(capacity) + 3) * Fields + guards * 2, guard), complete(initial), actual(initial.size());
+    for (unsigned i = 0; i < capacity; ++i) {
+        std::copy(values[i].begin(), values[i].end(), input.begin() + guards + size_t(i) * 3);
+        const auto row = oracle(values[i]);
+        static_assert(std::tuple_size_v<decltype(row)> == Fields);
+        std::copy(row.begin(), row.end(), complete.begin() + guards + size_t(i) * Fields);
+    }
+    device_buffer source(input.size() * sizeof(Word)), output(initial.size() * sizeof(Word));
+    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * sizeof(Word)));
+    auto from = source.value + guards * sizeof(Word), to = output.value + guards * sizeof(Word);
+    for (unsigned threads : {33u, 128u}) for (unsigned count : {0u, 1u, 37u, capacity}) {
+        CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, initial.data(), initial.size() * sizeof(Word)));
+        void* arguments[]{&to, &from, &count};
+        CONFORMANCE_CUDA(cuLaunchKernel(program.function(kernel), (capacity + threads - 1) / threads, 1, 1,
+            threads, 1, 1, 0, nullptr, arguments, nullptr));
+        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * sizeof(Word)));
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const bool active = i >= guards && i < guards + size_t(count) * Fields;
+            const auto expected = active ? complete[i] : guard;
+            if (active ? equivalent(actual[i], expected) : actual[i] == expected) continue;
+            const auto position = active ? " record=" + std::to_string((i - guards) / Fields)
+                + " field=" + std::to_string((i - guards) % Fields) : " guard=" + std::to_string(i);
+            throw std::runtime_error(std::string(kernel) + position + " threads=" + std::to_string(threads)
+                + " count=" + std::to_string(count) + " got=" + std::to_string(actual[i]) + " expected=" + std::to_string(expected));
+        }
+        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * sizeof(Word)));
+        require(preserved == input, std::string(kernel) + " preserves every source byte and guard");
+    }
+}
 
 inline void virtual_runtime(cudaError_t result) {
     require(result == cudaSuccess, std::string("virtual memory Runtime: ") + cudaGetErrorString(result));

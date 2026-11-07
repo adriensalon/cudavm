@@ -136,8 +136,6 @@ __device__ inline double __hiloint2double(int hi,int lo) {
     unsigned long long bits=(static_cast<unsigned long long>(unsigned(hi))<<32)|unsigned(lo);
     return __builtin_bit_cast(double,bits);
 }
-__device__ inline float __fmaf_rn(float x,float y,float z) {return __builtin_elementwise_fma(x,y,z);}
-__device__ inline float __fsub_rn(float x,float y) {return x-y;}
 // Parsed by the half header's optional transcendental wrappers. A caller using
 // it still needs a device implementation, like other unresolved NVRTC calls.
 extern "C" __device__ float tanhf(float);

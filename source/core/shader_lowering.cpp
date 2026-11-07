@@ -1765,6 +1765,25 @@ struct lowering {
             values[&input]=b.CreateXor(value(input.getOperand(0)),b.getInt32(0x80000000u));return;
         }
         if(auto* binary=llvm::dyn_cast<llvm::BinaryOperator>(&input);binary && input.getType()->isFloatTy()) {
+            // Shader arithmetic can flush subnormal inputs/results. Keep the
+            // application operators on the same guarded exact path as FMA.
+            // Numerical helpers own their native arithmetic and bounds; wrapping
+            // those operations again expands nested fallback dispatch needlessly.
+            const bool numerical_helper = kernel.hasFnAttribute("cudavm.math")
+                || kernel.getName().starts_with("__cudavm_native_");
+            const auto opcode = binary->getOpcode();
+            if ((opcode == llvm::Instruction::FAdd || opcode == llvm::Instruction::FSub)
+                && !numerical_helper) {
+                auto* right = value(binary->getOperand(1));
+                if (opcode == llvm::Instruction::FSub) right = b.CreateXor(right, b.getInt32(0x80000000u));
+                values[&input] = numeric_call("__cudavm_native_add_f32", b.getInt32Ty(), {value(binary->getOperand(0)), right});
+                return;
+            }
+            if (opcode == llvm::Instruction::FMul && !numerical_helper) {
+                values[&input] = numeric_call("__cudavm_native_mul_f32", b.getInt32Ty(),
+                    {value(binary->getOperand(0)), value(binary->getOperand(1))});
+                return;
+            }
             auto* left=b.CreateBitCast(value(binary->getOperand(0)),b.getFloatTy());
             auto* right=b.CreateBitCast(value(binary->getOperand(1)),b.getFloatTy());
             auto* operation=b.CreateBinOp(binary->getOpcode(),left,right);
