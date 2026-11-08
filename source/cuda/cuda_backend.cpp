@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <type_traits>
 #include <cstdio>
 namespace cudavm {
 namespace {
@@ -49,6 +50,8 @@ struct cuda_api {
     decltype(&cuLaunchKernel) launch = driver.get<decltype(launch)>("cuLaunchKernel");
     decltype(&cuFuncGetParamInfo) parameter_info = nullptr;
     decltype(&cuMemBatchDecompressAsync) decompress = nullptr;
+    decltype(&cuTensorMapEncodeTiled) tensor_map_encode = nullptr;
+    decltype(&cuTensorMapReplaceAddress) tensor_map_replace = nullptr;
     cuda_api() {
         parameter_info = reinterpret_cast<decltype(parameter_info)>(driver.find("cuFuncGetParamInfo"));
         if (!parameter_info) {
@@ -67,6 +70,16 @@ struct cuda_api {
             if (resolve && resolve("cuMemBatchDecompressAsync", &address, 12060, 0) == CUDA_SUCCESS)
                 decompress = reinterpret_cast<decltype(decompress)>(address);
         }
+        auto resolve_tensor_map = [&](const char* name, auto& output) {
+            using pointer = std::remove_reference_t<decltype(output)>;
+            output = reinterpret_cast<pointer>(driver.find(name));
+            if (output) return;
+            using resolver_type = CUresult (CUDAAPI*)(const char*, void**, int, cuuint64_t);
+            auto resolve = reinterpret_cast<resolver_type>(driver.find("cuGetProcAddress")); void* address{};
+            if (resolve && resolve(name, &address, 12000, 0) == CUDA_SUCCESS) output = reinterpret_cast<pointer>(address);
+        };
+        resolve_tensor_map("cuTensorMapEncodeTiled", tensor_map_encode);
+        resolve_tensor_map("cuTensorMapReplaceAddress", tensor_map_replace);
     }
 };
 struct cuda_ipc_mapping {
@@ -1357,6 +1370,17 @@ struct cuda_session : session {
     }
     cuda_session(std::shared_ptr<cuda_api> api, CUdevice device, unsigned flags = CU_CTX_MAP_HOST)
         : context(std::make_shared<cuda_context>(std::move(api), device, flags)) {}
+    void encode_tiled_tensor_map(CUtensorMap& output, const tensor_map_tiled_options& value) override {
+        cuda_context_guard guard(*context);
+        require(context->api->tensor_map_encode, CUDA_ERROR_NOT_SUPPORTED, "native tensor map encoder is unavailable");
+        check(context->api->tensor_map_encode(&output, value.data_type, value.rank, value.address, value.dimensions, value.strides,
+            value.box, value.element_strides, value.interleave, value.swizzle, value.promotion, value.fill), "cuTensorMapEncodeTiled");
+    }
+    void replace_tensor_map_address(CUtensorMap& output, void* address) override {
+        cuda_context_guard guard(*context);
+        require(context->api->tensor_map_replace, CUDA_ERROR_NOT_SUPPORTED, "native tensor map address replacement is unavailable");
+        check(context->api->tensor_map_replace(&output, address), "cuTensorMapReplaceAddress");
+    }
     void set_profiling(bool enabled) override {
         cuda_context_guard guard(*context);
         const char* symbol = enabled ? "cuProfilerStart" : "cuProfilerStop";

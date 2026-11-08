@@ -465,6 +465,8 @@ DRIVER_PROCEDURE(cuTexObjectGetResourceViewDesc, 5000, cuTexObjectGetResourceVie
 DRIVER_PROCEDURE(cuSurfObjectCreate, 5000, cuSurfObjectCreate)
 DRIVER_PROCEDURE(cuSurfObjectDestroy, 5000, cuSurfObjectDestroy)
 DRIVER_PROCEDURE(cuSurfObjectGetResourceDesc, 5000, cuSurfObjectGetResourceDesc)
+DRIVER_PROCEDURE(cuTensorMapEncodeTiled, 12000, cuTensorMapEncodeTiled)
+DRIVER_PROCEDURE(cuTensorMapReplaceAddress, 12000, cuTensorMapReplaceAddress)
 DRIVER_PROCEDURE(cuUserObjectRelease, 11030, cuUserObjectRelease)
 DRIVER_PROCEDURE(cuUserObjectRetain, 11030, cuUserObjectRetain)
 DRIVER_PROCEDURE(cuWaitExternalSemaphoresAsync, 10000, cuWaitExternalSemaphoresAsync)

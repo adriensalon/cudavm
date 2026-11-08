@@ -851,6 +851,7 @@ const char* error_string(CUresult error) {
 #include "graph_diagnostics.inl"
 #include "function_state.inl"
 #include "device_state.inl"
+#include "tensor_map_state.inl"
 }
 }
 using namespace cudavm;
@@ -861,6 +862,7 @@ using namespace cudavm;
 #include "device_exports.inl"
 #include "memory_exports.inl"
 #include "array_exports.inl"
+#include "tensor_map_exports.inl"
 #include "image_object_exports.inl"
 #include "host_memory_exports.inl"
 #include "stream_exports.inl"

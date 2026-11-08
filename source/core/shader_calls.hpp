@@ -28,7 +28,8 @@ inline bool shader_call_signature_matches(const llvm::CallInst& call, const llvm
     return true;
 }
 inline bool shader_native_helper(const llvm::Function& function) {
-    return function.hasFnAttribute("cudavm.math") || function.hasFnAttribute("cudavm.service.helper") || function.getName().starts_with("_ZN13cudavm")
+    return function.hasFnAttribute("cudavm.wmma.arithmetic") || function.hasFnAttribute("cudavm.math")
+        || function.hasFnAttribute("cudavm.service.helper") || function.getName().starts_with("_ZN13cudavm")
         || function.getName().starts_with("__cudavm_native_");
 }
 struct shader_call_frame {

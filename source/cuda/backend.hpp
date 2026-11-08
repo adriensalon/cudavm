@@ -26,6 +26,18 @@
 
 namespace cudavm {
 struct session;
+// Borrowed host arrays remain live through the synchronous encoding call.
+struct tensor_map_tiled_options {
+    CUtensorMapDataType data_type;
+    cuuint32_t rank;
+    void* address;
+    const cuuint64_t *dimensions, *strides;
+    const cuuint32_t *box, *element_strides;
+    CUtensorMapInterleave interleave;
+    CUtensorMapSwizzle swizzle;
+    CUtensorMapL2promotion promotion;
+    CUtensorMapFloatOOBfill fill;
+};
 struct buffer;
 // Exportable pools own actual adapter objects. Opaque pointer records and OS
 // handles cross this boundary without application payload staging.
@@ -669,6 +681,12 @@ struct session {
     // Without an attached compatible profiling tool these controls have no
     // effect. Native CUDA overrides this to control its active vendor tool.
     virtual void set_profiling(bool) {}
+    virtual void encode_tiled_tensor_map(CUtensorMap&, const tensor_map_tiled_options&) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "tensor map encoding requires a native CUDA provider");
+    }
+    virtual void replace_tensor_map_address(CUtensorMap&, void*) {
+        throw failure(CUDA_ERROR_NOT_SUPPORTED, "tensor map address replacement requires a native CUDA provider");
+    }
     virtual unsigned native_block_limit() const {
         throw failure(CUDA_ERROR_NOT_SUPPORTED, "native block resource limit is unavailable");
     }

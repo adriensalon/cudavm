@@ -1623,9 +1623,15 @@ struct lowering {
                     args.push_back(argument->getType()->isFloatTy()?b.CreateBitCast(operand,b.getFloatTy()):operand);
                 }
                 auto id = function->getIntrinsicID();
-                if(id==llvm::Intrinsic::fma && instruction.getType()->isFloatTy() && (dxil || kernel.getName()!="__cudavm_native_fma"))
+                if(id==llvm::Intrinsic::fma && instruction.getType()->isFloatTy()
+                    && !kernel.hasFnAttribute("cudavm.wmma.arithmetic") && (dxil || kernel.getName()!="__cudavm_native_fma"))
                     return numeric_call(dxil?"__cudavm_native_word_f32_fma":"__cudavm_native_fma",b.getInt32Ty(),
                         {value(instruction.getArgOperand(0)),value(instruction.getArgOperand(1)),value(instruction.getArgOperand(2))});
+                // DXIL exposes native multiply-add through fmuladd. WMMA's
+                // accumulation contract permits this single-precision path.
+                if(id==llvm::Intrinsic::fma && instruction.getType()->isFloatTy() && dxil
+                    && kernel.hasFnAttribute("cudavm.wmma.arithmetic"))
+                    return b.CreateBitCast(b.CreateIntrinsic(llvm::Intrinsic::fmuladd,{b.getFloatTy()},args),b.getInt32Ty());
                 if (dxil && (id==llvm::Intrinsic::ctlz || id==llvm::Intrinsic::cttz)) {
                     auto bits=instruction.getType()->getIntegerBitWidth();
                     bool leading=id==llvm::Intrinsic::ctlz;

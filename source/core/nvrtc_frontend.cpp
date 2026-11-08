@@ -280,6 +280,14 @@ nvrtc_output import_cuda_source(llvm::LLVMContext& context, const std::string& s
     add(input, text);
     auto overlay = llvm::makeIntrusiveRefCnt<llvm::vfs::OverlayFileSystem>(llvm::vfs::getRealFileSystem());
     overlay->pushOverlay(files);
+    // Keep pinned fragment types and overload declarations. Their implementation
+    // header expects NVIDIA target builtins; NVRTC supplies bounded definitions
+    // using the already lowered warp operations instead of Clang builtin enums.
+    auto wmma_files = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
+    auto wmma_source = device_source("device_wmma.cu");
+    wmma_files->addFile(root + "/public/nvcc/crt/mma.hpp", 0,
+        llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(wmma_source.data(), wmma_source.size())));
+    overlay->pushOverlay(wmma_files);
     std::vector<std::string> args {"-triple", "nvptx64-nvidia-cuda", "-aux-triple", LLVM_HOST_TRIPLE,
         "-fcuda-is-device", "-x", "cuda", "-std=" + settings.standard,
         "-target-cpu", settings.architecture, "-target-sdk-version=12.8", "-fms-extensions",
@@ -322,6 +330,15 @@ nvrtc_output import_cuda_source(llvm::LLVMContext& context, const std::string& s
     if (!compiler.ExecuteAction(action)) throw std::runtime_error("NVRTC CUDA compilation failed");
     auto module = action.takeModule();
     if (!module) throw std::runtime_error("NVRTC device frontend produced no IR");
+    if (auto* wmma = module->getFunction("__cudavm_rtc_wmma_fma")) {
+        auto* real = llvm::Type::getFloatTy(context);
+        if (wmma->isDeclaration() || wmma->getFunctionType() != llvm::FunctionType::get(real, {real, real, real}, false)
+            || !wmma->hasFnAttribute(llvm::Attribute::NoInline))
+            throw std::runtime_error("invalid WMMA accumulation helper signature");
+        // This private body implements WMMA's accumulation precision, rather
+        // than a scalar CUDA rounding intrinsic. Retain that distinction in LTO.
+        wmma->addFnAttr("cudavm.wmma.arithmetic");
+    }
     materialize_data_aliases(*module, action.aliases);
     // CodeGen can cache an unused constant address while resolving a CUDA
     // builtin's static property getter. It is not a device-program reference;

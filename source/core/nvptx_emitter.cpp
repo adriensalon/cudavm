@@ -198,6 +198,7 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
     // Packed half comparisons and half absolute value need PTX 6.5; the pinned
     // tanh assembly needs PTX 7.0 even on SM 75. Dynamic alloca needs PTX 7.3 and SM 52.
     // 128-bit register/move/atomic forms need PTX 8.3 even on SM 90.
+    // Bulk async copies, transaction barriers and async proxy fences need 8.0.
     // Never lower a newer architecture's default floor.
     unsigned dialect=0;
     for(const auto& function:*module)for(const auto& block:function)for(const auto& instruction:block) {
@@ -206,6 +207,9 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
             auto text=llvm::cast<llvm::InlineAsm>(call->getCalledOperand())->getAsmString();
             if(text.contains(".u32.f16x2") || text.contains("abs.f16"))dialect=std::max(dialect,65u);
             if(text.contains("tanh.approx."))dialect=std::max(dialect,70u);
+            if(text.contains("cp.async.bulk.") || text.contains("mbarrier.arrive.expect_tx.")
+                || text.contains("mbarrier.expect_tx.") || text.contains("fence.proxy.async")
+                || text.contains("fence.mbarrier_init."))dialect=std::max(dialect,80u);
             if(text.contains(".b128"))dialect=std::max(dialect,83u);
         }
     }
@@ -214,7 +218,7 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
         auto sm=std::stoi(architecture.substr(3));
         if (dialect>=73 && sm<52) throw std::runtime_error("dynamic invocation-private storage requires SM 52 or later");
         // LLVM's SM88 target already requires PTX 9.0; SM100+ starts at 8.6.
-        if (dialect>=83 && sm<100 && sm!=88) features="+ptx"+std::to_string(dialect);
+        if (dialect>=80 && sm<100 && sm!=88) features="+ptx"+std::to_string(dialect);
         else if (dialect && sm<(dialect>=73?87:80)) features="+ptx"+std::to_string(dialect);
     }
     std::unique_ptr<llvm::TargetMachine> machine(target->createTargetMachine(module->getTargetTriple(), architecture, features, settings, std::nullopt));
