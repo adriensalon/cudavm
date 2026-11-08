@@ -1,6 +1,7 @@
 #include "device_numeric.cu"
 #include "device_half.cu"
 #include "device_arithmetic.cu"
+#include "device_math_double.cu"
 extern "C" __device__ inline int __nv_isnanf(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)>0x7f800000u;}
 extern "C" __device__ inline int __nv_isinff(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)==0x7f800000u;}
 extern "C" __device__ inline int __nv_finitef(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)<0x7f800000u;}

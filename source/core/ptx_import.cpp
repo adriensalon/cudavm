@@ -116,6 +116,8 @@ struct ptx_type {
 ptx_type ptx_scalar(const ptx_token& token, bool memory = false) {
     auto name = token.text; if (name.starts_with('.')) name.erase(0, 1);
     if (name == "f16x2" && !memory) return {32, 'h'};
+    if (name == "bf16") return {16, 'v'};
+    if (name == "bf16x2" && !memory) return {32, 'w'};
     if (name == "pred" && !memory) return {1, 'p'};
     for (auto prefix : {'b', 'u', 's', 'f'}) for (unsigned bits : {8u, 16u, 32u, 64u})
         if (name == prefix + std::to_string(bits)) {
@@ -719,6 +721,53 @@ class ptx_parser {
         auto word=[&](llvm::Value* v)->llvm::Value* {return v->getType()->isFloatingPointTy()?b.CreateBitCast(v,llvm::Type::getIntNTy(context,v->getType()->getPrimitiveSizeInBits())):v;};
         auto real=[&](llvm::Value* v)->llvm::Value* {return b.CreateBitCast(helper("word_f16_to_f32",{b.CreateZExtOrTrunc(word(v),b.getInt32Ty())},b.getInt32Ty()),b.getFloatTy());};
         auto done=[&](llvm::Value* v,ptx_type t){write(operands[0],v,t,false);return true;};
+        if((type.kind=='v' || type.kind=='w') && (op=="fma" || op=="add" || op=="sub" || op=="mul") &&
+            (parts.size()==2 || (parts.size()==3 && parts[1]=="rn") ||
+             (op=="fma" && parts.size()==4 && parts[1]=="rn" && parts[2]=="relu"))) {
+            bool fused=op=="fma";arity(fused?4:3);
+            auto compute=[&](unsigned shift) {
+                auto input=[&](unsigned i){return b.CreateAnd(b.CreateLShr(b.CreateZExtOrTrunc(read(operands[i],type),b.getInt32Ty()),shift),b.getInt32(65535));};
+                auto* a=input(1);auto* c=input(2);
+                if(op=="sub")c=b.CreateXor(c,b.getInt32(0x8000));
+                auto* value=helper("word_bf16_fma",{a,op=="add" || op=="sub"?b.getInt32(0x3f80):c,
+                    fused?input(3):op=="mul"?b.getInt32(0x8000):c},b.getInt32Ty());
+                if(parts.size()==4) {
+                    auto* nan=b.CreateICmpUGT(b.CreateAnd(value,b.getInt32(0x7fff)),b.getInt32(0x7f80));
+                    auto* negative=b.CreateICmpNE(b.CreateAnd(value,b.getInt32(0x8000)),b.getInt32(0));
+                    value=b.CreateSelect(nan,b.getInt32(0x7fff),b.CreateSelect(negative,b.getInt32(0),value));
+                }
+                return value;
+            };
+            auto* value=compute(0);
+            return done(type.kind=='w'?b.CreateOr(value,b.CreateShl(compute(16),16)):b.CreateTrunc(value,b.getInt16Ty()),type);
+        }
+        if((type.kind=='v' || type.kind=='w') && (op=="min" || op=="max") && parts.size()==2) {
+            arity(3);
+            auto compute=[&](unsigned shift) {
+                auto input=[&](unsigned i){return b.CreateTrunc(b.CreateLShr(b.CreateZExtOrTrunc(read(operands[i],type),b.getInt32Ty()),shift),b.getInt16Ty());};
+                auto* a=input(1);auto* c=input(2);
+                auto* ax=b.CreateAnd(a,b.getInt16(0x7fff));auto* cx=b.CreateAnd(c,b.getInt16(0x7fff));
+                auto* an=b.CreateICmpUGT(ax,b.getInt16(0x7f80));auto* cn=b.CreateICmpUGT(cx,b.getInt16(0x7f80));
+                auto key=[&](llvm::Value* v){return b.CreateXor(v,b.CreateSelect(b.CreateICmpNE(b.CreateAnd(v,b.getInt16(0x8000)),b.getInt16(0)),b.getInt16(0xffff),b.getInt16(0x8000)));};
+                auto* value=b.CreateSelect(op=="max"?b.CreateICmpUGT(key(a),key(c)):b.CreateICmpULT(key(a),key(c)),a,c);
+                value=b.CreateSelect(an,c,b.CreateSelect(cn,a,value));
+                return b.CreateSelect(b.CreateAnd(an,cn),b.getInt16(0x7fff),value);
+            };
+            auto* value=compute(0);
+            return done(type.kind=='w'?b.CreateOr(b.CreateZExt(value,b.getInt32Ty()),b.CreateShl(b.CreateZExt(compute(16),b.getInt32Ty()),16)):value,type);
+        }
+        if(op=="cvt" && parts.size()==4 && parts[2]=="bf16" && type.kind=='f' && type.bits==32) {
+            const std::vector<std::string> modes{"rn","rz","rm","rp"};
+            auto found=std::find(modes.begin(),modes.end(),parts[1]);
+            if(found==modes.end())return false;
+            arity(2);auto* value=helper("word_f32_to_bf16",{word(read(operands[1],type)),b.getInt32(unsigned(found-modes.begin()))},b.getInt32Ty());
+            return done(b.CreateTrunc(value,b.getInt16Ty()),{16,'v'});
+        }
+        if(op=="cvt" && parts==std::vector<std::string>{"cvt","rn","bf16x2","f32"}) {
+            arity(3);
+            auto convert=[&](unsigned i){return helper("word_f32_to_bf16",{word(read(operands[i],type)),b.getInt32(0)},b.getInt32Ty());};
+            return done(b.CreateOr(convert(2),b.CreateShl(convert(1),16)),{32,'w'});
+        }
         auto flush_float = [&](llvm::Value* value) -> llvm::Value* {
             auto* bits = word(value);
             return b.CreateBitCast(b.CreateSelect(b.CreateICmpULT(b.CreateAnd(bits, b.getInt32(0x7fffffff)), b.getInt32(0x800000)),
@@ -1176,6 +1225,7 @@ class ptx_parser {
         const auto& op = parts[0]; const auto& operands = instruction.operands; const auto& opcode = instruction.opcode;
         if((op=="setp" || op=="set") && parts.size()>=3 && (parts.back().starts_with('s') || parts.back().starts_with('u') || parts.back().starts_with('b'))) {
             auto type=ptx_scalar({parts.back(),opcode.line,opcode.column});
+            if(type.kind!='s' && type.kind!='u' && type.kind!='b')return false;
             unsigned at=2;std::string boolean;
             if(at<parts.size() && (parts[at]=="and" || parts[at]=="or" || parts[at]=="xor"))boolean=parts[at++];
             if(parts.size()!=at+(op=="set"?2u:1u) || operands.size()!=(boolean.empty()?3u:4u) || type.bits<16)ptx_fail(opcode,"unsupported integer comparison",true);

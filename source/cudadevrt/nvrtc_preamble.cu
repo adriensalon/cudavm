@@ -41,6 +41,13 @@ extern "C" __device__ void* __nv_aligned_device_malloc(__SIZE_TYPE__, __SIZE_TYP
 extern "C" __device__ int printf(const char*, ...);
 extern "C" __device__ int vprintf(const char*, const char*);
 extern "C" __device__ void __assertfail(const char*, const char*, unsigned, const char*, __SIZE_TYPE__);
+#ifndef assert
+#ifdef NDEBUG
+#define assert(condition) static_cast<void>(0)
+#else
+#define assert(condition) ((condition) ? static_cast<void>(0) : __assertfail(#condition, __FILE__, __LINE__, __func__, sizeof(char)))
+#endif
+#endif
 extern "C" __device__ inline void* memcpy(void* destination,const void* source,__SIZE_TYPE__ bytes) {return __builtin_memcpy(destination,source,bytes);}
 extern "C" __device__ __attribute__((convergent)) void __cudavm_rtc_barrier_sync(unsigned);
 extern "C" __device__ __attribute__((convergent)) void __cudavm_rtc_barrier_count(unsigned,unsigned);

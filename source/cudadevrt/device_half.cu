@@ -123,6 +123,61 @@ extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word
     else {magnitude=addend-product;sign=cs;}
     return magnitude?__cudavm_native_word_f16_round(magnitude,base,sign,0):0u;
 }
+// Bfloat16 retains the FP32 exponent range but rounds to eight significand
+// bits. Keep the exact product and sticky addend until that final rounding.
+extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_bf16_round(unsigned long long magnitude,int scale,unsigned sign) {
+    if(!magnitude)return sign;
+    int exponent=63-__builtin_clzll(magnitude)+scale;
+    int shift=(exponent<-126?-133:exponent-7)-scale;
+    unsigned long long retained=magnitude,remainder=0,midpoint=0;
+    if(shift>0) {
+        retained=shift<64?magnitude>>shift:0;
+        remainder=shift<64?magnitude&((1ull<<shift)-1):magnitude;
+        midpoint=shift<=64?1ull<<(shift-1):0;
+    } else retained=magnitude<<unsigned(-shift);
+    retained+=shift>0 && shift<=64 && (remainder>midpoint || (remainder==midpoint && (retained&1)));
+    if(exponent<-126)return sign|unsigned(retained);
+    if(retained>=256){retained>>=1;++exponent;}
+    return exponent>127?sign|0x7f80u:sign|unsigned((exponent+127)<<7)|(unsigned(retained)&127u);
+}
+extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f32_to_bf16(unsigned a,unsigned mode) {
+    if((a&0x7fffffffu)>0x7f800000u)return 0x7fffu;
+    unsigned retained=a>>16,discarded=a&65535u;
+    retained+=mode==0?(discarded>32768u || (discarded==32768u && (retained&1))):
+        mode==2?((a>>31)!=0 && discarded!=0):mode==3?((a>>31)==0 && discarded!=0):false;
+    return retained;
+}
+extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_bf16_fma(unsigned a,unsigned b,unsigned c) {
+    unsigned ax=a&0x7fffu,bx=b&0x7fffu,cx=c&0x7fffu,sign=(a^b)&0x8000u,cs=c&0x8000u;
+    if(ax>0x7f80u || bx>0x7f80u || cx>0x7f80u || (ax==0x7f80u && !bx) || (bx==0x7f80u && !ax))return 0x7fffu;
+    if(ax==0x7f80u || bx==0x7f80u)return cx==0x7f80u && sign!=cs?0x7fffu:sign|0x7f80u;
+    if(cx==0x7f80u)return c;
+    unsigned ae=ax>>7,be=bx>>7,ce=cx>>7;
+    unsigned long long product=((ax&127u)|(ae?128u:0u))*((bx&127u)|(be?128u:0u));
+    unsigned long long addend=(cx&127u)|(ce?128u:0u);
+    int pe=int(ae?ae:1)+int(be?be:1)-268,qe=int(ce?ce:1)-134;
+    if(!product && !addend)return sign==cs?sign:0u;
+    if(!product)return c;
+    int top=pe+16>qe+8?pe+16:qe+8,base=top-60;
+    product=pe>=base?product<<unsigned(pe-base):cudavm::half_shift_jam(product,unsigned(base-pe));
+    addend=qe>=base?addend<<unsigned(qe-base):cudavm::half_shift_jam(addend,unsigned(base-qe));
+    unsigned long long magnitude;
+    if(sign==cs)magnitude=product+addend;
+    else if(product>=addend)magnitude=product-addend;
+    else {magnitude=addend-product;sign=cs;}
+    return magnitude?__cudavm_native_word_bf16_round(magnitude,base,sign):0u;
+}
+extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_bf16_div(unsigned a,unsigned b) {
+    unsigned ax=a&0x7fffu,bx=b&0x7fffu,sign=(a^b)&0x8000u;
+    if(ax>0x7f80u || bx>0x7f80u || (!ax && !bx) || (ax==0x7f80u && bx==0x7f80u))return 0x7fffu;
+    if(ax==0x7f80u || !bx)return sign|0x7f80u;
+    if(!ax || bx==0x7f80u)return sign;
+    unsigned ae=ax>>7,be=bx>>7,m=(ax&127u)|(ae?128u:0u),n=(bx&127u)|(be?128u:0u);
+    unsigned long long numerator=static_cast<unsigned long long>(m)<<32;
+    unsigned long long quotient=numerator/n;
+    quotient|=numerator%n!=0;
+    return __cudavm_native_word_bf16_round(quotient,int(ae?ae:1)-int(be?be:1)-32,sign);
+}
 // DXIL's multiply-add does not promise a single binary32 rounding. Keep the
 // exact product and a jammed addend until the final rounding, including FTZ
 // sensitive inputs. Other shader inputs use this same strict FMA contract.

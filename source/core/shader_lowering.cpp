@@ -56,6 +56,7 @@
 namespace cudavm {
 namespace {
 #include "shader_half.inl"
+#include "shader_low_precision.inl"
 void scalar_math(llvm::Module& module) {
     auto* divide = module.getFunction("__cudavm_native_divide");
     auto* compare = module.getFunction("__cudavm_native_compare");
@@ -405,6 +406,14 @@ void optimize(llvm::Module& module) {
     fp.addPass(llvm::InstCombinePass()); fp.addPass(llvm::SimplifyCFGPass());
     passes.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(fp)));
     passes.run(module, modules);
+    if (specialize_shader_low_precision_conversions(module)) {
+        modules.invalidate(module, llvm::PreservedAnalyses::none());
+        llvm::FunctionPassManager constants;
+        constants.addPass(llvm::SCCPPass()); constants.addPass(llvm::InstCombinePass()); constants.addPass(llvm::SimplifyCFGPass());
+        llvm::ModulePassManager specialized;
+        specialized.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(constants)));
+        specialized.run(module, modules);
+    }
     // InstCombine folds a bitcast of a packed word into its vector load/store.
     // Normalize after that fold and immediately before scalarization, so the
     // scalarizer keeps each aligned word access intact.
@@ -2096,6 +2105,7 @@ std::unique_ptr<llvm::Module> prepare_native_shader_module(const llvm::Module& i
         replacement->copyAttributesFrom(global); replacement->takeName(global);
         global->replaceAllUsesWith(llvm::ConstantExpr::getAddrSpaceCast(replacement, global->getType())); global->eraseFromParent();
     }
+    preserve_shader_low_precision_conversions(*module);
     lower_shader_half(*module);
     lower_inline_ptx(*module);
     lower_half_math_intrinsics(*module);

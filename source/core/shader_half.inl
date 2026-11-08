@@ -1,14 +1,17 @@
 // Translate only the checked PTX forms used by the pinned half headers. The
 // CUDA module keeps its native instructions; this runs on the shader clone.
 void lower_shader_half(llvm::Module& module) {
-    // The headers refine an approximate FP32 reciprocal for half division.
-    // Select the exact shared half quotient directly, avoiding an expansion of
+    // The headers refine FP32 division for their 16-bit formats.
+    // Select the exact shared quotient directly, avoiding an expansion of
     // that correction sequence through strict FP32 division and FMA helpers.
-    for(bool pair:{false,true}) {
-        std::string name=pair?"_ZL7__h2div7__half2S_":"_ZL6__hdiv6__halfS_";
+    for(auto [spelling,pair,helper_name]:{
+            std::tuple{"_ZL6__hdiv6__halfS_",false,"__cudavm_native_word_f16_div"},
+            std::tuple{"_ZL7__h2div7__half2S_",true,"__cudavm_native_word_f16_div"},
+            std::tuple{"_ZL6__hdiv13__nv_bfloat16S_",false,"__cudavm_native_word_bf16_div"}}) {
+        std::string name=spelling;
         for(auto& function:module) {
             if(function.isDeclaration() || !function.hasFnAttribute("cudavm.cuda.source") || (function.getName()!=name && !function.getName().starts_with(name+".")))continue;
-            auto* helper=module.getFunction("__cudavm_native_word_f16_div");
+            auto* helper=module.getFunction(helper_name);
             if(!helper || helper->isDeclaration())throw std::runtime_error("missing half division helper");
             auto* result_type=function.getReturnType();
             bool aggregate=!pair && result_type->isStructTy() && result_type->getStructNumElements()==1 && result_type->getStructElementType(0)->isIntegerTy(16);

@@ -104,11 +104,35 @@ void options_validation() {
         require(program.success() == control, "valid retry repairs invalid option and reproduces control PTX");
     }
 }
+void options_assertions() {
+    compiler_fixture_program program(R"cuda(
+#ifndef assert
+#error nvrtc_assert_required
+#endif
+#ifdef NDEBUG
+__device__ constexpr unsigned disabled_assertion() {
+    unsigned evaluated = 0;
+    assert(++evaluated);
+    return evaluated;
+}
+static_assert(disabled_assertion() == 0, "NDEBUG does not evaluate the expression");
+extern "C" __global__ void options_control(unsigned* output) { *output = disabled_assertion(); }
+#else
+extern "C" __global__ void options_control(unsigned* output) {
+    assert(output != nullptr);
+    *output = 1;
+}
+#endif
+)cuda", "compiler_assertions.cu");
+    require(program.success().find("__assertfail") != std::string::npos, "enabled assert retains the device assertion ABI");
+    require(program.success({"-DNDEBUG"}).find("__assertfail") == std::string::npos, "NDEBUG eliminates the assertion call");
+    require(program.success({"-DNDEBUG", "-UNDEBUG"}).find("__assertfail") != std::string::npos, "ordered NDEBUG removal restores assertions");
+}
 std::string_view compiler_options_case = "all";
 void execute_compiler_options() {
-    const std::array<std::pair<std::string_view, void (*)()>, 5> cases{{
+    const std::array<std::pair<std::string_view, void (*)()>, 6> cases{{
         {"defaults", options_defaults}, {"dialects", options_dialects}, {"macros", options_macros},
-        {"isolation", options_isolation}, {"validation", options_validation}}};
+        {"isolation", options_isolation}, {"validation", options_validation}, {"assertions", options_assertions}}};
     bool selected = false;
     for (const auto& [name, execute] : cases) if (compiler_options_case == "all" || compiler_options_case == name) { selected = true; execute(); }
     require(selected, "unknown compiler_options case");

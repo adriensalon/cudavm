@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 #ifdef CUDAVM_CONFORMANCE_REGISTRATION
 #include <cuda_runtime_api.h>
@@ -578,7 +579,13 @@ void execute_numerical_rows(const loaded_program& program, const char* kernel,
         for (size_t i = 0; i < actual.size(); ++i) {
             const bool active = i >= guards && i < guards + size_t(count) * Fields;
             const auto expected = active ? complete[i] : guard;
-            if (active ? equivalent(actual[i], expected) : actual[i] == expected) continue;
+            bool matches = actual[i] == expected;
+            if (active) {
+                if constexpr (std::is_invocable_r_v<bool, Equivalent, Word, Word, size_t>)
+                    matches = equivalent(actual[i], expected, (i - guards) % Fields);
+                else matches = equivalent(actual[i], expected);
+            }
+            if (matches) continue;
             const auto position = active ? " record=" + std::to_string((i - guards) / Fields)
                 + " field=" + std::to_string((i - guards) % Fields) : " guard=" + std::to_string(i);
             throw std::runtime_error(std::string(kernel) + position + " threads=" + std::to_string(threads)
