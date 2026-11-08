@@ -297,18 +297,7 @@ template<class Format> std::array<uint64_t, 6> elementary_rounding(uint64_t bits
 // Find the two adjacent destination values enclosing sqrt(x) or 1/x. Compare
 // the exact squared midpoint or midpoint product to choose nearest-even.
 // The conceptual value after maximum finite is 2^(bias+1), for overflow ties.
-template<class Format> uint64_t elementary_root(uint64_t bits, bool reciprocal) {
-    if (Format::is_nan(bits)) return Format::nan;
-    const auto magnitude = bits & (Format::sign - 1), sign = bits & Format::sign;
-    if (reciprocal) {
-        if (!magnitude) return sign | Format::infinity;
-        if (Format::is_infinite(bits)) return sign;
-    } else {
-        if (!magnitude) return bits;
-        if (sign) return Format::nan;
-        if (Format::is_infinite(bits)) return bits;
-    }
-    const auto source = Format::decode(magnitude);
+template<class Format> uint64_t elementary_root_value(const numerical_dyadic& source, bool reciprocal = false) {
     const numerical_dyadic one{numerical_integer(1), 0, false};
     auto compare = [&](const numerical_dyadic& candidate) {
         numerical_dyadic product{candidate.magnitude.times(reciprocal ? source.magnitude : candidate.magnitude),
@@ -322,12 +311,25 @@ template<class Format> uint64_t elementary_root(uint64_t bits, bool reciprocal) 
         else high = middle;
     }
     const auto lower = Format::decode(low);
-    if (compare(lower) == 0) return sign | low;
+    if (compare(lower) == 0) return low;
     const auto upper = high == Format::infinity ? numerical_dyadic{numerical_integer(1), Format::bias + 1, false}
         : Format::decode(high);
     auto midpoint = numerical_sum(lower, upper, 0); --midpoint.scale;
     const auto order = compare(midpoint);
-    return sign | (order < 0 || (order == 0 && (low & 1)) ? high : low);
+    return order < 0 || (order == 0 && (low & 1)) ? high : low;
+}
+template<class Format> uint64_t elementary_root(uint64_t bits, bool reciprocal) {
+    if (Format::is_nan(bits)) return Format::nan;
+    const auto magnitude = bits & (Format::sign - 1), sign = bits & Format::sign;
+    if (reciprocal) {
+        if (!magnitude) return sign | Format::infinity;
+        if (Format::is_infinite(bits)) return sign;
+    } else {
+        if (!magnitude) return bits;
+        if (sign) return Format::nan;
+        if (Format::is_infinite(bits)) return bits;
+    }
+    return sign | elementary_root_value<Format>(Format::decode(magnitude), reciprocal);
 }
 // Bracket 1/sqrt(x) using exact candidate^2*x products. This avoids rounding
 // an intermediate square root or reciprocal through any other format.
@@ -553,16 +555,16 @@ void expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> ex
 
 // Shared storage/launch checks; the owning slice supplies its independent rows
 // and the only permitted equivalences for numerical results.
-template<class Word, size_t Fields, class Oracle, class Equivalent>
+template<class Word, size_t Fields, size_t InputFields, class Oracle, class Equivalent>
 void execute_numerical_rows(const loaded_program& program, const char* kernel,
-    const std::vector<std::array<Word, 3>>& values, Oracle oracle, Equivalent equivalent) {
+    const std::vector<std::array<Word, InputFields>>& values, Oracle oracle, Equivalent equivalent) {
     constexpr unsigned guards = 12;
     const Word guard = numerical_output_guard<Word>;
     const auto capacity = unsigned(values.size());
-    std::vector<Word> input(size_t(capacity) * 3 + guards * 2, guard), preserved(input.size());
+    std::vector<Word> input(size_t(capacity) * InputFields + guards * 2, guard), preserved(input.size());
     std::vector<Word> initial((size_t(capacity) + 3) * Fields + guards * 2, guard), complete(initial), actual(initial.size());
     for (unsigned i = 0; i < capacity; ++i) {
-        std::copy(values[i].begin(), values[i].end(), input.begin() + guards + size_t(i) * 3);
+        std::copy(values[i].begin(), values[i].end(), input.begin() + guards + size_t(i) * InputFields);
         const auto row = oracle(values[i]);
         static_assert(std::tuple_size_v<decltype(row)> == Fields);
         std::copy(row.begin(), row.end(), complete.begin() + guards + size_t(i) * Fields);

@@ -6,6 +6,7 @@ struct device_math_operation {
     const char* shader_helper;
     unsigned arguments;
     const char* llvm_intrinsic = nullptr;
+    const char* public_name = nullptr;
 };
 inline constexpr device_math_operation device_math_operations[] = {
     {"sqrtf", "llvm.nvvm.sqrt.rn.f", "cvMathSqrt", 1},
@@ -19,6 +20,10 @@ inline constexpr device_math_operation device_math_operations[] = {
     {"logf", nullptr, "math_log", 1},
     {"log10f", nullptr, "math_log10", 1},
     {"tanhf", nullptr, "math_tanh", 1},
+    {"fast_fdividef", nullptr, "math_fast_divide", 2, nullptr, "__fdividef"},
+    {"hypotf", nullptr, "math_hypot", 2},
+    {"norm3df", nullptr, "math_norm3d", 3},
+    {"norm4df", nullptr, "math_norm4d", 4},
     {"fabsf", nullptr, "cvMathAbs", 1, "llvm.fabs.f32"},
     {"fminf", nullptr, "cvMathMin", 2, "llvm.minnum.f32"},
     {"copysignf", nullptr, "cvMathCopySign", 2, "llvm.copysign.f32"},
@@ -28,5 +33,10 @@ inline constexpr device_math_operation device_math_operations[] = {
     {"roundf", nullptr, "cvMathRound", 1, "llvm.round.f32"},
     {"rintf", nullptr, "cvMathRint", 1, "llvm.rint.f32"},
     {"nearbyintf", nullptr, "cvMathRint", 1, "llvm.nearbyint.f32"},
+};
+inline constexpr device_math_operation device_double_norm_operations[] = {
+    {"hypot", nullptr, "math_double_hypot", 2},
+    {"norm3d", nullptr, "math_double_norm3d", 3},
+    {"norm4d", nullptr, "math_double_norm4d", 4},
 };
 }

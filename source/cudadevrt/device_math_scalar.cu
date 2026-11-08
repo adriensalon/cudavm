@@ -41,6 +41,14 @@ CV_MATH_FN float cvFloatDivide(float a,float b) {
     if(exponent>127) return CV_FLOAT(sign|0x7f800000u);
     return CV_FLOAT(sign|(uint(exponent+127)<<23u)|(quotient&0x007fffffu));
 }
+CV_MATH_FN float math_fast_divide(float a, float b) {
+    uint x=CV_BITS(a),y=CV_BITS(b),ax=x&0x7fffffffu,ay=y&0x7fffffffu;
+    // The named intrinsic has distinct large-denominator behavior even under
+    // default precise compiler options. Other cases retain the exact quotient.
+    if(ay>0x7e800000u && ay<0x7f800000u)
+        return CV_FLOAT(ax>=0x7f800000u?0x7fc00000u:(x^y)&0x80000000u);
+    return cvFloatDivide(a,b);
+}
 CV_MATH_FN float cvMathMax(float a, float b) {
     uint x=CV_BITS(a),y=CV_BITS(b),ax=x&0x7fffffffu,ay=y&0x7fffffffu;
     if(ax>0x7f800000u) return ay>0x7f800000u?CV_FLOAT(x|0x00400000u):b;

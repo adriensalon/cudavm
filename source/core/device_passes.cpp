@@ -1010,6 +1010,15 @@ void lower_device_math(llvm::Module& module) {
             function->addFnAttr("cudavm.math",operation.shader_helper);
         }
     }
+    for (const auto& operation : device_double_norm_operations) {
+        auto* function = module.getFunction(std::string("__nv_") + operation.name);
+        if (!function) continue;
+        auto* real = llvm::Type::getDoubleTy(module.getContext());
+        auto* signature = llvm::FunctionType::get(real, std::vector<llvm::Type*>(operation.arguments, real), false);
+        if (function->getFunctionType() != signature)
+            throw std::runtime_error("invalid CUDA math signature: " + function->getName().str());
+        if (!function->isDeclaration()) function->addFnAttr("cudavm.math", operation.shader_helper);
+    }
     check_ir(module);
 }
 void lower_device_integers(llvm::Module& module) {

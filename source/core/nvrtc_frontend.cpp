@@ -202,11 +202,26 @@ nvrtc_output import_cuda_source(llvm::LLVMContext& context, const std::string& s
     rtc_preamble+="#include <cudavm_device_math.h>\n";
     for(auto operation:device_math_operations) {
         std::string name=operation.name;
-        std::string arguments=operation.arguments==1?"float x":"float x, float y";
-        std::string call=operation.arguments==1?"x":"x, y";
+        std::string arguments, call;
+        constexpr const char* names[]{"x", "y", "z", "w"};
+        for (unsigned i = 0; i != operation.arguments; ++i) {
+            if (i) { arguments += ", "; call += ", "; }
+            arguments += std::string("float ") + names[i]; call += names[i];
+        }
         rtc_preamble += render_device_source("device_wrapper.cu.in", {
             {"result", "float"}, {"symbol", "__nv_"+name}, {"arguments", arguments},
-            {"name", name}, {"linkage", "extern \"C\" "}, {"call", call}});
+            {"name", operation.public_name ? std::string(operation.public_name) : name}, {"linkage", "extern \"C\" "}, {"call", call}});
+    }
+    for (const auto& operation : device_double_norm_operations) {
+        std::string arguments, call;
+        constexpr const char* names[]{"x", "y", "z", "w"};
+        for (unsigned i = 0; i != operation.arguments; ++i) {
+            if (i) { arguments += ", "; call += ", "; }
+            arguments += std::string("double ") + names[i]; call += names[i];
+        }
+        rtc_preamble += render_device_source("device_wrapper.cu.in", {
+            {"result", "double"}, {"symbol", "__nv_" + std::string(operation.name)}, {"arguments", arguments},
+            {"name", operation.name}, {"linkage", "extern \"C\" "}, {"call", call}});
     }
     for (auto real : {"float", "double"}) for (auto name : {"isnan", "isinf", "isfinite", "signbit"}) {
         bool single = std::string_view(real) == "float";

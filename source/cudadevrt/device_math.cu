@@ -2,6 +2,7 @@
 #include "device_half.cu"
 #include "device_arithmetic.cu"
 #include "device_math_double.cu"
+#include "device_math_norm.cu"
 extern "C" __device__ inline int __nv_isnanf(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)>0x7f800000u;}
 extern "C" __device__ inline int __nv_isinff(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)==0x7f800000u;}
 extern "C" __device__ inline int __nv_finitef(float x) {return (__builtin_bit_cast(unsigned,x)&0x7fffffffu)<0x7f800000u;}
@@ -58,6 +59,7 @@ extern "C" __device__ inline float __nv_log2f(float x) {return cudavm::math_log2
 extern "C" __device__ inline float __nv_logf(float x) {return cudavm::math_log(x);}
 extern "C" __device__ inline float __nv_log10f(float x) {return cudavm::math_log10(x);}
 extern "C" __device__ inline float __nv_tanhf(float x) {return cudavm::math_tanh(x);}
+extern "C" __device__ inline float __nv_fast_fdividef(float x,float y) {return cudavm::math_fast_divide(x,y);}
 extern "C" __device__ inline float __nv_fmaf_ieee_rn(float x,float y,float z) {
     return __builtin_bit_cast(float,__cudavm_native_word_f32_fma(__builtin_bit_cast(unsigned,x),__builtin_bit_cast(unsigned,y),__builtin_bit_cast(unsigned,z)));
 }
@@ -69,6 +71,7 @@ extern "C" __device__ __attribute__((used)) inline float __cudavm_native_sqrt(fl
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_max(float x,float y) {return cudavm::cvMathMax(x,y);}
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_min(float x,float y) {return cudavm::cvMathMin(x,y);}
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_divide(float x,float y) {return cudavm::cvFloatDivide(x,y);}
+extern "C" __device__ __attribute__((used)) inline float __cudavm_native_fast_fdivide(float x,float y) {return cudavm::math_fast_divide(x,y);}
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_integral(float x,unsigned mode) {return cudavm::cvMathIntegral(x,mode);}
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_compare(unsigned x,unsigned y,unsigned predicate) {return cudavm::cvFloatCompare(x,y,predicate);}
 extern "C" __device__ __attribute__((used)) inline float __cudavm_native_sin(float x) {return cudavm::cvMathSin(x);}
