@@ -24,6 +24,7 @@ inline constexpr device_math_operation device_math_operations[] = {
     {"hypotf", nullptr, "math_hypot", 2},
     {"norm3df", nullptr, "math_norm3d", 3},
     {"norm4df", nullptr, "math_norm4d", 4},
+    {"nextafterf", nullptr, "math_float_nextafter", 2},
     {"fabsf", nullptr, "cvMathAbs", 1, "llvm.fabs.f32"},
     {"fminf", nullptr, "cvMathMin", 2, "llvm.minnum.f32"},
     {"copysignf", nullptr, "cvMathCopySign", 2, "llvm.copysign.f32"},
@@ -34,9 +35,10 @@ inline constexpr device_math_operation device_math_operations[] = {
     {"rintf", nullptr, "cvMathRint", 1, "llvm.rint.f32"},
     {"nearbyintf", nullptr, "cvMathRint", 1, "llvm.nearbyint.f32"},
 };
-inline constexpr device_math_operation device_double_norm_operations[] = {
+inline constexpr device_math_operation device_double_math_operations[] = {
     {"hypot", nullptr, "math_double_hypot", 2},
     {"norm3d", nullptr, "math_double_norm3d", 3},
     {"norm4d", nullptr, "math_double_norm4d", 4},
+    {"nextafter", nullptr, "math_double_nextafter", 2},
 };
 }

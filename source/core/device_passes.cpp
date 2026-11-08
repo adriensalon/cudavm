@@ -1010,7 +1010,7 @@ void lower_device_math(llvm::Module& module) {
             function->addFnAttr("cudavm.math",operation.shader_helper);
         }
     }
-    for (const auto& operation : device_double_norm_operations) {
+    for (const auto& operation : device_double_math_operations) {
         auto* function = module.getFunction(std::string("__nv_") + operation.name);
         if (!function) continue;
         auto* real = llvm::Type::getDoubleTy(module.getContext());

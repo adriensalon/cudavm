@@ -774,7 +774,8 @@ class ptx_parser {
                 b.CreateAnd(bits, b.getInt32(0x80000000)), bits), b.getFloatTy());
         };
         if(type.kind=='f' && type.bits==32 && (op=="add" || op=="sub" || op=="mul" || op=="fma") &&
-            (std::find(parts.begin(),parts.end(),"sat")!=parts.end() || (parts.size()>2 && (parts[1]=="rz" || parts[1]=="rm" || parts[1]=="rp")))) {
+            (std::find(parts.begin(),parts.end(),"sat")!=parts.end() || std::find(parts.begin(),parts.end(),"ftz")!=parts.end() ||
+                (parts.size()>2 && (parts[1]=="rz" || parts[1]=="rm" || parts[1]=="rp")))) {
             unsigned at=1,mode=0;const std::vector<std::string> modes{"rn","rz","rm","rp"};
             if(at<parts.size()-1)if(auto found=std::find(modes.begin(),modes.end(),parts[at]);found!=modes.end()){mode=unsigned(found-modes.begin());++at;}
             bool flush=at<parts.size()-1 && parts[at]=="ftz";if(flush)++at;
@@ -788,7 +789,8 @@ class ptx_parser {
                 llvm::Value* addend=op=="fma"?read(operands[3],type):nullptr;
                 if(addend && flush)addend=flush_float(addend);
                 auto* bits=addend?word(addend):b.CreateAnd(b.CreateXor(word(a),word(c)),b.getInt32(0x80000000));
-                result=helper("word_f32_fma_mode",{word(a),word(c),bits,b.getInt32(mode)},b.getInt32Ty());
+                result=flush && op=="mul"?helper("word_f32_mul_ftz_mode",{word(a),word(c),b.getInt32(mode)},b.getInt32Ty()):
+                    helper("word_f32_fma_mode",{word(a),word(c),bits,b.getInt32(mode)},b.getInt32Ty());
             }
             if(saturate) {
                 auto* zero=b.CreateOr(b.CreateICmpSLT(result,b.getInt32(0)),b.CreateICmpUGT(b.CreateAnd(result,b.getInt32(0x7fffffff)),b.getInt32(0x7f800000)));

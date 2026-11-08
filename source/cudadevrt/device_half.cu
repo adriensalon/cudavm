@@ -181,7 +181,13 @@ extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word
 // DXIL's multiply-add does not promise a single binary32 rounding. Keep the
 // exact product and a jammed addend until the final rounding, including FTZ
 // sensitive inputs. Other shader inputs use this same strict FMA contract.
-extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f32_fma_mode(unsigned a,unsigned b,unsigned c,unsigned mode) {
+namespace cudavm {
+__device__ inline unsigned word_float_fma_mode(unsigned a,unsigned b,unsigned c,unsigned mode,bool flush) {
+    if(flush) {
+        if((a&0x7fffffffu)<0x800000u)a&=0x80000000u;
+        if((b&0x7fffffffu)<0x800000u)b&=0x80000000u;
+        if((c&0x7fffffffu)<0x800000u)c&=0x80000000u;
+    }
     unsigned ax=a&0x7fffffffu,bx=b&0x7fffffffu,cx=c&0x7fffffffu,sign=(a^b)&0x80000000u,cs=c&0x80000000u;
     if(ax>0x7f800000u || bx>0x7f800000u || cx>0x7f800000u || (ax==0x7f800000u && !bx) || (bx==0x7f800000u && !ax))return 0x7fc00000u;
     if(ax==0x7f800000u || bx==0x7f800000u)return cx==0x7f800000u && sign!=cs?0x7fc00000u:sign|0x7f800000u;
@@ -201,6 +207,9 @@ extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word
     else {magnitude=addend-product;sign=cs;}
     if(!magnitude)return mode==2u?0x80000000u:0u;
     int exponent=63-__builtin_clzll(magnitude)+base;
+    // FTZ multiplication detects a tiny result before rounding, including
+    // products that would round up to minimum normal with gradual underflow.
+    if(flush && exponent<-126)return sign;
     int shift=(exponent<-126?-149:exponent-23)-base;
     unsigned long long q=magnitude,rem=0,mid=0;
     if(shift>0){q=shift<64?magnitude>>shift:0;rem=shift<64?magnitude&((1ull<<shift)-1):magnitude;mid=shift<=64?1ull<<(shift-1):0;}
@@ -210,6 +219,13 @@ extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word
     if(exponent<-126)return sign|unsigned(q);
     if(q>=0x1000000ull){q>>=1;++exponent;}
     return exponent>127?sign|((mode==1u || (mode==2u && !sign) || (mode==3u && sign))?0x7f7fffffu:0x7f800000u):sign|unsigned(exponent+127)<<23|(unsigned(q)&0x7fffffu);
+}
+}
+extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f32_fma_mode(unsigned a,unsigned b,unsigned c,unsigned mode) {
+    return cudavm::word_float_fma_mode(a,b,c,mode,false);
+}
+extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f32_mul_ftz_mode(unsigned a,unsigned b,unsigned mode) {
+    return cudavm::word_float_fma_mode(a,b,(a^b)&0x80000000u,mode,true);
 }
 extern "C" __device__ __attribute__((used)) inline unsigned __cudavm_native_word_f32_fma(unsigned a,unsigned b,unsigned c) {
     return __cudavm_native_word_f32_fma_mode(a,b,c,0u);

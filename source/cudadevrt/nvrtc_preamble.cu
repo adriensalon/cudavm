@@ -14,6 +14,7 @@
 #include <__clang_cuda_builtin_vars.h>
 typedef __SIZE_TYPE__ size_t;
 #include <cuda_runtime_api.h>
+#include "device_runtime.cu"
 #include <__clang_cuda_texture_intrinsics.h>
 #include <texture_indirect_functions.h>
 #include <surface_indirect_functions.h>

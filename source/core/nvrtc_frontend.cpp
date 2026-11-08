@@ -212,7 +212,7 @@ nvrtc_output import_cuda_source(llvm::LLVMContext& context, const std::string& s
             {"result", "float"}, {"symbol", "__nv_"+name}, {"arguments", arguments},
             {"name", operation.public_name ? std::string(operation.public_name) : name}, {"linkage", "extern \"C\" "}, {"call", call}});
     }
-    for (const auto& operation : device_double_norm_operations) {
+    for (const auto& operation : device_double_math_operations) {
         std::string arguments, call;
         constexpr const char* names[]{"x", "y", "z", "w"};
         for (unsigned i = 0; i != operation.arguments; ++i) {
@@ -293,7 +293,10 @@ nvrtc_output import_cuda_source(llvm::LLVMContext& context, const std::string& s
         "-internal-isystem", root + "/public",
         "-internal-isystem", root + "/device",
         "-I", root + "/headers", "-Wno-ignored-attributes", input};
-    if (settings.relocatable) args.push_back("-fgpu-rdc");
+    if (settings.relocatable) {
+        args.push_back("-fgpu-rdc");
+        args.push_back("-D__CUDACC_RDC__=1");
+    }
     for (const auto& include : settings.includes) args.insert(args.end(), {"-I", include});
     for (const auto& define : settings.defines) args.push_back("-D" + define);
     for (const auto& undefine : settings.undefines) args.push_back("-U" + undefine);
@@ -325,6 +328,15 @@ nvrtc_output import_cuda_source(llvm::LLVMContext& context, const std::string& s
     // discard these orphan constants before checking optional weak closure.
     for (auto& global : module->globals()) global.removeDeadConstantUsers();
     if (llvm::verifyModule(*module, &stream)) throw std::runtime_error("NVRTC frontend produced invalid IR");
+    if (auto* version = module->getFunction("__cudaCDP2RuntimeGetVersion"); version && version->isDeclaration()) {
+        auto* implementation = module->getFunction("__cudavm_rtc_runtime_version");
+        if (!implementation || implementation->isDeclaration() || implementation->getFunctionType() != version->getFunctionType())
+            throw std::runtime_error("invalid CUDA device Runtime version-query signature");
+        // Only this stateless CDP2 query has an embedded implementation. Other
+        // device Runtime declarations keep their normal closure diagnostics.
+        version->replaceAllUsesWith(implementation);
+        version->eraseFromParent();
+    }
     if (auto* barrier = module->getFunction("__cudavm_rtc_syncthreads")) {
         // Use the intrinsic's name and signature, never the Clang archive's
         // stale NVVM enum. Barrier 0 synchronizes the entire CTA with ordering.
