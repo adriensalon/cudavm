@@ -981,6 +981,9 @@ struct lowering {
         auto* address = pair(function->getArg(0), function->getArg(1));
         auto scope = dxil?llvm::SyncScope::System:requested_scope;
         if(!opencl && order==llvm::AtomicOrdering::SequentiallyConsistent) {
+            // Native OpenGL compilers can reject this lock loop across a
+            // function call. Inline the guard without weakening its ordering.
+            if (!dxil) function->addFnAttr(llvm::Attribute::AlwaysInline);
             // A common device mutex orders SC operations and fences across all
             // locations and widths. Word 1 is in the reserved transport prefix;
             // the 64-bit representation mutex remains independently at word 0.
@@ -2183,7 +2186,9 @@ std::unique_ptr<llvm::Module> lower_native_shader(const llvm::Module& input, con
     }
     trace("verify");
     if (auto* storage = module->getNamedGlobal("cudavm.shared"); storage && storage->hasInitializer()) storage->setLinkage(llvm::GlobalValue::InternalLinkage);
-    if (llvm::any_of(*module, [](const auto& function) { return function.hasFnAttribute("cudavm.image.operations"); })) {
+    if (llvm::any_of(*module, [](const auto& function) {
+            return function.hasFnAttribute("cudavm.image.operations") || function.hasFnAttribute(llvm::Attribute::AlwaysInline);
+        })) {
         llvm::LoopAnalysisManager loops; llvm::FunctionAnalysisManager functions;
         llvm::CGSCCAnalysisManager calls; llvm::ModuleAnalysisManager modules; llvm::PassBuilder builder;
         builder.registerLoopAnalyses(loops); builder.registerFunctionAnalyses(functions);

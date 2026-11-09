@@ -66,9 +66,9 @@ inline void validate_spirv_words(std::span<const uint32_t> code) {
         unsigned minimum = 1;
         switch (opcode) {
         case 5: case 6: case 15: minimum = opcode == 15 ? 4 : opcode == 6 ? 4 : 3; break;
-        case 16: case 71: case 23: case 33: case 43: case 44: case 46: case 50: case 55: case 62: case 63: case 247: minimum = 3; break;
+        case 16: case 71: case 23: case 33: case 43: case 44: case 46: case 50: case 55: case 62: case 63: case 247: case 251: minimum = 3; break;
         case 21: case 28: case 32: case 59: case 61: case 65: case 66: case 83: case 224: minimum = 4; break;
-        case 72: case 64: case 81: case 250: case 251: minimum = 4; break;
+        case 72: case 64: case 81: case 250: minimum = 4; break;
         case 12: case 54: case 79: case 82: minimum = 5; break;
         case 17: case 19: case 20: case 22: case 30: case 41: case 42: case 248: case 249: case 254: minimum = opcode == 22 || opcode == 41 || opcode == 42 ? 3 : 2; break;
         case 246: minimum = 4; break;
@@ -162,12 +162,58 @@ inline std::vector<uint32_t> trim_spirv_resource_names(std::span<const uint32_t>
     }
     return result;
 }
+inline std::vector<uint32_t> normalize_opengl_spirv_loops(std::span<const uint32_t> code) {
+    std::vector<uint32_t> result(code.begin(), code.begin() + 5);
+    std::map<uint32_t, uint32_t> outgoing_labels;
+    for (size_t i = 5; i < code.size();) {
+        auto count = code[i] >> 16, op = code[i] & 0xffffu;
+        if (op != 248) {
+            result.insert(result.end(), code.begin() + i, code.begin() + i + count);
+            i += count; continue;
+        }
+        size_t end = i + count, previous = i, last = i;
+        while (end < code.size() && (code[end] & 0xffffu) != 248 && (code[end] & 0xffffu) != 56) {
+            previous = last; last = end; end += code[end] >> 16;
+        }
+        if ((code[previous] & 0xffffu) == 246 && (code[last] & 0xffffu) == 250) {
+            // Native GL compilers can duplicate side effects in a conditional
+            // loop header. Keep its PHIs and merge in a header that branches
+            // unconditionally to the body, as in GLSL's structured loop form.
+            size_t body = i + count;
+            while (body < previous) {
+                auto opcode = code[body] & 0xffffu;
+                if (opcode != 245 && opcode != 8 && opcode != 317) break;
+                body += code[body] >> 16;
+            }
+            auto body_label = result[3]++, selection_merge = result[3]++;
+            outgoing_labels[code[i + 1]] = body_label;
+            result.insert(result.end(), code.begin() + i, code.begin() + body);
+            result.insert(result.end(), code.begin() + previous, code.begin() + last);
+            result.insert(result.end(), {(2u << 16) | 249u, body_label, (2u << 16) | 248u, body_label});
+            result.insert(result.end(), code.begin() + body, code.begin() + previous);
+            // Both arms can exit the selection through the enclosing loop's
+            // merge/continue targets, leaving this selection merge unreachable.
+            result.insert(result.end(), {(3u << 16) | 247u, selection_merge, 0});
+            result.insert(result.end(), code.begin() + last, code.begin() + end);
+            result.insert(result.end(), {(2u << 16) | 248u, selection_merge, (1u << 16) | 255u});
+        } else result.insert(result.end(), code.begin() + i, code.begin() + end);
+        i = end;
+    }
+    for (size_t i = 5; i < result.size(); i += result[i] >> 16)
+        if ((result[i] & 0xffffu) == 245)
+            for (unsigned operand = 4; operand < (result[i] >> 16); operand += 2)
+                if (auto label = outgoing_labels.find(result[i + operand]); label != outgoing_labels.end())
+                    result[i + operand] = label->second;
+    return result;
+}
 inline std::vector<uint32_t> adapt_spirv_for_opengl(std::span<const uint32_t> input) {
     auto code = trim_spirv_resource_names(input);
     std::set<uint32_t> buffers, resource_pointers, input_output;
     std::map<uint32_t, uint32_t> pointer_spaces;
+    std::map<uint32_t, uint32_t> scalar_widths;
     for (size_t i = 5; i < code.size(); i += code[i] >> 16) {
         auto count = code[i] >> 16, op = code[i] & 0xffffu;
+        if ((op == 21 || op == 22) && count >= 3) scalar_widths[code[i + 1]] = code[i + 2];
         if (op == 32 && count == 4) {
             pointer_spaces[code[i + 1]] = code[i + 2];
             if (code[i + 2] == 12) { buffers.insert(code[i + 3]); resource_pointers.insert(code[i + 1]); code[i + 2] = 2; }
@@ -188,6 +234,12 @@ inline std::vector<uint32_t> adapt_spirv_for_opengl(std::span<const uint32_t> in
         }
         if (op == 5 && aliases.contains(code[i + 1])) continue;
         std::vector<uint32_t> instruction(code.begin() + i, code.begin() + i + count);
+        // Some native GL compilers reject scalar null constants as atomic
+        // operands. Spell the identical zero value as an ordinary constant.
+        if (op == 46 && count == 3 && scalar_widths.contains(instruction[1])) {
+            instruction.resize(3 + (scalar_widths.at(instruction[1]) + 31) / 32, 0);
+            instruction[0] = (uint32_t(instruction.size()) << 16) | 43u;
+        }
         if (op == 71 && count >= 3 && buffers.contains(instruction[1]) && instruction[2] == 2) instruction[2] = 3;
         if (op == 59 && count >= 4 && instruction[3] == 12) instruction[3] = 2;
         if (op == 15) {
@@ -201,6 +253,6 @@ inline std::vector<uint32_t> adapt_spirv_for_opengl(std::span<const uint32_t> in
         if ((op == 65 || op == 66 || op == 83) && count >= 4 && aliases.contains(instruction[3])) instruction[3] = aliases.at(instruction[3]);
         result.insert(result.end(), instruction.begin(), instruction.end());
     }
-    return result;
+    return normalize_opengl_spirv_loops(result);
 }
 }

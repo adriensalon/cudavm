@@ -1,7 +1,6 @@
 #include "dynamic_library.hpp"
 #include "device_resources.hpp"
 #include "../core/spirv_artifact.hpp"
-#include "opengl_shader.hpp"
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -9,7 +8,6 @@
 #include <mutex>
 #include <thread>
 #include <limits>
-#include <atomic>
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
@@ -64,13 +62,17 @@ struct opengl_context {
             require(context != nullptr && current(dc, context), CUDA_ERROR_NO_DEVICE, "OpenGL bootstrap context unavailable");
             using modern_type = HGLRC (WINAPI*)(HDC, HGLRC, const int*);
             auto modern = reinterpret_cast<modern_type>(find("wglCreateContextAttribsARB"));
-            require(modern != nullptr, CUDA_ERROR_NOT_SUPPORTED, "OpenGL 4.3 context creation unavailable");
-            const int attributes[] = {0x2091, 4, 0x2092, 3, 0x9126, 1, 0};
+            require(modern != nullptr, CUDA_ERROR_NOT_SUPPORTED, "OpenGL core context creation unavailable");
             // The temporary legacy context is outside the requested share
             // group. Detach it before creating a shared core context.
             current(nullptr, nullptr);
-            HGLRC replacement = modern(dc, share ? share->context : nullptr, attributes);
-            if (!replacement) throw failure(CUDA_ERROR_NOT_SUPPORTED, "OpenGL 4.3 core context unavailable: " + std::to_string(GetLastError()));
+            HGLRC replacement = nullptr;
+            for (int minor : {6, 3}) {
+                const int attributes[] = {0x2091, 4, 0x2092, minor, 0x9126, 1, 0};
+                replacement = modern(dc, share ? share->context : nullptr, attributes);
+                if (replacement) break;
+            }
+            if (!replacement) throw failure(CUDA_ERROR_NOT_SUPPORTED, "OpenGL 4.6 or 4.3 core context unavailable: " + std::to_string(GetLastError()));
             current(nullptr, nullptr);
             remove(context);
             context = replacement;
@@ -135,9 +137,12 @@ struct opengl_context {
             require(choose(display, config_attributes, &config, 1, &count) && count > 0, CUDA_ERROR_NOT_SUPPORTED, "EGL OpenGL pbuffer unavailable");
             const int dimensions[] = {0x3057, 1, 0x3056, 1, 0x3038};
             surface = create_surface(display, config, dimensions);
-            const int attributes[] = {0x3098, 4, 0x30fb, 3, 0x30fd, 1, 0x3038};
-            context = create(display, config, share ? share->context : nullptr, attributes);
-            require(surface && context && current(display, surface, surface, context), CUDA_ERROR_NOT_SUPPORTED, "EGL OpenGL 4.3 context unavailable");
+            for (int minor : {6, 3}) {
+                const int attributes[] = {0x3098, 4, 0x30fb, minor, 0x30fd, 1, 0x3038};
+                context = create(display, config, share ? share->context : nullptr, attributes);
+                if (context) break;
+            }
+            require(surface && context && current(display, surface, surface, context), CUDA_ERROR_NOT_SUPPORTED, "EGL OpenGL 4.6 or 4.3 context unavailable");
         } catch (...) { cleanup(); throw; }
     }
     void* find(const char* name) { auto value = proc(name); return value ? value : gl.find(name); }
@@ -173,7 +178,6 @@ struct opengl_api {
     using error_type = enum_type (GL_CALL*)();
     using string_type = const unsigned char* (GL_CALL*)(enum_type);
     using create_shader_type = uint (GL_CALL*)(enum_type);
-    using shader_source_type = void (GL_CALL*)(uint,int,const char* const*,const int*);
     using shader_binary_type = void (GL_CALL*)(int,const uint*,enum_type,const void*,int);
     using specialize_type = void (GL_CALL*)(uint,const char*,uint,const uint*,const uint*);
     using shader_action_type = void (GL_CALL*)(uint);
@@ -194,7 +198,7 @@ struct opengl_api {
     gen_type gen; delete_type remove; bind_type bind; data_type data; write_type write; read_type read; copy_type copy;
     clear_type clear;
     finish_type finish; error_type error; string_type string;
-    create_shader_type create_shader;shader_source_type shader_source;shader_action_type compile_shader,delete_shader;
+    create_shader_type create_shader;shader_action_type delete_shader;
     query_type shader_query,program_query;log_type shader_log,program_log;
     create_program_type create_program;attach_type attach;shader_action_type link_program,use_program,delete_program;
     bind_base_type bind_base;dispatch_type dispatch;barrier_type memory_barrier;
@@ -202,7 +206,7 @@ struct opengl_api {
     uint64_t storage_buffer_bytes = 0;
     shader_binary_type shader_binary = nullptr;
     specialize_type specialize = nullptr;
-    std::atomic<bool> native_spirv{false};
+    bool native_spirv = false;
     bool native_int64 = false;
     unsigned timestamp_bits = 0;
     unsigned native_group_count[3]{}, native_group_size[3]{}, native_invocations = 0, native_shared_bytes = 0;
@@ -231,8 +235,7 @@ struct opengl_api {
         query_counter=load<query_counter_type>(context,"glQueryCounter");query_result=load<query_result_type>(context,"glGetQueryObjectui64v");
         auto get_query=load<query_type>(context,"glGetQueryiv");int clock_bits=0;get_query(0x8e28,0x8864,&clock_bits);
         timestamp_bits=unsigned(std::clamp(clock_bits,0,64));
-        create_shader=load<create_shader_type>(context,"glCreateShader");shader_source=load<shader_source_type>(context,"glShaderSource");
-        compile_shader=load<shader_action_type>(context,"glCompileShader");delete_shader=load<shader_action_type>(context,"glDeleteShader");
+        create_shader=load<create_shader_type>(context,"glCreateShader");delete_shader=load<shader_action_type>(context,"glDeleteShader");
         shader_query=load<query_type>(context,"glGetShaderiv");shader_log=load<log_type>(context,"glGetShaderInfoLog");
         create_program=load<create_program_type>(context,"glCreateProgram");attach=load<attach_type>(context,"glAttachShader");
         link_program=load<shader_action_type>(context,"glLinkProgram");use_program=load<shader_action_type>(context,"glUseProgram");
@@ -251,10 +254,8 @@ struct opengl_api {
         }
         int invocations = 0; get_integer(0x90eb, &invocations); native_invocations = unsigned(std::max(0,invocations));
         int shared = 0; get_integer(0x8262, &shared); native_shared_bytes = unsigned(std::max(0,shared));
-        shader_binary = reinterpret_cast<shader_binary_type>(context.find("glShaderBinary"));
-        specialize = reinterpret_cast<specialize_type>(context.find("glSpecializeShader"));
-        if (!specialize) specialize = reinterpret_cast<specialize_type>(context.find("glSpecializeShaderARB"));
         initialize_interop(context);
+        require(native_spirv, CUDA_ERROR_NOT_SUPPORTED, "OpenGL requires 4.6 or GL_ARB_gl_spirv with binary shader specialization");
     }
     void check(const char* operation) {
         auto value = error();
@@ -504,7 +505,7 @@ struct opengl_session : session {
         return native && native->owner->resource_owner()==owner->resource_owner() && !native->imported && value.size%4==0 && value.storage_offset()%4==0 && value.size<=packet_arena_capacity && value.storage_offset()<=packet_arena_capacity-value.size && value.storage().size<=owner->api->storage_buffer_bytes;
     }
     bool supports_native_spirv(std::span<const uint32_t> code) const override {
-        if ((!owner->api->native_spirv && !native_glsl_configured) || !owner->api->native_int64) return false;
+        if (!owner->api->native_spirv || !owner->api->native_int64) return false;
         try {
             auto gl = cudavm::adapt_spirv_for_opengl(code);
             for (size_t i = 5; i < gl.size(); i += gl[i] >> 16)
@@ -525,21 +526,12 @@ struct opengl_session : session {
     std::unique_ptr<compute_pipeline> compile_native_spirv(std::span<const uint32_t> input, const launch_shape& shape) override {
         require(supports_native_spirv(input), CUDA_ERROR_NOT_SUPPORTED, "OpenGL SPIR-V ingestion or required device capabilities are unavailable");
         validate_native_spirv_shape(shape); auto code = cudavm::adapt_spirv_for_opengl(input);
-        // Binary specialization is unreliable on some otherwise conforming GL
-        // drivers. GLSL ingestion of the same native IR avoids that vendor JIT.
-        if(native_glsl_configured) return compile_native_glsl(native_glsl(code));
         auto compiled = std::make_unique<opengl_pipeline>(owner); compiled->direct_buffers=packet_direct_bindings;
         compiled->program = owner->invoke([&] {
             auto& api = *owner->api; api.check("OpenGL native SPIR-V preflight");
             uint shader = api.create_shader(0x91b9), program = 0;
             auto reject = [&](const char* stage, const std::string& log) {
-                if (log.find("C9999") != log.npos) {
-                    api.native_spirv = false;
-                    // Specialization can also set a GL error. Consume errors
-                    // belonging to this rejected compile before auto fallback.
-                    for (unsigned i = 0; i < 16 && api.error(); ++i) {}
-                    throw failure(CUDA_ERROR_NOT_SUPPORTED,"OpenGL driver SPIR-V compiler rejected the native profile with an internal error: " + log);
-                }
+                for (unsigned i = 0; i < 16 && api.error(); ++i) {}
                 throw failure(CUDA_ERROR_INVALID_IMAGE,std::string("OpenGL native SPIR-V ") + stage + " failed: " + log);
             };
             try {
@@ -555,23 +547,6 @@ struct opengl_session : session {
                 api.check("OpenGL native SPIR-V ingestion");
             } catch (...) { if (program) api.delete_program(program); if (shader) api.delete_shader(shader); throw; }
             api.delete_shader(shader); return program;
-        });
-        return compiled;
-    }
-    std::unique_ptr<compute_pipeline> compile_native_glsl(const std::string& source) {
-        auto compiled=std::make_unique<opengl_pipeline>(owner);
-        compiled->direct_buffers=packet_direct_bindings;
-        compiled->program=owner->invoke([&] {
-            auto& api=*owner->api;uint shader=api.create_shader(0x91b9),program=0;
-            try {
-                auto* text=source.c_str();api.shader_source(shader,1,&text,nullptr);api.compile_shader(shader);
-                int status=0;api.shader_query(shader,0x8b81,&status);
-                if(!status) { int length=0;api.shader_query(shader,0x8b84,&length);std::string log(std::max(1,length),'\0');api.shader_log(shader,int(log.size()),nullptr,log.data());throw failure(CUDA_ERROR_INVALID_IMAGE,"OpenGL shader compilation failed: "+log); }
-                program=api.create_program();api.attach(program,shader);api.link_program(program);api.program_query(program,0x8b82,&status);
-                if(!status) {int length=0;api.program_query(program,0x8b84,&length);std::string log(std::max(1,length),'\0');api.program_log(program,int(log.size()),nullptr,log.data());throw failure(CUDA_ERROR_INVALID_IMAGE,"OpenGL shader link failed: "+log);}
-            } catch(...) { if(program) api.delete_program(program);if(shader) api.delete_shader(shader);throw; }
-            api.delete_shader(shader);
-            return program;
         });
         return compiled;
     }

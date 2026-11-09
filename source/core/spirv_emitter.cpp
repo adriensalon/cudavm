@@ -10,6 +10,7 @@
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/UnifyFunctionExitNodes.h>
 namespace llvm {
 extern "C" bool SPIRVTranslate(Module*, std::string&, std::string&, const std::vector<std::string>&, CodeGenOptLevel, Triple);
 }
@@ -27,6 +28,14 @@ std::string emit_native_spirv(const llvm::Module& input) {
     llvm::SMDiagnostic parse_diagnostic;
     auto module=llvm::parseAssemblyString(assembly,parse_diagnostic,context);
     if(!module)throw std::runtime_error("native SPIR-V emission could not clone target IR");
+    bool opencl = module->getTargetTriple().getOS() != llvm::Triple::Vulkan;
+    if (!opencl) {
+        // Native OpenGL compilers can reject structured functions with several
+        // returns. Normalize shader IR before SPIR-V structurization instead.
+        llvm::FunctionAnalysisManager analyses;
+        for (auto& function : *module)
+            if (!function.isDeclaration()) llvm::UnifyFunctionExitNodesPass().run(function, analyses);
+    }
     std::string bytes, diagnostic;
     if(std::getenv("CUDAVM_TRACE_NATIVE")) std::fprintf(stderr,"native SPIR-V emit module=%s\n",input.getModuleIdentifier().c_str());
     if (!llvm::SPIRVTranslate(module.get(), bytes, diagnostic, {}, llvm::CodeGenOptLevel::None, module->getTargetTriple()))
@@ -34,7 +43,6 @@ std::string emit_native_spirv(const llvm::Module& input) {
     // CUDA block barriers order global and shared memory. The HLSL group
     // intrinsic supplies WorkgroupMemory; add UniformMemory for our SSBO ABI.
     // Allocate fresh constants so a user's equal-valued integer is untouched.
-    bool opencl = module->getTargetTriple().getOS() != llvm::Triple::Vulkan;
     auto code = cudavm::decode_spirv_words(bytes, nullptr, !opencl);
     // OpenCL requires Int8 support. In particular, unused opaque transport
     // pointers may be emitted as byte pointers in a no-op kernel signature.
@@ -52,7 +60,7 @@ std::string emit_native_spirv(const llvm::Module& input) {
         if(opcode==71 && code[i+2]==42)no_contraction.insert(code[i+1]);
         // Separate native add/subtract/multiply instructions retain their
         // rounding boundaries, including compensated numerical helpers.
-        // GLSL ingestion needs explicit NoContraction (precise) decorations;
+        // Native shader ingestion needs explicit NoContraction decorations;
         // an absent fast-math flag alone does not preserve those boundaries.
         // Explicit fused operations remain extended Fma instructions.
         if((opcode==129 || opcode==131 || opcode==133) && no_contraction.insert(code[i+2]).second)

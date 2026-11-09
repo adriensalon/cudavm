@@ -75,7 +75,9 @@ template<class Word> void check_floating_global(const loaded_program& program, c
                     CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), counters.value, sizeof(actual)));
                     auto expected = initial;
                     expected[1] = expected[2] = atomic_quarters<Word>(seed + delta * active);
-                    require(actual == expected, context + ": returned/discarded add and state guards");
+                    for (size_t i = 0; i < actual.size(); ++i)
+                        require(actual[i] == expected[i], context + ": state word " + std::to_string(i)
+                            + " got " + std::to_string(actual[i]) + ", expected " + std::to_string(expected[i]));
                     expect_floating_tickets(std::vector<Word>(output.values.begin() + 4,
                         output.values.begin() + 4 + active), seed, delta, context);
                 }

@@ -49,7 +49,13 @@
                 check("OpenGL device identity");
             }
         }
-        native_spirv = has("GL_ARB_gl_spirv") && shader_binary && specialize;
+        int major = 0, minor = 0;
+        integer(0x821b, &major); integer(0x821c, &minor);
+        bool core_spirv = major > 4 || (major == 4 && minor >= 6);
+        shader_binary = reinterpret_cast<shader_binary_type>(context.find("glShaderBinary"));
+        specialize = reinterpret_cast<specialize_type>(context.find(core_spirv ? "glSpecializeShader" : "glSpecializeShaderARB"));
+        if (!specialize && core_spirv) specialize = reinterpret_cast<specialize_type>(context.find("glSpecializeShaderARB"));
+        native_spirv = (core_spirv || has("GL_ARB_gl_spirv")) && shader_binary && specialize;
         native_int64 = has("GL_ARB_gpu_shader_int64");
         if (has("GL_NVX_gpu_memory_info")) {
             int kilobytes=0; integer(0x9047,&kilobytes);
