@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 include_guard(GLOBAL)
 
-# Pinned upstream release; frontend patches are owned by cudavm.
 set(CUDAVM_LLVM_VERSION "22.1.4")
 set(CUDAVM_LLVM_TAG "llvmorg-${CUDAVM_LLVM_VERSION}")
 set(CUDAVM_LLVM_REVISION "35990504507d79e0b9deb809c8ee5e1b34ceef20")
@@ -58,8 +57,6 @@ function(cudavm_llvm_source_contract output)
     set(${output} "${contract}" PARENT_SCOPE)
 endfunction()
 
-# The same profile produces ExternalProject arguments and the SDK fingerprint.
-# Parallelism and mirror location do not change the compiler artifacts.
 function(cudavm_llvm_build_contract output args_output)
     cudavm_llvm_source_contract(contract)
     set(config "{}")
@@ -143,7 +140,6 @@ function(cudavm_llvm_prepare_source root verify_only)
             checkout --detach "${CUDAVM_LLVM_REVISION}"
             WORKING_DIRECTORY "${source}" COMMAND_ERROR_IS_FATAL ANY)
     endif()
-    # Scope trust to this owned checkout; never change the user's global Git config.
     set(git "${GIT_EXECUTABLE}" -c "safe.directory=${source}" -c core.autocrlf=input -c core.safecrlf=false)
     execute_process(COMMAND ${git} rev-parse HEAD WORKING_DIRECTORY "${source}"
         OUTPUT_VARIABLE revision OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
@@ -165,8 +161,6 @@ function(cudavm_llvm_prepare_source root verify_only)
         --unified=3 --diff-algorithm=myers --full-index --binary)
     execute_process(COMMAND ${git} diff ${diff_args} HEAD WORKING_DIRECTORY "${source}"
         OUTPUT_VARIABLE actual COMMAND_ERROR_IS_FATAL ANY)
-    # Construct the exact expected diff with an isolated index. This accounts for
-    # shared-file hunks without staging, reverting or rewriting the live checkout.
     string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef nonce)
     set(index "${root}/contract-index-${nonce}")
     set(index_git "${CMAKE_COMMAND}" -E env "GIT_INDEX_FILE=${index}" ${git})
@@ -214,8 +208,6 @@ function(cudavm_llvm_prepare_source root verify_only)
     if(NOT verify_only)
         cudavm_llvm_source_contract(contract)
         file(CONFIGURE OUTPUT "${root}/source-contract.json" CONTENT "${contract}\n" @ONLY)
-        # Publish only after a successful build, including a repeated build of the
-        # same profile. Interrupted rebuilds must never retain a success receipt.
         file(REMOVE "${root}/build/cudavm-llvm.json")
     endif()
     message(STATUS "Verified cudavm LLVM ${CUDAVM_LLVM_VERSION}, ordered nvptx/spirv/dxil patches: ${source}")
@@ -266,7 +258,7 @@ function(cudavm_llvm_verify_build root publish)
     foreach(index RANGE ${last})
         string(JSON key MEMBER "${configuration}" ${index})
         if(key MATCHES "^CMAKE_(C|CXX)_COMPILER_(ID|VERSION)$")
-            continue() # These are compiler-detection fields, not cache entries.
+            continue()
         endif()
         string(JSON expected GET "${configuration}" "${key}")
         set(found FALSE)
@@ -301,15 +293,12 @@ function(cudavm_llvm_verify_build root publish)
     endif()
 endfunction()
 
-# Consumer SDK setup and static archive composition share the pinned dependency contract.
-function(cudavm_core_dependencies target output_dir)
+function(cudavm_core_dependencies target)
     if(NOT target MATCHES "^cudavm_core_(shared|static)$")
         message(FATAL_ERROR "Only compiler module variants may link Clang/LLVM targets")
     endif()
     target_include_directories(${target} PRIVATE "${engine_dir}")
     target_include_directories(${target} SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
-    # Clang's GNU-driver Windows build does not export this definition through
-    # its imported targets. These dependencies are always static.
     target_compile_definitions(${target} PRIVATE ${LLVM_DEFINITIONS} LLVM_BUILD_STATIC CLANG_BUILD_STATIC)
     set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY MultiThreaded)
     if(MSVC)
@@ -324,12 +313,9 @@ function(cudavm_core_dependencies target output_dir)
     endif()
     get_target_property(kind ${target} TYPE)
     if(NOT kind STREQUAL "STATIC_LIBRARY")
-        # Build-time LLVM targets never leak into the installed SDK.
         target_link_libraries(${target} PRIVATE "$<BUILD_INTERFACE:${ARGN}>")
         return()
     endif()
-    # A static compiler is self-contained. Rebundle LLVM only here, leaving the
-    # facades small and avoiding LLVM targets in either consumer link graph.
     set(queue ${ARGN})
     set(visited)
     set(archives)
@@ -359,68 +345,12 @@ function(cudavm_core_dependencies target output_dir)
     list(REMOVE_DUPLICATES archives)
     list(REMOVE_DUPLICATES system_libraries)
     target_link_libraries(${target} PRIVATE ${system_libraries})
-    if(WIN32)
-        get_filename_component(tool_directory "${CMAKE_AR}" DIRECTORY)
-        find_program(CUDAVM_ARCHIVE_TOOL NAMES llvm-lib lib HINTS "${tool_directory}" REQUIRED)
-    else()
-        set(CUDAVM_ARCHIVE_TOOL "${CMAKE_AR}")
-    endif()
-    # Static archivers do not relink when imported dependency archives change.
-    # A generated member gives those files a normal dependency edge.
-    set(archive_list "${output_dir}/${target}_archives_$<CONFIG>.txt")
-    file(GENERATE OUTPUT "${archive_list}" CONTENT "$<JOIN:${archives},\n>\n")
-    set(dependency_member "${output_dir}/${target}_llvm_dependencies.cpp")
-    add_custom_command(OUTPUT "${dependency_member}"
-        COMMAND ${CMAKE_COMMAND} -E touch "${dependency_member}"
-        DEPENDS ${archives} "${archive_list}" "${CMAKE_CURRENT_FUNCTION_LIST_FILE}" VERBATIM)
-    target_sources(${target} PRIVATE "${dependency_member}")
-    add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} "-DTOOL=${CUDAVM_ARCHIVE_TOOL}" "-DOUTPUT=$<TARGET_FILE:${target}>"
-            "-DARCHIVE_LIST=${archive_list}" "-DWINDOWS=${WIN32}"
-            -DCUDAVM_LLVM_ACTION=merge_static -P "${CMAKE_CURRENT_FUNCTION_LIST_FILE}" VERBATIM)
+    cudavm_merge_static_libraries(${target} ${archives})
 endfunction()
 
-
-
-function(cudavm_merge_static)
-    # Merge indexed archive members, never nested archives. Only compiler_static
-    # invokes this; installed consumers need no LLVM CMake package or archive paths.
-    if(DEFINED ARCHIVE_LIST)
-        file(STRINGS "${ARCHIVE_LIST}" archives)
-    else()
-        string(REPLACE "|" ";" archives "${ARCHIVES}")
-    endif()
-    set(merged "${OUTPUT}.merged")
-    if(WINDOWS)
-        set(response "/NOLOGO\n/OUT:\"${merged}\"\n\"${OUTPUT}\"\n")
-        foreach(archive IN LISTS archives)
-            string(APPEND response "\"${archive}\"\n")
-        endforeach()
-        file(WRITE "${OUTPUT}.rsp" "${response}")
-        execute_process(COMMAND "${TOOL}" "@${OUTPUT}.rsp"
-            COMMAND_ERROR_IS_FATAL ANY)
-        file(REMOVE "${OUTPUT}.rsp")
-    else()
-        set(script "CREATE \"${merged}\"\nADDLIB \"${OUTPUT}\"\n")
-        foreach(archive IN LISTS archives)
-            string(APPEND script "ADDLIB \"${archive}\"\n")
-        endforeach()
-        string(APPEND script "SAVE\nEND\n")
-        file(WRITE "${OUTPUT}.mri" "${script}")
-        execute_process(COMMAND "${TOOL}" -M INPUT_FILE "${OUTPUT}.mri" COMMAND_ERROR_IS_FATAL ANY)
-        file(REMOVE "${OUTPUT}.mri")
-    endif()
-    file(RENAME "${merged}" "${OUTPUT}")
-endfunction()
-
-# Include this file for the contract helpers; execute it with -P for maintenance.
 if(CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
-    if(NOT CUDAVM_LLVM_ACTION MATCHES "^(prepare|verify|publish|merge_static)$")
-        message(FATAL_ERROR "Set CUDAVM_LLVM_ACTION to prepare, verify, publish or merge_static")
-    endif()
-    if(CUDAVM_LLVM_ACTION STREQUAL "merge_static")
-        cudavm_merge_static()
-        return()
+    if(NOT CUDAVM_LLVM_ACTION MATCHES "^(prepare|verify|publish)$")
+        message(FATAL_ERROR "Set CUDAVM_LLVM_ACTION to prepare, verify or publish")
     endif()
     if(NOT CUDAVM_LLVM_ROOT)
         message(FATAL_ERROR "LLVM maintenance requires a private build root")
@@ -437,60 +367,52 @@ endif()
 if(CMAKE_SCRIPT_MODE_FILE OR NOT CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_CURRENT_LIST_DIR)
     return()
 endif()
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT CUDAVM_LLVM_ACTION STREQUAL "build")
+    message(FATAL_ERROR "Configure cudavm from the repository root; external dependencies are not standalone projects")
+endif()
 
-# A parent build consumes its coherent SDK; a standalone configure bootstraps it.
 if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    # LLVM source, patches and generated libraries are owned by cudavm.
-    cudavm_llvm_source_contract(source_contract)
-    string(SHA256 source_key "${source_contract}")
-    string(SUBSTRING "${source_key}" 0 12 source_key)
-    set(llvm_root "${PROJECT_SOURCE_DIR}/.tmp/llvm/${CUDAVM_LLVM_VERSION}-${source_key}")
-    set(CUDAVM_LLVM_BUILD_DIR "${llvm_root}/build" CACHE PATH "Coherent static three-target LLVM/Clang SDK")
-    set(CUDAVM_CLANG_RESOURCE_DIR "${CUDAVM_LLVM_BUILD_DIR}/lib/clang/22" CACHE PATH "Matching patched Clang resource headers embedded in nvrtc")
-    option(CUDAVM_LLVM_BOOTSTRAP "Build cudavm's pinned LLVM dependency when it is missing or stale" ON)
+    set(llvm_root "${PROJECT_SOURCE_DIR}/.tmp/llvm/${CUDAVM_LLVM_VERSION}-native")
+    set(llvm_build_dir "${llvm_root}/build")
     set(CUDAVM_LLVM_GIT_REPOSITORY "https://github.com/llvm/llvm-project.git" CACHE STRING "LLVM repository or local Git mirror")
     set(CUDAVM_LLVM_BUILD_JOBS 4 CACHE STRING "Maximum concurrent LLVM compilation jobs")
     cudavm_llvm_build_contract(expected_contract unused_llvm_args)
     string(JSON expected_fingerprint GET "${expected_contract}" fingerprint)
     set(sdk_matches FALSE)
-    if(EXISTS "${CUDAVM_LLVM_BUILD_DIR}/cudavm-llvm.json")
-        file(READ "${CUDAVM_LLVM_BUILD_DIR}/cudavm-llvm.json" llvm_contract)
+    if(EXISTS "${llvm_build_dir}/cudavm-llvm.json")
+        file(READ "${llvm_build_dir}/cudavm-llvm.json" llvm_contract)
         string(JSON sdk_fingerprint ERROR_VARIABLE receipt_error GET "${llvm_contract}" fingerprint)
         if(NOT receipt_error AND sdk_fingerprint STREQUAL expected_fingerprint)
             set(sdk_matches TRUE)
         endif()
     endif()
-    if(NOT sdk_matches OR NOT EXISTS "${CUDAVM_LLVM_BUILD_DIR}/lib/cmake/llvm/LLVMConfig.cmake")
-        if(CUDAVM_LLVM_BOOTSTRAP AND CUDAVM_LLVM_BUILD_DIR STREQUAL "${llvm_root}/build")
-            set(bootstrap_args -S "${PROJECT_SOURCE_DIR}/external/llvm" -B "${llvm_root}" -G "${CMAKE_GENERATOR}"
-                "-DCMAKE_C_COMPILER:FILEPATH=${CMAKE_C_COMPILER}"
-                "-DCMAKE_CXX_COMPILER:FILEPATH=${CMAKE_CXX_COMPILER}"
-                "-DCUDAVM_LLVM_GIT_REPOSITORY:STRING=${CUDAVM_LLVM_GIT_REPOSITORY}"
-                "-DCUDAVM_LLVM_BUILD_JOBS:STRING=${CUDAVM_LLVM_BUILD_JOBS}")
-            if(CMAKE_MAKE_PROGRAM)
-                list(APPEND bootstrap_args "-DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}")
-            endif()
-            if(CMAKE_GENERATOR_PLATFORM)
-                list(APPEND bootstrap_args -A "${CMAKE_GENERATOR_PLATFORM}")
-            endif()
-            if(CMAKE_GENERATOR_TOOLSET)
-                list(APPEND bootstrap_args -T "${CMAKE_GENERATOR_TOOLSET}")
-            endif()
-            message(STATUS "Bootstrapping cudavm LLVM ${CUDAVM_LLVM_VERSION}, NVPTX/SPIRV/DirectX")
-            execute_process(COMMAND "${CMAKE_COMMAND}" ${bootstrap_args} COMMAND_ERROR_IS_FATAL ANY)
-            execute_process(COMMAND "${CMAKE_COMMAND}" --build "${llvm_root}" --config Release
-                COMMAND_ERROR_IS_FATAL ANY)
-        else()
-            message(FATAL_ERROR "LLVM SDK is missing or stale (revision, three patches, targets or build profile). Build cmake -S external/llvm -B <clean-root> and cmake --build <clean-root>, then set CUDAVM_LLVM_BUILD_DIR=<clean-root>/build and CUDAVM_CLANG_RESOURCE_DIR=<clean-root>/build/lib/clang/22")
+    if(NOT sdk_matches OR NOT EXISTS "${llvm_build_dir}/lib/cmake/llvm/LLVMConfig.cmake")
+        set(bootstrap_args -S "${PROJECT_SOURCE_DIR}/external/llvm" -B "${llvm_root}" -G "${CMAKE_GENERATOR}"
+            -DCUDAVM_LLVM_ACTION=build
+            "-DCMAKE_C_COMPILER:FILEPATH=${CMAKE_C_COMPILER}"
+            "-DCMAKE_CXX_COMPILER:FILEPATH=${CMAKE_CXX_COMPILER}"
+            "-DCUDAVM_LLVM_GIT_REPOSITORY:STRING=${CUDAVM_LLVM_GIT_REPOSITORY}"
+            "-DCUDAVM_LLVM_BUILD_JOBS:STRING=${CUDAVM_LLVM_BUILD_JOBS}")
+        if(CMAKE_MAKE_PROGRAM)
+            list(APPEND bootstrap_args "-DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}")
         endif()
+        if(CMAKE_GENERATOR_PLATFORM)
+            list(APPEND bootstrap_args -A "${CMAKE_GENERATOR_PLATFORM}")
+        endif()
+        if(CMAKE_GENERATOR_TOOLSET)
+            list(APPEND bootstrap_args -T "${CMAKE_GENERATOR_TOOLSET}")
+        endif()
+        message(STATUS "Bootstrapping cudavm LLVM ${CUDAVM_LLVM_VERSION}, NVPTX/SPIRV/DirectX")
+        execute_process(COMMAND "${CMAKE_COMMAND}" ${bootstrap_args} COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND "${CMAKE_COMMAND}" --build "${llvm_root}" --config Release
+            COMMAND_ERROR_IS_FATAL ANY)
     endif()
-    file(READ "${CUDAVM_LLVM_BUILD_DIR}/cudavm-llvm.json" llvm_contract)
+    file(READ "${llvm_build_dir}/cudavm-llvm.json" llvm_contract)
     string(JSON sdk_fingerprint GET "${llvm_contract}" fingerprint)
     if(NOT sdk_fingerprint STREQUAL expected_fingerprint)
         message(FATAL_ERROR "LLVM SDK does not match cudavm's complete source/build contract")
     endif()
-    get_filename_component(sdk_root "${CUDAVM_LLVM_BUILD_DIR}" DIRECTORY)
-    execute_process(COMMAND "${CMAKE_COMMAND}" "-DCUDAVM_LLVM_ROOT=${sdk_root}"
+    execute_process(COMMAND "${CMAKE_COMMAND}" "-DCUDAVM_LLVM_ROOT=${llvm_root}"
         -DCUDAVM_LLVM_ACTION=verify
         -P "${PROJECT_SOURCE_DIR}/external/llvm/CMakeLists.txt" COMMAND_ERROR_IS_FATAL ANY)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
@@ -498,15 +420,15 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         "${PROJECT_SOURCE_DIR}/external/llvm/cudavm_nvptx.patch"
         "${PROJECT_SOURCE_DIR}/external/llvm/cudavm_spirv.patch"
         "${PROJECT_SOURCE_DIR}/external/llvm/cudavm_dxil.patch"
-        "${CUDAVM_LLVM_BUILD_DIR}/cudavm-llvm.json"
-        "${CUDAVM_LLVM_BUILD_DIR}/CMakeCache.txt"
-        "${sdk_root}/build-contract.json"
-        "${sdk_root}/source-contract.json"
-        "${sdk_root}/src/.git/HEAD")
+        "${llvm_build_dir}/cudavm-llvm.json"
+        "${llvm_build_dir}/CMakeCache.txt"
+        "${llvm_root}/build-contract.json"
+        "${llvm_root}/source-contract.json"
+        "${llvm_root}/src/.git/HEAD")
     set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG Release)
     set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release)
-    set(LLVM_DIR "${CUDAVM_LLVM_BUILD_DIR}/lib/cmake/llvm" CACHE PATH "Selected cudavm LLVM package" FORCE)
-    set(Clang_DIR "${CUDAVM_LLVM_BUILD_DIR}/lib/cmake/clang" CACHE PATH "Selected cudavm Clang package" FORCE)
+    set(LLVM_DIR "${llvm_build_dir}/lib/cmake/llvm" CACHE PATH "Selected cudavm LLVM package" FORCE)
+    set(Clang_DIR "${llvm_build_dir}/lib/cmake/clang" CACHE PATH "Selected cudavm Clang package" FORCE)
     find_package(LLVM ${CUDAVM_LLVM_VERSION} EXACT REQUIRED CONFIG NO_DEFAULT_PATH PATHS "${LLVM_DIR}")
     find_package(Clang REQUIRED CONFIG NO_DEFAULT_PATH PATHS "${Clang_DIR}")
     set(enabled_targets ${LLVM_TARGETS_TO_BUILD})
@@ -514,8 +436,6 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     if(LLVM_ENABLE_RTTI OR NOT enabled_targets STREQUAL "DirectX;NVPTX;SPIRV")
         message(FATAL_ERROR "cudavm requires its RTTI-disabled static NVPTX/SPIRV/DirectX LLVM profile")
     endif()
-    # Check the entire static dependency closure, including archives that CMake's
-    # generated package exports even when they have not actually been built.
     set(llvm_queue clangCodeGen clangTooling LLVMPasses LLVMNVPTXCodeGen LLVMSPIRVCodeGen LLVMDirectXCodeGen)
     foreach(item IN LISTS llvm_queue)
         if(NOT TARGET "${item}")
@@ -547,17 +467,8 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
             list(APPEND llvm_queue ${dependencies})
         endif()
     endwhile()
-    # Wrapper changes belong to cudavm_nvptx.patch and clang-resource-headers.
-    file(REAL_PATH "${CUDAVM_CLANG_RESOURCE_DIR}" resource_root)
-    file(REAL_PATH "${CUDAVM_LLVM_BUILD_DIR}/lib/clang/22" sdk_resource_root)
-    if(WIN32)
-        string(TOLOWER "${resource_root}" resource_root)
-        string(TOLOWER "${sdk_resource_root}" sdk_resource_root)
-    endif()
-    if(NOT resource_root STREQUAL sdk_resource_root)
-        message(FATAL_ERROR "CUDAVM_CLANG_RESOURCE_DIR must select this SDK's matching lib/clang/22 directory")
-    endif()
-    set(wrapper_source "${CUDAVM_CLANG_RESOURCE_DIR}/include/__clang_cuda_runtime_wrapper.h")
+    set(clang_resource_dir "${llvm_build_dir}/lib/clang/${LLVM_VERSION_MAJOR}")
+    set(wrapper_source "${clang_resource_dir}/include/__clang_cuda_runtime_wrapper.h")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${wrapper_source}")
     file(READ "${wrapper_source}" wrapper)
     if(NOT wrapper MATCHES "#if __has_include\\(\"curand_mtgp32_kernel.h\"\\)" OR NOT wrapper MATCHES "return __builtin_fmal\\(x, y, z\\)")
@@ -584,7 +495,7 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     foreach(variable LLVM_INCLUDE_DIRS CLANG_INCLUDE_DIRS LLVM_DEFINITIONS LLVM_BUILD_MAIN_SRC_DIR
             CUDAVM_LLVM_LICENSE includes_from_bin includes_from_lib sdk_notice_from_bin sdk_notice_from_lib
             CMAKE_MAP_IMPORTED_CONFIG_DEBUG CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO
-            device_libraries source_libraries link_libraries engine_dir wrapper_path)
+            device_libraries source_libraries link_libraries engine_dir wrapper_path llvm_build_dir clang_resource_dir)
         set(${variable} "${${variable}}" PARENT_SCOPE)
     endforeach()
     return()
@@ -617,8 +528,6 @@ ExternalProject_Add(cudavm_llvm
     BUILD_ALWAYS TRUE
     INSTALL_COMMAND "${CMAKE_COMMAND}" "-DCUDAVM_LLVM_ROOT=${CMAKE_BINARY_DIR}"
         -DCUDAVM_LLVM_ACTION=publish -P "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
-# Verify on every build, including interrupted patch application. Never reset
-# an occupied checkout. A changed contract also forces LLVM configuration.
 ExternalProject_Add_Step(cudavm_llvm source_contract
     COMMAND ${prepare}
     DEPENDEES download DEPENDERS configure

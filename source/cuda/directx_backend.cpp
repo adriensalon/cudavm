@@ -7,9 +7,7 @@
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
-#if defined(CUDAVM_DXC_LIBRARY)
-#include <dxc/dxcapi.h>
-#endif
+#include "directx_validation.hpp"
 namespace cudavm {
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -47,7 +45,6 @@ struct directx_device {
         check(value->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence");
         event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
         require(event != nullptr, CUDA_ERROR_UNKNOWN, "DirectX fence event creation failed");
-#if defined(CUDAVM_DXC_LIBRARY) && defined(CUDAVM_DXIL_LIBRARY)
         D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_0};
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 features{};
         D3D12_FEATURE_DATA_D3D12_OPTIONS base{};
@@ -59,7 +56,6 @@ struct directx_device {
         }
         native_dxil = SUCCEEDED(value->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL,&model,sizeof(model))) && model.HighestShaderModel>=D3D_SHADER_MODEL_6_0
             && SUCCEEDED(wave_features) && features.Int64ShaderOps;
-#endif
     }
     ~directx_device() { if (event) CloseHandle(event); }
     ComPtr<ID3D12Resource> resource(size_t bytes, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state) {
@@ -493,24 +489,11 @@ struct directx_session : session {
     std::unique_ptr<compute_pipeline> compile_native_dxil(std::string_view bytes,const launch_shape& shape) override {
         require(supports_native_dxil(bytes),CUDA_ERROR_NOT_SUPPORTED,"DirectX native DXIL requires shader model 6.0 and Int64ShaderOps");
         validate_native_dxil_shape(shape);
-#if defined(CUDAVM_DXC_LIBRARY) && defined(CUDAVM_DXIL_LIBRARY)
-        static dynamic_library compiler({"dxcompiler.dll",CUDAVM_DXC_LIBRARY},true,CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
-        static dynamic_library validator({"dxil.dll",CUDAVM_DXIL_LIBRARY},true,CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
-        auto create_utils=compiler.get<decltype(&DxcCreateInstance)>("DxcCreateInstance");
-        auto create_validator=validator.get<decltype(&DxcCreateInstance)>("DxcCreateInstance");
-        ComPtr<IDxcUtils> utilities; ComPtr<IDxcValidator> validation;
-        check(create_utils(CLSID_DxcUtils,IID_PPV_ARGS(&utilities)),"Create DXIL utilities");
-        check(create_validator(CLSID_DxcValidator,IID_PPV_ARGS(&validation)),"Create DXIL validator");
-        ComPtr<IDxcBlobEncoding> input; check(utilities->CreateBlob(bytes.data(),UINT(bytes.size()),DXC_CP_ACP,&input),"Create native DXIL blob");
-        ComPtr<IDxcOperationResult> result; check(validation->Validate(input.Get(),DxcValidatorFlags_InPlaceEdit,&result),"Validate native DXIL");
-        HRESULT status; check(result->GetStatus(&status),"Get native DXIL validation status");
-        if(FAILED(status)) { ComPtr<IDxcBlobEncoding> errors; result->GetErrorBuffer(&errors); throw failure(CUDA_ERROR_INVALID_IMAGE,"Native DXIL validation failed: " +
-            (errors?std::string(static_cast<const char*>(errors->GetBufferPointer()),errors->GetBufferSize()):std::to_string(status))); }
-        ComPtr<IDxcBlob> code; check(result->GetResult(&code),"Get signed native DXIL");
-        return compile_binary(code->GetBufferPointer(),code->GetBufferSize());
-#else
-        throw failure(CUDA_ERROR_NOT_SUPPORTED,"DXIL validation is unavailable in this build");
-#endif
+        std::string code(bytes), diagnostic;
+        const auto status = validate_directx_dxil(code, diagnostic);
+        require(status >= 0, status == E_OUTOFMEMORY ? CUDA_ERROR_OUT_OF_MEMORY : CUDA_ERROR_INVALID_IMAGE,
+            "Native DXIL validation failed: " + diagnostic);
+        return compile_binary(code.data(), code.size());
     }
     void dispatch(compute_pipeline& pipeline,const launch_shape& shape,buffer& memory,buffer& parameters) override {
         wait_device(enqueue_dispatch(pipeline, shape, memory, parameters, nullptr));

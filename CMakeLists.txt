@@ -1,4 +1,54 @@
 cmake_minimum_required(VERSION 3.24)
+
+function(cudavm_merge_static_libraries target)
+    set(root "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/${target}_archives")
+    set(merged "$<TARGET_FILE:${target}>.merged")
+    if(WIN32)
+        get_filename_component(tool_directory "${CMAKE_AR}" DIRECTORY)
+        find_program(archive_tool NAMES llvm-lib lib HINTS "${tool_directory}" NO_CACHE REQUIRED)
+        set(command_file "${root}/$<CONFIG>.rsp")
+        set(contents "/NOLOGO\n/OUT:\"${merged}\"\n\"$<TARGET_FILE:${target}>\"\n")
+        foreach(archive IN LISTS ARGN)
+            string(APPEND contents "\"${archive}\"\n")
+        endforeach()
+        set(merge_command "${archive_tool}" "@${command_file}")
+    else()
+        set(command_file "${root}/$<CONFIG>.mri")
+        set(contents "CREATE \"${merged}\"\nADDLIB \"$<TARGET_FILE:${target}>\"\n")
+        foreach(archive IN LISTS ARGN)
+            string(APPEND contents "ADDLIB \"${archive}\"\n")
+        endforeach()
+        string(APPEND contents "SAVE\nEND\n")
+        set(merge_command sh -c "\"$1\" -M < \"$2\"" sh "${CMAKE_AR}" "${command_file}")
+    endif()
+    file(GENERATE OUTPUT "${command_file}" CONTENT "${contents}")
+    set(member "${root}/dependencies_$<CONFIG>.cpp")
+    add_custom_command(OUTPUT "${member}"
+        COMMAND "${CMAKE_COMMAND}" -E touch "${member}"
+        DEPENDS ${ARGN} "${command_file}" "${CMAKE_CURRENT_FUNCTION_LIST_FILE}" VERBATIM)
+    target_sources(${target} PRIVATE "${member}")
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${merge_command}
+        COMMAND "${CMAKE_COMMAND}" -E rename "${merged}" "$<TARGET_FILE:${target}>" VERBATIM)
+endfunction()
+
+function(cudavm_embed_file path output symbol)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${path}")
+    file(READ "${path}" embedded_contents)
+    string(FIND "${embedded_contents}" ")cudavm_resource\"" delimiter_collision)
+    if(NOT delimiter_collision EQUAL -1)
+        message(FATAL_ERROR "Embedded source contains the raw-string delimiter: ${path}")
+    endif()
+    set(embedded_symbol "${symbol}")
+    file(CONFIGURE OUTPUT "${output}" CONTENT [[// Embedded source bytes; original license notices are retained below.
+static constexpr char @embedded_symbol@[] = R"cudavm_resource(@embedded_contents@)cudavm_resource";
+]] @ONLY)
+endfunction()
+
+if(NOT CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_CURRENT_LIST_DIR)
+    return()
+endif()
+
 if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     message(FATAL_ERROR "Build cudavm separately and use its installed SDK; add_subdirectory(cudavm) is unsupported")
 endif()
@@ -445,12 +495,11 @@ if(NOT cuda_version MATCHES "13040$")
     message(FATAL_ERROR "cudavm uses the pinned CUDA 13.4 headers (CUDA_VERSION 13040); found ${cuda_version}")
 endif()
 
-if(NOT WIN32)
-    find_package(Threads REQUIRED)
-endif()
-
 add_subdirectory(external/cccl)
 add_subdirectory(external/llvm)
+add_subdirectory(external/opencl)
+add_subdirectory(external/vulkan)
+add_subdirectory(external/directx)
 add_subdirectory(source)
 
 install(TARGETS ${cudavm_install_targets}
