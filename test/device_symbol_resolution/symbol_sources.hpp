@@ -1,5 +1,5 @@
 #pragma once
-#include "conformance.hpp"
+#include "test_framework.hpp"
 
 namespace cudavm {
 inline std::vector<std::string> symbol_sources(std::string_view profile) {

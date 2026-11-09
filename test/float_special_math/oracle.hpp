@@ -1,5 +1,5 @@
 #pragma once
-#include "../conformance.hpp"
+#include "../test_framework.hpp"
 
 namespace cudavm {
 inline std::array<uint32_t, 4> float_norm_components(const std::array<uint64_t, 3>& row) {

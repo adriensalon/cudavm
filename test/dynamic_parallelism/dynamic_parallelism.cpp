@@ -1,4 +1,4 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 
 namespace cudavm {
 constexpr const char* parallel_source = R"cuda(

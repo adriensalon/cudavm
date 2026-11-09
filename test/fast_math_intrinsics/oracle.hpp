@@ -1,5 +1,5 @@
 #pragma once
-#include "../conformance.hpp"
+#include "../test_framework.hpp"
 
 namespace cudavm {
 inline std::array<uint32_t, 2> fast_divide_oracle(const std::array<uint32_t, 3>& row) {

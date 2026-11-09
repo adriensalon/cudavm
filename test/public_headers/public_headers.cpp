@@ -1,4 +1,4 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <nvrtc/nvrtc.h>

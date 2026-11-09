@@ -1,4 +1,4 @@
-#include "fixtures.hpp"
+#include "test_fixtures.hpp"
 
 namespace cudavm {
 void cache_case(const loaded_program& program, unsigned x, unsigned y, unsigned count) {

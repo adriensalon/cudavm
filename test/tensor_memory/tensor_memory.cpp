@@ -1,4 +1,4 @@
-#include "fixtures.hpp"
+#include "test_fixtures.hpp"
 
 namespace cudavm {
 void tensor_memory_case(const loaded_program& program, std::array<unsigned, 3> shape,

@@ -1,4 +1,4 @@
-#include "fixtures.hpp"
+#include "test_fixtures.hpp"
 
 namespace cudavm {
 void execute_device_runtime(const loaded_program& program) {

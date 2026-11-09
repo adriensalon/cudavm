@@ -1,6 +1,7 @@
 // CLI and build artifact paths only. Libraries own compilation and linking.
 #include "../core/frontend_api.hpp"
 #include "../core/linker_api.hpp"
+#include "device_inventory.hpp"
 #include <cstdio>
 #include <map>
 #include <stdexcept>
@@ -13,8 +14,14 @@ int main(int argc, char** argv) {
             "usage: cudavm-nvcc compile-tu --input source.cu --host host.cpp --bitcode device.bc [--manifest tu.json]\n"
             "       cudavm-nvcc link-device --bitcode device.bc ... --portable program.bc [--target cuda --binary program.ptx --module program.cpp]\n"
             "         [--library-bitcode candidate.bc ... --host-input host.obj --host-input library.lib ...]\n"
-            "       cudavm-nvcc --print-resources");
+            "       cudavm-nvcc --print-resources\n"
+            "       cudavm-nvcc --list-devices\n"
+            "Set CUDAVM_BACKENDS and CUDAVM_DEVICES in the process environment to filter devices.");
         std::string command = argv[1];
+        if (command == "--list-devices") {
+            if (argc != 2) throw std::runtime_error("--list-devices accepts no arguments; use CUDAVM_BACKENDS and CUDAVM_DEVICES to filter devices");
+            return print_device_inventory();
+        }
         std::map<std::string, std::vector<const char*>> fields;
         for (int i = 2; i < argc; ++i) {
             std::string key = argv[i];

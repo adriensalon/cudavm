@@ -1,4 +1,4 @@
-#include "fixtures.hpp"
+#include "test_fixtures.hpp"
 
 namespace cudavm {
 std::array<uint32_t, 24> float_arithmetic_oracle(const std::array<uint32_t, 3>& input) {

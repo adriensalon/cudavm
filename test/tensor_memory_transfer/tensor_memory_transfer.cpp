@@ -1,4 +1,4 @@
-#include "fixtures.hpp"
+#include "test_fixtures.hpp"
 
 namespace cudavm {
 static_assert(sizeof(CUtensorMap) == 128 && alignof(CUtensorMap) == 128);

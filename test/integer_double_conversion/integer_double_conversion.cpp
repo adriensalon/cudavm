@@ -1,4 +1,4 @@
-#include "fixtures.hpp"
+#include "test_fixtures.hpp"
 
 namespace cudavm {
 std::array<uint64_t, 10> integer_double_conversion_to_real(const std::array<uint64_t, 3>& input) {

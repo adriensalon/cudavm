@@ -1,5 +1,5 @@
-#include "conformance.hpp"
-#include "fixtures.hpp"
+#include "test_framework.hpp"
+#include "test_fixtures.hpp"
 
 namespace cudavm {
 std::string_view coherence_case;

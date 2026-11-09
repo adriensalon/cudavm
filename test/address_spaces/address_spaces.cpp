@@ -1,4 +1,4 @@
-#include "fixtures.hpp"
+#include "test_fixtures.hpp"
 #include "address_nvcc.hpp"
 #include <algorithm>
 #include <iostream>

@@ -1,5 +1,5 @@
 #pragma once
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include "module_fixtures.hpp"
 #include "../module_loading/module_oracle.hpp"
 #include <chrono>

@@ -1,4 +1,4 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include <nvPTXCompiler.h>
 #include <algorithm>
 #include <array>

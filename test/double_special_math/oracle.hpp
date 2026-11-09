@@ -1,5 +1,5 @@
 #pragma once
-#include "../conformance.hpp"
+#include "../test_framework.hpp"
 
 namespace cudavm {
 inline uint64_t double_norm_oracle(const std::array<uint64_t, 4>& words, unsigned dimensions) {

@@ -6,7 +6,7 @@
 // readback after synchronization or destruction with accepted work pending.
 // No destroyed context/resource is reused. Primary reset, affinity, green
 // contexts, imported modules, fatal errors and other host ABIs remain open.
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include <cudaTypedefs.h>
 #include <algorithm>
 #include <chrono>

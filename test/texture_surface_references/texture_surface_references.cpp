@@ -1,4 +1,4 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include "reference_fixture.hpp"
 
 namespace cudavm {

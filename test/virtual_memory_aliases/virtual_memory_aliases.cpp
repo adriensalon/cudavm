@@ -1,4 +1,4 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include <cudaTypedefs.h>
 
 namespace cudavm {

@@ -1,6 +1,6 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #ifdef CUDAVM_CONFORMANCE_SOURCE_CHECK
-#include "fixtures.hpp"
+#include "test_fixtures.hpp"
 #include <nvrtc.h>
 #endif
 #ifndef CUDAVM_CONFORMANCE_HOST_ONLY

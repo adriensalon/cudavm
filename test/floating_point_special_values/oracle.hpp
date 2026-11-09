@@ -1,5 +1,5 @@
 #pragma once
-#include "../conformance.hpp"
+#include "../test_framework.hpp"
 
 namespace cudavm {
 template<class Format> uint64_t special_neighbor(uint64_t x, uint64_t y) {

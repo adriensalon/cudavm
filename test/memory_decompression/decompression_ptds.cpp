@@ -1,5 +1,5 @@
 #define CUDA_API_PER_THREAD_DEFAULT_STREAM
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include <cudaTypedefs.h>
 #include <type_traits>
 namespace cudavm {

@@ -1,4 +1,4 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include <cuda/cudavm_cuda.h>
 #include <cudaTypedefs.h>
 #include <cstring>

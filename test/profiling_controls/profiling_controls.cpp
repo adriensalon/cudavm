@@ -1,4 +1,4 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include <cudaProfiler.h>
 #include <cudaProfilerTypedefs.h>
 #include <cuda_profiler_api.h>

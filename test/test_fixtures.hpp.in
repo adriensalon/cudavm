@@ -1,5 +1,5 @@
 #pragma once
-#include "conformance.hpp"
+#include "test_framework.hpp"
 namespace cudavm {
 inline constexpr char fixture_source[] = R"cudavm(@fixture_cu@)cudavm";
 inline constexpr char fixture_ptx[] = R"cudavm(@fixture_ptx@)cudavm";

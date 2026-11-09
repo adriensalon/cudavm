@@ -1,4 +1,4 @@
-#include "fixtures.hpp"
+#include "test_fixtures.hpp"
 
 namespace cudavm {
 std::array<uint32_t, 13> language_oracle(uint32_t value, unsigned index) {

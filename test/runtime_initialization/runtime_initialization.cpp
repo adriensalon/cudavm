@@ -1,4 +1,4 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <exception>

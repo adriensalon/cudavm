@@ -1,4 +1,4 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include "device_library_images.hpp"
 
 namespace cudavm {

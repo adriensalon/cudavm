@@ -50,12 +50,12 @@ frontend_resources installed(const std::filesystem::path& include) {
 frontend_resources resolve_resources(const std::string& root) {
     if (!root.empty()) return installed((std::filesystem::absolute(root) / CUDAVM_INSTALL_INCLUDE_DIR).lexically_normal());
     auto module = module_directory();
-    for (const auto& [includes, package] : {std::pair{CUDAVM_INCLUDES_FROM_BIN, CUDAVM_PACKAGE_FROM_BIN},
-            std::pair{CUDAVM_INCLUDES_FROM_LIB, CUDAVM_PACKAGE_FROM_LIB}}) {
+    for (const auto& [includes, notice] : {std::pair{CUDAVM_INCLUDES_FROM_BIN, CUDAVM_SDK_NOTICE_FROM_BIN},
+            std::pair{CUDAVM_INCLUDES_FROM_LIB, CUDAVM_SDK_NOTICE_FROM_LIB}}) {
         auto candidate = (module / includes).lexically_normal();
-        // The existing CMake package distinguishes an SDK from a nearby source
-        // checkout's include tree. No compiler resource manifest is needed.
-        if (std::filesystem::is_regular_file(module / package)
+        // The installed compiler's LLVM notice distinguishes an SDK from a nearby
+        // source checkout without requiring a CMake package or resource manifest.
+        if (std::filesystem::is_regular_file(module / notice)
                 && std::filesystem::is_regular_file(candidate / "cudart/cuda_runtime.h")) return installed(candidate);
     }
     std::error_code error;

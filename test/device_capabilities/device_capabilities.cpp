@@ -1,4 +1,4 @@
-#include "fixtures.hpp"
+#include "test_fixtures.hpp"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 

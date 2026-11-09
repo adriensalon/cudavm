@@ -1,4 +1,4 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include "symbol_sources.hpp"
 
 namespace cudavm {

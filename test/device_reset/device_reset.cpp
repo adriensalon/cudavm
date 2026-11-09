@@ -6,7 +6,7 @@
 // are never queried, freed or otherwise reused. Legacy reset, registered
 // modules, async/pool allocations, fatal faults and multi-device reset remain
 // open obligations. There are no compiler inputs or capability-based passes.
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <chrono>

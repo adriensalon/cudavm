@@ -1,5 +1,5 @@
 #pragma once
-#include "../conformance.hpp"
+#include "../test_framework.hpp"
 
 namespace cudavm {
 inline uint32_t mode_flush(uint32_t bits) {

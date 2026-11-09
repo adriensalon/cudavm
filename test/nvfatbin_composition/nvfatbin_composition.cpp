@@ -1,4 +1,4 @@
-#include "conformance.hpp"
+#include "test_framework.hpp"
 #include <nvFatbin.h>
 #include <nvJitLink.h>
 #include <nvPTXCompiler.h>
