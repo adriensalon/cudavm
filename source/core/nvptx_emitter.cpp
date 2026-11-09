@@ -206,7 +206,10 @@ std::string emit_cuda_ir(const llvm::Module& input, const std::string& architect
         if(auto* call=llvm::dyn_cast<llvm::CallInst>(&instruction);call && call->isInlineAsm()) {
             auto text=llvm::cast<llvm::InlineAsm>(call->getCalledOperand())->getAsmString();
             if(text.contains(".u32.f16x2") || text.contains("abs.f16"))dialect=std::max(dialect,65u);
+            if(text.contains("mma.sync.aligned.m16n8k8."))dialect=std::max(dialect,65u);
             if(text.contains("tanh.approx."))dialect=std::max(dialect,70u);
+            if(text.contains("wgmma."))dialect=std::max(dialect,80u);
+            if(text.contains("tcgen05."))dialect=std::max(dialect,86u);
             if(text.contains("cp.async.bulk.") || text.contains("mbarrier.arrive.expect_tx.")
                 || text.contains("mbarrier.expect_tx.") || text.contains("fence.proxy.async")
                 || text.contains("fence.mbarrier_init."))dialect=std::max(dialect,80u);

@@ -11,6 +11,8 @@
 #include <llvm/AsmParser/Parser.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DebugInfo.h>
+#include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/DiagnosticPrinter.h>
 #include <llvm/IR/InlineAsm.h>
@@ -177,7 +179,7 @@ void compatible_symbols(const llvm::Module& target, const llvm::Module& source) 
 }
 }
 
-std::unique_ptr<llvm::Module> import_nvvm(llvm::LLVMContext& context, std::string_view bytes, const char* label, const char* architecture) {
+std::unique_ptr<llvm::Module> import_nvvm(llvm::LLVMContext& context, std::string_view bytes, const char* label, const char* architecture, bool nvidia_lto) {
     nvvm_require(!bytes.empty() && bytes.size() <= (size_t(1) << 30), "empty or oversized module");
     nvvm_require(architecture && std::string_view(architecture).starts_with("sm_"), "invalid target architecture");
     auto target = "compute_" + std::string(architecture + 3);
@@ -194,7 +196,18 @@ std::unique_ptr<llvm::Module> import_nvvm(llvm::LLVMContext& context, std::strin
         for (const auto& metadata : module->named_metadata()) nvvm_require(!metadata.getName().starts_with("cudavm."), "reserved cudavm input metadata");
         rename_metadata(*module, "nvvm.annotations", annotations_key);
         rename_metadata(*module, "llvm.module.flags", flags_key);
-        nvvm_require(!module->getNamedMetadata("llvm.dbg.cu"), "debug information is outside the supported import profile");
+        if (auto* units = module->getNamedMetadata("llvm.dbg.cu")) {
+            nvvm_require(nvidia_lto, "debug information is outside the supported import profile");
+            for (auto* row : units->operands()) {
+                auto* unit = llvm::dyn_cast<llvm::DICompileUnit>(row);
+                nvvm_require(unit && unit->getEmissionKind() == llvm::DICompileUnit::NoDebug,
+                    "LTO source debug emission is outside the supported import profile");
+            }
+            // LLVM upgrades function debug attachments during materialization.
+            // Keep that upgrader's own version visible while all external flags
+            // remain quarantined for validation below.
+            module->addModuleFlag(llvm::Module::Error, "Debug Info Version", 3);
+        }
         if (auto error = module->materializeAll())
             throw compiler_error(compiler_status::invalid, ("NVVM: " + llvm::toString(std::move(error))).c_str());
     } else {
@@ -206,6 +219,28 @@ std::unique_ptr<llvm::Module> import_nvvm(llvm::LLVMContext& context, std::strin
         if (!module) {
             std::string message; llvm::raw_string_ostream stream(message); diagnostic.print(name, stream);
             throw compiler_error(compiler_status::invalid, message.c_str());
+        }
+    }
+    if (nvidia_lto) {
+        // Native NVRTC retains NoDebug provenance and line locations in LTO.
+        // They are not executable semantics or a debugger-support contract.
+        if (auto* units = module->getNamedMetadata(debug_key)) module->eraseNamedMetadata(units);
+        llvm::StripDebugInfo(*module);
+        if (auto* flags = module->getNamedMetadata("llvm.module.flags")) module->eraseNamedMetadata(flags);
+        if (auto* flags = module->getNamedMetadata(flags_key)) {
+            std::vector<llvm::MDNode*> retained;
+            for (auto* row : flags->operands()) {
+                nvvm_require(row->getNumOperands() == 3, "invalid module flag");
+                auto* key = llvm::dyn_cast_or_null<llvm::MDString>(row->getOperand(1));
+                if (key && key->getString() == "Debug Info Version") {
+                    auto* behavior = llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(row->getOperand(0));
+                    auto* version = llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(row->getOperand(2));
+                    nvvm_require(behavior && behavior->getBitWidth() == 32 && behavior->getZExtValue() == llvm::Module::Error
+                        && version && version->getBitWidth() == 32 && version->getZExtValue() == 3,
+                        "unsupported LTO debug metadata version");
+                } else retained.push_back(row);
+            }
+            flags->clearOperands(); for (auto* row : retained) flags->addOperand(row);
         }
     }
     for (const auto& metadata : module->named_metadata())
@@ -241,6 +276,17 @@ std::unique_ptr<llvm::Module> import_nvvm(llvm::LLVMContext& context, std::strin
     if (auto* annotations = module->getNamedMetadata(annotations_key)) {
         for (auto* row : annotations->operands()) {
             nvvm_require(row->getNumOperands() >= 3 && row->getNumOperands() % 2, "invalid nvvm.annotations tuple");
+            // Native LTO optimization leaves annotations for removed functions.
+            // A null target has no remaining executable/ABI subject. Validate
+            // its record shape, without applying its hints to another function.
+            if (nvidia_lto && !row->getOperand(0)) {
+                for (unsigned i = 1; i < row->getNumOperands(); i += 2) {
+                    auto* key = llvm::dyn_cast_or_null<llvm::MDString>(row->getOperand(i));
+                    auto* value = llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(row->getOperand(i + 1));
+                    nvvm_require(key && value && value->getBitWidth() == 32, "invalid orphan LTO annotation");
+                }
+                continue;
+            }
             auto* function = llvm::mdconst::dyn_extract_or_null<llvm::Function>(row->getOperand(0));
             nvvm_require(function, "kernel annotation requires a function");
             for (unsigned i = 1; i < row->getNumOperands(); i += 2) {

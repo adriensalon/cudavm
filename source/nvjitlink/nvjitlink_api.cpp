@@ -3,6 +3,7 @@
 #include <nvjitlink/export.h>
 #include "../core/program_api.hpp"
 #include "../core/compiler_profiles.hpp"
+#include "../core/nvidia_lto_import.hpp"
 #include "../nvfatbin/container_api.hpp"
 #include <algorithm>
 #include <chrono>
@@ -109,7 +110,10 @@ void nvjitlink_add(nvjitlink_program& program, nvJitLinkInputType type, const vo
     case NVJITLINK_INPUT_LTOIR:
         if (!program.options.lto) nvjitlink_fail(program, NVJITLINK_ERROR_LTO_NOT_ENABLED, "LTOIR inputs require -lto");
         kind = compiler_input_kind::nvltoir; break;
-    case NVJITLINK_INPUT_ANY: kind = compiler_input_kind::automatic; break;
+    case NVJITLINK_INPUT_ANY:
+        if (!program.options.lto && has_nvidia_lto_ir({static_cast<const char*>(data), size}))
+            nvjitlink_fail(program, NVJITLINK_ERROR_LTO_NOT_ENABLED, "LTOIR inputs require -lto");
+        kind = compiler_input_kind::automatic; break;
     case NVJITLINK_INPUT_FATBIN: kind = compiler_input_kind::fatbinary; break;
     case NVJITLINK_INPUT_NONE: nvjitlink_fail(program, NVJITLINK_ERROR_INVALID_INPUT, "input type NONE is invalid");
     default: nvjitlink_fail(program, NVJITLINK_ERROR_UNRECOGNIZED_INPUT, "this container input type is not implemented");

@@ -142,6 +142,16 @@ void ptx_import_declarations() {
         ptx_import_reject(ptx_import_header() + ".entry ptx_import_rejected(" + parameters + ") { ret; }", reason);
 }
 void ptx_import_instructions() {
+    ptx_import_accept(ptx_import_kernel(".reg .b64 %p; mov.u64 %p, 0; "
+        "prefetch.global.L1 [%p]; prefetch.global.L2 [%p]; prefetch.L1 [%p]; prefetch.L2 [%p]; prefetchu.L1 [%p]; ret;",
+        "ptx_import_control"));
+    ptx_import_reject(ptx_import_kernel(".reg .b64 %p; prefetch.global.L3 [%p]; ret;"),
+        "unsupported cache prefetch instruction", NVJITLINK_ERROR_UNRECOGNIZED_INPUT);
+    ptx_import_reject(ptx_import_kernel(".reg .b64 %p; prefetch.global.L1 [%p], 1; ret;"), "operand count");
+    ptx_import_reject(ptx_import_kernel(".reg .b32 %p; prefetch.global.L1 [%p]; ret;"), "width");
+    for (const auto* instruction : {"ld.global.wb.u32 %r,[%p];", "st.global.ca.u32 [%p],%r;"})
+        ptx_import_reject(ptx_import_kernel(std::string(".reg .b64 %p; .reg .u32 %r; ") + instruction + " ret;"),
+            "unsupported memory instruction", NVJITLINK_ERROR_UNRECOGNIZED_INPUT);
     for (const auto& [body, reason] : std::array<std::pair<const char*, const char*>, 8>{{
         {".reg .b32 %r; .reg .b32 %r; ret;", "duplicate register"},
         {".reg .b32 %r; mov.u32 %unknown, 1; ret;", "undeclared register"},

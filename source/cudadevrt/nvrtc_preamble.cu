@@ -13,6 +13,8 @@
 #include <vector_types.h>
 #include <__clang_cuda_builtin_vars.h>
 typedef __SIZE_TYPE__ size_t;
+typedef __PTRDIFF_TYPE__ ptrdiff_t;
+typedef long clock_t;
 #include <cuda_runtime_api.h>
 #include "device_runtime.cu"
 #include <__clang_cuda_texture_intrinsics.h>
@@ -60,9 +62,11 @@ extern "C" __device__ void __cudavm_rtc_fence_system();
 __device__ inline void __threadfence_block() {__cudavm_rtc_fence_block();}
 __device__ inline void __threadfence() {__cudavm_rtc_fence_device();}
 __device__ inline void __threadfence_system() {__cudavm_rtc_fence_system();}
-// Legacy public pipeline headers parse timed barrier helpers even when callers
-// only use the pipeline's batch operations. Keep native timing operations inline;
-// a shader that reaches them still requires explicit backend lowering.
+// These native counters also serve the timed barrier helpers parsed by public
+// pipeline headers. Reached timing operations still need shader backend lowering.
+__device__ inline clock_t clock() {
+    int cycles; asm volatile("mov.u32 %0, %%clock;" : "=r"(cycles)); return cycles;
+}
 __device__ inline long long clock64() {
     long long cycles; asm volatile("mov.u64 %0, %%clock64;" : "=l"(cycles)); return cycles;
 }

@@ -117,7 +117,12 @@ struct fixture_data {
     std::span<const unsigned char> cubin;
     unsigned architecture = 75;
     unsigned minimum_ptx = 0;
+    std::string_view architecture_suffix;
+    unsigned source_standard = 17;
 };
+inline std::string conformance_architecture(const fixture_data& fixtures) {
+    return std::to_string(fixtures.architecture) + std::string(fixtures.architecture_suffix);
+}
 
 // Independent exact dyadic arithmetic for numerical fixtures. No host floating
 // operations, compiler internals, CUDA helpers or shader implementations are used.

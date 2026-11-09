@@ -1,0 +1,5 @@
+#pragma once
+namespace cudavm {
+inline constexpr unsigned char lto_kernel_fixture[]{@lto_kernel_bytes@};
+inline constexpr unsigned char lto_helper_fixture[]{@lto_helper_bytes@};
+}

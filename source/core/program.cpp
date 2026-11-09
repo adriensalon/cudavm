@@ -3,6 +3,7 @@
 #include "ptx_import.hpp"
 #include "cubin_import.hpp"
 #include "nvvm_import.hpp"
+#include "nvidia_lto_import.hpp"
 #include "native_emission.hpp"
 #include "device_numeric_ir.hpp"
 #include "spirv_emitter.hpp"
@@ -102,14 +103,16 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
         if (has_fatbin(bytes)) kind = compiler_input_kind::fatbinary;
         else if (has_program_image(bytes)) kind = compiler_input_kind::program_image;
         else if (has_ptx_header(bytes)) kind = compiler_input_kind::ptx;
+        else if (has_nvidia_lto_ir(bytes)) kind = compiler_input_kind::nvltoir;
         else if (bytes.starts_with("\x7f" "ELF")) kind = compiler_input_kind::cubin;
-        else throw compiler_error(compiler_status::unsupported, "unrecognized compiler input (expected cudavm program image, fatbinary, cubin or PTX)");
+        else throw compiler_error(compiler_status::unsupported, "unrecognized compiler input (expected cudavm program image, fatbinary, cubin, NVIDIA LTO or PTX)");
     }
     if ((kind == compiler_input_kind::cubin || kind == compiler_input_kind::nvltoir) && request.data
         && has_program_image(std::string_view(request.data, request.size))) kind = compiler_input_kind::program_image;
     if (request.abi_version == 3 && request.data && request.size && ((kind == compiler_input_kind::ptx && has_program_image({request.data, request.size}))
         || (kind != compiler_input_kind::fatbinary && has_fatbin({request.data, request.size}))
-        || ((kind == compiler_input_kind::cubin || kind == compiler_input_kind::nvltoir) && has_ptx_header({request.data, request.size}))))
+        || ((kind == compiler_input_kind::cubin || kind == compiler_input_kind::nvltoir) && has_ptx_header({request.data, request.size}))
+        || (kind != compiler_input_kind::nvltoir && has_nvidia_lto_ir({request.data, request.size}))))
         throw compiler_error(compiler_status::input_type_mismatch, "compiler input bytes do not match the declared input type");
     switch (kind) {
     case compiler_input_kind::fatbinary: {
@@ -214,7 +217,13 @@ std::unique_ptr<compiler_program> import_compiler_program(const compiler_input_r
         output->architecture = architecture ? architecture : "sm_75";
         output->module = import_nvvm(output->context, {request.data, request.size}, request.name, output->architecture.c_str());
         break;
-    case compiler_input_kind::nvltoir: throw compiler_error(compiler_status::unsupported, "NVIDIA LTO-IR import is not implemented");
+    case compiler_input_kind::nvltoir: {
+        require_compiler_request(request.data && request.size, "empty NVIDIA LTO input");
+        auto decoded = decode_nvidia_lto({request.data, request.size});
+        output->architecture = std::move(decoded.architecture);
+        output->module = import_nvvm(output->context, decoded.bitcode, request.name, output->architecture.c_str(), true);
+        break;
+    }
     case compiler_input_kind::cubin:
         require_compiler_request(request.data && request.size, "empty cubin input");
         output->module = import_cubin(output->context, {request.data, request.size}, architecture ? architecture : "");

@@ -4,7 +4,7 @@
 
 namespace cudavm {
 // Implemented compiler profiles, separate from the pinned public header surface.
-inline constexpr std::array<int, 3> source_architectures{75, 80, 90};
+inline constexpr std::array<int, 4> source_architectures{75, 80, 90, 100};
 inline constexpr std::array<int, 6> ptx_compile_architectures{75, 80, 86, 87, 89, 90};
 inline constexpr std::array<std::string_view, 5> nvvm_compile_architectures{"compute_75", "compute_80", "compute_87", "compute_89", "compute_90"};
 inline constexpr std::array<std::array<int, 2>, 20> ptx_language_versions{{

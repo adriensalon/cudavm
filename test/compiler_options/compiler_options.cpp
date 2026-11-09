@@ -19,6 +19,34 @@ extern "C" __global__ void options_control(unsigned* out) { *out = __CUDA_ARCH__
     require(size.before == 0x37591abd && size.after == 0x9417c35b && size.value == 0,
         "default virtual target has no CUBIN and preserves size output guards");
 }
+void options_architectures() {
+    compiler_fixture_program program(R"cuda(
+static_assert(__CUDA_ARCH__ == EXPECTED_ARCH, "effective source architecture");
+#ifdef __CUDA_ARCH_FEAT_SM90_ALL
+static_assert(EXPECTED_ARCH == 900 && EXPECT_SPECIFIC == 1, "Hopper-specific features enabled");
+#elif defined(__CUDA_ARCH_FEAT_SM100_ALL)
+static_assert(EXPECTED_ARCH == 1000 && EXPECT_SPECIFIC == 1, "SM100-specific features enabled");
+#else
+static_assert(EXPECT_SPECIFIC == 0, "generic architecture has no specific features");
+#endif
+extern "C" __global__ void options_control(unsigned* out) { *out = __CUDA_ARCH__; }
+)cuda", "compiler_architectures.cu");
+    for (unsigned architecture : {90u, 100u}) {
+        const auto number = std::to_string(architecture), expected = "-DEXPECTED_ARCH=" + std::to_string(architecture * 10);
+        const std::vector<std::string> generic_options{"-arch=compute_" + number, expected, "-DEXPECT_SPECIFIC=0"};
+        const auto generic = program.success(generic_options);
+        require(generic.find(".target sm_" + number + "\n") != std::string::npos, "generic source target remains generic");
+        const auto specific = program.success({"-arch=compute_" + number + "a", expected, "-DEXPECT_SPECIFIC=1"});
+        require(specific.find(".target sm_" + number + "a\n") != std::string::npos, "architecture-specific target survives native PTX emission");
+        program.check(program.compile({"-arch=sm_" + number + "a", expected, "-DEXPECT_SPECIFIC=1", "-dlto"}));
+        require(!program.lto().empty(), "physical architecture-specific option retains a relocatable public result");
+        for (const auto& invalid : {"compute_" + number + "f", "sm_" + std::to_string(architecture + 1) + "a"}) {
+            require(program.compile({"-arch=" + invalid, expected, "-DEXPECT_SPECIFIC=1"}) == NVRTC_ERROR_INVALID_OPTION,
+                "undeclared architecture variants remain unsupported options");
+            require(program.success(generic_options) == generic, "generic architecture repair clears architecture-specific features");
+        }
+    }
+}
 void options_dialects() {
     const std::string source = R"cuda(
 static_assert(__cplusplus == EXPECTED_CPP, "effective language dialect");
@@ -130,9 +158,10 @@ extern "C" __global__ void options_control(unsigned* output) {
 }
 std::string_view compiler_options_case = "all";
 void execute_compiler_options() {
-    const std::array<std::pair<std::string_view, void (*)()>, 6> cases{{
+    const std::array<std::pair<std::string_view, void (*)()>, 7> cases{{
         {"defaults", options_defaults}, {"dialects", options_dialects}, {"macros", options_macros},
-        {"isolation", options_isolation}, {"validation", options_validation}, {"assertions", options_assertions}}};
+        {"isolation", options_isolation}, {"validation", options_validation}, {"assertions", options_assertions},
+        {"architectures", options_architectures}}};
     bool selected = false;
     for (const auto& [name, execute] : cases) if (compiler_options_case == "all" || compiler_options_case == name) { selected = true; execute(); }
     require(selected, "unknown compiler_options case");

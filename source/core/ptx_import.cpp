@@ -2027,6 +2027,15 @@ class ptx_parser {
                     llvm::FunctionType::get(builder.getInt1Ty(), {pointer->getType()}, false));
                 write(instruction.operands[0], builder.CreateCall(callee, {pointer}), {1, 'p'});
             }
+            else if (parts[0] == "prefetch" || parts[0] == "prefetchu") {
+                if (opcode.text != "prefetch.global.L1" && opcode.text != "prefetch.global.L2" &&
+                        opcode.text != "prefetch.L1" && opcode.text != "prefetch.L2" && opcode.text != "prefetchu.L1")
+                    ptx_fail(opcode, "unsupported cache prefetch instruction", true);
+                arity(1);
+                // Check the address even though the portable representation may
+                // omit this cache hint. Prefetch supplies no memory fence.
+                (void)memory_address(instruction.operands[0], parts.size() == 3 ? 1 : 0);
+            }
             else if (parts[0] == "tex" || parts[0] == "suld" || parts[0] == "sust") image_instruction(parts, instruction, builder, scalar, write);
             else if (integer_instruction(parts, instruction, builder, scalar, write, carry)) {}
             else if (parts.size() >= 2) {
@@ -2047,6 +2056,12 @@ class ptx_parser {
                     bool load = op == "ld", parameter = parts.size() == 3 && parts[1] == "param";
                     bool global = (parts.size() == 3 && parts[1] == "global") ||
                         (load && parts.size() == 4 && parts[1] == "global" && parts[2] == "nc");
+                    // Cache operators preserve the ordinary memory consistency
+                    // contract. Native source keeps its inline instructions;
+                    // the common IR retains the accesses without cache policy.
+                    if (parts.size() == 4 && parts[1] == "global" && (load
+                            ? parts[2] == "ca" || parts[2] == "cg" || parts[2] == "cs" || parts[2] == "lu" || parts[2] == "cv"
+                            : parts[2] == "wb" || parts[2] == "cg" || parts[2] == "cs" || parts[2] == "wt")) global = true;
                     bool shared = parts.size() == 3 && parts[1] == "shared";
                     bool local = parts.size() == 3 && parts[1] == "local";
                     bool constant = parts.size() == 3 && parts[1] == "const";

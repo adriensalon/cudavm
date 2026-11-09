@@ -433,8 +433,9 @@ void check_source_fixture() {
         throw std::runtime_error(std::string(nvrtcGetErrorString(status)) + ": " + diagnostic);
     };
     check(nvrtcCreateProgram(&program.value, fixtures.source.data(), "checked_fixture.cu", 0, nullptr, nullptr));
-    const auto architecture = "-arch=compute_" + std::to_string(fixtures.architecture);
-    const char* options[]{architecture.c_str(), "--std=c++17"};
+    const auto architecture = "-arch=compute_" + conformance_architecture(fixtures);
+    const auto standard = "--std=c++" + std::to_string(fixtures.source_standard);
+    const char* options[]{architecture.c_str(), standard.c_str()};
     check(nvrtcCompileProgram(program.value, 2, options));
     size_t size = 0; check(nvrtcGetPTXSize(program.value, &size));
     require(size > 1, "compiled source fixture has a nonempty PTX result");
@@ -445,7 +446,7 @@ void check_source_fixture() {
         if (index < 16 || index >= size + 16) require(output[index] == char(0x5b), "source fixture PTX extent guards");
     require(output[size + 15] == 0, "source fixture PTX has its declared terminator");
     const std::string_view ptx(output.data() + 16, size - 1);
-    require(ptx.find(".entry ") != ptx.npos && ptx.find(".target sm_" + std::to_string(fixtures.architecture)) != ptx.npos,
+    require(ptx.find(".entry ") != ptx.npos && ptx.find(".target sm_" + conformance_architecture(fixtures)) != ptx.npos,
         "owned source fixture output retains its kernel and declared architecture");
     if (fixtures.minimum_ptx) {
         const auto version = ptx.find(".version ");
@@ -514,7 +515,7 @@ struct conformance_device {
     std::string name;
 };
 
-conformance_device select_conformance_device(std::string_view backend, void (*probe)() = nullptr, unsigned architecture = 0) {
+conformance_device select_conformance_device(std::string_view backend, void (*probe)() = nullptr, unsigned architecture = 0, bool specific = false) {
     const std::array<std::string_view, 5> backends{"cuda", "vulkan", "directx", "opencl", "opengl"};
     const std::array<std::string_view, 5> labels{"CUDA", "Vulkan", "DirectX", "OpenCL", "OpenGL"};
     const auto found = std::find(backends.begin(), backends.end(), backend);
@@ -538,8 +539,8 @@ conformance_device select_conformance_device(std::string_view backend, void (*pr
             int major = 0, minor = 0;
             CONFORMANCE_CUDA(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, candidate));
             CONFORMANCE_CUDA(cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, candidate));
-            if (unsigned(major * 10 + minor) < architecture) {
-                std::cout << "unavailable device=" << name << "; requires sm_" << architecture
+            if (unsigned(major * 10 + minor) < architecture || (specific && unsigned(major * 10 + minor) != architecture)) {
+                std::cout << "unavailable device=" << name << "; requires sm_" << architecture << (specific ? "a" : "")
                     << ", reports sm_" << major << minor << std::endl;
                 continue;
             }
@@ -650,14 +651,15 @@ std::vector<char> import_fixture(const fixture_data& fixtures, std::string_view 
     if (importer == "cu") {
         source_program program;
         program.check(nvrtcCreateProgram(&program.value, fixtures.source.data(), "fixture.cu", 0, nullptr, nullptr));
-        const auto architecture = "-arch=sm_" + std::to_string(fixtures.architecture);
+        const auto architecture = "-arch=sm_" + conformance_architecture(fixtures);
+        const auto standard = "--std=c++" + std::to_string(fixtures.source_standard);
 #ifdef CUDAVM_CONFORMANCE_SOURCE_LTO
-        const char* options[]{architecture.c_str(), "--std=c++17", "-dlto"};
+        const char* options[]{architecture.c_str(), standard.c_str(), "-dlto"};
         program.check(nvrtcCompileProgram(program.value, 3, options));
         size_t size = 0;
         program.check(nvrtcGetLTOIRSize(program.value, &size));
 #else
-        const char* options[]{architecture.c_str(), "--std=c++17"};
+        const char* options[]{architecture.c_str(), standard.c_str()};
         program.check(nvrtcCompileProgram(program.value, 2, options));
         size_t size = 0;
         program.check(nvrtcGetCUBINSize(program.value, &size));
@@ -676,7 +678,7 @@ std::vector<char> import_fixture(const fixture_data& fixtures, std::string_view 
     nvvm_program program;
     program.check(nvvmCreateProgram(&program.value));
     program.check(nvvmAddModuleToProgram(program.value, fixtures.nvvm.data(), fixtures.nvvm.size(), "fixture.ll"));
-    const auto architecture = "-arch=compute_" + std::to_string(fixtures.architecture);
+    const auto architecture = "-arch=compute_" + conformance_architecture(fixtures);
     const char* options[]{architecture.c_str(), "-gen-lto"};
     program.check(nvvmCompileProgram(program.value, 2, options));
     size_t size = 0;
@@ -685,7 +687,7 @@ std::vector<char> import_fixture(const fixture_data& fixtures, std::string_view 
     std::vector<char> ir(size);
     program.check(nvvmGetCompiledResult(program.value, ir.data()));
     link_program link;
-    const auto link_architecture = "-arch=sm_" + std::to_string(fixtures.architecture);
+    const auto link_architecture = "-arch=sm_" + conformance_architecture(fixtures);
     const char* link_options[]{link_architecture.c_str(), "-lto"};
     link.check(nvJitLinkCreate(&link.value, 2, link_options));
     link.check(nvJitLinkAddData(link.value, NVJITLINK_INPUT_LTOIR, ir.data(), ir.size(), "fixture"));
@@ -783,7 +785,7 @@ int run_conformance(int argc, char** argv, const fixture_data& fixtures,
         require(argc == 3, "usage: <executable> <backend> <cu|ptx|cubin|nvvm>");
         require(load_repetitions > 0, "at least one loader execution is required");
         const std::string backend = argv[1];
-        const auto device = select_conformance_device(backend, probe_execution, fixtures.architecture);
+        const auto device = select_conformance_device(backend, probe_execution, fixtures.architecture, !fixtures.architecture_suffix.empty());
         if (device.value == -1) return 77;
         std::cout << "backend=" << backend << " importer=" << argv[2] << " device=" << device.name << std::endl;
         device_context context(device.value, context_flags);

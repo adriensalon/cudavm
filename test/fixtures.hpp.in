@@ -6,5 +6,5 @@ inline constexpr char fixture_ptx[] = R"cudavm(@fixture_ptx@)cudavm";
 inline constexpr char fixture_nvvm[] = R"cudavm(@fixture_ll@)cudavm";
 inline constexpr std::array<unsigned char, @fixture_cubin_size@> fixture_cubin{@fixture_cubin@};
 inline constexpr fixture_data fixtures{
-    fixture_source, fixture_ptx, fixture_nvvm, fixture_cubin, @fixture_architecture@, @fixture_minimum_ptx@};
+    fixture_source, fixture_ptx, fixture_nvvm, fixture_cubin, @fixture_architecture@, @fixture_minimum_ptx@, "@fixture_architecture_suffix@", @fixture_source_standard@};
 }

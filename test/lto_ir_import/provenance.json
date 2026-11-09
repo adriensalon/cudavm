@@ -1,0 +1,28 @@
+{
+  "producer": "NVIDIA NVRTC",
+  "version": [
+    12,
+    4
+  ],
+  "producer_binary": "nvrtc64_120_0.dll",
+  "producer_sha256": "3aa3cd8aa10437e212760c0e1ed730807811ec3bc330216dbfde4b26211d2243",
+  "options": [
+    "-arch=compute_75",
+    "-dlto",
+    "--relocatable-device-code=true",
+    "--std=c++17"
+  ],
+  "working_directory": "C:/",
+  "source_names": [
+    "lto_ir_import.cu",
+    "lto_helper.cu"
+  ],
+  "entry": "lto_results",
+  "device_definition": "lto_transform",
+  "sha256": {
+    "lto_ir_import.cu": "40e68c7f1f6a6e1c48b694b64e8df4f1865fd59f250bc9985677553e959972d6",
+    "lto_ir_import.ltoir": "8e4d1c75a74c620e3e7b93ed3ab43f4ce452908a9ffa37e5c855c024ea66c964",
+    "lto_helper.cu": "0d3438b8be6958b044aff9fde00c86831e659ebdc4b805acb0a7e9e794c33659",
+    "lto_helper.ltoir": "94818ecbdda7d4bde92025f199efe699972256a5213a3be1576deeae1309d419"
+  }
+}
