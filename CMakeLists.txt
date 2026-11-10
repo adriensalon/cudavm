@@ -474,7 +474,7 @@ endif()
 find_package(Git REQUIRED)
 
 option(CUDAVM_BUILD_TEST "Build cudavm tests" ${PROJECT_IS_TOP_LEVEL})
-option(CUDAVM_BUILD_PERF "Build ray tracing performance/correctness benchmarks" OFF)
+option(CUDAVM_BUILD_PERF "Build cudavm performance slices" OFF)
 
 foreach(backend CUDA OPENCL OPENGL VULKAN)
     option(CUDAVM_ENABLE_${backend} "Build the ${backend} compute backend" ON)
@@ -609,6 +609,7 @@ if(CUDAVM_BUILD_TEST)
 endif()
 
 if(CUDAVM_BUILD_PERF)
+    enable_testing()
     add_subdirectory(perf)
 endif()
 
