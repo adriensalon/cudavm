@@ -1,0 +1,37 @@
+{
+  "platform": "windows-x86_64",
+  "runtime_linkage": "none (Driver-only client)",
+  "host_compiler": "clang version 22.1.4 (https://github.com/llvm/llvm-project 35990504507d79e0b9deb809c8ee5e1b34ceef20)",
+  "host_crt": "Microsoft static release CRT, Visual C++ tools 14.44.35207",
+  "windows_sdk": "10.0.26100.0",
+  "header_version": "CUDA 12.4",
+  "minimum_driver_api": 12000,
+  "import_library": "NVIDIA CUDA 12.4 lib/x64/cuda.lib",
+  "command": [
+    "clang++",
+    "-std=c++17",
+    "-O2",
+    "-D_MT",
+    "-Xclang",
+    "--dependent-lib=libcmt",
+    "-I<NVIDIA-toolkit>\\include",
+    "-I<generated-images>",
+    "<fixture>\\driver_client.cpp",
+    "<NVIDIA-toolkit>\\lib\\x64\\cuda.lib",
+    "-o",
+    "<fixture>\\windows_x64\\driver_client.exe",
+    "-Wl,/Brepro"
+  ],
+  "gpu_images": "Embedded unmodified kernel_launch PTX and NVIDIA ptxas SM75 cubin; see ../kernel_launch/provenance.json",
+  "sha256": {
+    "driver_client.cpp": "621a190c91a6c6a9964c1dd67582cde8f6276e69aba36b47327be5a07e44abb0",
+    "produce.py": "a58b10d45a708d11ec45e300ddcc8f38fb43da20379d79b685bb242be60ee372",
+    "windows_x64/driver_client.exe": "d369f526ab30c75c0703a87af004484d56bdb42e0de358376507794e644eb7c1",
+    "../kernel_launch/kernel_launch.ptx": "667c4de8e28cbca9b06bf02d7c34b185899dfb113996b5c54dceddd73de90ed4",
+    "../kernel_launch/kernel_launch.cubin": "2942cf1b40f3149b764356c8a7803f2e08fec00dd19d5e981a889dbc0066c65a"
+  },
+  "producer_sha256": {
+    "include/cuda.h": "e92376169061ab3f7ec1d2a758de3f477ab5f3e6ae3baee075c069f9c1224a91",
+    "lib/x64/cuda.lib": "dd3e4ab72e8c55d951c8280df9102836780bd284567856b2f35dd124eb0ea61a"
+  }
+}

@@ -473,15 +473,32 @@ struct conformance_driver_error : std::runtime_error {
     conformance_driver_error(CUresult status, const std::string& message)
         : std::runtime_error(message), result(status) {}
 };
-int native_cuda_version() {
+std::string native_cuda_reference_library() {
 #if defined(_WIN32)
-    auto library = LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    std::string directory(32768, '\0');
+    auto size = GetSystemDirectoryA(directory.data(), unsigned(directory.size()));
+    require(size && size < directory.size(), "native CUDA reference system directory is available");
+    directory.resize(size);
+    return directory + "/nvcuda.dll";
+#else
+    const auto* selected = std::getenv("CUDAVM_CUDA_DRIVER");
+    return selected ? selected : "libcuda.so.1";
+#endif
+}
+int native_cuda_version() {
+    const auto path = native_cuda_reference_library();
+#if defined(_WIN32)
+    auto library = LoadLibraryExA(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
     require_capability(library, "native CUDA driver unavailable");
     auto query = reinterpret_cast<decltype(&cuDriverGetVersion)>(GetProcAddress(library, "cuDriverGetVersion"));
     int version{}; auto status = query ? query(&version) : CUDA_ERROR_NOT_SUPPORTED; FreeLibrary(library);
 #else
-    auto library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    auto library = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     require_capability(library, "native CUDA driver unavailable");
+    if (dlsym(library, "cudavmGetDiagnostic")) {
+        dlclose(library);
+        require_capability(false, "native CUDA reference resolved to the facade; set CUDAVM_CUDA_DRIVER to its vendor path");
+    }
     auto query = reinterpret_cast<decltype(&cuDriverGetVersion)>(dlsym(library, "cuDriverGetVersion"));
     int version{}; auto status = query ? query(&version) : CUDA_ERROR_NOT_SUPPORTED; dlclose(library);
 #endif

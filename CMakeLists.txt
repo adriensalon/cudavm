@@ -516,10 +516,18 @@ add_subdirectory(external/vulkan)
 add_subdirectory(external/directx)
 add_subdirectory(source)
 
-install(TARGETS ${cudavm_install_targets}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+foreach(target IN LISTS cudavm_install_targets)
+    set(component Unspecified)
+    if(target STREQUAL "cudavm_cuda_shared")
+        set(component cuda_driver)
+    elseif(target STREQUAL "cudavm_core_shared")
+        set(component cuda_compiler)
+    endif()
+    install(TARGETS ${target}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT ${component}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${component}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${component})
+endforeach()
 install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 if(CUDAVM_BUILD_TEST)

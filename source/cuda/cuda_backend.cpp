@@ -1,4 +1,5 @@
 #include "dynamic_library.hpp"
+#include "native_driver_library.hpp"
 #include <cudaProfiler.h>
 #include "cuda_graph_capture.hpp"
 #include "ptx_parameters.hpp"
@@ -19,11 +20,7 @@ void check(CUresult result, const char* operation) {
     if (result != CUDA_SUCCESS) throw failure(result, std::string(operation) + " failed: " + std::to_string(result));
 }
 struct cuda_api {
-#if defined(_WIN32)
-    dynamic_library driver{{"nvcuda.dll"}};
-#else
-    dynamic_library driver{{"libcuda.so.1", "libcuda.so"}};
-#endif
+    native_driver_library driver;
     decltype(&cuInit) init = driver.get<decltype(init)>("cuInit");
     decltype(&cuDeviceGetCount) count = driver.get<decltype(count)>("cuDeviceGetCount");
     decltype(&cuDeviceGet) device = driver.get<decltype(device)>("cuDeviceGet");

@@ -67,6 +67,16 @@ endforeach()
 _cudavm_add_component(cuda cuda/driver_api.cpp cuda/procedure_address.cpp cuda/opengl_graphics.cpp cuda/registry.cpp cuda/host_memory.cpp
     cuda/shader_module.cpp cuda/shader_services.cpp cuda/shader_ptx.cpp ${backend_sources})
 
+# Public Driver clients use NVIDIA's loader and import-library names. Internal
+# target names and the private static Driver archive retain their ownership.
+if(WIN32)
+    set_target_properties(cudavm_cuda_shared PROPERTIES
+        RUNTIME_OUTPUT_NAME nvcuda ARCHIVE_OUTPUT_NAME cuda)
+elseif(UNIX AND NOT APPLE)
+    set_target_properties(cudavm_cuda_shared PROPERTIES OUTPUT_NAME cuda SOVERSION 1
+        INSTALL_RPATH "$ORIGIN")
+endif()
+
 foreach(linkage shared static)
     foreach(backend IN LISTS CUDAVM_ENABLED_BACKENDS)
         string(TOUPPER "${backend}" name)

@@ -503,6 +503,7 @@ template<class Word> inline constexpr Word numerical_output_guard = Word(0x9b3d7
 // execution failures on an applicable device must still fail the test.
 void require_capability(bool available, const std::string& reason);
 // Query native service availability independently of the pinned facade version.
+std::string native_cuda_reference_library();
 int native_cuda_version();
 void check_driver(CUresult result, const char* operation);
 #define CONFORMANCE_CUDA(call) ::cudavm::check_driver((call), #call)

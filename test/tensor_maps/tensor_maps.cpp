@@ -185,10 +185,11 @@ void tensor_map_validation() {
 // The system driver is an independent ABI reference; never decode an opaque map.
 struct native_tensor_map_reference {
 #if defined(_WIN32)
-    HMODULE library = LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE library = LoadLibraryExA(native_cuda_reference_library().c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
     void* find(const char* name) { return reinterpret_cast<void*>(GetProcAddress(library, name)); }
 #else
-    void* library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    void* library = dlopen(native_cuda_reference_library().c_str(), RTLD_NOW | RTLD_LOCAL);
     void* find(const char* name) { return dlsym(library, name); }
 #endif
     decltype(&cuTensorMapEncodeTiled) encode{};

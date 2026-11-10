@@ -1,5 +1,6 @@
 #pragma once
 #include "backend.hpp"
+#include <filesystem>
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -20,6 +21,14 @@ class dynamic_library {
     void* handle_ = nullptr;
 #endif
 public:
+    explicit dynamic_library(const std::filesystem::path& path, CUresult missing) {
+#if defined(_WIN32)
+        handle_ = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+#else
+        handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
+        if (!handle_) throw failure(missing, "native CUDA driver library is unavailable: " + path.string());
+    }
     explicit dynamic_library(std::initializer_list<const char*> names, bool application_search = false, CUresult missing = CUDA_ERROR_NO_DEVICE) {
         for (const char* name : names) {
 #if defined(_WIN32)

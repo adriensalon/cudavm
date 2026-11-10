@@ -3,3 +3,7 @@
 
 # LLVM patches must use LF to match the upstream source and canonical diffs.
 /external/llvm/*.patch text eol=lf
+/test/nvidia_dynamic_clients/windows_x64/*.exe binary
+/test/nvidia_dynamic_clients/driver_client.cpp text eol=lf
+/test/nvidia_dynamic_clients/produce.py text eol=lf
+/test/kernel_launch/kernel_launch.ptx text eol=lf
