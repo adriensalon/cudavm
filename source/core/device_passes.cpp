@@ -89,6 +89,14 @@ void optimize_closed(llvm::Module& module, bool specialize) {
     passes.run(module, modules);
 }
 void close_graph(llvm::Module& module) {
+    if (auto* version = module.getFunction("__cudaCDP2RuntimeGetVersion");
+        version && version->hasFnAttribute("cudavm.device.runtime.version")) {
+        if (version->isDeclaration() || !version->getReturnType()->isIntegerTy(32) || version->arg_size() != 1
+            || !version->getArg(0)->getType()->isPointerTy()) throw std::runtime_error("invalid device Runtime version helper signature");
+        // The installed helper is stateless ordinary device code. Other CDP2
+        // definitions still require the device-runtime lowering below.
+        version->setName("__cudavm_aot_runtime_version");
+    }
     if (auto* output = module.getFunction("vprintf")) {
         // CUDA defines the null-format return value. Host stdio declarations
         // can otherwise attach nonnull to Clang's lowered device call.
@@ -471,9 +479,14 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
         check_ir(module);
         std::string imported;
         if (!module.getNamedMetadata(stage_key)) {
-            if (units.empty()) throw std::runtime_error("external LLVM device libraries require an explicit cudavm translation unit: " + origin);
+            const archived_unit* prototype_input = units.empty() ? nullptr : &units.begin()->second;
+            if (!prototype_input) {
+                auto selected = host_link(values.host_inputs).select({});
+                for (const auto& library : libraries) if (selected.contains(library.identity)) { prototype_input = &library.input; break; }
+            }
+            if (!prototype_input) throw std::runtime_error("external LLVM device libraries require a selected cudavm translation unit: " + origin);
             llvm::LLVMContext prototype_context;
-            const auto& input = units.begin()->second;
+            const auto& input = *prototype_input;
             auto prototype = llvm::parseBitcodeFile(llvm::MemoryBufferRef(input.bytes, input.origin), prototype_context);
             if (!prototype) throw std::runtime_error("invalid source ABI prototype: " + llvm::toString(prototype.takeError()));
             imported = import_external_library(module, buffer, **prototype, values);
@@ -499,8 +512,11 @@ std::map<std::string, archived_unit> collect_link_inputs(const compiler_options&
             buffers.emplace_back(llvm::MemoryBuffer::getMemBufferCopy(normalized, path), path);
         } else buffers.emplace_back(std::move(*file), path);
     }
-    for (const auto& input : values.ir_inputs)
-        buffers.emplace_back(llvm::MemoryBuffer::getMemBufferCopy(input.bytes, input.name), input.name);
+    for (const auto& input : values.ir_inputs) {
+        auto buffer = llvm::MemoryBuffer::getMemBufferCopy(input.bytes, input.name);
+        if (input.library) candidate(buffer->getMemBufferRef(), input.name);
+        else buffers.emplace_back(std::move(buffer), input.name);
+    }
     for (const auto& [file, path] : buffers) {
         if (file->getBuffer().starts_with("!<arch>\n") || file->getBuffer().starts_with("!<thin>\n")) {
             auto archive = llvm::object::Archive::create(file->getMemBufferRef());

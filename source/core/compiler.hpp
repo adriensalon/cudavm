@@ -34,10 +34,13 @@ struct frontend_resources {
 };
 frontend_resources resolve_resources(const std::string& root = {});
 llvm::json::Object describe_resources(const frontend_resources&);
-struct compiler_ir_input { std::string bytes, name; };
+struct compiler_ir_input { std::string bytes, name; bool library = false; };
 struct compiler_options {
     std::string input, host, bitcode, portable, ir, manifest, binary, target, depfile, module;
     std::string standard = "c++20", architecture = "sm_75";
+    unsigned optimization_level = 1;
+    std::string dependency_target;
+    std::vector<std::string> undefines;
     std::vector<std::string> inputs, includes, defines, library_inputs, host_inputs;
     std::vector<compiler_ir_input> ir_inputs;
     frontend_resources resources;
@@ -69,6 +72,7 @@ struct host_extraction {
     llvm::json::Array kernels, launches, registrations, symbols;
 };
 host_extraction extract_host(const compiler_options&);
+std::string preprocess_source(const compiler_options&);
 std::unique_ptr<llvm::Module> compile_device(llvm::LLVMContext&, const compiler_options&, const std::vector<std::string>& host_dependencies = {}, const llvm::json::Array* host_symbols = nullptr);
 void mark_translation_unit(llvm::Module&, const compiler_options&, const host_extraction&);
 // In-memory program names are diagnostic labels, not unique file identities.

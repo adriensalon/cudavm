@@ -5,8 +5,6 @@ function(_cudavm_add_component component)
         set(target "cudavm_${component}_${linkage}")
         add_library(${target} ${library_kind} ${ARGN})
         add_library(cudavm::${component}_${linkage} ALIAS ${target})
-        set_target_properties(${target} PROPERTIES
-            OUTPUT_NAME "cudavm_${component}$<$<STREQUAL:${linkage},static>:_static>")
         set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
             LIBRARY_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}" ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
         target_compile_features(${target} PRIVATE cxx_std_20)
@@ -67,16 +65,6 @@ endforeach()
 _cudavm_add_component(cuda cuda/driver_api.cpp cuda/procedure_address.cpp cuda/opengl_graphics.cpp cuda/registry.cpp cuda/host_memory.cpp
     cuda/shader_module.cpp cuda/shader_services.cpp cuda/shader_ptx.cpp ${backend_sources})
 
-# Public Driver clients use NVIDIA's loader and import-library names. Internal
-# target names and the private static Driver archive retain their ownership.
-if(WIN32)
-    set_target_properties(cudavm_cuda_shared PROPERTIES
-        RUNTIME_OUTPUT_NAME nvcuda ARCHIVE_OUTPUT_NAME cuda)
-elseif(UNIX AND NOT APPLE)
-    set_target_properties(cudavm_cuda_shared PROPERTIES OUTPUT_NAME cuda SOVERSION 1
-        INSTALL_RPATH "$ORIGIN")
-endif()
-
 foreach(linkage shared static)
     foreach(backend IN LISTS CUDAVM_ENABLED_BACKENDS)
         string(TOUPPER "${backend}" name)
@@ -107,15 +95,12 @@ _cudavm_add_component(cudart cudart/runtime_api.cpp)
 foreach(linkage shared static)
     target_link_libraries(cudavm_cudart_${linkage} PUBLIC cudavm_cuda_${linkage})
 
-    if(UNIX)
-        set_property(TARGET cudavm_cudart_${linkage} PROPERTY INSTALL_RPATH "$ORIGIN")
-    endif()
 endforeach()
 
 _cudavm_add_component(nvfatbin nvfatbin/nvfatbin_api.cpp)
 set(core_binary_dir "${CMAKE_CURRENT_BINARY_DIR}/core")
 
-_cudavm_add_component(core core/result_api.cpp core/program_api.cpp core/frontend_api.cpp core/linker_api.cpp core/image_api.cpp
+_cudavm_add_component(core core/result_api.cpp core/program_api.cpp core/frontend_api.cpp core/linker_api.cpp core/object_link_api.cpp core/image_api.cpp
     core/compiler.cpp core/program.cpp
     core/device_sources.cpp core/cuda_frontend.cpp core/nvrtc_frontend.cpp
     "${core_binary_dir}/embedded_headers.cpp"
@@ -197,24 +182,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     set_source_files_properties(core/nvrtc_frontend.cpp PROPERTIES COMPILE_OPTIONS -Wno-overlength-strings)
 endif()
 
-install(FILES "${CUDAVM_LLVM_LICENSE}"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME LLVM_LICENSE.txt)
-
 foreach(component nvrtc nvptxcompiler nvjitlink nvvm)
     _cudavm_add_component(${component} "${component}/${component}_api.cpp")
 
     foreach(linkage shared static)
         target_link_libraries(cudavm_${component}_${linkage} PUBLIC cudavm::core_${linkage})
 
-        if(APPLE)
-            set_property(TARGET cudavm_${component}_${linkage} PROPERTY INSTALL_RPATH "@loader_path")
-        elseif(UNIX)
-            set_property(TARGET cudavm_${component}_${linkage} PROPERTY INSTALL_RPATH "$ORIGIN")
-        endif()
     endforeach()
 endforeach()
 
-add_executable(cudavm_nvcc nvcc/main.cpp nvcc/device_inventory.cpp)
+add_executable(cudavm_nvcc nvcc/main.cpp nvcc/device_inventory.cpp nvcc/driver.cpp nvcc/options.cpp nvcc/process.cpp)
 add_executable(cudavm::nvcc ALIAS cudavm_nvcc)
 
 if(NOT DEFINED CMAKE_RUNTIME_OUTPUT_DIRECTORY OR CMAKE_RUNTIME_OUTPUT_DIRECTORY STREQUAL "")
@@ -225,7 +202,7 @@ if(NOT DEFINED CMAKE_ARCHIVE_OUTPUT_DIRECTORY OR CMAKE_ARCHIVE_OUTPUT_DIRECTORY 
     set_property(TARGET cudavm_nvcc PROPERTY ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/nvcc")
 endif()
 
-set_target_properties(cudavm_nvcc PROPERTIES OUTPUT_NAME cudavm-nvcc MSVC_RUNTIME_LIBRARY MultiThreaded)
+set_target_properties(cudavm_nvcc PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreaded)
 target_compile_features(cudavm_nvcc PRIVATE cxx_std_20)
 target_link_libraries(cudavm_nvcc PRIVATE cudavm::core_shared)
 target_include_directories(cudavm_nvcc SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/include/cuda")
@@ -248,21 +225,20 @@ if(WIN32)
     target_compile_definitions(cudavm_nvcc PRIVATE NDEBUG _ITERATOR_DEBUG_LEVEL=0)
 endif()
 
-if(UNIX)
-    file(RELATIVE_PATH libraries_from_bin "/${CMAKE_INSTALL_BINDIR}" "/${CMAKE_INSTALL_LIBDIR}")
-
-    if(APPLE)
-        set_property(TARGET cudavm_nvcc PROPERTY INSTALL_RPATH "@loader_path/${libraries_from_bin}")
-    else()
-        set_property(TARGET cudavm_nvcc PROPERTY INSTALL_RPATH "$ORIGIN/${libraries_from_bin}")
-    endif()
-endif()
-
 foreach(linkage shared static)
     set_property(TARGET cudavm_cuda_${linkage} PROPERTY CUDAVM_RUNTIME_FILES "${shader_compiler_files}")
 endforeach()
 
 cudavm_prepare_target(cudavm_nvcc)
-install(TARGETS cudavm_nvcc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(device_runtime_source "${CMAKE_CURRENT_BINARY_DIR}/cudadevrt/device_runtime.cpp")
+    add_custom_command(OUTPUT "${device_runtime_source}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/cudadevrt"
+        COMMAND "$<TARGET_FILE:cudavm_nvcc>" --build-device-runtime "${device_runtime_source}"
+        DEPENDS cudavm_nvcc cudavm_core_shared VERBATIM)
+    add_library(cudavm_cudadevrt_static STATIC "${device_runtime_source}")
+    set_target_properties(cudavm_cudadevrt_static PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreaded ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+endif()
 
 set(cudavm_install_targets ${cudavm_install_targets} PARENT_SCOPE)

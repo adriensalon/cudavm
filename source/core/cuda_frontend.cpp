@@ -55,15 +55,16 @@ std::vector<std::string> frontend_arguments(const compiler_options& values, bool
     };
     for (auto& include : values.includes) { args.emplace_back("-I"); args.push_back(include); }
     for (auto& define : values.defines) args.push_back("-D" + define);
+    for (auto& undefine : values.undefines) args.push_back("-U" + undefine);
     if (device) {
         args.insert(args.end(), {"-include", values.resources.resource_dir+"/cudavm_device_math.h"});
-        args.emplace_back("-O1");
+        args.emplace_back("-O" + std::to_string(values.optimization_level));
         args.emplace_back("-fgpu-rdc");
         args.emplace_back("-Xclang"); args.emplace_back("-disable-llvm-passes");
         if (!values.depfile.empty()) {
             // Embedded system headers are tracked by the compiler library's
             // build. Only real user headers belong in the consumer depfile.
-            args.insert(args.end(), {"-MMD", "-MF", values.depfile, "-MT", values.bitcode});
+            args.insert(args.end(), {"-MMD", "-MF", values.depfile, "-MT", values.dependency_target.empty() ? values.bitcode : values.dependency_target});
         }
     }
     args.push_back(std::filesystem::absolute(values.input).string());
@@ -427,6 +428,26 @@ struct device_action : clang::EmitLLVMOnlyAction {
         if (result) materialize_data_aliases(*result, aliases);
     }
 };
+struct preprocess_action : clang::PreprocessorFrontendAction {
+    const compiler_options& values;
+    std::string& output;
+    preprocess_action(const compiler_options& request, std::string& text) : values(request), output(text) {}
+    bool BeginInvocation(clang::CompilerInstance& compiler) override {
+        if (!values.depfile.empty()) {
+            clang::DependencyOutputOptions options;
+            options.OutputFile = values.depfile;
+            options.Targets.push_back(values.dependency_target.empty() ? values.input : values.dependency_target);
+            compiler.addDependencyCollector(std::make_shared<real_dependency_generator>(options, values.resources.resource_dir, std::vector<std::string>{}));
+        }
+        return clang::PreprocessorFrontendAction::BeginInvocation(compiler);
+    }
+    void ExecuteAction() override {
+        auto& compiler = getCompilerInstance();
+        compiler.getPreprocessorOutputOpts().ShowCPP = 1;
+        llvm::raw_string_ostream stream(output);
+        clang::DoPrintPreprocessedInput(compiler.getPreprocessor(), &stream, compiler.getPreprocessorOutputOpts());
+    }
+};
 template<class Action> void invoke(const compiler_options& values, bool device, std::unique_ptr<Action> action) {
     clang::FileSystemOptions file_options;
     auto manager = llvm::makeIntrusiveRefCnt<clang::FileManager>(file_options, frontend_files(values.resources));
@@ -442,6 +463,9 @@ host_extraction extract_host(const compiler_options& values) {
     host_extraction result;
     invoke(values, false, std::make_unique<host_action>(result, translation_unit_id(values), values));
     return result;
+}
+std::string preprocess_source(const compiler_options& values) {
+    std::string result; invoke(values, false, std::make_unique<preprocess_action>(values, result)); return result;
 }
 std::unique_ptr<llvm::Module> compile_device(llvm::LLVMContext& context, const compiler_options& values, const std::vector<std::string>& host_dependencies, const llvm::json::Array* host_symbols) {
     std::unique_ptr<llvm::Module> module;

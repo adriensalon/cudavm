@@ -5,11 +5,18 @@
 #include <llvm/Support/FormatVariadic.h>
 
 using namespace cudavm;
-extern "C" CUDAVM_CORE_API int cudavm_core_compile_translation_unit_v1(const compiler_translation_unit_request* request, compiler_result** output) noexcept {
+namespace cudavm {
+int compile_translation_unit(const compiler_translation_unit_request* request, const compiler_translation_unit_request_v2* extra, compiler_result** output) noexcept {
     return run_compiler_file_api(output, [&](compiler_options& values, compiler_result&) {
         // Frontend serialization is independent of GPU contexts/registry locks.
         std::lock_guard lock(compiler_mutex());
-        if (!request || request->abi_version != 1) throw std::runtime_error("compile options require abi_version 1");
+        if (!request || request->abi_version != (extra ? 2u : 1u)) throw std::runtime_error("invalid translation-unit request version");
+        if (extra) {
+            require_compiler_request(extra->optimization_level <= 3, "invalid optimization level");
+            values.optimization_level = extra->optimization_level;
+            values.dependency_target = compiler_option_text(extra->dependency_target);
+            append_compiler_option_strings(extra->undefine_count, extra->undefines, values.undefines);
+        }
         values.input = compiler_option_text(request->input); values.host = compiler_option_text(request->host);
         values.bitcode = compiler_option_text(request->bitcode); values.manifest = compiler_option_text(request->manifest);
         values.depfile = compiler_option_text(request->depfile);
@@ -39,6 +46,30 @@ extern "C" CUDAVM_CORE_API int cudavm_core_compile_translation_unit_v1(const com
         write_bitcode(values.bitcode, *module);
         write_file(values.host, host.host);
         write_file(values.manifest, llvm::formatv("{0:2}\n", llvm::json::Value(std::move(metadata))).str());
+    });
+}
+}
+extern "C" CUDAVM_CORE_API int cudavm_core_compile_translation_unit_v1(const compiler_translation_unit_request* request, compiler_result** output) noexcept {
+    return compile_translation_unit(request, nullptr, output);
+}
+extern "C" CUDAVM_CORE_API int cudavm_core_compile_translation_unit_v2(const compiler_translation_unit_request_v2* request, compiler_result** output) noexcept {
+    return compile_translation_unit(request ? &request->base : nullptr, request, output);
+}
+extern "C" CUDAVM_CORE_API int cudavm_core_preprocess_translation_unit_v2(const compiler_translation_unit_request_v2* request, compiler_result** output) noexcept {
+    return run_compiler_file_api(output, [&](compiler_options& values, compiler_result& result) {
+        std::lock_guard lock(compiler_mutex());
+        require_compiler_request(request && request->base.abi_version == 2 && request->base.input
+            && request->optimization_level <= 3, "invalid preprocessing request");
+        values.input = request->base.input; values.bitcode = compiler_option_text(request->base.bitcode);
+        values.depfile = compiler_option_text(request->base.depfile);
+        values.dependency_target = compiler_option_text(request->dependency_target);
+        values.standard = compiler_option_text(request->base.standard); values.architecture = compiler_option_text(request->base.architecture);
+        values.optimization_level = request->optimization_level;
+        append_compiler_option_strings(request->base.include_count, request->base.includes, values.includes);
+        append_compiler_option_strings(request->base.define_count, request->base.defines, values.defines);
+        append_compiler_option_strings(request->undefine_count, request->undefines, values.undefines);
+        values.resources = resolve_resources(compiler_option_text(request->base.resources_root));
+        result.output = preprocess_source(values);
     });
 }
 extern "C" CUDAVM_CORE_API int cudavm_core_describe_resources_v1(const char* root, compiler_result** output) noexcept {

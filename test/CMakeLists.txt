@@ -237,6 +237,7 @@ add_custom_target(cudavm_test)
 include("${CMAKE_CURRENT_SOURCE_DIR}/host_linkage/slice.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/nvidia_dynamic_clients/slice.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/nvidia_static_runtime_clients/slice.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/nvcc_driver/slice.cmake")
 
 cudavm_add_conformance_slice(nvfatbin_lifecycle HOST_ONLY THREADS COMPONENTS nvfatbin CASES discovery handles outputs lifetime validation threading FAMILY_CHECKS C02.lifecycle C02.outputs)
 cudavm_add_conformance_slice(nvfatbin_composition HOST_ONLY COMPONENTS nvfatbin nvjitlink nvptxcompiler CASES targets compression files images ownership FAMILY_CHECKS C02.inputs C02.roundtrip)

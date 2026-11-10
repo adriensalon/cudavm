@@ -516,6 +516,45 @@ add_subdirectory(external/vulkan)
 add_subdirectory(external/directx)
 add_subdirectory(source)
 
+# Public SDK filenames and installation policy are owned here. Source targets
+# retain their internal cudavm names and do not install themselves.
+foreach(target IN LISTS cudavm_install_targets)
+    if(target MATCHES "^cudavm_(.+)_(shared|static)$")
+        set(component "${CMAKE_MATCH_1}")
+        set(suffix "")
+        if(CMAKE_MATCH_2 STREQUAL "static")
+            set(suffix "_static")
+        endif()
+        set_target_properties(${target} PROPERTIES OUTPUT_NAME "cudavm_${component}${suffix}")
+    endif()
+endforeach()
+set_target_properties(cudavm_nvcc PROPERTIES OUTPUT_NAME cudavm-nvcc)
+if(WIN32)
+    set_target_properties(cudavm_cuda_shared PROPERTIES RUNTIME_OUTPUT_NAME nvcuda ARCHIVE_OUTPUT_NAME cuda)
+    set_target_properties(cudavm_cudart_shared PROPERTIES RUNTIME_OUTPUT_NAME cudart64_13 ARCHIVE_OUTPUT_NAME cudart)
+    set_target_properties(cudavm_cudart_static PROPERTIES OUTPUT_NAME cudart_static)
+    if(TARGET cudavm_cudadevrt_static)
+        set_target_properties(cudavm_cudadevrt_static PROPERTIES OUTPUT_NAME cudadevrt)
+    endif()
+elseif(UNIX AND NOT APPLE)
+    set_target_properties(cudavm_cuda_shared PROPERTIES OUTPUT_NAME cuda SOVERSION 1 INSTALL_RPATH "$ORIGIN")
+endif()
+install(FILES "${CUDAVM_LLVM_LICENSE}" DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME LLVM_LICENSE.txt)
+install(TARGETS cudavm_nvcc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(UNIX)
+    set(library_origin "$ORIGIN")
+    if(APPLE)
+        set(library_origin "@loader_path")
+    endif()
+    foreach(component cudart nvrtc nvptxcompiler nvjitlink nvvm)
+        foreach(linkage shared static)
+            set_property(TARGET cudavm_${component}_${linkage} PROPERTY INSTALL_RPATH "${library_origin}")
+        endforeach()
+    endforeach()
+    file(RELATIVE_PATH libraries_from_bin "/${CMAKE_INSTALL_BINDIR}" "/${CMAKE_INSTALL_LIBDIR}")
+    set_property(TARGET cudavm_nvcc PROPERTY INSTALL_RPATH "${library_origin}/${libraries_from_bin}")
+endif()
+
 foreach(target IN LISTS cudavm_install_targets)
     set(component Unspecified)
     if(target STREQUAL "cudavm_cuda_shared")
@@ -529,6 +568,40 @@ foreach(target IN LISTS cudavm_install_targets)
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${component})
 endforeach()
 install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+# Public Windows x64 compiler installation. Module-owned include trees remain
+# available for extensions and the private bootstrap compiler; public CUDA
+# include spellings are assembled alongside them without modifying their bytes.
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(public_modules cuda cudart cudadevrt nvcc nvrtc nvvm nvptxcompiler nvjitlink nvfatbin)
+    foreach(module IN LISTS public_modules)
+        install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/${module}/"
+            DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" COMPONENT cuda_sdk
+            PATTERN export.h EXCLUDE)
+    endforeach()
+    install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" COMPONENT cuda_sdk)
+    install(DIRECTORY "${CUDAVM_CCCL_INCLUDE_DIR}/nv" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" COMPONENT cuda_sdk)
+    install(PROGRAMS "$<TARGET_FILE:cudavm_nvcc>" DESTINATION "${CMAKE_INSTALL_BINDIR}" RENAME nvcc.exe COMPONENT cuda_sdk)
+    foreach(target cudavm_cuda_shared cudavm_cudart_shared cudavm_core_shared)
+        install(FILES "$<TARGET_FILE:${target}>" DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT cuda_sdk)
+    endforeach()
+    foreach(target cudavm_cuda_shared cudavm_cudart_shared)
+        install(FILES "$<TARGET_LINKER_FILE:${target}>" DESTINATION "lib/x64" COMPONENT cuda_sdk)
+    endforeach()
+    install(FILES "$<TARGET_FILE:cudavm_cudart_static>" DESTINATION "lib/x64" COMPONENT cuda_sdk)
+    install(FILES "$<TARGET_FILE:cudavm_cudadevrt_static>" DESTINATION "lib/x64" COMPONENT cuda_sdk)
+    install(FILES "${CUDAVM_LLVM_LICENSE}" DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME LLVM_LICENSE.txt COMPONENT cuda_sdk)
+    file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sdk/version.json" CONTENT [[{
+  "cuda": {"name": "cudavm CUDA-compatible SDK", "version": "13.4.1"},
+  "cudavm": {"version": "@PROJECT_VERSION@", "compiler_profile": "windows-x64-clang-v1"}
+}
+]] @ONLY)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/sdk/version.txt" "CUDA Version 13.4.1\n")
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/sdk/version.json" "${CMAKE_CURRENT_BINARY_DIR}/sdk/version.txt" DESTINATION . COMPONENT cuda_sdk)
+    # nvcc consumes these same helper sources from the core's embedded bundle.
+    # No NVIDIA libdevice bitcode or external compiler tool is borrowed.
+    install(FILES "${PROJECT_SOURCE_DIR}/source/cudadevrt/device_numeric_entry.cu"
+        "${PROJECT_SOURCE_DIR}/source/cudadevrt/device_math.cu" DESTINATION nvvm/libdevice COMPONENT cuda_sdk)
+endif()
 
 if(CUDAVM_BUILD_TEST)
     enable_testing()

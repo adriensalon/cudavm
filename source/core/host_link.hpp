@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <llvm/Object/Archive.h>
+#include <llvm/BinaryFormat/Magic.h>
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/MemoryBuffer.h>
 
@@ -18,6 +19,7 @@ struct host_link {
     std::vector<member> members;
     explicit host_link(const std::vector<std::string>& paths) {
         auto add = [&](llvm::MemoryBufferRef bytes, const std::string& origin, bool selected) {
+            if (llvm::identify_magic(bytes.getBuffer()) == llvm::file_magic::coff_import_library) return;
             auto object = llvm::object::ObjectFile::createObjectFile(bytes);
             if (!object) throw std::runtime_error("host selection requires native object code " + origin + ": " + llvm::toString(object.takeError()));
             member result{{}, {}, selected};
@@ -81,6 +83,10 @@ struct host_link {
             llvm::StringRef symbol(name);
             if (!symbol.starts_with(prefix)) continue;
             auto id = symbol.drop_front(prefix.size());
+            // Whole-program CUDA objects already own their image and the
+            // program accessor. Their registration must not reopen a device
+            // link merely because they share a host link with RDC objects.
+            if (definitions.contains("__cudavm_program_" + id.str())) continue;
             if (id.size() == 64 && id.find_first_not_of("0123456789abcdef") == llvm::StringRef::npos)
                 result.insert(id.str());
         }

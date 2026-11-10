@@ -2,6 +2,7 @@
 #include "../core/frontend_api.hpp"
 #include "../core/linker_api.hpp"
 #include "device_inventory.hpp"
+#include "driver.hpp"
 #include <cstdio>
 #include <map>
 #include <stdexcept>
@@ -9,6 +10,9 @@
 #include <vector>
 using namespace cudavm;
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--build-device-runtime") return nvcc_build_device_runtime(argv[2]);
+    if (argc < 2 || (std::string(argv[1]) != "compile-tu" && std::string(argv[1]) != "link-device"
+        && std::string(argv[1]) != "--print-resources" && std::string(argv[1]) != "--list-devices")) return run_nvcc_driver(argc, argv);
     try {
         if (argc < 2) throw std::runtime_error(
             "usage: cudavm-nvcc compile-tu --input source.cu --host host.cpp --bitcode device.bc [--manifest tu.json]\n"

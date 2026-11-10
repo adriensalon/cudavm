@@ -31,6 +31,10 @@ std::string embed_cuda(const llvm::Module& module, const std::string& code) {
     const auto& kernels = *description.getArray("kernels");
     std::string layout = llvm::formatv("{0}", llvm::json::Value(llvm::json::Array(kernels))).str();
     auto identity = digest(code + layout);
+    // Generated modules may share a translation unit with extracted host code.
+    auto prefix = "__cudavm_" + identity + "_";
+    auto image_name = prefix + "image", program_name = prefix + "program", kernels_name = prefix + "kernels";
+    auto registration_name = prefix + "registration", registration_type = prefix + "register_program";
     auto* units = module.getNamedMetadata("cudavm.translation.units");
     if (!units || !units->getNumOperands()) throw std::runtime_error("cannot embed a module without translation-unit identities");
     std::set<std::string> identifiers;
@@ -81,7 +85,7 @@ std::string embed_cuda(const llvm::Module& module, const std::string& code) {
     // String storage avoids one C++ initializer AST node per artifact byte.
     // Keep literals short and escape every non-ASCII byte independently of
     // the host source encoding. Their implicit terminator preserves the ABI.
-    stream << "namespace {\nconst unsigned char image[] =\n\"";
+    stream << "namespace {\nconst unsigned char " << image_name << "[] =\n\"";
     unsigned column = 0;
     for (unsigned char byte : code) {
         if (byte >= 32 && byte <= 126 && byte != '"' && byte != '\\' && byte != '?') stream << char(byte);
@@ -93,7 +97,7 @@ std::string embed_cuda(const llvm::Module& module, const std::string& code) {
     for (const auto& value : kernels) {
         const auto& parameters = *value.getAsObject()->getArray("parameters");
         if (!parameters.empty()) {
-            stream << "const cudavmKernelParameter parameters" << index << "[] = {\n";
+            stream << "const cudavmKernelParameter " << prefix << "parameters" << index << "[] = {\n";
             for (const auto& parameter : parameters) {
                 auto* data = parameter.getAsObject();
                 stream << '{' << *data->getInteger("size") << ',' << *data->getInteger("alignment") << ',' << *data->getInteger("offset") << "},\n";
@@ -103,29 +107,30 @@ std::string embed_cuda(const llvm::Module& module, const std::string& code) {
         ++index;
     }
     if (!kernels.empty()) {
-        stream << "const cudavmKernelDescriptor kernels[] = {\n";
+        stream << "const cudavmKernelDescriptor " << kernels_name << "[] = {\n";
         index = 0;
         for (const auto& value : kernels) {
             auto* kernel = value.getAsObject();
             auto count = kernel->getArray("parameters")->size();
             stream << '{' << literal(*kernel->getString("symbol")) << ',' << count << ',';
-            if (count) stream << "parameters" << index; else stream << "nullptr";
+            if (count) stream << prefix << "parameters" << index; else stream << "nullptr";
             stream << "},\n"; ++index;
         }
         stream << "};\n";
     }
-    stream << "const cudavmProgram program{1,cudavmBackendCuda,\"" << identity
-        << "\",image,sizeof(image)," << kernels.size() << ',' << (kernels.empty() ? "nullptr" : "kernels") << "};\n"
-        "struct register_program { register_program() noexcept {\n";
-    for (const auto& id : identifiers) stream << "::__cudavm_register_" << id << "(&program);\n";
+    stream << "const cudavmProgram " << program_name << "{1,cudavmBackendCuda,\"" << identity
+        << "\"," << image_name << ",sizeof(" << image_name << ")," << kernels.size() << ',' << (kernels.empty() ? "nullptr" : kernels_name) << "};\n"
+        "struct " << registration_type << " { " << registration_type << "() noexcept {\n";
+    for (const auto& id : identifiers) stream << "::__cudavm_register_" << id << "(&" << program_name << ");\n";
     stream << "} };\n"
         "// CPU registration runs before ordinary user dynamic initializers.\n"
         "#if defined(_MSC_VER)\n#pragma init_seg(lib)\n"
-        "register_program registration;\n"
-        "#elif defined(__GNUC__)\nregister_program registration __attribute__((init_priority(101)));\n"
+        << registration_type << ' ' << registration_name << ";\n"
+        "#elif defined(__GNUC__)\n"
+        << registration_type << ' ' << registration_name << " __attribute__((init_priority(101)));\n"
         "#else\n#error cudavm requires a supported host initialization-order mechanism\n#endif\n}\n";
     for (const auto& id : identifiers)
-        stream << "extern \"C\" const cudavmProgram* __cudavm_program_" << id << "() { return &program; }\n";
+        stream << "extern \"C\" const cudavmProgram* __cudavm_program_" << id << "() { return &" << program_name << "; }\n";
     return output;
 }
 }
