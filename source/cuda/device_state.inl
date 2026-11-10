@@ -1,4 +1,10 @@
 int provider_device_attribute(int device, CUdevice_attribute which) {
+#if defined(_WIN32)
+    // These shader adapters create normal WDDM queues, without disabling the
+    // operating system's GPU timeout. Older Runtime versions still query it.
+    if (which == CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT &&
+        (device_kind(device) == cudavmBackendVulkan || device_kind(device) == cudavmBackendDirectX)) return 1;
+#endif
     if (device_kind(device) != cudavmBackendCuda && (which == CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID ||
         which == CU_DEVICE_ATTRIBUTE_PCI_BUS_ID || which == CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID)) {
         try {

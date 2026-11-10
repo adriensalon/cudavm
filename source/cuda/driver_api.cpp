@@ -9,6 +9,7 @@
 #include "shader_ptx.hpp"
 #include "ptx_parameters.hpp"
 #include "nvidia_image.hpp"
+#include "runtime_handshake.hpp"
 #include <array>
 #include <bit>
 #include <cmath>
@@ -25,6 +26,11 @@
 #include <charconv>
 #include <cstdio>
 #include <string_view>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #if defined(__clang__) && defined(_WIN32)
 // The SDK declares these APIs without dll attributes. Definitions must export
@@ -37,8 +43,14 @@
 extern "C" CUDAVM_API CUresult CUDAAPI cuFuncGetAttribute(int*, CUfunction_attribute, CUfunction);
 extern "C" CUDAVM_API CUresult CUDAAPI cuDeviceGetAttribute(int*, CUdevice_attribute, CUdevice);
 extern "C" CUDAVM_API CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int*, CUfunction, int, size_t, unsigned);
+extern "C" CUDAVM_API CUresult CUDAAPI cuCtxSetCurrent(CUcontext);
+extern "C" CUDAVM_API CUresult CUDAAPI cuCtxGetCurrent(CUcontext*);
 
 namespace cudavm {
+struct context_local_storage {
+    void* value = nullptr;
+    void (CUDAAPI* destroy)(CUcontext, void*, void*) = nullptr;
+};
 namespace {
 struct stream_state;
 struct graph_memory_region;
@@ -63,6 +75,7 @@ struct context {
     // Commands executed on another context can still own this context's buffers.
     std::vector<std::weak_ptr<command_completion>> foreign_work;
     std::unordered_map<CUcontext, std::weak_ptr<context>> peers;
+    std::unordered_map<void*, context_local_storage> local_storage;
     completion transport_tail; // Scalar shader transport snapshots all bindings.
     completion peer_copy_barrier; // Plain peer copies serialize all participating contexts.
 };
@@ -520,6 +533,11 @@ void destroy(const std::shared_ptr<context>& owner, bool pop_current = true) {
     if (owner->primary) { global().primaries.erase(owner->device); global().primary_flags.erase(owner->device); }
     // Other host threads retain opaque handles; lookup rejects these after destruction.
     if (pop_current) std::erase(context_stack(), owner->handle);
+    auto local_storage = std::move(owner->local_storage);
+    if (!local_storage.empty()) driver_wait([&] {
+        for (const auto& [key, entry] : local_storage)
+            if (entry.destroy) entry.destroy(owner->handle, key, entry.value);
+    });
 }
 void reset_primary(int device) {
     valid_device(device);
@@ -856,6 +874,8 @@ const char* error_string(CUresult error) {
 }
 using namespace cudavm;
 #define DRIVER_API(name, parameters, ...) extern "C" CUDAVM_API CUresult CUDAAPI name parameters { return driver_call([&] { __VA_ARGS__; }); }
+
+#include "runtime_exports_state.inl"
 
 #include "interop_exports.inl"
 #include "peer_access_state.inl"

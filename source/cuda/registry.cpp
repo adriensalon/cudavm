@@ -52,7 +52,15 @@ int shader_device_attribute(const shader_resource_limits& limits, CUdevice_attri
         return int(std::min(32768u, limits.shared_bytes));
     case CU_DEVICE_ATTRIBUTE_WARP_SIZE: return 32; // Logical CUDA warp used by compiler collective lowering.
     case CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED: return 1;
+    // CUDA's deprecated overlap query describes the same copy-engine facility
+    // as asyncEngineCount. Keep older Runtime property discovery consistent.
+    case CU_DEVICE_ATTRIBUTE_GPU_OVERLAP: return shader_device_attribute(limits, CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT) != 0;
     case CU_DEVICE_ATTRIBUTE_CLOCK_RATE: return 0;
+    // Legacy informational queries removed from newer cudaDeviceProp records.
+    // The shader transport exposes no memory-clock or native FP64 throughput data.
+    case CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE:
+    case CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO:
+    case CU_DEVICE_ATTRIBUTE_COOPERATIVE_MULTI_DEVICE_LAUNCH: return 0;
     case CU_DEVICE_ATTRIBUTE_MAX_PITCH: return std::numeric_limits<int>::max();
     case CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE1D_WIDTH: case CU_DEVICE_ATTRIBUTE_MAXIMUM_SURFACE1D_WIDTH:
     case CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE1D_LAYERED_WIDTH: case CU_DEVICE_ATTRIBUTE_MAXIMUM_SURFACE1D_LAYERED_WIDTH:

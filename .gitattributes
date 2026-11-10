@@ -7,3 +7,6 @@
 /test/nvidia_dynamic_clients/driver_client.cpp text eol=lf
 /test/nvidia_dynamic_clients/produce.py text eol=lf
 /test/kernel_launch/kernel_launch.ptx text eol=lf
+/test/nvidia_static_runtime_clients/windows_x64/*.exe binary
+/test/nvidia_static_runtime_clients/runtime_client.cu text eol=lf
+/test/nvidia_static_runtime_clients/produce.py text eol=lf

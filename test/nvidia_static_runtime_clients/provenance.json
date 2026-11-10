@@ -1,0 +1,47 @@
+{
+  "platform": "windows-x86_64",
+  "runtime_linkage": "genuine NVIDIA CUDA 12.4 cudart_static.lib",
+  "runtime_version": 12040,
+  "device_runtime": "none",
+  "default_stream": "legacy",
+  "application_manifest": "none; application-local DLL redirection marker supplied at deployment",
+  "host_crt": "Microsoft static release CRT, Visual C++ tools 14.44.35207",
+  "windows_sdk": "10.0.26100.0",
+  "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2024 NVIDIA Corporation\nBuilt on Thu_Mar_28_02:30:10_Pacific_Daylight_Time_2024\nCuda compilation tools, release 12.4, V12.4.131\nBuild cuda_12.4.r12.4/compiler.34097967_0",
+  "command": [
+    "<NVIDIA-toolkit>\\bin\\nvcc.exe",
+    "--cudart=static",
+    "--cudadevrt=none",
+    "--use-local-env",
+    "--allow-unsupported-compiler",
+    "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
+    "-std=c++17",
+    "-O3",
+    "-gencode=arch=compute_75,code=sm_75",
+    "-Xcompiler",
+    "/MT",
+    "-Xlinker",
+    "/MANIFEST:NO",
+    "--keep",
+    "--keep-dir",
+    "<producer-work>",
+    "<fixture>\\runtime_client.cu",
+    "-o",
+    "<fixture>\\windows_x64\\runtime_client.exe"
+  ],
+  "original_cubin_sha256": {
+    "runtime_client.cubin": "3d98bd5a5c7b131bcaf0964d12ba986616009132b1344a6a64d9c04d29735f30",
+    "runtime_client_dlink.cubin": "d52f194d1683753a6f3426c1e7a7eb145d369c4f89b0c6957012102d900bd306"
+  },
+  "sha256": {
+    "runtime_client.cu": "4cdced46a44eb8cd5d099fa5515c9c9e646ee234f9b9db1d30eadf1dc45c9e40",
+    "produce.py": "4005b1b03f575dd919a6669de3a488fef2dc7df68d50616b17a6cf284e267040",
+    "windows_x64/runtime_client.exe": "1b761c254289aae4d9d9b60cfb91f439da4a09330e66f395bea3f5962c71338e"
+  },
+  "producer_sha256": {
+    "bin/nvcc.exe": "ff3d3f68d1c76c0f658a1efd6dfbe1f2ec0d1838754698f02d3e17b9eaafa9cd",
+    "include/cuda.h": "e92376169061ab3f7ec1d2a758de3f477ab5f3e6ae3baee075c069f9c1224a91",
+    "include/cuda_runtime.h": "06fd5b2b2becb7f9165e88b8fdfdab778136f614be80ff82628c78ea97e218f4",
+    "lib/x64/cudart_static.lib": "497507ce46461d5abfae04dc77a06e01774a886ec471924215e0247239daa822"
+  }
+}

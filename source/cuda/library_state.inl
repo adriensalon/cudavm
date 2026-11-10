@@ -347,15 +347,29 @@ CUlibrary library_load(const void* image, const char* path, CUjit_option* option
         }
     }
     auto entry = std::make_shared<library_entry>();
+    const void* source_image = image;
+    unsigned wrapper_version = 0;
+    if (image) {
+        uint32_t magic; std::memcpy(&magic, image, sizeof(magic));
+        if (magic == 0x466243b1) {
+            // An embedded NVIDIA Runtime passes its registration wrapper to
+            // cuLibraryLoadData, rather than the enclosed fatbinary itself.
+            struct wrapper { uint32_t magic, version; const void* image; const void* auxiliary; } value;
+            std::memcpy(&value, image, sizeof(value));
+            require((value.version == 1 || value.version == 2) && (value.image || value.version == 2), CUDA_ERROR_INVALID_IMAGE, "invalid NVIDIA library wrapper");
+            source_image = value.image; wrapper_version = value.version;
+        }
+    }
     if (path) {
         std::ifstream file(path, std::ios::binary); require(bool(file), CUDA_ERROR_FILE_NOT_FOUND, "library file not found");
         entry->image.assign(std::istreambuf_iterator<char>(file), {});
-    } else if (has_fatbin(image)) { auto bytes = fatbin_memory_view(image); entry->image.assign(bytes.data(), bytes.size()); }
-    else if (has_nvidia_cubin(image)) entry->image.assign(static_cast<const char*>(image), nvidia_image_length(image));
-    else entry->image = static_cast<const char*>(image);
+    } else if (has_fatbin(source_image)) { auto bytes = fatbin_memory_view(source_image); entry->image.assign(bytes.data(), bytes.size()); }
+    else if (has_nvidia_cubin(source_image)) entry->image.assign(static_cast<const char*>(source_image), nvidia_image_length(source_image));
+    else if (source_image) entry->image = static_cast<const char*>(source_image);
     bool portable = has_program_image(entry->image) || has_portable_fatbin(std::string_view(entry->image));
     require(!host_table || !portable, CUDA_ERROR_NOT_SUPPORTED, "portable images do not provide native host universal tables");
     if (!portable) entry->native = global().provider->load_library(image, path, options, values, count, library_options, library_values, library_count);
+    require(entry->native || wrapper_version != 2, CUDA_ERROR_NOT_SUPPORTED, "linked NVIDIA library wrappers require native CUDA");
     require(!host_table || entry->native, CUDA_ERROR_NOT_SUPPORTED, "host universal tables require native CUDA");
     for (unsigned i = 0; i < count; ++i) {
         require(options[i] >= 0 && options[i] < CU_JIT_NUM_OPTIONS, CUDA_ERROR_INVALID_VALUE, "invalid JIT option identifier");
