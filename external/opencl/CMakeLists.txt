@@ -9,14 +9,9 @@ if(NOT CUDAVM_ENABLE_OPENCL)
 endif()
 
 include(FetchContent)
-set(FETCHCONTENT_QUIET OFF)
 FetchContent_Declare(opencl_headers
     URL https://github.com/KhronosGroup/OpenCL-Headers/archive/refs/tags/v2026.05.29.tar.gz
     URL_HASH SHA256=d9e6c48357de5002da11ce45de600e0c3ffe6ab4f628a3b9fe2b38603161658a
-    DOWNLOAD_DIR "${CMAKE_BINARY_DIR}/_deps"
-    DOWNLOAD_NAME opencl.tar.gz
-    DOWNLOAD_NO_PROGRESS FALSE
-    USES_TERMINAL_DOWNLOAD TRUE
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
     SOURCE_SUBDIR CL)
 FetchContent_MakeAvailable(opencl_headers)

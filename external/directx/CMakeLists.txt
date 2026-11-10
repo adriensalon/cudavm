@@ -224,14 +224,10 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     endif()
 
     include(FetchContent)
-    set(FETCHCONTENT_QUIET OFF)
     FetchContent_Declare(windows_sdk
         URL https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.cpp/10.0.26100.1/microsoft.windows.sdk.cpp.10.0.26100.1.nupkg
         URL_HASH SHA256=b4730a467a8f29145fc0136b2b3f626767e985f6aa6e32f1352953c38d6ff5d2
-        DOWNLOAD_DIR "${CMAKE_BINARY_DIR}/_deps"
-        DOWNLOAD_NAME directx.zip
-        DOWNLOAD_NO_PROGRESS FALSE
-        USES_TERMINAL_DOWNLOAD TRUE
+        DOWNLOAD_NAME microsoft.windows.sdk.cpp.10.0.26100.1.zip
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE
         SOURCE_SUBDIR c/Include)
     FetchContent_MakeAvailable(windows_sdk)

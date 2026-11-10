@@ -5,12 +5,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 include(FetchContent)
-set(FETCHCONTENT_QUIET OFF)
 FetchContent_Declare(cccl
     URL https://github.com/NVIDIA/cccl/archive/refs/tags/v3.4.2.tar.gz
     URL_HASH SHA256=544f5f14c59cae6cfdad3156aa720f2dd44fbd6feb3556d10bdb4fe6aa3cdf4b
-    DOWNLOAD_NO_PROGRESS FALSE
-    USES_TERMINAL_DOWNLOAD TRUE
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
     SOURCE_SUBDIR libcudacxx/include)
 FetchContent_MakeAvailable(cccl)
