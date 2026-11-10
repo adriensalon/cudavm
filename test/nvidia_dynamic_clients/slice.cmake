@@ -17,14 +17,17 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(A
     add_dependencies(cudavm_test cudavm_test_nvidia_dynamic_clients)
 
     _cudavm_add_nvidia_driver_client_case(nvidia_library_discovery host discovery)
+
     if("cuda" IN_LIST conformance_backends)
         _cudavm_add_nvidia_driver_client_case(native_cuda_coexistence host blocked)
     endif()
+
     foreach(backend cuda vulkan directx)
         if(backend IN_LIST conformance_backends)
             foreach(mode ptx cubin)
                 _cudavm_add_nvidia_driver_client_case(nvidia_dynamic_clients "${backend}" "${mode}")
             endforeach()
+
             if(NOT backend STREQUAL "cuda")
                 _cudavm_add_nvidia_driver_client_case(nvidia_library_discovery "${backend}" missing_compiler)
             endif()

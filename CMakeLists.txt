@@ -520,9 +520,11 @@ foreach(target IN LISTS cudavm_install_targets)
     if(target MATCHES "^cudavm_(.+)_(shared|static)$")
         set(component "${CMAKE_MATCH_1}")
         set(suffix "")
+
         if(CMAKE_MATCH_2 STREQUAL "static")
             set(suffix "_static")
         endif()
+
         set_target_properties(${target} PROPERTIES OUTPUT_NAME "cudavm_${component}${suffix}")
     endif()
 endforeach()
@@ -533,6 +535,7 @@ if(WIN32)
     set_target_properties(cudavm_cuda_shared PROPERTIES RUNTIME_OUTPUT_NAME nvcuda ARCHIVE_OUTPUT_NAME cuda)
     set_target_properties(cudavm_cudart_shared PROPERTIES RUNTIME_OUTPUT_NAME cudart64_13 ARCHIVE_OUTPUT_NAME cudart)
     set_target_properties(cudavm_cudart_static PROPERTIES OUTPUT_NAME cudart_static)
+
     if(TARGET cudavm_cudadevrt_static)
         set_target_properties(cudavm_cudadevrt_static PROPERTIES OUTPUT_NAME cudadevrt)
     endif()
@@ -545,25 +548,30 @@ install(TARGETS cudavm_nvcc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(UNIX)
     set(library_origin "$ORIGIN")
+
     if(APPLE)
         set(library_origin "@loader_path")
     endif()
+
     foreach(component cudart nvrtc nvptxcompiler nvjitlink nvvm)
         foreach(linkage shared static)
             set_property(TARGET cudavm_${component}_${linkage} PROPERTY INSTALL_RPATH "${library_origin}")
         endforeach()
     endforeach()
+
     file(RELATIVE_PATH libraries_from_bin "/${CMAKE_INSTALL_BINDIR}" "/${CMAKE_INSTALL_LIBDIR}")
     set_property(TARGET cudavm_nvcc PROPERTY INSTALL_RPATH "${library_origin}/${libraries_from_bin}")
 endif()
 
 foreach(target IN LISTS cudavm_install_targets)
     set(component Unspecified)
+
     if(target STREQUAL "cudavm_cuda_shared")
         set(component cuda_driver)
     elseif(target STREQUAL "cudavm_core_shared")
         set(component cuda_compiler)
     endif()
+
     install(TARGETS ${target}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT ${component}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${component}
@@ -574,20 +582,25 @@ install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/" DESTINATION ${CMAKE_INSTALL_I
 
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(public_modules cuda cudart cudadevrt nvcc nvrtc nvvm nvptxcompiler nvjitlink nvfatbin)
+
     foreach(module IN LISTS public_modules)
         install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/${module}/"
             DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" COMPONENT cuda_sdk
             PATTERN export.h EXCLUDE)
     endforeach()
+
     install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" COMPONENT cuda_sdk)
     install(DIRECTORY "${CUDAVM_CCCL_INCLUDE_DIR}/nv" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" COMPONENT cuda_sdk)
     install(PROGRAMS "$<TARGET_FILE:cudavm_nvcc>" DESTINATION "${CMAKE_INSTALL_BINDIR}" RENAME nvcc.exe COMPONENT cuda_sdk)
+
     foreach(target cudavm_cuda_shared cudavm_cudart_shared cudavm_core_shared)
         install(FILES "$<TARGET_FILE:${target}>" DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT cuda_sdk)
     endforeach()
+
     foreach(target cudavm_cuda_shared cudavm_cudart_shared)
         install(FILES "$<TARGET_LINKER_FILE:${target}>" DESTINATION "lib/x64" COMPONENT cuda_sdk)
     endforeach()
+
     install(FILES "$<TARGET_FILE:cudavm_cudart_static>" DESTINATION "lib/x64" COMPONENT cuda_sdk)
     install(FILES "$<TARGET_FILE:cudavm_cudadevrt_static>" DESTINATION "lib/x64" COMPONENT cuda_sdk)
     install(FILES "${CUDAVM_LLVM_LICENSE}" DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME LLVM_LICENSE.txt COMPONENT cuda_sdk)

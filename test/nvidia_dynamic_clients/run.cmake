@@ -15,6 +15,7 @@ foreach(index RANGE 0 ${last})
     string(JSON name MEMBER "${hashes}" ${index})
     string(JSON expected GET "${hashes}" "${name}")
     file(SHA256 "${fixture}/${name}" actual)
+
     if(NOT actual STREQUAL expected)
         message(FATAL_ERROR "Independent NVIDIA client/producer input changed without regenerated provenance: ${name}")
     endif()
@@ -37,6 +38,7 @@ foreach(component cuda_driver cuda_compiler)
     execute_process(COMMAND "${CMAKE_COMMAND}" --install "${build}" --config "${config}"
         --prefix "${original}" --component "${component}"
         RESULT_VARIABLE installed OUTPUT_VARIABLE install_output ERROR_VARIABLE install_error TIMEOUT 45)
+
     if(NOT installed STREQUAL "0")
         message(FATAL_ERROR "Install ${component} failed: ${installed}\n${install_output}\n${install_error}")
     endif()
@@ -88,6 +90,7 @@ elseif(mode STREQUAL "missing_compiler")
     if(NOT result STREQUAL "1" OR NOT error MATCHES "cuModuleLoadData: CUDA_ERROR_JIT_COMPILER_NOT_FOUND")
         message(FATAL_ERROR "Missing deployed compiler did not produce the exact Driver error: ${result}")
     endif()
+
     message("PASS: absent compiler is not borrowed from the build tree")
 elseif(NOT result STREQUAL "0")
     message(FATAL_ERROR "Unchanged NVIDIA-linked client failed: ${result}; deployment retained at ${relocated}")

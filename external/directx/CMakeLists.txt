@@ -162,6 +162,7 @@ if(CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
         if(NOT CUDAVM_DIRECTX_ROOT)
             message(FATAL_ERROR "DXC maintenance requires its source directory")
         endif()
+
         set(source "${CUDAVM_DIRECTX_ROOT}")
 
         if(NOT EXISTS "${source}/.git")
@@ -171,6 +172,7 @@ if(CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
 
             if(EXISTS "${source}")
                 file(GLOB entries "${source}/*" "${source}/.*")
+
                 if(entries)
                     message(FATAL_ERROR "Preserving existing non-Git DXC source directory: ${source}")
                 endif()

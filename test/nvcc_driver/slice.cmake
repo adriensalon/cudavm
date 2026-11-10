@@ -4,9 +4,11 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_CXX_COMPILER_ID MATCHES "Clan
     add_custom_target(cudavm_test_public_sdk DEPENDS cudavm_nvcc cudavm_core_shared cudavm_cuda_shared
         cudavm_cudart_shared cudavm_cudart_static cudavm_cudadevrt_static)
     add_dependencies(cudavm_test cudavm_test_public_sdk)
+
     foreach(mode discovery protocol execution archives cmake cmake_rdc)
         set(slice nvcc_driver)
         set(backend host)
+
         if(mode STREQUAL "discovery")
             set(slice nvidia_sdk_discovery)
         elseif(mode MATCHES "^cmake")
@@ -15,9 +17,11 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_CXX_COMPILER_ID MATCHES "Clan
         elseif(mode STREQUAL "execution" OR mode STREQUAL "archives")
             set(backend vulkan)
         endif()
+
         if(backend STREQUAL "vulkan" AND NOT "vulkan" IN_LIST conformance_backends)
             continue()
         endif()
+
         set(case "conformance.${slice}.${backend}.${mode}")
         add_test(NAME "${case}" COMMAND "${CMAKE_COMMAND}"
             "-Dbuild=${CMAKE_BINARY_DIR}" "-Dconfig=$<CONFIG>" "-Dwork=${CMAKE_CURRENT_BINARY_DIR}/public_sdk"

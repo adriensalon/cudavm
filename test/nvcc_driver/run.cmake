@@ -68,17 +68,21 @@ if(NOT DEFINED ENV{INCLUDE} OR NOT DEFINED ENV{LIB})
     set(vswhere "$ENV{ProgramFiles\(x86\)}/Microsoft Visual Studio/Installer/vswhere.exe")
     execute_process(COMMAND "${vswhere}" -latest -property installationPath
         OUTPUT_VARIABLE visual_studio OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+
     if(NOT visual_studio)
         message(FATAL_ERROR "An x64 Visual Studio C++ environment is required")
     endif()
+
     file(TO_NATIVE_PATH "${visual_studio}/Common7/Tools/VsDevCmd.bat" developer_command)
     file(WRITE "${root}/host_environment.cmd"
         "@echo off\r\ncall \"${developer_command}\" -arch=x64 -host_arch=x64 >nul\r\nif errorlevel 1 exit /b 1\r\nset\r\n")
     execute_process(COMMAND "$ENV{COMSPEC}" /d /c call "${root}/host_environment.cmd"
         OUTPUT_VARIABLE environment COMMAND_ERROR_IS_FATAL ANY)
     string(REPLACE "\r\n" "\n" environment "${environment}")
+
     while(NOT environment STREQUAL "")
         string(FIND "${environment}" "\n" end)
+
         if(end LESS 0)
             set(line "${environment}")
             set(environment "")
@@ -87,6 +91,7 @@ if(NOT DEFINED ENV{INCLUDE} OR NOT DEFINED ENV{LIB})
             math(EXPR next "${end} + 1")
             string(SUBSTRING "${environment}" ${next} -1 environment)
         endif()
+
         if(line MATCHES "^([^=]+)=(.*)$")
             set(ENV{${CMAKE_MATCH_1}} "${CMAKE_MATCH_2}")
         endif()
@@ -155,6 +160,7 @@ set(paths "$ENV{PATH}")
 foreach(directory IN LISTS paths)
     string(TOLOWER "${directory}" lower)
     string(FIND "${lower}" "${system_root}" system_prefix)
+
     if(lower MATCHES "microsoft visual studio|windows kits" OR system_prefix EQUAL 0)
         list(APPEND tools "${directory}")
     endif()
@@ -201,9 +207,11 @@ elseif(mode STREQUAL "protocol")
     file(READ "${depfile}" dependencies)
     _cudavm_sdk_contains("${dependencies}" "parameters.hpp" "Depfile tracks real user headers")
     _cudavm_sdk_contains("${dependencies}" "compiled" "Depfile names the public output")
+
     if(dependencies MATCHES "\\.nvcc-")
         message(FATAL_ERROR "Temporary compiler paths leaked into the public depfile")
     endif()
+
     set(executable "${sdk}/bin/cpu.exe")
     _cudavm_sdk_run("${nvcc}" "${object}" -o "${executable}")
     _cudavm_sdk_run("${executable}" cpu)
@@ -234,15 +242,18 @@ elseif(mode STREQUAL "execution")
         _cudavm_sdk_run("${executable}" cpu)
         _cudavm_sdk_gpu("${executable}")
     endforeach()
+
     _cudavm_sdk_run("${nvcc}" -rdc=true "${source}/device_version.cu" -o "${sdk}/bin/device_version.exe")
     _cudavm_sdk_gpu("${sdk}/bin/device_version.exe")
 elseif(mode STREQUAL "archives")
     set(objects)
+
     foreach(unit kernel helper dead)
         set(object "${root}/${unit}.obj")
         _cudavm_sdk_run("${nvcc}" -dc -O1 "${source}/${unit}.cu" -o "${object}")
         list(APPEND objects "${object}")
     endforeach()
+
     set(main_object "${root}/main.obj")
     set(archive "${root}/device.lib")
     _cudavm_sdk_run("${nvcc}" -c "${source}/main.cpp" -o "${main_object}")
@@ -263,9 +274,11 @@ else()
     file(COPY "${CMAKE_CURRENT_LIST_DIR}/../cuda_build_integration/CMakeLists.txt" DESTINATION "${source}")
     set(consumer_build "${root}/consumer build")
     set(rdc OFF)
+
     if(mode STREQUAL "cmake_rdc")
         set(rdc ON)
     endif()
+
     _cudavm_sdk_run("${cmake}" -S "${source}" -B "${consumer_build}" -G Ninja "-DCMAKE_MAKE_PROGRAM=${ninja}"
         "-DCMAKE_CXX_COMPILER=${host}" "-DCMAKE_CUDA_COMPILER=${nvcc}" "-DCMAKE_CUDA_HOST_COMPILER=${host}"
         "-DCUDAToolkit_ROOT=${sdk}" -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_STANDARD=17
@@ -274,6 +287,7 @@ else()
     _cudavm_sdk_run("${cmake}" --build "${consumer_build}" --parallel 2)
     _cudavm_sdk_gpu("${sdk}/bin/cuda_stock.exe")
     _cudavm_sdk_run("${cmake}" --build "${consumer_build}" --parallel 2)
+
     if(mode STREQUAL "cmake")
         file(APPEND "${source}/parameters.hpp" "\nstatic_assert(fixture_bias == 7);\n")
         _cudavm_sdk_run("${cmake}" --build "${consumer_build}" --parallel 2)

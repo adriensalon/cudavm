@@ -15,6 +15,7 @@ foreach(index RANGE 0 ${last})
     string(JSON name MEMBER "${hashes}" ${index})
     string(JSON expected GET "${hashes}" "${name}")
     file(SHA256 "${fixture}/${name}" actual)
+
     if(NOT actual STREQUAL expected)
         message(FATAL_ERROR "NVIDIA static Runtime producer input changed without regenerated provenance: ${name}")
     endif()
@@ -39,6 +40,7 @@ if(NOT backend STREQUAL "native")
         execute_process(COMMAND "${CMAKE_COMMAND}" --install "${build}" --config "${config}"
             --prefix "${original}" --component "${component}"
             RESULT_VARIABLE installed OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 45)
+
         if(NOT installed STREQUAL "0")
             message(FATAL_ERROR "Install ${component} failed: ${installed}\n${output}\n${error}")
         endif()
@@ -70,6 +72,7 @@ set(ENV{CUDAVM_BACKENDS} "${backend}")
 
 if(backend STREQUAL "native")
     set(driver "$ENV{SystemRoot}/System32/nvcuda.dll")
+
     if(NOT EXISTS "${driver}")
         message("SKIP: compatibility profile unavailable")
         file(REMOVE_RECURSE "${root}")
@@ -77,6 +80,7 @@ if(backend STREQUAL "native")
     endif()
 else()
     set(driver "${relocated}/bin/nvcuda.dll")
+
     if(NOT EXISTS "${driver}" OR NOT EXISTS "${relocated}/bin/cudavm_core.dll")
         message(FATAL_ERROR "Installed shader Driver and compiler are required")
     endif()
@@ -104,12 +108,14 @@ elseif(NOT result STREQUAL "0")
     message(FATAL_ERROR "Unchanged NVIDIA static Runtime client failed: ${result}; deployment retained at ${relocated}")
 elseif(mode STREQUAL "audit")
     file(READ "${root}/runtime.trace" trace)
+
     foreach(witness "call LoadLibraryExA path=nvcuda.dll flags=800"
             "call cuGetProcAddress" "call cuGetExportTable uuid=6bd5fb6c5bf4e74a8987d93912fd9df9"
             "call cuGetExportTable uuid=d4082055bde6704b8d34ba123c66e1f2"
             "call table:c693336e1121df11a8c368f355d89593:0"
             "call driver:cuLibraryLoadData" "call driver:cuLaunchKernel" "exit 0")
         string(FIND "${trace}" "${witness}" found)
+
         if(found EQUAL -1)
             message(FATAL_ERROR "Runtime audit is missing witness '${witness}'; log retained at ${root}/runtime.trace")
         endif()
