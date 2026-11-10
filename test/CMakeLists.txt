@@ -1,14 +1,4 @@
 cmake_minimum_required(VERSION 3.24)
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    project(cudavm_conformance LANGUAGES NONE)
-    message(FATAL_ERROR "Configure the cudavm root with CUDAVM_BUILD_TEST=ON; private test helpers come from the parent build")
-endif()
-if(NOT TARGET cudavm::cuda_shared)
-    message(FATAL_ERROR "Public conformance requires cudavm::cuda_shared")
-endif()
-get_target_property(conformance_backends cudavm::cuda_shared CUDAVM_COMPILED_BACKENDS)
-add_custom_target(cudavm-conformance)
-include("${CMAKE_CURRENT_SOURCE_DIR}/host_linkage/slice.cmake")
 
 function(cudavm_add_conformance_slice name)
     cmake_parse_arguments(slice "API_ONLY;HOST_ONLY;THREADS;SOURCE_ONLY;SOURCE_CHECK;SOURCE_LTO" "FIXTURE;ARCHITECTURE;MINIMUM_PTX;SOURCE_STANDARD" "FAMILY_CHECKS;CASES;HOST_CASES;COMPONENTS;BACKENDS;PROFILES" ${ARGN})
@@ -100,7 +90,7 @@ function(cudavm_add_conformance_slice name)
         configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/test_fixtures.hpp.in"
             "${generated_root}/test_fixtures.hpp" @ONLY)
     endif()
-    set(target "cudavm-conformance-${name}")
+    set(target "cudavm_test_${name}")
     add_executable(${target} "${CMAKE_CURRENT_SOURCE_DIR}/${name}/${name}.cpp" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/test_framework.cpp")
     if(slice_HOST_ONLY)
         target_compile_definitions(${target} PRIVATE CUDAVM_CONFORMANCE_HOST_ONLY)
@@ -114,8 +104,7 @@ function(cudavm_add_conformance_slice name)
             target_compile_definitions(${target} PRIVATE "CUDAVM_CONFORMANCE_${compiler_api}")
         endif()
     endforeach()
-    if(slice_THREADS)
-        find_package(Threads REQUIRED)
+    if(slice_THREADS AND NOT WIN32)
         target_link_libraries(${target} PRIVATE Threads::Threads)
     endif()
     if(NOT slice_API_ONLY)
@@ -133,9 +122,9 @@ function(cudavm_add_conformance_slice name)
         set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY MultiThreaded)
     endif()
     cudavm_prepare_target(${target})
-    add_dependencies(cudavm-conformance ${target})
+    add_dependencies(cudavm_test ${target})
     if(slice_SOURCE_CHECK)
-        set(source_check_target "${target}-source-check")
+        set(source_check_target "${target}_source_check")
         add_executable(${source_check_target} "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/test_framework.cpp")
         target_compile_features(${source_check_target} PRIVATE cxx_std_20)
         target_compile_definitions(${source_check_target} PRIVATE CUDAVM_CONFORMANCE_HOST_ONLY CUDAVM_CONFORMANCE_SOURCE_CHECK CUDAVM_CONFORMANCE_NVRTC)
@@ -146,7 +135,7 @@ function(cudavm_add_conformance_slice name)
             set_property(TARGET ${source_check_target} PROPERTY MSVC_RUNTIME_LIBRARY MultiThreaded)
         endif()
         cudavm_prepare_target(${source_check_target})
-        add_dependencies(cudavm-conformance ${source_check_target})
+        add_dependencies(cudavm_test ${source_check_target})
         add_test(NAME "conformance.${name}.host.source" COMMAND ${source_check_target})
         set_tests_properties("conformance.${name}.host.source" PROPERTIES
             LABELS "conformance;${name};host;source;${slice_FAMILY_CHECKS}"
@@ -222,6 +211,31 @@ function(cudavm_add_conformance_slice name)
     endforeach()
 endfunction()
 
+function(_cudavm_configure_program_image_fixtures target folder)
+    foreach(kind cu ptx)
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/module_loading/module_loading.${kind}" module_loading_${kind})
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/module_loading/module_loading.${kind}")
+    endforeach()
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/program_image_roundtrip/program_image_roundtrip.ll" program_image_nvvm_text)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/program_image_roundtrip/program_image_roundtrip.ll")
+    configure_file(module_loading/module_fixtures.hpp.in "${folder}/module_fixtures.hpp" @ONLY)
+    configure_file(program_image_roundtrip/nvvm_image_fixture.hpp.in "${folder}/nvvm_image_fixture.hpp" @ONLY)
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/${folder}" "${CMAKE_CURRENT_SOURCE_DIR}/program_image_roundtrip")
+endfunction()
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(cudavm_test LANGUAGES NONE)
+    message(FATAL_ERROR "Configure the cudavm root with CUDAVM_BUILD_TEST=ON; private test helpers come from the parent build")
+endif()
+
+if(NOT TARGET cudavm::cuda_shared)
+    message(FATAL_ERROR "Public conformance requires cudavm::cuda_shared")
+endif()
+
+get_target_property(conformance_backends cudavm::cuda_shared CUDAVM_COMPILED_BACKENDS)
+add_custom_target(cudavm_test)
+include("${CMAKE_CURRENT_SOURCE_DIR}/host_linkage/slice.cmake")
+
 cudavm_add_conformance_slice(nvfatbin_lifecycle HOST_ONLY THREADS COMPONENTS nvfatbin CASES discovery handles outputs lifetime validation threading FAMILY_CHECKS C02.lifecycle C02.outputs)
 cudavm_add_conformance_slice(nvfatbin_composition HOST_ONLY COMPONENTS nvfatbin nvjitlink nvptxcompiler CASES targets compression files images ownership FAMILY_CHECKS C02.inputs C02.roundtrip)
 cudavm_add_conformance_slice(nvrtc_lifecycle HOST_ONLY THREADS COMPONENTS nvrtc CASES discovery ownership outputs retry validation threading FAMILY_CHECKS C02.lifecycle C02.outputs)
@@ -242,21 +256,25 @@ cudavm_add_conformance_slice(nvjitlink_diagnostics HOST_ONLY COMPONENTS nvjitlin
 cudavm_add_conformance_slice(ptx_import HOST_ONLY COMPONENTS nvjitlink nvptxcompiler CASES versions targets declarations instructions lexical FAMILY_CHECKS C02.inputs C02.binary)
 cudavm_add_conformance_slice(nvvm_import HOST_ONLY COMPONENTS nvvm nvjitlink CASES dialects bitcode versions layout metadata operations FAMILY_CHECKS C02.inputs C02.binary)
 cudavm_add_conformance_slice(lto_ir_import API_ONLY COMPONENTS nvjitlink CASES data files automatic HOST_CASES format FAMILY_CHECKS C02.inputs C02.binary)
-if(TARGET cudavm-conformance-lto_ir_import)
+
+if(TARGET cudavm_test_lto_ir_import)
     foreach(kind kernel helper)
         if(kind STREQUAL "kernel")
             set(lto_file lto_ir_import)
         else()
             set(lto_file lto_helper)
         endif()
+
         file(READ "${CMAKE_CURRENT_SOURCE_DIR}/lto_ir_import/${lto_file}.ltoir" lto_${kind}_bytes HEX)
         string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," lto_${kind}_bytes "${lto_${kind}_bytes}")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/lto_ir_import/${lto_file}.ltoir")
     endforeach()
+
     configure_file(lto_ir_import/lto_fixture.hpp.in lto_ir_import/lto_fixture.hpp @ONLY)
-    target_include_directories(cudavm-conformance-lto_ir_import PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/lto_ir_import")
+    target_include_directories(cudavm_test_lto_ir_import PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/lto_ir_import")
 endif()
-if(TARGET cudavm-conformance-nvvm_import)
+
+if(TARGET cudavm_test_nvvm_import)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/nvvm_import/nvvm_import.ll" nvvm_import_text)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/nvvm_import/nvvm_import.bc" nvvm_import_bytes HEX)
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," nvvm_import_bytes "${nvvm_import_bytes}")
@@ -264,61 +282,64 @@ if(TARGET cudavm-conformance-nvvm_import)
         "${CMAKE_CURRENT_SOURCE_DIR}/nvvm_import/nvvm_import.ll"
         "${CMAKE_CURRENT_SOURCE_DIR}/nvvm_import/nvvm_import.bc")
     configure_file(nvvm_import/nvvm_fixture.hpp.in nvvm_import/nvvm_fixture.hpp @ONLY)
-    target_include_directories(cudavm-conformance-nvvm_import PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/nvvm_import")
+    target_include_directories(cudavm_test_nvvm_import PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/nvvm_import")
 endif()
+
 cudavm_add_conformance_slice(fatbinary_import API_ONLY COMPONENTS nvjitlink CASES plain compressed load_fatbinary linker files
     HOST_CASES extents versions metadata compression FAMILY_CHECKS C02.inputs C02.binary)
-if(TARGET cudavm-conformance-fatbinary_import)
+
+if(TARGET cudavm_test_fatbinary_import)
     foreach(kind plain compressed)
         file(READ "${CMAKE_CURRENT_SOURCE_DIR}/fatbinary_import/${kind}.fatbin" fatbinary_${kind}_bytes HEX)
         string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," fatbinary_${kind}_bytes "${fatbinary_${kind}_bytes}")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/fatbinary_import/${kind}.fatbin")
     endforeach()
+
     configure_file(fatbinary_import/fatbinary_fixture.hpp.in fatbinary_import/fatbinary_fixture.hpp @ONLY)
-    target_include_directories(cudavm-conformance-fatbinary_import PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/fatbinary_import")
+    target_include_directories(cudavm_test_fatbinary_import PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/fatbinary_import")
 endif()
+
 cudavm_add_conformance_slice(cubin_import HOST_ONLY COMPONENTS nvjitlink CASES ownership metadata registers addressing spaces FAMILY_CHECKS C02.inputs C02.binary)
 cudavm_add_conformance_slice(module_loading API_ONLY COMPONENTS nvrtc CASES memory files options queries isolation validation HOST_CASES sources FAMILY_CHECKS C02.modules)
-if(TARGET cudavm-conformance-module_loading)
+
+if(TARGET cudavm_test_module_loading)
     foreach(kind cu ptx)
         file(READ "${CMAKE_CURRENT_SOURCE_DIR}/module_loading/module_loading.${kind}" module_loading_${kind})
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/module_loading/module_loading.${kind}")
     endforeach()
+
     configure_file(module_loading/module_fixtures.hpp.in module_loading/module_fixtures.hpp @ONLY)
-    target_include_directories(cudavm-conformance-module_loading PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/module_loading")
+    target_include_directories(cudavm_test_module_loading PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/module_loading")
 endif()
+
 cudavm_add_conformance_slice(library_loading API_ONLY THREADS COMPONENTS nvrtc cudart CASES contextless files contexts resources retirement validation HOST_CASES sources FAMILY_CHECKS C02.modules)
-if(TARGET cudavm-conformance-library_loading)
+
+if(TARGET cudavm_test_library_loading)
     foreach(kind cu ptx)
         file(READ "${CMAKE_CURRENT_SOURCE_DIR}/module_loading/module_loading.${kind}" module_loading_${kind})
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/module_loading/module_loading.${kind}")
     endforeach()
+
     configure_file(module_loading/module_fixtures.hpp.in library_loading/module_fixtures.hpp @ONLY)
-    target_include_directories(cudavm-conformance-library_loading PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/library_loading")
+    target_include_directories(cudavm_test_library_loading PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/library_loading")
 endif()
-function(cudavm_configure_program_image_fixtures target folder)
-    foreach(kind cu ptx)
-        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/module_loading/module_loading.${kind}" module_loading_${kind})
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/module_loading/module_loading.${kind}")
-    endforeach()
-    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/program_image_roundtrip/program_image_roundtrip.ll" program_image_nvvm_text)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/program_image_roundtrip/program_image_roundtrip.ll")
-    configure_file(module_loading/module_fixtures.hpp.in "${folder}/module_fixtures.hpp" @ONLY)
-    configure_file(program_image_roundtrip/nvvm_image_fixture.hpp.in "${folder}/nvvm_image_fixture.hpp" @ONLY)
-    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/${folder}" "${CMAKE_CURRENT_SOURCE_DIR}/program_image_roundtrip")
-endfunction()
+
 set(program_image_producers nvrtc_cubin nvrtc_rdc nvrtc_lto ptxcompiler_cubin ptxcompiler_rdc nvvm_lto
     nvjitlink_cubin nvjitlink_lto nvjitlink_rdc nvjitlink_rdc_lto)
 set(program_image_roundtrip_cases)
+
 foreach(producer IN LISTS program_image_producers)
     foreach(consumer direct linker fatbin)
         list(APPEND program_image_roundtrip_cases "${producer}.${consumer}")
     endforeach()
 endforeach()
+
 cudavm_add_conformance_slice(program_image_roundtrip API_ONLY COMPONENTS nvrtc nvjitlink nvptxcompiler nvvm nvfatbin cudart
     CASES ${program_image_roundtrip_cases} HOST_CASES producers FAMILY_CHECKS C02.roundtrip C02.outputs C02.binary)
-if(TARGET cudavm-conformance-program_image_roundtrip)
-    cudavm_configure_program_image_fixtures(cudavm-conformance-program_image_roundtrip program_image_roundtrip)
+
+if(TARGET cudavm_test_program_image_roundtrip)
+    _cudavm_configure_program_image_fixtures(cudavm_test_program_image_roundtrip program_image_roundtrip)
+
     foreach(backend IN LISTS conformance_backends)
         foreach(producer IN LISTS program_image_producers)
             foreach(consumer direct linker fatbin)
@@ -329,50 +350,60 @@ if(TARGET cudavm-conformance-program_image_roundtrip)
         endforeach()
     endforeach()
 endif()
+
 cudavm_add_conformance_slice(program_image_persistence API_ONLY COMPONENTS nvrtc nvjitlink nvptxcompiler nvvm cudart
     CASES ${program_image_producers} HOST_CASES copies FAMILY_CHECKS C02.roundtrip)
-if(TARGET cudavm-conformance-program_image_persistence)
-    cudavm_configure_program_image_fixtures(cudavm-conformance-program_image_persistence program_image_persistence)
-    add_executable(cudavm-conformance-program_image_cache_loader program_image_persistence/cache_loader.cpp test_framework.cpp)
-    target_compile_features(cudavm-conformance-program_image_cache_loader PRIVATE cxx_std_20)
-    target_include_directories(cudavm-conformance-program_image_cache_loader PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(cudavm-conformance-program_image_cache_loader PRIVATE cudavm::cuda_shared cudavm::cudart_shared ${CMAKE_DL_LIBS})
-    cudavm_configure_program_image_fixtures(cudavm-conformance-program_image_cache_loader program_image_cache_loader)
-    cudavm_prepare_target(cudavm-conformance-program_image_cache_loader)
-    set_target_properties(cudavm-conformance-program_image_cache_loader PROPERTIES
+
+if(TARGET cudavm_test_program_image_persistence)
+    _cudavm_configure_program_image_fixtures(cudavm_test_program_image_persistence program_image_persistence)
+    add_executable(cudavm_test_program_image_cache_loader program_image_persistence/cache_loader.cpp test_framework.cpp)
+    target_compile_features(cudavm_test_program_image_cache_loader PRIVATE cxx_std_20)
+    target_include_directories(cudavm_test_program_image_cache_loader PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(cudavm_test_program_image_cache_loader PRIVATE cudavm::cuda_shared cudavm::cudart_shared ${CMAKE_DL_LIBS})
+    _cudavm_configure_program_image_fixtures(cudavm_test_program_image_cache_loader program_image_cache_loader)
+    cudavm_prepare_target(cudavm_test_program_image_cache_loader)
+    set_target_properties(cudavm_test_program_image_cache_loader PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
     if(APPLE)
-        set_target_properties(cudavm-conformance-program_image_cache_loader PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE INSTALL_RPATH "@loader_path")
+        set_target_properties(cudavm_test_program_image_cache_loader PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE INSTALL_RPATH "@loader_path")
     elseif(UNIX)
-        set_target_properties(cudavm-conformance-program_image_cache_loader PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE INSTALL_RPATH "$ORIGIN")
+        set_target_properties(cudavm_test_program_image_cache_loader PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE INSTALL_RPATH "$ORIGIN")
     endif()
-    add_dependencies(cudavm-conformance-program_image_persistence cudavm-conformance-program_image_cache_loader)
+
+    add_dependencies(cudavm_test_program_image_persistence cudavm_test_program_image_cache_loader)
+
     foreach(backend IN LISTS conformance_backends)
         set(cached_case "conformance.program_image_persistence.${backend}.cached")
         add_test(NAME "${cached_case}" COMMAND "${CMAKE_COMMAND}"
-            "-Dproducer=$<TARGET_FILE:cudavm-conformance-program_image_persistence>"
-            "-Dloader=$<TARGET_FILE:cudavm-conformance-program_image_cache_loader>"
+            "-Dproducer=$<TARGET_FILE:cudavm_test_program_image_persistence>"
+            "-Dloader=$<TARGET_FILE:cudavm_test_program_image_cache_loader>"
             "-Dbackend=${backend}" "-Dwork=${CMAKE_CURRENT_BINARY_DIR}/program_image_persistence/cache"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/program_image_persistence/cached.cmake")
         set_tests_properties("${cached_case}" PROPERTIES TIMEOUT 200 RUN_SERIAL TRUE
             SKIP_REGULAR_EXPRESSION "SKIP: isolated cached-image backend is unavailable"
             LABELS "conformance;program_image_persistence;${backend};C02.roundtrip;cached;nvrtc_cubin")
+
         foreach(producer IN LISTS program_image_producers)
             set_tests_properties("conformance.program_image_persistence.${backend}.${producer}" PROPERTIES TIMEOUT 180)
         endforeach()
     endforeach()
 endif()
+
 cudavm_add_conformance_slice(program_image_validation API_ONLY COMPONENTS nvrtc nvjitlink cudart
     CASES rejection fallback HOST_CASES framing versions extents metadata artifacts profiles FAMILY_CHECKS C02.inputs C02.roundtrip)
-if(TARGET cudavm-conformance-program_image_validation)
-    cudavm_configure_program_image_fixtures(cudavm-conformance-program_image_validation program_image_validation)
+
+if(TARGET cudavm_test_program_image_validation)
+    _cudavm_configure_program_image_fixtures(cudavm_test_program_image_validation program_image_validation)
+
     foreach(backend IN LISTS conformance_backends)
         foreach(case rejection fallback)
             set_tests_properties("conformance.program_image_validation.${backend}.${case}" PROPERTIES TIMEOUT 180)
         endforeach()
     endforeach()
 endif()
-if(TARGET cudavm-conformance-cubin_import)
+
+if(TARGET cudavm_test_cubin_import)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/device_stack/device_stack.cubin" cubin_import_bytes HEX)
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," cubin_import_bytes "${cubin_import_bytes}")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/device_stack/device_stack.cubin")
@@ -380,8 +411,9 @@ if(TARGET cudavm-conformance-cubin_import)
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," cubin_address_bytes "${cubin_address_bytes}")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/address_spaces/address_spaces.cubin")
     configure_file(cubin_import/cubin_fixture.hpp.in cubin_import/cubin_fixture.hpp @ONLY)
-    target_include_directories(cudavm-conformance-cubin_import PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/cubin_import")
+    target_include_directories(cudavm_test_cubin_import PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/cubin_import")
 endif()
+
 cudavm_add_conformance_slice(device_discovery API_ONLY THREADS COMPONENTS cudart CASES enumeration versions names properties validation state FAMILY_CHECKS H02.discovery)
 cudavm_add_conformance_slice(device_capabilities FIXTURE device_builtins COMPONENTS cudart FAMILY_CHECKS H02.capabilities D06.truthfulness)
 cudavm_add_conformance_slice(function_resources FIXTURE dynamic_shared_memory COMPONENTS cudart FAMILY_CHECKS H02.capabilities H02.configuration)
@@ -390,11 +422,14 @@ cudavm_add_conformance_slice(profiling_controls API_ONLY COMPONENTS cudart CASES
     HOST_CASES cold FAMILY_CHECKS H02.configuration)
 cudavm_add_conformance_slice(device_configuration API_ONLY COMPONENTS cudart CASES scheduling limits preferences isolation validation FAMILY_CHECKS H02.configuration)
 set(registration_backends cuda)
+
 if(TARGET cudavm::nvrtc_shared)
     set(registration_backends ${conformance_backends})
 endif()
+
 cudavm_add_conformance_slice(runtime_registration API_ONLY COMPONENTS cudart BACKENDS ${registration_backends} CASES ptx cubin FAMILY_CHECKS A01.registration C01.link)
-if(TARGET cudavm-conformance-runtime_registration)
+
+if(TARGET cudavm_test_runtime_registration)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/global_symbols/global_symbols.ptx" registration_ptx)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/global_symbols/global_symbols.cubin" registration_cubin HEX)
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," registration_cubin "${registration_cubin}")
@@ -402,8 +437,8 @@ if(TARGET cudavm-conformance-runtime_registration)
         "${CMAKE_CURRENT_SOURCE_DIR}/global_symbols/global_symbols.ptx"
         "${CMAKE_CURRENT_SOURCE_DIR}/global_symbols/global_symbols.cubin")
     configure_file(runtime_registration/registration_fixtures.hpp.in runtime_registration/registration_fixtures.hpp @ONLY)
-    target_include_directories(cudavm-conformance-runtime_registration PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/runtime_registration")
-    set(target cudavm-conformance-runtime_registration-static)
+    target_include_directories(cudavm_test_runtime_registration PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/runtime_registration")
+    set(target cudavm_test_runtime_registration_static)
     add_executable(${target} runtime_registration/runtime_registration.cpp test_framework.cpp)
     target_compile_features(${target} PRIVATE cxx_std_20)
     target_compile_definitions(${target} PRIVATE CUDAVM_CONFORMANCE_REGISTRATION)
@@ -412,7 +447,8 @@ if(TARGET cudavm-conformance-runtime_registration)
     target_link_libraries(${target} PRIVATE cudavm::cudart_static cudavm::cuda_static ${CMAKE_DL_LIBS})
     cudavm_prepare_target(${target})
     set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-    add_dependencies(cudavm-conformance ${target})
+    add_dependencies(cudavm_test ${target})
+
     foreach(input ptx cubin)
         add_test(NAME conformance.runtime_registration.cuda.${input}.static COMMAND ${target} cuda ${input})
         set_tests_properties(conformance.runtime_registration.cuda.${input}.static PROPERTIES
@@ -420,8 +456,10 @@ if(TARGET cudavm-conformance-runtime_registration)
             ENVIRONMENT "CUDAVM_BACKENDS=cuda" SKIP_RETURN_CODE 77 TIMEOUT 120)
     endforeach()
 endif()
+
 cudavm_add_conformance_slice(managed_registration API_ONLY COMPONENTS cudart CASES ptx cubin FAMILY_CHECKS A01.registration M02.managed)
-if(TARGET cudavm-conformance-managed_registration)
+
+if(TARGET cudavm_test_managed_registration)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/managed_registration/managed_registration.ptx" managed_ptx)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/managed_registration/managed_registration.cubin" managed_cubin HEX)
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," managed_cubin "${managed_cubin}")
@@ -429,61 +467,73 @@ if(TARGET cudavm-conformance-managed_registration)
         "${CMAKE_CURRENT_SOURCE_DIR}/managed_registration/managed_registration.ptx"
         "${CMAKE_CURRENT_SOURCE_DIR}/managed_registration/managed_registration.cubin")
     configure_file(managed_registration/managed_fixtures.hpp.in managed_registration/managed_fixtures.hpp @ONLY)
-    target_include_directories(cudavm-conformance-managed_registration PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/managed_registration")
+    target_include_directories(cudavm_test_managed_registration PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/managed_registration")
 endif()
+
 cudavm_add_conformance_slice(procedure_address API_ONLY THREADS COMPONENTS cudart CASES calls versions streams HOST_CASES discovery validation threading FAMILY_CHECKS A01.discovery)
+
 foreach(registration_slice runtime_registration managed_registration)
-    if(TARGET cudavm-conformance-${registration_slice})
-        target_compile_definitions(cudavm-conformance-${registration_slice} PRIVATE CUDAVM_CONFORMANCE_REGISTRATION)
+    if(TARGET cudavm_test_${registration_slice})
+        target_compile_definitions(cudavm_test_${registration_slice} PRIVATE CUDAVM_CONFORMANCE_REGISTRATION)
     endif()
 endforeach()
+
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     cudavm_add_conformance_slice(host_abi_layout HOST_ONLY COMPONENTS cuda cudart CASES vectors transfers arrays graphs unions FAMILY_CHECKS A01.layout)
 endif()
+
 cudavm_add_conformance_slice(public_declarations HOST_ONLY COMPONENTS cuda cudart CASES driver runtime compilers callbacks versions FAMILY_CHECKS A01.declarations)
 cudavm_add_conformance_slice(public_types HOST_ONLY COMPONENTS cuda cudart CASES errors memory streams graphs handles FAMILY_CHECKS A01.types)
 cudavm_add_conformance_slice(api_errors HOST_ONLY THREADS COMPONENTS cuda cudart CASES driver runtime validation state threading FAMILY_CHECKS H02.errors)
 cudavm_add_conformance_slice(asynchronous_errors API_ONLY THREADS COMPONENTS cudart nvrtc
     CASES stream event context query dependencies library FAMILY_CHECKS H02.last_error H05.recovery)
 cudavm_add_conformance_slice(host_abi_exports HOST_ONLY COMPONENTS cuda cudart CASES driver runtime combined FAMILY_CHECKS A01.exports)
-if(TARGET cudavm-conformance-host_abi_exports)
-    add_library(cudavm-conformance-host-abi-client SHARED "${CMAKE_CURRENT_SOURCE_DIR}/host_abi_exports/host_abi_client.cpp")
-    target_compile_features(cudavm-conformance-host-abi-client PRIVATE cxx_std_20)
-    target_include_directories(cudavm-conformance-host-abi-client PRIVATE
+
+if(TARGET cudavm_test_host_abi_exports)
+    add_library(cudavm_test_host_abi_client SHARED "${CMAKE_CURRENT_SOURCE_DIR}/host_abi_exports/host_abi_client.cpp")
+    target_compile_features(cudavm_test_host_abi_client PRIVATE cxx_std_20)
+    target_include_directories(cudavm_test_host_abi_client PRIVATE
         "$<TARGET_PROPERTY:cudavm::cuda_shared,INTERFACE_INCLUDE_DIRECTORIES>"
         "$<TARGET_PROPERTY:cudavm::cudart_shared,INTERFACE_INCLUDE_DIRECTORIES>")
-    target_link_libraries(cudavm-conformance-host-abi-client PRIVATE ${CMAKE_DL_LIBS})
-    target_link_libraries(cudavm-conformance-host_abi_exports PRIVATE ${CMAKE_DL_LIBS})
-    cudavm_prepare_target(cudavm-conformance-host-abi-client)
-    set_target_properties(cudavm-conformance-host-abi-client PROPERTIES
+    target_link_libraries(cudavm_test_host_abi_client PRIVATE ${CMAKE_DL_LIBS})
+    target_link_libraries(cudavm_test_host_abi_exports PRIVATE ${CMAKE_DL_LIBS})
+    cudavm_prepare_target(cudavm_test_host_abi_client)
+    set_target_properties(cudavm_test_host_abi_client PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
         CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
-    add_dependencies(cudavm-conformance-host_abi_exports cudavm-conformance-host-abi-client)
-    target_compile_definitions(cudavm-conformance-host_abi_exports PRIVATE
-        "CUDAVM_ABI_CLIENT_PATH=\"$<TARGET_FILE:cudavm-conformance-host-abi-client>\""
+    add_dependencies(cudavm_test_host_abi_exports cudavm_test_host_abi_client)
+    target_compile_definitions(cudavm_test_host_abi_exports PRIVATE
+        "CUDAVM_ABI_CLIENT_PATH=\"$<TARGET_FILE:cudavm_test_host_abi_client>\""
         "CUDAVM_ABI_DRIVER_PATH=\"$<TARGET_FILE:cudavm::cuda_shared>\""
         "CUDAVM_ABI_RUNTIME_PATH=\"$<TARGET_FILE:cudavm::cudart_shared>\"")
 endif()
+
 set(public_header_cases cxx reverse)
+
 if(NOT CMAKE_C_COMPILER)
     include(CheckLanguage)
     check_language(C)
 endif()
+
 if(CMAKE_C_COMPILER)
     enable_language(C)
     list(APPEND public_header_cases c)
 else()
     message(STATUS "Public header C profile unavailable: no host C compiler")
 endif()
+
 cudavm_add_conformance_slice(public_headers HOST_ONLY COMPONENTS cuda cudart CASES ${public_header_cases} FAMILY_CHECKS A01.headers)
-if(TARGET cudavm-conformance-public_headers)
-    target_sources(cudavm-conformance-public_headers PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/public_headers/public_headers_reverse.cpp")
+
+if(TARGET cudavm_test_public_headers)
+    target_sources(cudavm_test_public_headers PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/public_headers/public_headers_reverse.cpp")
+
     if(CMAKE_C_COMPILER)
-        target_sources(cudavm-conformance-public_headers PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/public_headers/public_headers.c")
-        target_compile_definitions(cudavm-conformance-public_headers PRIVATE CUDAVM_CONFORMANCE_HAVE_C_HEADERS)
-        set_target_properties(cudavm-conformance-public_headers PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED TRUE)
+        target_sources(cudavm_test_public_headers PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/public_headers/public_headers.c")
+        target_compile_definitions(cudavm_test_public_headers PRIVATE CUDAVM_CONFORMANCE_HAVE_C_HEADERS)
+        set_target_properties(cudavm_test_public_headers PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED TRUE)
     endif()
 endif()
+
 cudavm_add_conformance_slice(device_allocation API_ONLY FAMILY_CHECKS M01.allocation M01.validation)
 cudavm_add_conformance_slice(memory_fill API_ONLY FAMILY_CHECKS M01.fill M01.padding)
 cudavm_add_conformance_slice(memory_copy API_ONLY FAMILY_CHECKS M01.copy M01.padding)
@@ -539,18 +589,22 @@ cudavm_add_conformance_slice(memory_pool_reuse API_ONLY COMPONENTS cudart CASES 
 cudavm_add_conformance_slice(memory_pool_sharing API_ONLY THREADS BACKENDS cuda COMPONENTS cudart CASES validation roundtrip sharing retirement HOST_CASES discovery FAMILY_CHECKS M04.sharing)
 cudavm_add_conformance_slice(peer_access API_ONLY THREADS BACKENDS cuda COMPONENTS cudart CASES topology validation unsupported atomics local visibility lifetime limits HOST_CASES discovery FAMILY_CHECKS M05.peer M05.visibility M05.limits)
 cudavm_add_conformance_slice(peer_copy API_ONLY THREADS COMPONENTS cudart CASES linear streams ptds geometry arrays ordering retirement validation devices HOST_CASES discovery FAMILY_CHECKS M05.peer M01.copy M01.completion)
-if(TARGET cudavm-conformance-peer_copy)
-    target_sources(cudavm-conformance-peer_copy PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/peer_copy/peer_copy_ptds.cpp")
+
+if(TARGET cudavm_test_peer_copy)
+    target_sources(cudavm_test_peer_copy PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/peer_copy/peer_copy_ptds.cpp")
     string(JOIN "," peer_copy_backends ${conformance_backends})
-    add_test(NAME conformance.peer_copy.mixed COMMAND cudavm-conformance-peer_copy any mixed)
+    add_test(NAME conformance.peer_copy.mixed COMMAND cudavm_test_peer_copy any mixed)
     set_tests_properties(conformance.peer_copy.mixed PROPERTIES ENVIRONMENT "CUDAVM_BACKENDS=${peer_copy_backends}"
         LABELS "conformance;peer_copy;mixed;M05.peer;M01.copy;M01.completion" SKIP_RETURN_CODE 77 TIMEOUT 240 RUN_SERIAL TRUE)
 endif()
+
 cudavm_add_conformance_slice(memory_ipc API_ONLY THREADS BACKENDS cuda COMPONENTS cudart CASES validation metadata sharing references retirement context_release legacy HOST_CASES discovery FAMILY_CHECKS H03.ipc H03.release)
 cudavm_add_conformance_slice(memory_decompression API_ONLY THREADS COMPONENTS cudart CASES metadata validation unsupported deflate snappy lz4 batch ordering ptds retirement allocators HOST_CASES discovery fixtures FAMILY_CHECKS M01.copy M01.validation)
-if(TARGET cudavm-conformance-memory_decompression)
-    target_sources(cudavm-conformance-memory_decompression PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/memory_decompression/decompression_ptds.cpp")
+
+if(TARGET cudavm_test_memory_decompression)
+    target_sources(cudavm_test_memory_decompression PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/memory_decompression/decompression_ptds.cpp")
 endif()
+
 cudavm_add_conformance_slice(graph_host_nodes API_ONLY COMPONENTS cudart CASES ordering parameters retirement validation FAMILY_CHECKS G01.nodes)
 cudavm_add_conformance_slice(graph_node_enable API_ONLY COMPONENTS cudart CASES defaults toggles nonzero independence validation FAMILY_CHECKS G01.update)
 cudavm_add_conformance_slice(graph_clone API_ONLY COMPONENTS cudart CASES correspondence edits lifetime validation FAMILY_CHECKS G01.clone)
@@ -644,22 +698,26 @@ cudavm_add_conformance_slice(fast_math_intrinsics SOURCE_ONLY SOURCE_CHECK SOURC
 cudavm_add_conformance_slice(floating_point_modes SOURCE_ONLY SOURCE_CHECK SOURCE_LTO PROFILES add multiply fused separate FAMILY_CHECKS D05.modes)
 cudavm_add_conformance_slice(floating_point_special_values SOURCE_ONLY SOURCE_CHECK SOURCE_LTO PROFILES float_neighbors double_neighbors FAMILY_CHECKS D05.special)
 set(quad_precision_cases disabled_headers)
+
 if(WIN32)
     list(APPEND quad_precision_cases windows_headers cpp_type c_type math_symbol)
 endif()
+
 cudavm_add_conformance_slice(quad_precision_math HOST_ONLY COMPONENTS nvrtc CASES ${quad_precision_cases} FAMILY_CHECKS D05.representation D05.rounding D05.accuracy)
 cudavm_add_conformance_slice(device_runtime SOURCE_ONLY SOURCE_CHECK SOURCE_LTO FAMILY_CHECKS D03.children A01.registration)
 cudavm_add_conformance_slice(dynamic_parallelism HOST_ONLY COMPONENTS nvrtc CASES source_rdc rdc_rejection source_lto FAMILY_CHECKS D03.children D03.progress)
 cudavm_add_conformance_slice(distributed_shared_memory SOURCE_ONLY SOURCE_CHECK SOURCE_LTO ARCHITECTURE 90 MINIMUM_PTX 78 BACKENDS cuda FAMILY_CHECKS D06.cluster D01.storage)
 cudavm_add_conformance_slice(tensor_maps API_ONLY THREADS CASES validation FAMILY_CHECKS D06.layout)
-if(TARGET cudavm-conformance-tensor_maps AND "cuda" IN_LIST conformance_backends)
+
+if(TARGET cudavm_test_tensor_maps AND "cuda" IN_LIST conformance_backends)
     foreach(tensor_map_case encoding replacement)
-        add_test(NAME conformance.tensor_maps.cuda.${tensor_map_case} COMMAND cudavm-conformance-tensor_maps cuda ${tensor_map_case})
+        add_test(NAME conformance.tensor_maps.cuda.${tensor_map_case} COMMAND cudavm_test_tensor_maps cuda ${tensor_map_case})
         set_tests_properties(conformance.tensor_maps.cuda.${tensor_map_case} PROPERTIES
             ENVIRONMENT "CUDAVM_BACKENDS=cuda" LABELS "conformance;tensor_maps;cuda;${tensor_map_case};D06.layout"
             SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
     endforeach()
 endif()
+
 cudavm_add_conformance_slice(tensor_memory_transfer SOURCE_ONLY SOURCE_CHECK SOURCE_LTO ARCHITECTURE 90 MINIMUM_PTX 80 BACKENDS cuda FAMILY_CHECKS D06.async D06.layout)
 cudavm_add_conformance_slice(wmma_operations SOURCE_ONLY SOURCE_CHECK SOURCE_LTO PROFILES rr rc cr cc fill precision FAMILY_CHECKS D06.tensor D06.layout)
 cudavm_add_conformance_slice(mma_operations SOURCE_ONLY SOURCE_CHECK SOURCE_LTO MINIMUM_PTX 65 BACKENDS cuda PROFILES f16 f16_precision FAMILY_CHECKS D06.tensor D06.layout)
@@ -680,7 +738,8 @@ cudavm_add_conformance_slice(device_assert SOURCE_ONLY THREADS COMPONENTS cudart
 cudavm_add_conformance_slice(device_progress FAMILY_CHECKS D01.progress D03.progress)
 cudavm_add_conformance_slice(warp_reduction SOURCE_ONLY ARCHITECTURE 80 FAMILY_CHECKS D03.collectives)
 cudavm_add_conformance_slice(address_spaces FAMILY_CHECKS C01.spaces)
-if(TARGET cudavm-conformance-address_spaces)
+
+if(TARGET cudavm_test_address_spaces)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/address_spaces/address_spaces_nvcc.cubin" address_nvcc_bytes HEX)
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," address_nvcc_bytes "${address_nvcc_bytes}")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/address_spaces/address_spaces_nvcc.cubin")

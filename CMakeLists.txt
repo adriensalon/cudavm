@@ -40,20 +40,9 @@ function(cudavm_embed_file path output symbol)
         message(FATAL_ERROR "Embedded source contains the raw-string delimiter: ${path}")
     endif()
     set(embedded_symbol "${symbol}")
-    file(CONFIGURE OUTPUT "${output}" CONTENT [[// Embedded source bytes; original license notices are retained below.
-static constexpr char @embedded_symbol@[] = R"cudavm_resource(@embedded_contents@)cudavm_resource";
+    file(CONFIGURE OUTPUT "${output}" CONTENT [[static constexpr char @embedded_symbol@[] = R"cudavm_resource(@embedded_contents@)cudavm_resource";
 ]] @ONLY)
 endfunction()
-
-if(NOT CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_CURRENT_LIST_DIR)
-    return()
-endif()
-
-if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    message(FATAL_ERROR "Build cudavm separately and use its installed SDK; add_subdirectory(cudavm) is unsupported")
-endif()
-project(cudavm VERSION 0.1.0 LANGUAGES C CXX)
-include(GNUInstallDirs)
 
 function(_cudavm_prepare_target target)
     get_target_property(kind ${target} TYPE)
@@ -107,22 +96,22 @@ function(_cudavm_prepare_target target)
     endwhile()
     if(files)
         list(REMOVE_DUPLICATES files)
-        add_custom_target(${target}-deploy
+        add_custom_target(${target}_deploy
             COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${target}>
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${files} $<TARGET_FILE_DIR:${target}>
             DEPENDS ${files} COMMENT "Deploying ${target} runtime libraries" VERBATIM)
-        add_dependencies(${target} ${target}-deploy)
+        add_dependencies(${target} ${target}_deploy)
     endif()
 endfunction()
 
-function(_cudavm_target_sources target)
+function(cudavm_target_sources target)
     cmake_parse_arguments(ARG "DEVICE_LIBRARY;SELECTIVE" "ARCH;BACKEND;RUNTIME" "SOURCES;DEVICE_LIBRARIES;HOST_LIBRARIES" ${ARGN})
     if(NOT TARGET "${target}" OR (NOT ARG_SOURCES AND NOT ARG_DEVICE_LIBRARIES) OR ARG_UNPARSED_ARGUMENTS)
-        message(FATAL_ERROR "_cudavm_target_sources requires an existing target and SOURCES or DEVICE_LIBRARIES")
+        message(FATAL_ERROR "cudavm_target_sources requires an existing target and SOURCES or DEVICE_LIBRARIES")
     endif()
     get_property(configured TARGET "${target}" PROPERTY CUDAVM_DEVICE_LINK_INPUTS SET)
     if(configured)
-        message(FATAL_ERROR "Call _cudavm_target_sources once per target with all mixed sources")
+        message(FATAL_ERROR "Call cudavm_target_sources once per target with all mixed sources")
     endif()
     if(ARG_DEVICE_LIBRARY AND ARG_BACKEND)
         message(FATAL_ERROR "A DEVICE_LIBRARY retains translation-unit IR; select BACKEND on the final program")
@@ -149,7 +138,7 @@ function(_cudavm_target_sources target)
     endif()
     set(root "${CMAKE_CURRENT_BINARY_DIR}/cudavm/${target}/$<CONFIG>")
     if(ARG_SELECTIVE AND NOT ARG_DEVICE_LIBRARY AND NOT ARG_SOURCES)
-        file(GENERATE OUTPUT "${root}/link_root.cu" CONTENT "// Generated empty CUDA link root.\n")
+        file(GENERATE OUTPUT "${root}/link_root.cu" CONTENT "\n")
         list(APPEND ARG_SOURCES "${root}/link_root.cu")
     endif()
     set(inputs)
@@ -162,7 +151,7 @@ function(_cudavm_target_sources target)
         get_filename_component(source_dir "${input}" DIRECTORY)
         string(SHA256 digest "${input}")
         string(SUBSTRING "${digest}" 0 12 digest)
-        set(stem "${root}/${name}-${digest}")
+        set(stem "${root}/${name}_${digest}")
         add_custom_command(OUTPUT "${stem}.host.cpp" "${stem}.bc" "${stem}.json"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${root}"
             COMMAND $<TARGET_FILE:cudavm::nvcc> compile-tu --input "${input}"
@@ -214,8 +203,8 @@ function(_cudavm_target_sources target)
     list(REMOVE_DUPLICATES inputs)
     set_property(TARGET "${target}" PROPERTY CUDAVM_DEVICE_LINK_INPUTS "${inputs}")
     if(ARG_DEVICE_LIBRARY)
-        add_custom_target("${target}-device" DEPENDS ${inputs} ${library_inputs})
-        add_dependencies("${target}" "${target}-device")
+        add_custom_target("${target}_device" DEPENDS ${inputs} ${library_inputs})
+        add_dependencies("${target}" "${target}_device")
         return()
     endif()
     foreach(input IN LISTS inputs)
@@ -228,7 +217,7 @@ function(_cudavm_target_sources target)
             list(APPEND bitcode --library-bitcode "${input}")
         endforeach()
         get_target_property(host_sources ${target} SOURCES)
-        set(host_target "${target}-cudavm-host")
+        set(host_target "${target}_cudavm_host")
         add_library(${host_target} OBJECT ${host_sources})
         foreach(property INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS COMPILE_FEATURES)
             set_property(TARGET ${host_target} PROPERTY ${property} "$<TARGET_PROPERTY:${target},${property}>")
@@ -277,8 +266,8 @@ function(_cudavm_target_sources target)
             --portable "${root}/program.bc" --ir "${root}/program.ll" --manifest "${root}/program.json"
             --arch "${ARG_ARCH}" ${emission}
         DEPENDS ${inputs} ${library_inputs} ${host_dependencies} ${compiler_dependencies} COMMAND_EXPAND_LISTS VERBATIM)
-    add_custom_target("${target}-device" DEPENDS ${outputs})
-    add_dependencies("${target}" "${target}-device")
+    add_custom_target("${target}_device" DEPENDS ${outputs})
+    add_dependencies("${target}" "${target}_device")
     set_property(TARGET "${target}" PROPERTY CUDAVM_DEVICE_BITCODE "${root}/program.bc")
 endfunction()
 
@@ -426,7 +415,7 @@ function(_cudavm_finalize_target target)
         else()
             list(APPEND device_options DEVICE_LIBRARY SELECTIVE)
         endif()
-        _cudavm_target_sources(${target} ${device_options} ARCH sm_${archs} RUNTIME ${runtime_target}
+        cudavm_target_sources(${target} ${device_options} ARCH sm_${archs} RUNTIME ${runtime_target}
             SOURCES ${cuda_sources} DEVICE_LIBRARIES ${libraries})
         set_property(TARGET ${target} PROPERTY CUDAVM_DEVICE_RESOLVED ${resolve})
     endif()
@@ -467,30 +456,55 @@ function(cudavm_add_target target kind)
     cmake_language(EVAL CODE "cmake_language(DEFER CALL _cudavm_finalize_target [[${target}]])")
 endfunction()
 
+if(NOT CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_CURRENT_LIST_DIR)
+    return()
+endif()
+
+if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    message(FATAL_ERROR "Build cudavm separately and use its installed SDK; add_subdirectory(cudavm) is unsupported")
+endif()
+
+project(cudavm VERSION 0.1.0 LANGUAGES C CXX)
+include(GNUInstallDirs)
+
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+endif()
+
+find_package(Git REQUIRED)
+
 option(CUDAVM_BUILD_TEST "Build cudavm tests" ${PROJECT_IS_TOP_LEVEL})
 option(CUDAVM_BUILD_PERF "Build ray tracing performance/correctness benchmarks" OFF)
+
 foreach(backend CUDA OPENCL OPENGL VULKAN)
     option(CUDAVM_ENABLE_${backend} "Build the ${backend} compute backend" ON)
 endforeach()
+
 option(CUDAVM_ENABLE_DIRECTX "Build the DirectX compute backend (Windows only)" ${WIN32})
+
 if(CUDAVM_ENABLE_DIRECTX AND NOT WIN32)
     message(FATAL_ERROR "CUDAVM_ENABLE_DIRECTX requires Windows")
 endif()
+
 set(CUDAVM_ENABLED_BACKENDS)
+
 foreach(backend CUDA VULKAN DIRECTX OPENCL OPENGL)
     if(CUDAVM_ENABLE_${backend})
         string(TOLOWER "${backend}" name)
         list(APPEND CUDAVM_ENABLED_BACKENDS ${name})
     endif()
 endforeach()
+
 if(NOT CUDAVM_ENABLED_BACKENDS)
     message(FATAL_ERROR "Enable at least one CUDAVM_ENABLE_<backend> option")
 endif()
+
 message(STATUS "cudavm enabled backends (discovery order): ${CUDAVM_ENABLED_BACKENDS}")
 
 set(CUDAVM_CUDA_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/include/cudart")
 set(CUDAVM_CUDA_CRT_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/include/nvcc")
 file(STRINGS "${PROJECT_SOURCE_DIR}/include/cuda/cuda.h" cuda_version REGEX "^#define CUDA_VERSION ")
+
 if(NOT cuda_version MATCHES "13040$")
     message(FATAL_ERROR "cudavm uses the pinned CUDA 13.4 headers (CUDA_VERSION 13040); found ${cuda_version}")
 endif()
@@ -512,6 +526,7 @@ if(CUDAVM_BUILD_TEST)
     enable_testing()
     add_subdirectory(test)
 endif()
+
 if(CUDAVM_BUILD_PERF)
     add_subdirectory(perf)
 endif()

@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
+
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     message(FATAL_ERROR "Configure cudavm from the repository root; external dependencies are not standalone projects")
 endif()
+
 if(NOT CUDAVM_ENABLE_OPENCL)
     return()
 endif()
@@ -19,4 +21,4 @@ add_library(cudavm_opencl_headers INTERFACE)
 target_include_directories(cudavm_opencl_headers SYSTEM INTERFACE
     "$<BUILD_INTERFACE:${opencl_headers_SOURCE_DIR}>")
 install(FILES "${opencl_headers_SOURCE_DIR}/LICENSE"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME OpenCL-Headers-LICENSE.txt)
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME OpenCL_Headers_LICENSE.txt)

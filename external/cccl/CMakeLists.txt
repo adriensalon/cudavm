@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
+
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     message(FATAL_ERROR "Configure cudavm from the repository root; external dependencies are not standalone projects")
 endif()
@@ -12,9 +13,11 @@ FetchContent_Declare(cccl
 FetchContent_MakeAvailable(cccl)
 
 set(CUDAVM_CCCL_INCLUDE_DIR "${cccl_SOURCE_DIR}/libcudacxx/include")
+
 if(NOT EXISTS "${CUDAVM_CCCL_INCLUDE_DIR}/nv/target")
     message(FATAL_ERROR "CCCL 3.4.2 source is missing libcudacxx/include/nv/target")
 endif()
+
 set(CUDAVM_CCCL_INCLUDE_DIR "${CUDAVM_CCCL_INCLUDE_DIR}" PARENT_SCOPE)
 install(FILES "${cccl_SOURCE_DIR}/LICENSE"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME CCCL-LICENSE.txt)
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME CCCL_LICENSE.txt)

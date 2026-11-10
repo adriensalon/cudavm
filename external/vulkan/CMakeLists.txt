@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
+
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     message(FATAL_ERROR "Configure cudavm from the repository root; external dependencies are not standalone projects")
 endif()
+
 if(NOT CUDAVM_ENABLE_VULKAN)
     return()
 endif()

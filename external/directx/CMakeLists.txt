@@ -2,10 +2,7 @@ if(NOT CUDAVM_DIRECTX_ACTION STREQUAL "configure")
     cmake_minimum_required(VERSION 3.24)
 endif()
 
-set(CUDAVM_DIRECTX_VERSION "1.9.2607")
-set(CUDAVM_DIRECTX_REVISION "0d3ee6b551b8fa768fbf825300ebab81047ef6a8")
-
-function(cudavm_directx_isolate_static)
+function(_cudavm_directx_isolate_static)
     execute_process(COMMAND "${NM}" --defined-only --extern-only "${OUTPUT}"
         OUTPUT_VARIABLE symbols COMMAND_ERROR_IS_FATAL ANY)
     string(REGEX MATCHALL " [A-Za-z] (llvm_[A-Za-z0-9_]+|LLVM[A-Za-z0-9_]+)" exports "${symbols}")
@@ -26,7 +23,7 @@ function(cudavm_directx_isolate_static)
     file(REMOVE "${OUTPUT}.symbols")
 endfunction()
 
-function(cudavm_directx_configure_upstream)
+function(_cudavm_directx_configure_upstream)
     include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../CMakeLists.txt")
     find_library(atl_library NAMES atls PATHS ENV LIB NO_DEFAULT_PATH REQUIRED)
     link_libraries("${atl_library}")
@@ -51,11 +48,11 @@ function(cudavm_directx_configure_upstream)
     foreach(function IN LISTS c_functions)
         string(APPEND symbols "#define ${function} cudavm_directx_${function}\n")
     endforeach()
-    file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/cudavm-directx-symbols.hpp" CONTENT "${symbols}" @ONLY)
-    add_compile_options("/FI${CMAKE_BINARY_DIR}/cudavm-directx-symbols.hpp")
+    file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/cudavm_directx_symbols.hpp" CONTENT "${symbols}" @ONLY)
+    add_compile_options("/FI${CMAKE_BINARY_DIR}/cudavm_directx_symbols.hpp")
 endfunction()
 
-function(cudavm_directx_add_validator)
+function(_cudavm_directx_add_validator)
     add_library(cudavm_directx_validator STATIC "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/validator.cpp")
     target_compile_features(cudavm_directx_validator PRIVATE cxx_std_17)
     target_compile_options(cudavm_directx_validator PRIVATE /EHsc /GR)
@@ -69,7 +66,6 @@ function(cudavm_directx_add_validator)
     find_library(atl_library NAMES atls PATHS ENV LIB NO_DEFAULT_PATH REQUIRED)
     target_link_libraries(cudavm_directx_validator PRIVATE ${validator_libraries} "${atl_library}"
         ole32 advapi32 uuid version user32 shell32 oleaut32 shlwapi)
-
     set(queue ${validator_libraries})
     set(visited)
     set(archives)
@@ -102,55 +98,7 @@ function(cudavm_directx_add_validator)
         VERBATIM)
 endfunction()
 
-if(CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
-    if(CUDAVM_DIRECTX_ACTION STREQUAL "isolate_static")
-        cudavm_directx_isolate_static()
-    elseif(CUDAVM_DIRECTX_ACTION STREQUAL "prepare")
-        find_package(Git REQUIRED)
-        set(source "${CUDAVM_DIRECTX_ROOT}/src")
-        if(NOT EXISTS "${source}/.git")
-            if(CUDAVM_DIRECTX_VERIFY_ONLY)
-                message(FATAL_ERROR "Pinned DXC source is missing: ${source}")
-            endif()
-            if(EXISTS "${source}")
-                message(FATAL_ERROR "Preserving existing non-Git DXC source directory: ${source}")
-            endif()
-            execute_process(COMMAND "${GIT_EXECUTABLE}" -c core.autocrlf=input
-                clone --depth 1 --single-branch --branch "v${CUDAVM_DIRECTX_VERSION}"
-                "${CUDAVM_DIRECTX_GIT_REPOSITORY}" "${source}"
-                COMMAND_ERROR_IS_FATAL ANY)
-        endif()
-        set(git "${GIT_EXECUTABLE}" -c "safe.directory=${source}")
-        execute_process(COMMAND ${git} rev-parse HEAD WORKING_DIRECTORY "${source}"
-            OUTPUT_VARIABLE revision OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
-        if(NOT revision STREQUAL CUDAVM_DIRECTX_REVISION)
-            message(FATAL_ERROR "DXC source must be v${CUDAVM_DIRECTX_VERSION} (${CUDAVM_DIRECTX_REVISION}), found ${revision}")
-        endif()
-        execute_process(COMMAND ${git} status --porcelain --untracked-files=all
-            WORKING_DIRECTORY "${source}" OUTPUT_VARIABLE changes COMMAND_ERROR_IS_FATAL ANY)
-        if(NOT changes STREQUAL "")
-            message(FATAL_ERROR "Preserving local DXC source changes; use a clean checkout: ${changes}")
-        endif()
-    else()
-        message(FATAL_ERROR "Unknown CUDAVM_DIRECTX_ACTION")
-    endif()
-    return()
-endif()
-
-if(CUDAVM_DIRECTX_ACTION STREQUAL "configure")
-    cudavm_directx_configure_upstream()
-    cmake_language(DEFER CALL cudavm_directx_add_validator)
-    return()
-endif()
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT CUDAVM_DIRECTX_ACTION STREQUAL "build")
-    message(FATAL_ERROR "Configure cudavm from the repository root; external dependencies are not standalone projects")
-endif()
-
-if(NOT WIN32 AND NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    return()
-endif()
-
-function(cudavm_directx_build_contract output args_output)
+function(_cudavm_directx_build_contract output args_output)
     set(c_compiler "${CMAKE_C_COMPILER}")
     set(cxx_compiler "${CMAKE_CXX_COMPILER}")
     if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -199,16 +147,76 @@ function(cudavm_directx_dependencies target)
     cudavm_merge_static_libraries(${target} "$<TARGET_FILE:cudavm_directx_validator>")
 endfunction()
 
+set(CUDAVM_DIRECTX_VERSION "1.9.2607")
+set(CUDAVM_DIRECTX_REVISION "0d3ee6b551b8fa768fbf825300ebab81047ef6a8")
+
+if(CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
+    if(CUDAVM_DIRECTX_ACTION STREQUAL "isolate_static")
+        _cudavm_directx_isolate_static()
+    elseif(CUDAVM_DIRECTX_ACTION STREQUAL "prepare")
+        set(source "${CUDAVM_DIRECTX_ROOT}/src")
+
+        if(NOT EXISTS "${source}/.git")
+            if(CUDAVM_DIRECTX_VERIFY_ONLY)
+                message(FATAL_ERROR "Pinned DXC source is missing: ${source}")
+            endif()
+
+            if(EXISTS "${source}")
+                message(FATAL_ERROR "Preserving existing non-Git DXC source directory: ${source}")
+            endif()
+
+            execute_process(COMMAND "${GIT_EXECUTABLE}" -c core.autocrlf=input
+                clone --depth 1 --single-branch --branch "v${CUDAVM_DIRECTX_VERSION}"
+                "${CUDAVM_DIRECTX_GIT_REPOSITORY}" "${source}"
+                COMMAND_ERROR_IS_FATAL ANY)
+        endif()
+
+        set(git "${GIT_EXECUTABLE}" -c "safe.directory=${source}")
+        execute_process(COMMAND ${git} rev-parse HEAD WORKING_DIRECTORY "${source}"
+            OUTPUT_VARIABLE revision OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+
+        if(NOT revision STREQUAL CUDAVM_DIRECTX_REVISION)
+            message(FATAL_ERROR "DXC source must be v${CUDAVM_DIRECTX_VERSION} (${CUDAVM_DIRECTX_REVISION}), found ${revision}")
+        endif()
+
+        execute_process(COMMAND ${git} status --porcelain --untracked-files=all
+            WORKING_DIRECTORY "${source}" OUTPUT_VARIABLE changes COMMAND_ERROR_IS_FATAL ANY)
+
+        if(NOT changes STREQUAL "")
+            message(FATAL_ERROR "Preserving local DXC source changes; use a clean checkout: ${changes}")
+        endif()
+    else()
+        message(FATAL_ERROR "Unknown CUDAVM_DIRECTX_ACTION")
+    endif()
+
+    return()
+endif()
+
+if(CUDAVM_DIRECTX_ACTION STREQUAL "configure")
+    _cudavm_directx_configure_upstream()
+    cmake_language(DEFER CALL _cudavm_directx_add_validator)
+    return()
+endif()
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT CUDAVM_DIRECTX_ACTION STREQUAL "build")
+    message(FATAL_ERROR "Configure cudavm from the repository root; external dependencies are not standalone projects")
+endif()
+
+if(NOT WIN32 AND NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    return()
+endif()
+
 if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     if(NOT CUDAVM_ENABLE_DIRECTX AND NOT CUDAVM_ENABLE_OPENCL)
         return()
     endif()
+
     include(FetchContent)
     FetchContent_Declare(windows_sdk
         URL https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.cpp/10.0.26100.1/microsoft.windows.sdk.cpp.10.0.26100.1.nupkg
         URL_HASH SHA256=b4730a467a8f29145fc0136b2b3f626767e985f6aa6e32f1352953c38d6ff5d2
         DOWNLOAD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../.tmp/downloads"
-        DOWNLOAD_NAME windows-sdk-10.0.26100.1.zip
+        DOWNLOAD_NAME windows_sdk_10.0.26100.1.zip
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE
         SOURCE_SUBDIR c/Include)
     FetchContent_MakeAvailable(windows_sdk)
@@ -218,45 +226,58 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         "$<BUILD_INTERFACE:${windows_headers}/um>"
         "$<BUILD_INTERFACE:${windows_headers}/shared>"
         "$<BUILD_INTERFACE:${windows_headers}/winrt>")
+
     if(NOT CUDAVM_ENABLE_DIRECTX)
         return()
     endif()
+
     set(directx_root "${PROJECT_SOURCE_DIR}/.tmp/directx/${CUDAVM_DIRECTX_VERSION}")
     set(directx_build_dir "${directx_root}/build")
     set(CUDAVM_DIRECTX_GIT_REPOSITORY "https://github.com/microsoft/DirectXShaderCompiler.git" CACHE STRING "DXC repository or local Git mirror")
     set(CUDAVM_DIRECTX_BUILD_JOBS 4 CACHE STRING "Maximum concurrent DXC compilation jobs")
-    cudavm_directx_build_contract(contract unused_args)
-    set(receipt "${directx_build_dir}/cudavm-directx.txt")
+    _cudavm_directx_build_contract(contract unused_args)
+    set(receipt "${directx_build_dir}/cudavm_directx.txt")
     set(archive "${directx_build_dir}/lib/cudavm_directx_validator.lib")
     set(actual_contract "")
+
     if(EXISTS "${receipt}")
         file(READ "${receipt}" actual_contract)
     endif()
+
     if(NOT actual_contract STREQUAL contract OR NOT EXISTS "${archive}")
         message(STATUS "Bootstrapping static DirectX validator ${CUDAVM_DIRECTX_VERSION}")
         set(bootstrap_args -S "${CMAKE_CURRENT_SOURCE_DIR}" -B "${directx_root}" -G "${CMAKE_GENERATOR}"
             -DCUDAVM_DIRECTX_ACTION=build
+            "-DGIT_EXECUTABLE:FILEPATH=${GIT_EXECUTABLE}"
             "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}" "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
             "-DCUDAVM_DIRECTX_GIT_REPOSITORY=${CUDAVM_DIRECTX_GIT_REPOSITORY}"
             "-DCUDAVM_DIRECTX_BUILD_JOBS=${CUDAVM_DIRECTX_BUILD_JOBS}")
+
         if(CMAKE_MAKE_PROGRAM)
             list(APPEND bootstrap_args "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}")
         endif()
+
         if(CMAKE_GENERATOR_PLATFORM)
             list(APPEND bootstrap_args -A "${CMAKE_GENERATOR_PLATFORM}")
         endif()
+
         if(CMAKE_GENERATOR_TOOLSET)
             list(APPEND bootstrap_args -T "${CMAKE_GENERATOR_TOOLSET}")
         endif()
+
         execute_process(COMMAND "${CMAKE_COMMAND}" ${bootstrap_args} COMMAND_ERROR_IS_FATAL ANY)
         execute_process(COMMAND "${CMAKE_COMMAND}" --build "${directx_root}" --config Release
             COMMAND_ERROR_IS_FATAL ANY)
     endif()
+
     file(READ "${receipt}" actual_contract)
+
     if(NOT actual_contract STREQUAL contract)
         message(FATAL_ERROR "Static DXIL validator does not match the selected source/build profile")
     endif()
+
     execute_process(COMMAND "${CMAKE_COMMAND}" "-DCUDAVM_DIRECTX_ROOT=${directx_root}"
+        "-DGIT_EXECUTABLE:FILEPATH=${GIT_EXECUTABLE}"
         -DCUDAVM_DIRECTX_ACTION=prepare -DCUDAVM_DIRECTX_VERIFY_ONLY=ON
         -P "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt" COMMAND_ERROR_IS_FATAL ANY)
     add_library(cudavm_directx_validator STATIC IMPORTED GLOBAL)
@@ -267,25 +288,30 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         "${CMAKE_CURRENT_SOURCE_DIR}/validator.cpp"
         "${PROJECT_SOURCE_DIR}/source/cuda/directx_validation.hpp")
     install(FILES "${directx_root}/src/LICENSE.TXT"
-        DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME DXC-LICENSE.txt)
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME DXC_LICENSE.txt)
     install(FILES "${directx_root}/src/ThirdPartyNotices.txt"
-        DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME DXC-THIRD-PARTY-NOTICES.txt)
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME DXC_THIRD_PARTY_NOTICES.txt)
     return()
 endif()
 
 project(cudavm_directx LANGUAGES C CXX)
+
 if(NOT WIN32)
     message(FATAL_ERROR "cudavm's DirectX backend requires Windows")
 endif()
+
 find_path(CUDAVM_DIRECTX_ATL_INCLUDE_DIR atlbase.h PATHS ENV INCLUDE NO_DEFAULT_PATH)
+
 if(NOT CUDAVM_DIRECTX_ATL_INCLUDE_DIR)
     message(FATAL_ERROR "DXC requires Visual Studio C++ ATL headers. Install the C++ ATL component and configure from its C++ toolchain environment")
 endif()
+
 include(ExternalProject)
 set(CUDAVM_DIRECTX_GIT_REPOSITORY "https://github.com/microsoft/DirectXShaderCompiler.git" CACHE STRING "DXC source repository or local Git mirror")
 set(CUDAVM_DIRECTX_BUILD_JOBS 4 CACHE STRING "Maximum concurrent DXC compilation jobs")
-cudavm_directx_build_contract(contract directx_args)
+_cudavm_directx_build_contract(contract directx_args)
 set(prepare "${CMAKE_COMMAND}" "-DCUDAVM_DIRECTX_ROOT=${CMAKE_BINARY_DIR}"
+    "-DGIT_EXECUTABLE:FILEPATH=${GIT_EXECUTABLE}"
     "-DCUDAVM_DIRECTX_GIT_REPOSITORY=${CUDAVM_DIRECTX_GIT_REPOSITORY}"
     -DCUDAVM_DIRECTX_ACTION=prepare -P "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
 ExternalProject_Add(cudavm_directx
@@ -295,7 +321,7 @@ ExternalProject_Add(cudavm_directx
     BUILD_COMMAND "${CMAKE_COMMAND}" --build <BINARY_DIR> --config Release
         --parallel "${CUDAVM_DIRECTX_BUILD_JOBS}" --target cudavm_directx_validator
     BUILD_ALWAYS TRUE INSTALL_COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-        "${CMAKE_BINARY_DIR}/contract.txt" "${CMAKE_BINARY_DIR}/build/cudavm-directx.txt"
+        "${CMAKE_BINARY_DIR}/contract.txt" "${CMAKE_BINARY_DIR}/build/cudavm_directx.txt"
     USES_TERMINAL_CONFIGURE TRUE USES_TERMINAL_BUILD TRUE)
 file(WRITE "${CMAKE_BINARY_DIR}/contract.txt" "${contract}")
 ExternalProject_Add_Step(cudavm_directx verify_source

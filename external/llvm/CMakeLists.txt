@@ -1,17 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 include_guard(GLOBAL)
 
-set(CUDAVM_LLVM_VERSION "22.1.4")
-set(CUDAVM_LLVM_TAG "llvmorg-${CUDAVM_LLVM_VERSION}")
-set(CUDAVM_LLVM_REVISION "35990504507d79e0b9deb809c8ee5e1b34ceef20")
-
-set(CUDAVM_LLVM_PATCH_NAMES nvptx spirv dxil)
-set(CUDAVM_LLVM_TARGETS NVPTX SPIRV)
-set(CUDAVM_LLVM_EXPERIMENTAL_TARGETS DirectX)
-set(CUDAVM_LLVM_REQUIRED_TARGETS
-    clangCodeGen clangTooling LLVMPasses LLVMNVPTXCodeGen LLVMSPIRVCodeGen
-    LLVMDirectXCodeGen clang-resource-headers llc)
-
 function(cudavm_llvm_json_string output value)
     string(REPLACE "\\" "\\\\" escaped "${value}")
     string(REPLACE "\"" "\\\"" escaped "${escaped}")
@@ -57,7 +46,7 @@ function(cudavm_llvm_source_contract output)
     set(${output} "${contract}" PARENT_SCOPE)
 endfunction()
 
-function(cudavm_llvm_build_contract output args_output)
+function(_cudavm_llvm_build_contract output args_output)
     cudavm_llvm_source_contract(contract)
     set(config "{}")
     set(llvm_args)
@@ -112,8 +101,7 @@ function(cudavm_llvm_build_contract output args_output)
     set(${args_output} "${llvm_args}" PARENT_SCOPE)
 endfunction()
 
-function(cudavm_llvm_prepare_source root verify_only)
-    find_package(Git REQUIRED)
+function(_cudavm_llvm_prepare_source root verify_only)
     get_filename_component(root "${root}" ABSOLUTE)
     set(source "${root}/src")
     if(EXISTS "${source}" AND NOT EXISTS "${source}/.git")
@@ -162,7 +150,7 @@ function(cudavm_llvm_prepare_source root verify_only)
     execute_process(COMMAND ${git} diff ${diff_args} HEAD WORKING_DIRECTORY "${source}"
         OUTPUT_VARIABLE actual COMMAND_ERROR_IS_FATAL ANY)
     string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef nonce)
-    set(index "${root}/contract-index-${nonce}")
+    set(index "${root}/contract_index_${nonce}")
     set(index_git "${CMAKE_COMMAND}" -E env "GIT_INDEX_FILE=${index}" ${git})
     execute_process(COMMAND ${index_git} read-tree HEAD WORKING_DIRECTORY "${source}"
         COMMAND_ERROR_IS_FATAL ANY)
@@ -207,18 +195,17 @@ function(cudavm_llvm_prepare_source root verify_only)
     endif()
     if(NOT verify_only)
         cudavm_llvm_source_contract(contract)
-        file(CONFIGURE OUTPUT "${root}/source-contract.json" CONTENT "${contract}\n" @ONLY)
-        file(REMOVE "${root}/build/cudavm-llvm.json")
+        file(CONFIGURE OUTPUT "${root}/source_contract.json" CONTENT "${contract}\n" @ONLY)
+        file(REMOVE "${root}/build/cudavm_llvm.json")
     endif()
     message(STATUS "Verified cudavm LLVM ${CUDAVM_LLVM_VERSION}, ordered nvptx/spirv/dxil patches: ${source}")
-
 endfunction()
 
-function(cudavm_llvm_verify_build root publish)
+function(_cudavm_llvm_verify_build root publish)
     get_filename_component(root "${root}" ABSOLUTE)
     set(source "${root}/src")
-    cudavm_llvm_prepare_source("${root}" TRUE)
-    file(READ "${root}/build-contract.json" contract)
+    _cudavm_llvm_prepare_source("${root}" TRUE)
+    file(READ "${root}/build_contract.json" contract)
     string(JSON recorded_fingerprint GET "${contract}" fingerprint)
     string(JSON unsigned_contract REMOVE "${contract}" fingerprint)
     string(SHA256 actual_fingerprint "${unsigned_contract}")
@@ -234,10 +221,10 @@ function(cudavm_llvm_verify_build root publish)
         endif()
     endforeach()
     if(NOT publish)
-        if(NOT EXISTS "${root}/build/cudavm-llvm.json")
+        if(NOT EXISTS "${root}/build/cudavm_llvm.json")
             message(FATAL_ERROR "LLVM SDK receipt is missing")
         endif()
-        file(READ "${root}/build/cudavm-llvm.json" receipt)
+        file(READ "${root}/build/cudavm_llvm.json" receipt)
         if(NOT receipt STREQUAL contract)
             message(FATAL_ERROR "LLVM SDK receipt is stale; rebuild the dependency")
         endif()
@@ -288,7 +275,7 @@ function(cudavm_llvm_verify_build root publish)
         message(FATAL_ERROR "LLVM receipt cannot be published: missing llc validation tool")
     endif()
     if(publish)
-        file(CONFIGURE OUTPUT "${root}/build/cudavm-llvm.json" CONTENT "${contract}" @ONLY)
+        file(CONFIGURE OUTPUT "${root}/build/cudavm_llvm.json" CONTENT "${contract}" @ONLY)
         message(STATUS "Published coherent cudavm LLVM SDK receipt")
     endif()
 endfunction()
@@ -348,25 +335,41 @@ function(cudavm_core_dependencies target)
     cudavm_merge_static_libraries(${target} ${archives})
 endfunction()
 
+set(CUDAVM_LLVM_VERSION "22.1.4")
+set(CUDAVM_LLVM_TAG "llvmorg-${CUDAVM_LLVM_VERSION}")
+set(CUDAVM_LLVM_REVISION "35990504507d79e0b9deb809c8ee5e1b34ceef20")
+
+set(CUDAVM_LLVM_PATCH_NAMES nvptx spirv dxil)
+set(CUDAVM_LLVM_TARGETS NVPTX SPIRV)
+set(CUDAVM_LLVM_EXPERIMENTAL_TARGETS DirectX)
+set(CUDAVM_LLVM_REQUIRED_TARGETS
+    clangCodeGen clangTooling LLVMPasses LLVMNVPTXCodeGen LLVMSPIRVCodeGen
+    LLVMDirectXCodeGen clang-resource-headers llc)
+
 if(CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
     if(NOT CUDAVM_LLVM_ACTION MATCHES "^(prepare|verify|publish)$")
         message(FATAL_ERROR "Set CUDAVM_LLVM_ACTION to prepare, verify or publish")
     endif()
+
     if(NOT CUDAVM_LLVM_ROOT)
         message(FATAL_ERROR "LLVM maintenance requires a private build root")
     endif()
+
     if(CUDAVM_LLVM_ACTION STREQUAL "prepare")
-        cudavm_llvm_prepare_source("${CUDAVM_LLVM_ROOT}" "${CUDAVM_LLVM_VERIFY_ONLY}")
+        _cudavm_llvm_prepare_source("${CUDAVM_LLVM_ROOT}" "${CUDAVM_LLVM_VERIFY_ONLY}")
     elseif(CUDAVM_LLVM_ACTION STREQUAL "verify")
-        cudavm_llvm_verify_build("${CUDAVM_LLVM_ROOT}" FALSE)
+        _cudavm_llvm_verify_build("${CUDAVM_LLVM_ROOT}" FALSE)
     else()
-        cudavm_llvm_verify_build("${CUDAVM_LLVM_ROOT}" TRUE)
+        _cudavm_llvm_verify_build("${CUDAVM_LLVM_ROOT}" TRUE)
     endif()
+
     return()
 endif()
+
 if(CMAKE_SCRIPT_MODE_FILE OR NOT CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_CURRENT_LIST_DIR)
     return()
 endif()
+
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT CUDAVM_LLVM_ACTION STREQUAL "build")
     message(FATAL_ERROR "Configure cudavm from the repository root; external dependencies are not standalone projects")
 endif()
@@ -376,43 +379,55 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(llvm_build_dir "${llvm_root}/build")
     set(CUDAVM_LLVM_GIT_REPOSITORY "https://github.com/llvm/llvm-project.git" CACHE STRING "LLVM repository or local Git mirror")
     set(CUDAVM_LLVM_BUILD_JOBS 4 CACHE STRING "Maximum concurrent LLVM compilation jobs")
-    cudavm_llvm_build_contract(expected_contract unused_llvm_args)
+    _cudavm_llvm_build_contract(expected_contract unused_llvm_args)
     string(JSON expected_fingerprint GET "${expected_contract}" fingerprint)
     set(sdk_matches FALSE)
-    if(EXISTS "${llvm_build_dir}/cudavm-llvm.json")
-        file(READ "${llvm_build_dir}/cudavm-llvm.json" llvm_contract)
+
+    if(EXISTS "${llvm_build_dir}/cudavm_llvm.json")
+        file(READ "${llvm_build_dir}/cudavm_llvm.json" llvm_contract)
         string(JSON sdk_fingerprint ERROR_VARIABLE receipt_error GET "${llvm_contract}" fingerprint)
+
         if(NOT receipt_error AND sdk_fingerprint STREQUAL expected_fingerprint)
             set(sdk_matches TRUE)
         endif()
     endif()
+
     if(NOT sdk_matches OR NOT EXISTS "${llvm_build_dir}/lib/cmake/llvm/LLVMConfig.cmake")
         set(bootstrap_args -S "${PROJECT_SOURCE_DIR}/external/llvm" -B "${llvm_root}" -G "${CMAKE_GENERATOR}"
             -DCUDAVM_LLVM_ACTION=build
+            "-DGIT_EXECUTABLE:FILEPATH=${GIT_EXECUTABLE}"
             "-DCMAKE_C_COMPILER:FILEPATH=${CMAKE_C_COMPILER}"
             "-DCMAKE_CXX_COMPILER:FILEPATH=${CMAKE_CXX_COMPILER}"
             "-DCUDAVM_LLVM_GIT_REPOSITORY:STRING=${CUDAVM_LLVM_GIT_REPOSITORY}"
             "-DCUDAVM_LLVM_BUILD_JOBS:STRING=${CUDAVM_LLVM_BUILD_JOBS}")
+
         if(CMAKE_MAKE_PROGRAM)
             list(APPEND bootstrap_args "-DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}")
         endif()
+
         if(CMAKE_GENERATOR_PLATFORM)
             list(APPEND bootstrap_args -A "${CMAKE_GENERATOR_PLATFORM}")
         endif()
+
         if(CMAKE_GENERATOR_TOOLSET)
             list(APPEND bootstrap_args -T "${CMAKE_GENERATOR_TOOLSET}")
         endif()
+
         message(STATUS "Bootstrapping cudavm LLVM ${CUDAVM_LLVM_VERSION}, NVPTX/SPIRV/DirectX")
         execute_process(COMMAND "${CMAKE_COMMAND}" ${bootstrap_args} COMMAND_ERROR_IS_FATAL ANY)
         execute_process(COMMAND "${CMAKE_COMMAND}" --build "${llvm_root}" --config Release
             COMMAND_ERROR_IS_FATAL ANY)
     endif()
-    file(READ "${llvm_build_dir}/cudavm-llvm.json" llvm_contract)
+
+    file(READ "${llvm_build_dir}/cudavm_llvm.json" llvm_contract)
     string(JSON sdk_fingerprint GET "${llvm_contract}" fingerprint)
+
     if(NOT sdk_fingerprint STREQUAL expected_fingerprint)
         message(FATAL_ERROR "LLVM SDK does not match cudavm's complete source/build contract")
     endif()
+
     execute_process(COMMAND "${CMAKE_COMMAND}" "-DCUDAVM_LLVM_ROOT=${llvm_root}"
+        "-DGIT_EXECUTABLE:FILEPATH=${GIT_EXECUTABLE}"
         -DCUDAVM_LLVM_ACTION=verify
         -P "${PROJECT_SOURCE_DIR}/external/llvm/CMakeLists.txt" COMMAND_ERROR_IS_FATAL ANY)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
@@ -420,10 +435,10 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         "${PROJECT_SOURCE_DIR}/external/llvm/cudavm_nvptx.patch"
         "${PROJECT_SOURCE_DIR}/external/llvm/cudavm_spirv.patch"
         "${PROJECT_SOURCE_DIR}/external/llvm/cudavm_dxil.patch"
-        "${llvm_build_dir}/cudavm-llvm.json"
+        "${llvm_build_dir}/cudavm_llvm.json"
         "${llvm_build_dir}/CMakeCache.txt"
-        "${llvm_root}/build-contract.json"
-        "${llvm_root}/source-contract.json"
+        "${llvm_root}/build_contract.json"
+        "${llvm_root}/source_contract.json"
         "${llvm_root}/src/.git/HEAD")
     set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG Release)
     set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release)
@@ -433,55 +448,70 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     find_package(Clang REQUIRED CONFIG NO_DEFAULT_PATH PATHS "${Clang_DIR}")
     set(enabled_targets ${LLVM_TARGETS_TO_BUILD})
     list(SORT enabled_targets)
+
     if(LLVM_ENABLE_RTTI OR NOT enabled_targets STREQUAL "DirectX;NVPTX;SPIRV")
         message(FATAL_ERROR "cudavm requires its RTTI-disabled static NVPTX/SPIRV/DirectX LLVM profile")
     endif()
+
     set(llvm_queue clangCodeGen clangTooling LLVMPasses LLVMNVPTXCodeGen LLVMSPIRVCodeGen LLVMDirectXCodeGen)
+
     foreach(item IN LISTS llvm_queue)
         if(NOT TARGET "${item}")
             message(FATAL_ERROR "LLVM SDK is missing required imported target ${item}")
         endif()
     endforeach()
+
     set(llvm_seen)
+
     while(llvm_queue)
         list(POP_FRONT llvm_queue item)
         string(REGEX REPLACE "^\\$<LINK_ONLY:([^>]+)>$" "\\1" item "${item}")
+
         if(item IN_LIST llvm_seen OR NOT TARGET "${item}")
             continue()
         endif()
+
         list(APPEND llvm_seen "${item}")
         get_target_property(kind "${item}" TYPE)
+
         if(kind STREQUAL "STATIC_LIBRARY")
             get_target_property(archive "${item}" IMPORTED_LOCATION_RELEASE)
+
             if(NOT archive)
                 get_target_property(archive "${item}" IMPORTED_LOCATION)
             endif()
+
             if(NOT archive OR NOT EXISTS "${archive}")
                 message(FATAL_ERROR "LLVM SDK is incomplete: missing static archive for ${item}")
             endif()
         elseif(NOT kind STREQUAL "INTERFACE_LIBRARY")
             message(FATAL_ERROR "LLVM SDK component ${item} must be static, found ${kind}")
         endif()
+
         get_target_property(dependencies "${item}" INTERFACE_LINK_LIBRARIES)
+
         if(dependencies)
             list(APPEND llvm_queue ${dependencies})
         endif()
     endwhile()
+
     set(clang_resource_dir "${llvm_build_dir}/lib/clang/${LLVM_VERSION_MAJOR}")
     set(wrapper_source "${clang_resource_dir}/include/__clang_cuda_runtime_wrapper.h")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${wrapper_source}")
     file(READ "${wrapper_source}" wrapper)
+
     if(NOT wrapper MATCHES "#if __has_include\\(\"curand_mtgp32_kernel.h\"\\)" OR NOT wrapper MATCHES "return __builtin_fmal\\(x, y, z\\)")
         message(FATAL_ERROR "Clang resource headers must come from the LLVM build with cudavm_nvptx.patch")
     endif()
+
     set(wrapper_path "${PROJECT_BINARY_DIR}/cuda_runtime_wrapper.h")
     configure_file("${PROJECT_SOURCE_DIR}/source/core/cuda_runtime_wrapper.h.in" "${wrapper_path}" @ONLY)
     set(CUDAVM_LLVM_LICENSE "${LLVM_BUILD_MAIN_SRC_DIR}/../LICENSE.TXT")
 
     file(RELATIVE_PATH includes_from_bin "/${CMAKE_INSTALL_BINDIR}" "/${CMAKE_INSTALL_INCLUDEDIR}")
     file(RELATIVE_PATH includes_from_lib "/${CMAKE_INSTALL_LIBDIR}" "/${CMAKE_INSTALL_INCLUDEDIR}")
-    file(RELATIVE_PATH sdk_notice_from_bin "/${CMAKE_INSTALL_BINDIR}" "/${CMAKE_INSTALL_DATADIR}/licences/LLVM-LICENSE.txt")
-    file(RELATIVE_PATH sdk_notice_from_lib "/${CMAKE_INSTALL_LIBDIR}" "/${CMAKE_INSTALL_DATADIR}/licences/LLVM-LICENSE.txt")
+    file(RELATIVE_PATH sdk_notice_from_bin "/${CMAKE_INSTALL_BINDIR}" "/${CMAKE_INSTALL_DATADIR}/licences/LLVM_LICENSE.txt")
+    file(RELATIVE_PATH sdk_notice_from_lib "/${CMAKE_INSTALL_LIBDIR}" "/${CMAKE_INSTALL_DATADIR}/licences/LLVM_LICENSE.txt")
     set(device_libraries LLVMCore LLVMSupport LLVMAnalysis LLVMipo LLVMPasses LLVMScalarOpts
         LLVMTransformUtils LLVMBitReader LLVMBitWriter LLVMLinker LLVMObject)
     set(source_libraries clangTooling clangFrontend clangSerialization clangDriver
@@ -489,15 +519,18 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(link_libraries ${device_libraries} LLVMAsmParser LLVMTarget LLVMCodeGen LLVMNVPTXCodeGen LLVMSPIRVCodeGen LLVMDirectXCodeGen)
     set(engine_dir "${PROJECT_SOURCE_DIR}/source/core")
     get_property(llvm_imported_targets DIRECTORY PROPERTY IMPORTED_TARGETS)
+
     foreach(target IN LISTS llvm_imported_targets)
         set_property(TARGET ${target} PROPERTY IMPORTED_GLOBAL TRUE)
     endforeach()
+
     foreach(variable LLVM_INCLUDE_DIRS CLANG_INCLUDE_DIRS LLVM_DEFINITIONS LLVM_BUILD_MAIN_SRC_DIR
             CUDAVM_LLVM_LICENSE includes_from_bin includes_from_lib sdk_notice_from_bin sdk_notice_from_lib
             CMAKE_MAP_IMPORTED_CONFIG_DEBUG CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO
             device_libraries source_libraries link_libraries engine_dir wrapper_path llvm_build_dir clang_resource_dir)
         set(${variable} "${${variable}}" PARENT_SCOPE)
     endforeach()
+
     return()
 endif()
 
@@ -506,10 +539,11 @@ include(ExternalProject)
 set(CUDAVM_LLVM_GIT_REPOSITORY "https://github.com/llvm/llvm-project.git" CACHE STRING
     "LLVM source repository or local Git mirror; its release commit is verified")
 set(CUDAVM_LLVM_BUILD_JOBS 4 CACHE STRING "Maximum concurrent LLVM compilation jobs")
-cudavm_llvm_build_contract(build_contract llvm_args)
-file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/build-contract.json"
+_cudavm_llvm_build_contract(build_contract llvm_args)
+file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/build_contract.json"
     CONTENT "${build_contract}\n" @ONLY)
 set(prepare "${CMAKE_COMMAND}" "-DCUDAVM_LLVM_ROOT=${CMAKE_BINARY_DIR}"
+    "-DGIT_EXECUTABLE:FILEPATH=${GIT_EXECUTABLE}"
     "-DCUDAVM_LLVM_GIT_REPOSITORY=${CUDAVM_LLVM_GIT_REPOSITORY}"
     -DCUDAVM_LLVM_ACTION=prepare -P "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
 ExternalProject_Add(cudavm_llvm
@@ -527,6 +561,7 @@ ExternalProject_Add(cudavm_llvm
         --parallel "${CUDAVM_LLVM_BUILD_JOBS}" --target ${CUDAVM_LLVM_REQUIRED_TARGETS}
     BUILD_ALWAYS TRUE
     INSTALL_COMMAND "${CMAKE_COMMAND}" "-DCUDAVM_LLVM_ROOT=${CMAKE_BINARY_DIR}"
+        "-DGIT_EXECUTABLE:FILEPATH=${GIT_EXECUTABLE}"
         -DCUDAVM_LLVM_ACTION=publish -P "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
 ExternalProject_Add_Step(cudavm_llvm source_contract
     COMMAND ${prepare}
@@ -536,4 +571,4 @@ ExternalProject_Add_Step(cudavm_llvm source_contract
         "${CMAKE_CURRENT_SOURCE_DIR}/cudavm_spirv.patch"
         "${CMAKE_CURRENT_SOURCE_DIR}/cudavm_dxil.patch"
         "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
-        "${CMAKE_BINARY_DIR}/build-contract.json")
+        "${CMAKE_BINARY_DIR}/build_contract.json")
