@@ -154,7 +154,10 @@ if(CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
     if(CUDAVM_DIRECTX_ACTION STREQUAL "isolate_static")
         _cudavm_directx_isolate_static()
     elseif(CUDAVM_DIRECTX_ACTION STREQUAL "prepare")
-        set(source "${CUDAVM_DIRECTX_ROOT}/src")
+        if(NOT CUDAVM_DIRECTX_ROOT)
+            message(FATAL_ERROR "DXC maintenance requires its source directory")
+        endif()
+        set(source "${CUDAVM_DIRECTX_ROOT}")
 
         if(NOT EXISTS "${source}/.git")
             if(CUDAVM_DIRECTX_VERIFY_ONLY)
@@ -165,10 +168,19 @@ if(CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
                 message(FATAL_ERROR "Preserving existing non-Git DXC source directory: ${source}")
             endif()
 
-            execute_process(COMMAND "${GIT_EXECUTABLE}" -c core.autocrlf=input
-                clone --depth 1 --single-branch --branch "v${CUDAVM_DIRECTX_VERSION}"
-                "${CUDAVM_DIRECTX_GIT_REPOSITORY}" "${source}"
+            message(STATUS "Fetching DirectXShaderCompiler ${CUDAVM_DIRECTX_VERSION} sources (${CUDAVM_DIRECTX_REVISION})")
+            execute_process(COMMAND "${GIT_EXECUTABLE}" -c core.autocrlf=input init "${source}"
                 COMMAND_ERROR_IS_FATAL ANY)
+            set(git "${GIT_EXECUTABLE}" -c "safe.directory=${source}" -c core.autocrlf=input)
+            execute_process(COMMAND ${git} remote add origin "${CUDAVM_DIRECTX_GIT_REPOSITORY}"
+                WORKING_DIRECTORY "${source}" COMMAND_ERROR_IS_FATAL ANY)
+            execute_process(COMMAND ${git} fetch --progress --depth 1 --no-tags
+                origin "${CUDAVM_DIRECTX_REVISION}"
+                WORKING_DIRECTORY "${source}" COMMAND_ERROR_IS_FATAL ANY)
+            message(STATUS "Checking out DirectXShaderCompiler sources: ${source}")
+            execute_process(COMMAND ${git} -c advice.detachedHead=false
+                checkout --detach --progress "${CUDAVM_DIRECTX_REVISION}"
+                WORKING_DIRECTORY "${source}" COMMAND_ERROR_IS_FATAL ANY)
         endif()
 
         set(git "${GIT_EXECUTABLE}" -c "safe.directory=${source}")
@@ -212,11 +224,14 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     endif()
 
     include(FetchContent)
+    set(FETCHCONTENT_QUIET OFF)
     FetchContent_Declare(windows_sdk
         URL https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.cpp/10.0.26100.1/microsoft.windows.sdk.cpp.10.0.26100.1.nupkg
         URL_HASH SHA256=b4730a467a8f29145fc0136b2b3f626767e985f6aa6e32f1352953c38d6ff5d2
-        DOWNLOAD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../.tmp/downloads"
-        DOWNLOAD_NAME windows_sdk_10.0.26100.1.zip
+        DOWNLOAD_DIR "${CMAKE_BINARY_DIR}/_deps"
+        DOWNLOAD_NAME directx.zip
+        DOWNLOAD_NO_PROGRESS FALSE
+        USES_TERMINAL_DOWNLOAD TRUE
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE
         SOURCE_SUBDIR c/Include)
     FetchContent_MakeAvailable(windows_sdk)
@@ -231,8 +246,9 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         return()
     endif()
 
-    set(directx_root "${PROJECT_SOURCE_DIR}/.tmp/directx/${CUDAVM_DIRECTX_VERSION}")
-    set(directx_build_dir "${directx_root}/build")
+    set(directx_root "${CMAKE_BINARY_DIR}/_deps/directx-src")
+    set(directx_build_dir "${CMAKE_BINARY_DIR}/_deps/directx-build")
+    set(directx_subbuild_dir "${CMAKE_BINARY_DIR}/_deps/directx-subbuild")
     set(CUDAVM_DIRECTX_GIT_REPOSITORY "https://github.com/microsoft/DirectXShaderCompiler.git" CACHE STRING "DXC repository or local Git mirror")
     set(CUDAVM_DIRECTX_BUILD_JOBS 4 CACHE STRING "Maximum concurrent DXC compilation jobs")
     _cudavm_directx_build_contract(contract unused_args)
@@ -246,8 +262,10 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     if(NOT actual_contract STREQUAL contract OR NOT EXISTS "${archive}")
         message(STATUS "Bootstrapping static DirectX validator ${CUDAVM_DIRECTX_VERSION}")
-        set(bootstrap_args -S "${CMAKE_CURRENT_SOURCE_DIR}" -B "${directx_root}" -G "${CMAKE_GENERATOR}"
+        set(bootstrap_args -S "${CMAKE_CURRENT_SOURCE_DIR}" -B "${directx_subbuild_dir}" -G "${CMAKE_GENERATOR}"
             -DCUDAVM_DIRECTX_ACTION=build
+            "-DCUDAVM_DIRECTX_ROOT:PATH=${directx_root}"
+            "-DCUDAVM_DIRECTX_BUILD_DIR:PATH=${directx_build_dir}"
             "-DGIT_EXECUTABLE:FILEPATH=${GIT_EXECUTABLE}"
             "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}" "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
             "-DCUDAVM_DIRECTX_GIT_REPOSITORY=${CUDAVM_DIRECTX_GIT_REPOSITORY}"
@@ -266,7 +284,7 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         endif()
 
         execute_process(COMMAND "${CMAKE_COMMAND}" ${bootstrap_args} COMMAND_ERROR_IS_FATAL ANY)
-        execute_process(COMMAND "${CMAKE_COMMAND}" --build "${directx_root}" --config Release
+        execute_process(COMMAND "${CMAKE_COMMAND}" --build "${directx_subbuild_dir}" --config Release
             COMMAND_ERROR_IS_FATAL ANY)
     endif()
 
@@ -287,9 +305,9 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${receipt}"
         "${CMAKE_CURRENT_SOURCE_DIR}/validator.cpp"
         "${PROJECT_SOURCE_DIR}/source/cuda/directx_validation.hpp")
-    install(FILES "${directx_root}/src/LICENSE.TXT"
+    install(FILES "${directx_root}/LICENSE.TXT"
         DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME DXC_LICENSE.txt)
-    install(FILES "${directx_root}/src/ThirdPartyNotices.txt"
+    install(FILES "${directx_root}/ThirdPartyNotices.txt"
         DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME DXC_THIRD_PARTY_NOTICES.txt)
     return()
 endif()
@@ -307,22 +325,25 @@ if(NOT CUDAVM_DIRECTX_ATL_INCLUDE_DIR)
 endif()
 
 include(ExternalProject)
+if(NOT CUDAVM_DIRECTX_ROOT OR NOT CUDAVM_DIRECTX_BUILD_DIR)
+    message(FATAL_ERROR "DXC bootstrap requires its source and build directories")
+endif()
 set(CUDAVM_DIRECTX_GIT_REPOSITORY "https://github.com/microsoft/DirectXShaderCompiler.git" CACHE STRING "DXC source repository or local Git mirror")
 set(CUDAVM_DIRECTX_BUILD_JOBS 4 CACHE STRING "Maximum concurrent DXC compilation jobs")
 _cudavm_directx_build_contract(contract directx_args)
-set(prepare "${CMAKE_COMMAND}" "-DCUDAVM_DIRECTX_ROOT=${CMAKE_BINARY_DIR}"
+set(prepare "${CMAKE_COMMAND}" "-DCUDAVM_DIRECTX_ROOT=${CUDAVM_DIRECTX_ROOT}"
     "-DGIT_EXECUTABLE:FILEPATH=${GIT_EXECUTABLE}"
     "-DCUDAVM_DIRECTX_GIT_REPOSITORY=${CUDAVM_DIRECTX_GIT_REPOSITORY}"
     -DCUDAVM_DIRECTX_ACTION=prepare -P "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
 ExternalProject_Add(cudavm_directx
-    SOURCE_DIR "${CMAKE_BINARY_DIR}/src" BINARY_DIR "${CMAKE_BINARY_DIR}/build"
+    SOURCE_DIR "${CUDAVM_DIRECTX_ROOT}" BINARY_DIR "${CUDAVM_DIRECTX_BUILD_DIR}"
     DOWNLOAD_COMMAND ${prepare} UPDATE_COMMAND "" PATCH_COMMAND ""
     CMAKE_ARGS ${directx_args}
     BUILD_COMMAND "${CMAKE_COMMAND}" --build <BINARY_DIR> --config Release
         --parallel "${CUDAVM_DIRECTX_BUILD_JOBS}" --target cudavm_directx_validator
     BUILD_ALWAYS TRUE INSTALL_COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-        "${CMAKE_BINARY_DIR}/contract.txt" "${CMAKE_BINARY_DIR}/build/cudavm_directx.txt"
-    USES_TERMINAL_CONFIGURE TRUE USES_TERMINAL_BUILD TRUE)
-file(WRITE "${CMAKE_BINARY_DIR}/contract.txt" "${contract}")
+        "${CUDAVM_DIRECTX_BUILD_DIR}/contract.txt" "${CUDAVM_DIRECTX_BUILD_DIR}/cudavm_directx.txt"
+    USES_TERMINAL_DOWNLOAD TRUE USES_TERMINAL_CONFIGURE TRUE USES_TERMINAL_BUILD TRUE)
+file(CONFIGURE OUTPUT "${CUDAVM_DIRECTX_BUILD_DIR}/contract.txt" CONTENT "${contract}" @ONLY)
 ExternalProject_Add_Step(cudavm_directx verify_source
     COMMAND ${prepare} DEPENDEES download DEPENDERS configure ALWAYS TRUE)
