@@ -1,5 +1,3 @@
-# This pinned producer profile is Windows x64, legacy stream, static cudart
-# 12.4, manifest-free and cubin-only. Other profiles are separate obligations.
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
     add_executable(cudavm_test_runtime_trace "${CMAKE_CURRENT_LIST_DIR}/runtime_trace.cpp")
     add_executable(cudavm_test_runtime_exports "${CMAKE_CURRENT_LIST_DIR}/runtime_exports.cpp")
@@ -12,8 +10,7 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(A
     add_custom_target(cudavm_test_nvidia_static_runtime_clients
         DEPENDS cudavm_cuda_shared cudavm_core_shared cudavm_test_runtime_trace cudavm_test_runtime_exports)
     add_dependencies(cudavm_test cudavm_test_nvidia_static_runtime_clients)
-    # DirectX exposes LUIDs but no Driver UUID yet; CUDA 12.4's loader handshake
-    # requires legacy UUIDs for every visible device. Do not claim that profile.
+
     foreach(backend native vulkan)
         if(NOT backend STREQUAL "native" AND NOT backend IN_LIST conformance_backends)
             continue()

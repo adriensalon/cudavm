@@ -125,9 +125,6 @@ function(_cudavm_llvm_prepare_source source build_dir verify_only)
         execute_process(COMMAND ${git} fetch --progress --depth 1 --filter=blob:none
             --no-tags origin "${CUDAVM_LLVM_REVISION}"
             WORKING_DIRECTORY "${source}" COMMAND_ERROR_IS_FATAL ANY)
-
-        # Prefetch the sparse checkout's blobs explicitly: Git's implicit lazy
-        # fetch during checkout does not force progress in CMake/IDE output.
         execute_process(COMMAND ${git} rev-list --objects --no-object-names --missing=print
             "${CUDAVM_LLVM_REVISION}" -- ":(top,glob)*" llvm clang cmake libc third-party
             WORKING_DIRECTORY "${source}" OUTPUT_VARIABLE objects COMMAND_ERROR_IS_FATAL ANY)
@@ -568,9 +565,11 @@ endif()
 
 project(cudavm_llvm LANGUAGES C CXX)
 include(ExternalProject)
+
 if(NOT CUDAVM_LLVM_ROOT OR NOT CUDAVM_LLVM_BUILD_DIR)
     message(FATAL_ERROR "LLVM bootstrap requires its source and build directories")
 endif()
+
 set(CUDAVM_LLVM_GIT_REPOSITORY "https://github.com/llvm/llvm-project.git" CACHE STRING
     "LLVM source repository or local Git mirror; its release commit is verified")
 set(CUDAVM_LLVM_BUILD_JOBS 4 CACHE STRING "Maximum concurrent LLVM compilation jobs")

@@ -331,9 +331,11 @@ if(NOT CUDAVM_DIRECTX_ATL_INCLUDE_DIR)
 endif()
 
 include(ExternalProject)
+
 if(NOT CUDAVM_DIRECTX_ROOT OR NOT CUDAVM_DIRECTX_BUILD_DIR)
     message(FATAL_ERROR "DXC bootstrap requires its source and build directories")
 endif()
+
 set(CUDAVM_DIRECTX_GIT_REPOSITORY "https://github.com/microsoft/DirectXShaderCompiler.git" CACHE STRING "DXC source repository or local Git mirror")
 set(CUDAVM_DIRECTX_BUILD_JOBS 4 CACHE STRING "Maximum concurrent DXC compilation jobs")
 _cudavm_directx_build_contract(contract directx_args)

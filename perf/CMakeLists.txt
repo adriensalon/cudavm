@@ -1,18 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
 
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    project(cudavm_perf LANGUAGES NONE)
-    message(FATAL_ERROR "Configure the cudavm root with CUDAVM_BUILD_PERF=ON; private benchmark helpers come from the parent build")
-endif()
-
-add_library(cudavm_perf_framework STATIC perf_framework.cpp)
-target_compile_features(cudavm_perf_framework PUBLIC cxx_std_20)
-target_include_directories(cudavm_perf_framework PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-if(WIN32 AND MSVC)
-    set_property(TARGET cudavm_perf_framework PROPERTY MSVC_RUNTIME_LIBRARY MultiThreaded)
-endif()
-add_custom_target(cudavm_perf DEPENDS cudavm_perf_framework)
-
 function(cudavm_add_perf_slice name)
     cmake_parse_arguments(slice "HOST_ONLY" "" "CASES;COMPONENTS;BACKENDS" ${ARGN})
     if(slice_UNPARSED_ARGUMENTS OR slice_KEYWORDS_MISSING_VALUES)
@@ -24,7 +11,6 @@ function(cudavm_add_perf_slice name)
     if(slice_HOST_ONLY AND slice_BACKENDS)
         message(FATAL_ERROR "HOST_ONLY performance slices do not select backends")
     endif()
-
     set(components ${slice_COMPONENTS})
     set(backends ${CUDAVM_ENABLED_BACKENDS})
     if(slice_HOST_ONLY)
@@ -52,7 +38,6 @@ function(cudavm_add_perf_slice name)
         endif()
         list(APPEND libraries cudavm::${component}_shared)
     endforeach()
-
     set(fixture_root "${CMAKE_CURRENT_SOURCE_DIR}/${name}")
     set(generated_root "${CMAKE_CURRENT_BINARY_DIR}/${name}")
     set(fixture_cubin_size 0)
@@ -73,7 +58,6 @@ function(cudavm_add_perf_slice name)
     endforeach()
     configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/perf_fixtures.hpp.in"
         "${generated_root}/perf_fixtures.hpp" @ONLY)
-
     set(target "cudavm_perf_${name}")
     add_executable(${target} "${fixture_root}/${name}.cpp")
     target_include_directories(${target} PRIVATE "${generated_root}")
@@ -84,7 +68,6 @@ function(cudavm_add_perf_slice name)
     endif()
     cudavm_prepare_target(${target})
     add_dependencies(cudavm_perf ${target})
-
     set(cases ${slice_CASES})
     if(NOT cases)
         set(cases default)
@@ -106,4 +89,17 @@ function(cudavm_add_perf_slice name)
     endforeach()
 endfunction()
 
-# Register vertical slices here as their workloads and correctness checks land.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(cudavm_perf LANGUAGES NONE)
+    message(FATAL_ERROR "Configure the cudavm root with CUDAVM_BUILD_PERF=ON; private benchmark helpers come from the parent build")
+endif()
+
+add_library(cudavm_perf_framework STATIC perf_framework.cpp)
+target_compile_features(cudavm_perf_framework PUBLIC cxx_std_20)
+target_include_directories(cudavm_perf_framework PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+
+if(WIN32 AND MSVC)
+    set_property(TARGET cudavm_perf_framework PROPERTY MSVC_RUNTIME_LIBRARY MultiThreaded)
+endif()
+
+add_custom_target(cudavm_perf DEPENDS cudavm_perf_framework)

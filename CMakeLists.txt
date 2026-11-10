@@ -516,8 +516,6 @@ add_subdirectory(external/vulkan)
 add_subdirectory(external/directx)
 add_subdirectory(source)
 
-# Public SDK filenames and installation policy are owned here. Source targets
-# retain their internal cudavm names and do not install themselves.
 foreach(target IN LISTS cudavm_install_targets)
     if(target MATCHES "^cudavm_(.+)_(shared|static)$")
         set(component "${CMAKE_MATCH_1}")
@@ -528,7 +526,9 @@ foreach(target IN LISTS cudavm_install_targets)
         set_target_properties(${target} PROPERTIES OUTPUT_NAME "cudavm_${component}${suffix}")
     endif()
 endforeach()
+
 set_target_properties(cudavm_nvcc PROPERTIES OUTPUT_NAME cudavm-nvcc)
+
 if(WIN32)
     set_target_properties(cudavm_cuda_shared PROPERTIES RUNTIME_OUTPUT_NAME nvcuda ARCHIVE_OUTPUT_NAME cuda)
     set_target_properties(cudavm_cudart_shared PROPERTIES RUNTIME_OUTPUT_NAME cudart64_13 ARCHIVE_OUTPUT_NAME cudart)
@@ -539,8 +539,10 @@ if(WIN32)
 elseif(UNIX AND NOT APPLE)
     set_target_properties(cudavm_cuda_shared PROPERTIES OUTPUT_NAME cuda SOVERSION 1 INSTALL_RPATH "$ORIGIN")
 endif()
+
 install(FILES "${CUDAVM_LLVM_LICENSE}" DESTINATION "${CMAKE_INSTALL_DATADIR}/licences" RENAME LLVM_LICENSE.txt)
 install(TARGETS cudavm_nvcc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 if(UNIX)
     set(library_origin "$ORIGIN")
     if(APPLE)
@@ -567,10 +569,9 @@ foreach(target IN LISTS cudavm_install_targets)
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${component}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${component})
 endforeach()
+
 install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-# Public Windows x64 compiler installation. Module-owned include trees remain
-# available for extensions and the private bootstrap compiler; public CUDA
-# include spellings are assembled alongside them without modifying their bytes.
+
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(public_modules cuda cudart cudadevrt nvcc nvrtc nvvm nvptxcompiler nvjitlink nvfatbin)
     foreach(module IN LISTS public_modules)
@@ -597,8 +598,7 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
 ]] @ONLY)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/sdk/version.txt" "CUDA Version 13.4.1\n")
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/sdk/version.json" "${CMAKE_CURRENT_BINARY_DIR}/sdk/version.txt" DESTINATION . COMPONENT cuda_sdk)
-    # nvcc consumes these same helper sources from the core's embedded bundle.
-    # No NVIDIA libdevice bitcode or external compiler tool is borrowed.
+
     install(FILES "${PROJECT_SOURCE_DIR}/source/cudadevrt/device_numeric_entry.cu"
         "${PROJECT_SOURCE_DIR}/source/cudadevrt/device_math.cu" DESTINATION nvvm/libdevice COMPONENT cuda_sdk)
 endif()
