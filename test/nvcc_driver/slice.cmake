@@ -1,5 +1,4 @@
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
     get_filename_component(host_tool_directory "${CMAKE_CXX_COMPILER}" DIRECTORY)
     find_program(public_nvcc_host NAMES clang-cl HINTS "${host_tool_directory}" REQUIRED)
     add_custom_target(cudavm_test_public_sdk DEPENDS cudavm_nvcc cudavm_core_shared cudavm_cuda_shared
@@ -20,10 +19,12 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_CXX_COMPILER_ID MATCHES "Clan
             continue()
         endif()
         set(case "conformance.${slice}.${backend}.${mode}")
-        add_test(NAME "${case}" COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/run.py"
-            --build "${CMAKE_BINARY_DIR}" --config "$<CONFIG>" --work "${CMAKE_CURRENT_BINARY_DIR}/public_sdk"
-            --mode "${mode}" --cmake "${CMAKE_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}" --host "${public_nvcc_host}")
-        set_tests_properties("${case}" PROPERTIES RUN_SERIAL TRUE TIMEOUT 420 SKIP_RETURN_CODE 77
+        add_test(NAME "${case}" COMMAND "${CMAKE_COMMAND}"
+            "-Dbuild=${CMAKE_BINARY_DIR}" "-Dconfig=$<CONFIG>" "-Dwork=${CMAKE_CURRENT_BINARY_DIR}/public_sdk"
+            "-Dmode=${mode}" "-Dcmake=${CMAKE_COMMAND}" "-Dninja=${CMAKE_MAKE_PROGRAM}" "-Dhost=${public_nvcc_host}"
+            -P "${CMAKE_CURRENT_LIST_DIR}/run.cmake")
+        set_tests_properties("${case}" PROPERTIES RUN_SERIAL TRUE TIMEOUT 420
+            SKIP_REGULAR_EXPRESSION "SKIP: selected Vulkan backend has no available device"
             LABELS "conformance;${slice};${backend};A01.discovery;C01.options;C01.link;C02.inputs")
     endforeach()
 endif()
