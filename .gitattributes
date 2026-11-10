@@ -1,0 +1,5 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# LLVM patches must use LF to match the upstream source and canonical diffs.
+/external/llvm/*.patch text eol=lf
