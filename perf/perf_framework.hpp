@@ -98,11 +98,33 @@ struct perf_device_buffer {
 
 struct perf_stream {
     CUstream value{};
-    perf_stream();
+    explicit perf_stream(unsigned flags = CU_STREAM_NON_BLOCKING);
     ~perf_stream();
     perf_stream(const perf_stream&) = delete;
     perf_stream& operator=(const perf_stream&) = delete;
     void synchronize() const;
+    void close();
+};
+
+struct perf_event {
+    CUevent value{};
+    explicit perf_event(unsigned flags = 0);
+    ~perf_event();
+    perf_event(const perf_event&) = delete;
+    perf_event& operator=(const perf_event&) = delete;
+    void record(CUstream stream) const;
+    void synchronize() const;
+    void close();
+};
+
+struct perf_host_buffer {
+    void* value{};
+    size_t bytes{};
+    explicit perf_host_buffer(size_t size);
+    ~perf_host_buffer();
+    perf_host_buffer(const perf_host_buffer&) = delete;
+    perf_host_buffer& operator=(const perf_host_buffer&) = delete;
+    unsigned char* data() const;
     void close();
 };
 
@@ -112,6 +134,16 @@ struct perf_module {
     ~perf_module();
     perf_module(const perf_module&) = delete;
     perf_module& operator=(const perf_module&) = delete;
+    CUfunction function(const char* name) const;
+    void close();
+};
+
+struct perf_library {
+    CUlibrary value{};
+    explicit perf_library(const void* image);
+    ~perf_library();
+    perf_library(const perf_library&) = delete;
+    perf_library& operator=(const perf_library&) = delete;
     CUfunction function(const char* name) const;
     void close();
 };

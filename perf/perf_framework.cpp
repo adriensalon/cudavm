@@ -217,11 +217,30 @@ void perf_device_buffer::close() {
     if (value) { PERF_CUDA(cuMemFree(value)); value = 0; }
 }
 
-perf_stream::perf_stream() { PERF_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+perf_stream::perf_stream(unsigned flags) { PERF_CUDA(cuStreamCreate(&value, flags)); }
 perf_stream::~perf_stream() { if (value) cuStreamDestroy(value); }
 void perf_stream::synchronize() const { PERF_CUDA(cuStreamSynchronize(value)); }
 void perf_stream::close() {
     if (value) { PERF_CUDA(cuStreamDestroy(value)); value = nullptr; }
+}
+
+perf_event::perf_event(unsigned flags) { PERF_CUDA(cuEventCreate(&value, flags)); }
+perf_event::~perf_event() { if (value) cuEventDestroy(value); }
+void perf_event::record(CUstream stream) const { PERF_CUDA(cuEventRecord(value, stream)); }
+void perf_event::synchronize() const { PERF_CUDA(cuEventSynchronize(value)); }
+void perf_event::close() {
+    if (value) { PERF_CUDA(cuEventDestroy(value)); value = nullptr; }
+}
+
+perf_host_buffer::perf_host_buffer(size_t size) : bytes(size) {
+    PERF_CUDA(cuMemHostAlloc(&value, bytes, 0));
+}
+perf_host_buffer::~perf_host_buffer() {
+    if (value) { cuCtxSynchronize(); cuMemFreeHost(value); }
+}
+unsigned char* perf_host_buffer::data() const { return static_cast<unsigned char*>(value); }
+void perf_host_buffer::close() {
+    if (value) { PERF_CUDA(cuMemFreeHost(value)); value = nullptr; }
 }
 
 perf_module::perf_module(const void* image) { PERF_CUDA(cuModuleLoadData(&value, image)); }
@@ -233,6 +252,21 @@ CUfunction perf_module::function(const char* name) const {
 }
 void perf_module::close() {
     if (value) { PERF_CUDA(cuModuleUnload(value)); value = nullptr; }
+}
+
+perf_library::perf_library(const void* image) {
+    PERF_CUDA(cuLibraryLoadData(&value, image, nullptr, nullptr, 0, nullptr, nullptr, 0));
+}
+perf_library::~perf_library() { if (value) cuLibraryUnload(value); }
+CUfunction perf_library::function(const char* name) const {
+    CUkernel kernel{};
+    CUfunction result{};
+    PERF_CUDA(cuLibraryGetKernel(&kernel, value, name));
+    PERF_CUDA(cuKernelGetFunction(&result, kernel));
+    return result;
+}
+void perf_library::close() {
+    if (value) { PERF_CUDA(cuLibraryUnload(value)); value = nullptr; }
 }
 
 void require_perf_execution() {

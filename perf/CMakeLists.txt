@@ -119,6 +119,7 @@ target_compile_definitions(cudavm_perf_framework INTERFACE
     CUDAVM_PERF_HOST_SYSTEM="${CMAKE_SYSTEM_NAME}"
     CUDAVM_PERF_HOST_PROCESSOR="${CMAKE_SYSTEM_PROCESSOR}"
     CUDAVM_PERF_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+
 add_custom_target(cudavm_perf)
 
 cudavm_add_perf_slice(source_compilation HOST_ONLY COMPONENTS nvrtc CASES small large WARMUP 1 SAMPLES 3)
@@ -126,3 +127,8 @@ cudavm_add_perf_slice(context_lifecycle CASES explicit primary_retain WARMUP 2 S
 cudavm_add_perf_slice(kernel_launch CASES completed batched WARMUP 2 SAMPLES 7 ITERATIONS 16)
 cudavm_add_perf_slice(memory_copy CASES h2d_4k d2h_4k d2d_4k h2d_4m d2h_4m d2d_4m WARMUP 2 SAMPLES 7 ITERATIONS 8)
 cudavm_add_perf_slice(memory_fill CASES d8_4k d32_4k d8_4m d32_4m WARMUP 2 SAMPLES 7 ITERATIONS 8)
+cudavm_add_perf_slice(device_allocation CASES alloc_free_4k alloc_free_4m WARMUP 1 SAMPLES 5 ITERATIONS 8)
+cudavm_add_perf_slice(stream_lifecycle CASES blocking non_blocking WARMUP 1 SAMPLES 5 ITERATIONS 8)
+cudavm_add_perf_slice(event_timing CASES create_timed create_disabled record_timed record_disabled elapsed_query WARMUP 1 SAMPLES 5 ITERATIONS 4)
+cudavm_add_perf_slice(module_loading CASES module library WARMUP 1 SAMPLES 3)
+cudavm_add_perf_slice(vector_transform CASES resident_small resident_large pageable_small pageable_large pinned_small WARMUP 1 SAMPLES 5 ITERATIONS 4)
