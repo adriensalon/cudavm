@@ -1,0 +1,13 @@
+.version 6.0
+.target sm_50
+.address_size 64
+
+.visible .entry perf_increment(.param .u64 output) {
+    .reg .b64 %pointer;
+    .reg .b32 %value;
+    ld.param.u64 %pointer, [output];
+    ld.global.u32 %value, [%pointer];
+    add.u32 %value, %value, 1;
+    st.global.u32 [%pointer], %value;
+    ret;
+}
