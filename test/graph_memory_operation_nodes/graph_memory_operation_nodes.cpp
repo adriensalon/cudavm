@@ -17,11 +17,11 @@ struct memory_node_storage {
     device_buffer device{memory_node_bytes}; void* host{}; std::vector<unsigned char> initial;
     memory_node_storage() : initial(memory_node_bytes) {
         for (size_t i = 0; i < initial.size(); ++i) initial[i] = static_cast<unsigned char>(i * 37 + 13);
-        CONFORMANCE_CUDA(cuMemAllocHost(&host, memory_node_host_bytes));
+        TEST_CUDA(cuMemAllocHost(&host, memory_node_host_bytes));
         try { reset(); } catch (...) { cuMemFreeHost(host); host = nullptr; throw; }
     }
     ~memory_node_storage() { if (host) { cuCtxSynchronize(); cuMemFreeHost(host); } }
-    void reset() { CONFORMANCE_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size())); std::memset(host, 0xd3, memory_node_host_bytes); }
+    void reset() { TEST_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size())); std::memset(host, 0xd3, memory_node_host_bytes); }
     std::vector<unsigned char> expected(unsigned variant, bool operations = true) const {
         auto bytes = initial; std::fill_n(bytes.begin() + 32, 16, 0x41);
         if (operations) {
@@ -40,7 +40,7 @@ struct memory_node_storage {
     void untouched() const {
         require(std::all_of(static_cast<unsigned char*>(host), static_cast<unsigned char*>(host) + memory_node_host_bytes,
             [](unsigned char byte) { return byte == 0xd3; }), "memory-node upload does not execute readback");
-        std::vector<unsigned char> actual(memory_node_bytes); CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), device.value, actual.size()));
+        std::vector<unsigned char> actual(memory_node_bytes); TEST_CUDA(cuMemcpyDtoH(actual.data(), device.value, actual.size()));
         require(actual == initial, "memory-node construction/upload/invalid edits do not modify device storage");
     }
 };
@@ -61,7 +61,7 @@ std::vector<CUstreamBatchMemOpParams> memory_node_operations(const memory_node_s
         memory_node_write(address + 8, 0x81234567abcdef00ull + variant, true), memory_node_wait(address + 8, 0x81234567abcdef00ull + variant, true, predicate), gpu_barrier};
 }
 CUDA_BATCH_MEM_OP_NODE_PARAMS memory_node_params(std::vector<CUstreamBatchMemOpParams>& ops) {
-    CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context)); return {context, static_cast<unsigned>(ops.size()), ops.data(), 0};
+    CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context)); return {context, static_cast<unsigned>(ops.size()), ops.data(), 0};
 }
 CUgraphNodeParams memory_node_generic(const CUDA_BATCH_MEM_OP_NODE_PARAMS& p) {
     CUgraphNodeParams result{}; result.type = CU_GRAPH_NODE_TYPE_BATCH_MEM_OP; result.memOp = {p.ctx, p.count, p.paramArray, p.flags}; return result;
@@ -71,12 +71,12 @@ CUresult memory_node_set(CUgraphNode node, const CUDA_BATCH_MEM_OP_NODE_PARAMS& 
     return executable ? cuGraphExecBatchMemOpNodeSetParams(executable, node, &p) : cuGraphBatchMemOpNodeSetParams(node, &p);
 }
 void memory_node_query(CUgraphNode node, const CUDA_BATCH_MEM_OP_NODE_PARAMS& expected) {
-    memory_node_guarded<CUgraphNodeType> type; CONFORMANCE_CUDA(cuGraphNodeGetType(node, &type.value)); type.check();
+    memory_node_guarded<CUgraphNodeType> type; TEST_CUDA(cuGraphNodeGetType(node, &type.value)); type.check();
     require(type.value == CU_GRAPH_NODE_TYPE_BATCH_MEM_OP, "memory-operation node type");
     memory_node_guarded<CUDA_BATCH_MEM_OP_NODE_PARAMS> typed;
-    CONFORMANCE_CUDA(cuGraphBatchMemOpNodeGetParams(node, &typed.value)); typed.check();
+    TEST_CUDA(cuGraphBatchMemOpNodeGetParams(node, &typed.value)); typed.check();
     memory_node_guarded<CUgraphNodeParams> generic;
-    CONFORMANCE_CUDA(cuGraphNodeGetParams(node, &generic.value)); generic.check();
+    TEST_CUDA(cuGraphNodeGetParams(node, &generic.value)); generic.check();
     require(generic.value.type == CU_GRAPH_NODE_TYPE_BATCH_MEM_OP, "generic memory-operation node type");
     const auto check = [&](const auto& p) {
         require(p.ctx == expected.ctx && p.count == expected.count && p.flags == expected.flags && (!p.count || p.paramArray), "copied memory-operation context/count/flags");
@@ -93,35 +93,35 @@ void memory_node_query(CUgraphNode node, const CUDA_BATCH_MEM_OP_NODE_PARAMS& ex
     check(typed.value); check(generic.value.memOp);
 }
 struct memory_node_stream {
-    CUstream value{}; memory_node_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    CUstream value{}; memory_node_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~memory_node_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
-    void synchronize() const { CONFORMANCE_CUDA(cuStreamSynchronize(value)); }
+    void synchronize() const { TEST_CUDA(cuStreamSynchronize(value)); }
 };
 struct memory_node_graph {
     CUgraph value{}; CUgraphNode fill{}, node{}, read{};
-    memory_node_graph() { CONFORMANCE_CUDA(cuGraphCreate(&value, 0)); }
+    memory_node_graph() { TEST_CUDA(cuGraphCreate(&value, 0)); }
     ~memory_node_graph() { if (value) cuGraphDestroy(value); }
     void build(memory_node_storage& storage, std::vector<CUstreamBatchMemOpParams>& ops, bool generic) {
         auto params = memory_node_params(ops);
         CUDA_MEMSET_NODE_PARAMS producer{}; producer.dst = storage.device.value + 32; producer.value = memory_node_fill; producer.elementSize = 4; producer.width = 4; producer.height = 1;
-        CONFORMANCE_CUDA(cuGraphAddMemsetNode(&fill, value, nullptr, 0, &producer, params.ctx));
-        if (generic) { auto p = memory_node_generic(params); CONFORMANCE_CUDA(cuGraphAddNode(&node, value, &fill, nullptr, 1, &p)); }
-        else CONFORMANCE_CUDA(cuGraphAddBatchMemOpNode(&node, value, &fill, 1, &params));
+        TEST_CUDA(cuGraphAddMemsetNode(&fill, value, nullptr, 0, &producer, params.ctx));
+        if (generic) { auto p = memory_node_generic(params); TEST_CUDA(cuGraphAddNode(&node, value, &fill, nullptr, 1, &p)); }
+        else TEST_CUDA(cuGraphAddBatchMemOpNode(&node, value, &fill, 1, &params));
         CUDA_MEMCPY3D copy{}; copy.srcMemoryType = CU_MEMORYTYPE_DEVICE; copy.srcDevice = storage.device.value;
         copy.dstMemoryType = CU_MEMORYTYPE_HOST; copy.dstHost = static_cast<unsigned char*>(storage.host) + memory_node_host_offset;
         copy.srcPitch = copy.dstPitch = copy.WidthInBytes = memory_node_bytes; copy.srcHeight = copy.dstHeight = copy.Height = copy.Depth = 1;
-        CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&read, value, &node, 1, &copy, params.ctx));
+        TEST_CUDA(cuGraphAddMemcpyNode(&read, value, &node, 1, &copy, params.ctx));
     }
     void clone(const memory_node_graph& source) {
-        CONFORMANCE_CUDA(cuGraphDestroy(value)); value = nullptr; CONFORMANCE_CUDA(cuGraphClone(&value, source.value));
-        CONFORMANCE_CUDA(cuGraphNodeFindInClone(&node, source.node, value));
+        TEST_CUDA(cuGraphDestroy(value)); value = nullptr; TEST_CUDA(cuGraphClone(&value, source.value));
+        TEST_CUDA(cuGraphNodeFindInClone(&node, source.node, value));
     }
 };
 struct memory_node_executable {
     CUgraphExec value{};
-    explicit memory_node_executable(CUgraph graph) { CONFORMANCE_CUDA(cuGraphInstantiate(&value, graph, 0)); }
+    explicit memory_node_executable(CUgraph graph) { TEST_CUDA(cuGraphInstantiate(&value, graph, 0)); }
     ~memory_node_executable() { if (value) cuGraphExecDestroy(value); }
-    void launch(CUstream stream) const { CONFORMANCE_CUDA(cuGraphLaunch(value, stream)); }
+    void launch(CUstream stream) const { TEST_CUDA(cuGraphLaunch(value, stream)); }
 };
 void memory_node_ordering(bool generic) {
     memory_node_storage storage; memory_node_stream stream;
@@ -129,7 +129,7 @@ void memory_node_ordering(bool generic) {
         storage.reset(); memory_node_graph graph; auto ops = memory_node_operations(storage, variant), expected_ops = ops;
         graph.build(storage, ops, generic); std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
         auto expected = memory_node_params(expected_ops); memory_node_query(graph.node, expected);
-        memory_node_executable executable(graph.value); CONFORMANCE_CUDA(cuGraphUpload(executable.value, stream.value)); stream.synchronize(); storage.untouched();
+        memory_node_executable executable(graph.value); TEST_CUDA(cuGraphUpload(executable.value, stream.value)); stream.synchronize(); storage.untouched();
         for (unsigned repeat = 0; repeat < 3; ++repeat) { storage.reset(); executable.launch(stream.value); stream.synchronize(); storage.expect(storage.expected(variant)); }
     }
     for (unsigned count : {0u, 1u, 255u}) {
@@ -144,14 +144,14 @@ void memory_node_parameters(bool generic) {
     memory_node_storage storage; memory_node_stream stream; memory_node_graph source, clone;
     auto ops = memory_node_operations(storage); source.build(storage, ops, generic); clone.clone(source); memory_node_executable original(source.value), cloned(clone.value);
     auto first = memory_node_operations(storage); auto expected_first = memory_node_params(first);
-    ops = memory_node_operations(storage, 1); auto params = memory_node_params(ops); CONFORMANCE_CUDA(memory_node_set(source.node, params, generic)); std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
+    ops = memory_node_operations(storage, 1); auto params = memory_node_params(ops); TEST_CUDA(memory_node_set(source.node, params, generic)); std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
     auto second = memory_node_operations(storage, 1); auto expected_second = memory_node_params(second);
     memory_node_query(source.node, expected_second); memory_node_query(clone.node, expected_first); memory_node_executable changed(source.value);
     for (auto [executable, variant] : {std::pair{original.value, 0u}, std::pair{cloned.value, 0u}, std::pair{changed.value, 1u}}) {
-        storage.reset(); CONFORMANCE_CUDA(cuGraphLaunch(executable, stream.value)); stream.synchronize(); storage.expect(storage.expected(variant));
+        storage.reset(); TEST_CUDA(cuGraphLaunch(executable, stream.value)); stream.synchronize(); storage.expect(storage.expected(variant));
     }
-    CONFORMANCE_CUDA(cuGraphDestroy(source.value)); source.value = nullptr; memory_node_query(clone.node, expected_first);
-    ops = memory_node_operations(storage, 2); params = memory_node_params(ops); CONFORMANCE_CUDA(memory_node_set(clone.node, params, !generic)); std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
+    TEST_CUDA(cuGraphDestroy(source.value)); source.value = nullptr; memory_node_query(clone.node, expected_first);
+    ops = memory_node_operations(storage, 2); params = memory_node_params(ops); TEST_CUDA(memory_node_set(clone.node, params, !generic)); std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
     memory_node_executable edited(clone.value); storage.reset(); edited.launch(stream.value); stream.synchronize(); storage.expect(storage.expected(2));
     storage.reset(); cloned.launch(stream.value); stream.synchronize(); storage.expect(storage.expected(0));
 }
@@ -160,7 +160,7 @@ void memory_node_executable_updates(bool generic) {
     auto ops = memory_node_operations(storage); graph.build(storage, ops, generic); memory_node_executable executable(graph.value);
     auto original_ops = memory_node_operations(storage); auto original = memory_node_params(original_ops);
     ops = memory_node_operations(storage, 1, CU_STREAM_WAIT_VALUE_GEQ); auto params = memory_node_params(ops);
-    CONFORMANCE_CUDA(memory_node_set(graph.node, params, generic, executable.value)); std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
+    TEST_CUDA(memory_node_set(graph.node, params, generic, executable.value)); std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
     memory_node_query(graph.node, original);
     for (unsigned invalid = 0; invalid < 4; ++invalid) {
         ops = memory_node_operations(storage, 2); params = memory_node_params(ops);
@@ -171,7 +171,7 @@ void memory_node_executable_updates(bool generic) {
         require(memory_node_set(graph.node, params, generic, executable.value) == CUDA_ERROR_INVALID_VALUE, "incompatible executable memory-operation edits reject");
         memory_node_query(graph.node, original); storage.reset(); executable.launch(stream.value); stream.synchronize(); storage.expect(storage.expected(1));
     }
-    ops = memory_node_operations(storage, 2); params = memory_node_params(ops); CONFORMANCE_CUDA(memory_node_set(graph.node, params, !generic, executable.value));
+    ops = memory_node_operations(storage, 2); params = memory_node_params(ops); TEST_CUDA(memory_node_set(graph.node, params, !generic, executable.value));
     std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{}); storage.reset(); executable.launch(stream.value); stream.synchronize(); storage.expect(storage.expected(2));
     memory_node_executable source(graph.value); storage.reset(); source.launch(stream.value); stream.synchronize(); storage.expect(storage.expected(0));
 }
@@ -189,19 +189,19 @@ struct memory_node_gate_cleanup { memory_node_gate& gate; ~memory_node_gate_clea
 void memory_node_pending(bool generic) {
     memory_node_storage storage; memory_node_stream stream; memory_node_graph graph; auto ops = memory_node_operations(storage); graph.build(storage, ops, generic);
     memory_node_executable executable(graph.value); memory_node_gate gate; memory_node_gate_cleanup cleanup{gate};
-    CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, memory_node_gate::call, &gate)); gate.await(); executable.launch(stream.value);
-    ops = memory_node_operations(storage, 1); auto params = memory_node_params(ops); CONFORMANCE_CUDA(memory_node_set(graph.node, params, generic, executable.value));
+    TEST_CUDA(cuLaunchHostFunc(stream.value, memory_node_gate::call, &gate)); gate.await(); executable.launch(stream.value);
+    ops = memory_node_operations(storage, 1); auto params = memory_node_params(ops); TEST_CUDA(memory_node_set(graph.node, params, generic, executable.value));
     std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{}); require(cuStreamQuery(stream.value) == CUDA_ERROR_NOT_READY, "accepted memory-node launch remains pending");
     gate.release(); stream.synchronize(); gate.check(); storage.expect(storage.expected(0));
     storage.reset(); executable.launch(stream.value); stream.synchronize(); storage.expect(storage.expected(1));
     storage.reset(); memory_node_gate retiring; memory_node_gate_cleanup retire_cleanup{retiring};
-    CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, memory_node_gate::call, &retiring)); retiring.await(); executable.launch(stream.value);
-    CONFORMANCE_CUDA(cuGraphExecDestroy(executable.value)); executable.value = nullptr; CONFORMANCE_CUDA(cuGraphDestroy(graph.value)); graph.value = nullptr;
+    TEST_CUDA(cuLaunchHostFunc(stream.value, memory_node_gate::call, &retiring)); retiring.await(); executable.launch(stream.value);
+    TEST_CUDA(cuGraphExecDestroy(executable.value)); executable.value = nullptr; TEST_CUDA(cuGraphDestroy(graph.value)); graph.value = nullptr;
     retiring.release(); stream.synchronize(); retiring.check(); storage.expect(storage.expected(1));
 }
 void memory_node_validation(bool generic) {
     memory_node_storage storage; memory_node_stream stream; memory_node_graph graph; auto ops = memory_node_operations(storage); graph.build(storage, ops, generic);
-    auto original_ops = ops; auto original = memory_node_params(original_ops); CUgraphNode empty{}; CONFORMANCE_CUDA(cuGraphAddEmptyNode(&empty, graph.value, nullptr, 0));
+    auto original_ops = ops; auto original = memory_node_params(original_ops); CUgraphNode empty{}; TEST_CUDA(cuGraphAddEmptyNode(&empty, graph.value, nullptr, 0));
     for (unsigned invalid = 0; invalid < 11; ++invalid) {
         ops = memory_node_operations(storage, 1); auto params = memory_node_params(ops);
         if (invalid == 0) params.paramArray = nullptr;
@@ -220,7 +220,7 @@ void memory_node_validation(bool generic) {
         const auto status = generic ? cuGraphAddNode(&added.value, graph.value, nullptr, nullptr, 0, &p) : cuGraphAddBatchMemOpNode(&added.value, graph.value, nullptr, 0, &params);
         require(status == CUDA_ERROR_INVALID_VALUE, "invalid memory-operation additions reject"); added.check();
         require(memory_node_set(graph.node, params, generic) == CUDA_ERROR_INVALID_VALUE, "invalid memory-operation source setters reject");
-        memory_node_query(graph.node, original); size_t count{}; CONFORMANCE_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(count == 4, "invalid edits preserve graph membership"); storage.untouched();
+        memory_node_query(graph.node, original); size_t count{}; TEST_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(count == 4, "invalid edits preserve graph membership"); storage.untouched();
     }
     require(cuGraphBatchMemOpNodeGetParams(graph.node, nullptr) == CUDA_ERROR_INVALID_VALUE, "null memory-operation getter output");
     require(cuGraphBatchMemOpNodeSetParams(graph.node, nullptr) == CUDA_ERROR_INVALID_VALUE, "null memory-operation setter input");
@@ -230,7 +230,7 @@ void memory_node_validation(bool generic) {
     memory_node_executable executable(graph.value);
     require(cuGraphExecBatchMemOpNodeSetParams(executable.value, graph.node, nullptr) == CUDA_ERROR_INVALID_VALUE, "null executable memory-operation parameters");
     executable.launch(stream.value); stream.synchronize(); storage.expect(storage.expected(0));
-    ops = memory_node_operations(storage, 2); auto params = memory_node_params(ops); CONFORMANCE_CUDA(memory_node_set(graph.node, params, generic));
+    ops = memory_node_operations(storage, 2); auto params = memory_node_params(ops); TEST_CUDA(memory_node_set(graph.node, params, generic));
     std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{}); memory_node_executable repaired(graph.value); storage.reset(); repaired.launch(stream.value); stream.synchronize(); storage.expect(storage.expected(2));
 }
 std::string memory_node_case;
@@ -244,5 +244,5 @@ void execute_memory_nodes() {
 }
 int main(int argc, char** argv) {
     if (argc != 3) return 1;
-    cudavm::memory_node_case = argv[2]; return cudavm::run_conformance(2, argv, cudavm::execute_memory_nodes);
+    cudavm::memory_node_case = argv[2]; return cudavm::run_test(2, argv, cudavm::execute_memory_nodes);
 }

@@ -32,10 +32,10 @@ void execute_warp_match(const loaded_program& program) {
         };
         auto reset = [&] {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemsetD32(destination.value, guard, actual.size()));
+            TEST_CUDA(cuMemsetD32(destination.value, guard, actual.size()));
         };
         auto fetch = [&](const std::string& context) {
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
             expect_words(actual, expected, context + " threads=" + std::to_string(threads));
         };
         for (unsigned i = 0; i < total; ++i) {
@@ -48,11 +48,11 @@ void execute_warp_match(const loaded_program& program) {
                 : pattern == 5 ? (lane & 1 ? 0x8000000080000000ull : 0)
                 : pattern == 6 ? words[6] : words[(i / threads) % std::size(words)];
         }
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 8));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 8));
         for (uint32_t mask : {UINT32_MAX, 0x55555555u, 0xaaaaaaaau, 0x80010001u, 0x80000000u, 0u}) {
             reset();
             void* args[]{&out, &in, &mask};
-            CONFORMANCE_CUDA(cuLaunchKernel(masked, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuLaunchKernel(masked, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
             for (unsigned i = 0; i < total; ++i) {
                 const unsigned local = i % threads, lane = local % 32;
                 if (!(mask & (uint32_t(1) << lane))) continue;
@@ -67,7 +67,7 @@ void execute_warp_match(const loaded_program& program) {
         for (unsigned keep : {0u, 1u, 7u, 31u, 32u}) for (uint32_t mask : {UINT32_MAX, 0xaaaaaaaau}) {
             reset();
             void* args[]{&out, &in, &mask, &keep};
-            CONFORMANCE_CUDA(cuLaunchKernel(retiring, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuLaunchKernel(retiring, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
             for (unsigned i = 0; i < total; ++i) {
                 const unsigned local = i % threads, lane = local % 32;
                 const unsigned live = std::min({32u, threads - (local / 32) * 32, keep});
@@ -80,11 +80,11 @@ void execute_warp_match(const loaded_program& program) {
             }
             fetch("retiring match mask=" + std::to_string(mask) + " keep=" + std::to_string(keep));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 8));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 8));
         require(preserved == input, "match source words and guards preserved");
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_warp_match);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_warp_match);
 }

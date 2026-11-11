@@ -73,5 +73,5 @@ int main(int argc, char** argv) {
     const auto source = "#define CUDAVM_TRANSCENDENTAL_PROFILE " + std::to_string(cudavm::float_transcendental_profile) + "\n"
         + std::string(cudavm::fixtures.source);
     auto fixtures = cudavm::fixtures; fixtures.source = source;
-    return cudavm::run_conformance(3, argv, fixtures, cudavm::execute_float_transcendental_math);
+    return cudavm::run_test(3, argv, fixtures, cudavm::execute_float_transcendental_math);
 }

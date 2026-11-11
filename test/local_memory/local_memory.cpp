@@ -13,14 +13,14 @@ void execute_local_memory(const loaded_program& program) {
         std::vector<uint32_t> expected(total * fields + 2, guard), actual(expected.size());
         device_buffer source(input.size() * 4), destination(expected.size() * 4);
         auto in = source.value + 4, out = destination.value + 4;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (unsigned rounds : {0u, 1u, 5u, 19u})
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
             void* args[]{&out, &in, &count, &rounds};
-            CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+            TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
             for (unsigned i = 0; i < std::min(total, count); ++i) {
                 const uint32_t seed = input[i + 1];
                 std::array<uint32_t, 17> values{};
@@ -39,12 +39,12 @@ void execute_local_memory(const loaded_program& program) {
             expect_words(actual, expected, "local memory threads=" + std::to_string(threads)
                 + " rounds=" + std::to_string(rounds) + " count=" + std::to_string(count));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "local-memory source preservation");
     }
 }
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_local_memory);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_local_memory);
 }

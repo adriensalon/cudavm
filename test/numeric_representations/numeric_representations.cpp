@@ -29,13 +29,13 @@ void execute_numeric_representations(const loaded_program& program) {
         std::vector<uint32_t> expected(total * fields + 4, guard), actual(expected.size());
         device_buffer source(input.size() * 4), destination(expected.size() * 4);
         auto in = source.value + 8, out = destination.value + 8;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
             void* args[]{&out, &in, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+            TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
             for (unsigned i = 0; i < std::min(total, count); ++i) {
                 const auto a = input[2 + i * 4], b = input[3 + i * 4];
                 const auto lo = input[4 + i * 4], hi = input[5 + i * 4];
@@ -45,12 +45,12 @@ void execute_numeric_representations(const loaded_program& program) {
             expect_words(actual, expected, "numeric representations threads=" + std::to_string(threads)
                 + " count=" + std::to_string(count));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "numeric representation source preservation");
     }
 }
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_numeric_representations);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_numeric_representations);
 }

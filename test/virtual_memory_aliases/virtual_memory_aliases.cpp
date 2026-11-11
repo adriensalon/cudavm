@@ -19,7 +19,7 @@ void alias_buffers(bool submaps, bool released) {
         const size_t offset = 19 + runtime * 23, count = b.bytes - offset - 31;
         const auto pattern = static_cast<unsigned char>(runtime ? 0xd9 : 0x37);
         if (runtime) virtual_runtime(cudaMemset(reinterpret_cast<void*>(uintptr_t(b.value + offset)), pattern, count));
-        else CONFORMANCE_CUDA(cuMemsetD8(b.value + offset, pattern, count));
+        else TEST_CUDA(cuMemsetD8(b.value + offset, pattern, count));
         std::fill_n(expected.begin() + offset, count, pattern);
         virtual_memory_expect(a.value, expected, "full backing after alias write", runtime);
         virtual_memory_expect(b.value, {expected.data(), b.bytes}, "written alias and guards", !runtime);
@@ -46,7 +46,7 @@ void alias_remap() {
     virtual_memory_write(a.value, expected_a); virtual_memory_write(b.value, expected_b, true);
     for (unsigned phase = 0; phase < 4; ++phase) {
         virtual_memory_mapping mapping(fixed.value, bytes, phase & 1 ? physical_b.value : physical_a.value);
-        unsigned long long access = 99; CONFORMANCE_CUDA(cuMemGetAccess(&access, &properties.location, mapping.value));
+        unsigned long long access = 99; TEST_CUDA(cuMemGetAccess(&access, &properties.location, mapping.value));
         require(access == CU_MEM_ACCESS_FLAGS_PROT_NONE, "remapped VA starts without access");
         mapping.grant(properties.location);
         virtual_memory_expect(mapping.value, phase & 1 ? expected_b : expected_a, "fixed VA selects its new physical backing", phase & 1);
@@ -62,20 +62,20 @@ void alias_ordering() {
     a.grant(properties.location); b.grant(properties.location);
     device_buffer snapshot(bytes); auto expected = virtual_memory_pattern(bytes, 41); virtual_memory_write(a.value, expected);
     CUstream producer{}, consumer{}; CUevent event{};
-    CONFORMANCE_CUDA(cuStreamCreate(&producer, CU_STREAM_NON_BLOCKING));
+    TEST_CUDA(cuStreamCreate(&producer, CU_STREAM_NON_BLOCKING));
     struct stream_cleanup { CUstream value{}; ~stream_cleanup() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } } } clean_producer{producer}, clean_consumer;
-    CONFORMANCE_CUDA(cuStreamCreate(&consumer, CU_STREAM_NON_BLOCKING)); clean_consumer.value = consumer;
-    CONFORMANCE_CUDA(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
+    TEST_CUDA(cuStreamCreate(&consumer, CU_STREAM_NON_BLOCKING)); clean_consumer.value = consumer;
+    TEST_CUDA(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
     struct event_cleanup { CUevent value; ~event_cleanup() { cuEventDestroy(value); } } clean_event{event};
     for (unsigned phase = 0; phase < 3; ++phase) {
         const size_t offset = 23 + phase * 73, count = bytes - offset - 47;
         const auto pattern = static_cast<unsigned char>(phase * 37 + 51);
-        CONFORMANCE_CUDA(cuMemsetD8Async(a.value + offset, pattern, count, producer));
+        TEST_CUDA(cuMemsetD8Async(a.value + offset, pattern, count, producer));
         virtual_runtime(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event), reinterpret_cast<cudaStream_t>(producer)));
-        CONFORMANCE_CUDA(cuStreamWaitEvent(consumer, event, 0));
+        TEST_CUDA(cuStreamWaitEvent(consumer, event, 0));
         virtual_runtime(cudaMemcpyAsync(reinterpret_cast<void*>(uintptr_t(snapshot.value)), reinterpret_cast<void*>(uintptr_t(b.value)), bytes,
             cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(consumer)));
-        CONFORMANCE_CUDA(cuStreamSynchronize(consumer));
+        TEST_CUDA(cuStreamSynchronize(consumer));
         std::fill_n(expected.begin() + offset, count, pattern);
         virtual_memory_expect(snapshot.value, expected, "event-ordered snapshot through other alias");
         virtual_memory_expect(b.value, expected, "event-ordered complete alias backing", true);
@@ -83,8 +83,8 @@ void alias_ordering() {
 }
 void alias_contexts() {
     CUcontext original{}, separate{}; CUdevice device{};
-    CONFORMANCE_CUDA(cuCtxGetCurrent(&original)); CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuCtxCreate(&separate, nullptr, 0, device));
+    TEST_CUDA(cuCtxGetCurrent(&original)); TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuCtxCreate(&separate, nullptr, 0, device));
     try {
         const auto properties = virtual_memory_properties(); const auto bytes = virtual_memory_granularity(properties) * 2;
         virtual_physical_memory physical(bytes, properties);
@@ -92,8 +92,8 @@ void alias_contexts() {
         virtual_memory_mapping a(first.value, bytes, physical.value), b(second.value, bytes, physical.value);
         a.grant(properties.location); b.grant(properties.location);
         auto expected = virtual_memory_pattern(bytes, 97); virtual_memory_write(a.value, expected);
-        CONFORMANCE_CUDA(cuCtxSetCurrent(original));
-        CONFORMANCE_CUDA(cuCtxDestroy(separate)); separate = nullptr;
+        TEST_CUDA(cuCtxSetCurrent(original));
+        TEST_CUDA(cuCtxDestroy(separate)); separate = nullptr;
         virtual_memory_expect(b.value, expected, "process mapping survives creating context retirement", true);
         virtual_runtime(cudaMemset(reinterpret_cast<void*>(uintptr_t(b.value + 13)), 0x5b, bytes - 37));
         std::fill(expected.begin() + 13, expected.end() - 24, 0x5b);
@@ -101,7 +101,7 @@ void alias_contexts() {
         physical.close();
         virtual_memory_expect(b.value, expected, "retired context and released handle preserve mapping");
     } catch (...) { cuCtxSetCurrent(original); if (separate) cuCtxDestroy(separate); throw; }
-    CONFORMANCE_CUDA(cuCtxSetCurrent(original));
+    TEST_CUDA(cuCtxSetCurrent(original));
 }
 void alias_validation() {
     const auto properties = virtual_memory_properties(); const auto granularity = virtual_memory_granularity(properties), bytes = granularity * 2;
@@ -124,32 +124,32 @@ void alias_validation() {
 }
 void alias_contextless() {
     const auto properties = virtual_memory_properties(); CUcontext original{};
-    CONFORMANCE_CUDA(cuCtxGetCurrent(&original)); CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr));
+    TEST_CUDA(cuCtxGetCurrent(&original)); TEST_CUDA(cuCtxSetCurrent(nullptr));
     try {
         const auto bytes = virtual_memory_granularity(properties) * 2;
         virtual_physical_memory physical(bytes, properties); virtual_memory_reservation first(bytes), second(bytes);
         virtual_memory_mapping a(first.value, bytes, physical.value), b(second.value, bytes, physical.value);
         a.grant(properties.location); b.grant(properties.location);
-        CUcontext current = original; CONFORMANCE_CUDA(cuCtxGetCurrent(&current));
+        CUcontext current = original; TEST_CUDA(cuCtxGetCurrent(&current));
         require(!current, "VMM creation and mapping do not bind a public context");
-        CONFORMANCE_CUDA(cuCtxSetCurrent(original));
+        TEST_CUDA(cuCtxSetCurrent(original));
         const auto expected = virtual_memory_pattern(bytes, 73);
         virtual_memory_write(a.value, expected); virtual_memory_expect(b.value, expected, "context-free VMM maps execute in an explicit context", true);
-        CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr));
+        TEST_CUDA(cuCtxSetCurrent(nullptr));
         a.close(); b.close(); physical.close();
     } catch (...) { cuCtxSetCurrent(original); throw; }
-    CONFORMANCE_CUDA(cuCtxSetCurrent(original));
+    TEST_CUDA(cuCtxSetCurrent(original));
 }
 void alias_discovery() {
     for (const char* name : {"cuMemCreate", "cuMemRelease", "cuMemMap", "cuMemUnmap", "cuMemSetAccess", "cuMemGetAccess", "cuMemGetAllocationPropertiesFromHandle", "cuMemRetainAllocationHandle"}) {
         const int version = std::string_view(name) == "cuMemRetainAllocationHandle" ? 11000 : 10020;
         void* address{}; CUdriverProcAddressQueryResult status{};
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, version, 0, &status));
+        TEST_CUDA(cuGetProcAddress(name, &address, version, 0, &status));
         require(address && status == CU_GET_PROC_ADDRESS_SUCCESS, "virtual memory procedure introduction version");
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, version - 1, 0, &status));
+        TEST_CUDA(cuGetProcAddress(name, &address, version - 1, 0, &status));
         require(!address && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "virtual memory procedure predates introduction");
     }
-    void* address{}; CONFORMANCE_CUDA(cuGetProcAddress("cuMemMap", &address, 10020, 0, nullptr));
+    void* address{}; TEST_CUDA(cuGetProcAddress("cuMemMap", &address, 10020, 0, nullptr));
     require(reinterpret_cast<PFN_cuMemMap_v10020>(address)(0, 0, 0, 0, 0) == CUDA_ERROR_NOT_INITIALIZED, "discovered mapping preserves cold Driver behavior");
 }
 void execute_virtual_memory_aliases() {
@@ -166,7 +166,7 @@ void execute_virtual_memory_aliases() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_conformance(argc, argv, cudavm::alias_discovery);
+    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_test(argc, argv, cudavm::alias_discovery);
     if (argc == 3) { cudavm::alias_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_virtual_memory_aliases);
+    return cudavm::run_test(argc, argv, cudavm::execute_virtual_memory_aliases);
 }

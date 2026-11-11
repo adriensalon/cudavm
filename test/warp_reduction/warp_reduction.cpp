@@ -34,15 +34,15 @@ void execute_warp_reduction(const loaded_program& program) {
             for (unsigned i = 0; i < total; ++i)
                 input[guards + i] = pattern == 0 ? 0 : pattern == 1 ? UINT32_MAX : pattern == 2 ? edges[i % edges.size()]
                     : i * 0x9e3779b9u + 0x12345678u;
-            CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
             const auto values = std::span(input).subspan(guards, total);
             for (uint32_t mask : {UINT32_MAX, 0x55555555u, 0xaaaaaaaau, 0x80010001u, 0u})
             for (bool retirement : {false, true}) {
                 std::fill(expected.begin(), expected.end(), guard);
-                CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+                TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
                 void* args[]{&to, &from, &mask};
                 const auto function = program.function(retirement ? "retiring_reductions" : "masked_reductions");
-                CONFORMANCE_CUDA(cuLaunchKernel(function, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+                TEST_CUDA(cuLaunchKernel(function, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
                 for (unsigned i = 0; i < total; ++i) {
                     const auto local = i % threads, lane = local & 31u;
                     if (!(mask & (uint32_t(1) << lane))) continue;
@@ -53,15 +53,15 @@ void execute_warp_reduction(const loaded_program& program) {
                         std::copy(row.begin(), row.end(), expected.begin() + guards + i * (retirement ? 36 : 9) + phase * 9);
                     }
                 }
-                CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+                TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
                 expect_words(actual, expected, "all pinned 32-bit warp reduction overloads, masks, retirement and guards");
             }
-            CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
             expect_words(preserved, input, "warp reduction input and allocation preservation");
         }
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_warp_reduction);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_warp_reduction);
 }

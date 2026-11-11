@@ -169,5 +169,5 @@ void execute_compiler_options() {
 }
 int main(int argc, char** argv) {
     if (argc == 2) cudavm::compiler_options_case = argv[1];
-    return cudavm::run_host_conformance(argc, argv, cudavm::execute_compiler_options);
+    return cudavm::run_host_test(argc, argv, cudavm::execute_compiler_options);
 }

@@ -28,18 +28,18 @@ void execute_wide_atomics(const loaded_program& program) {
         auto pointer = storage.value + guards * 4, to = result.value + guards * 4, from = inputs.value + guards * 4;
         require(pointer % 16 == 0, "128-bit CAS target alignment");
         std::vector<uint32_t> initialized(output.size(), guard), preserved(operations.size());
-        CONFORMANCE_CUDA(cuMemcpyHtoD(storage.value, state.data(), state.size() * 4));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(result.value, initialized.data(), initialized.size() * 4));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(inputs.value, operations.data(), operations.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(storage.value, state.data(), state.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(result.value, initialized.data(), initialized.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(inputs.value, operations.data(), operations.size() * 4));
         unsigned count = 4; void* args[]{&to, &pointer, &from, &count};
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function("wide_serial"), 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), result.value, actual.size() * 4));
+        TEST_CUDA(cuLaunchKernel(program.function("wide_serial"), 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), result.value, actual.size() * 4));
         expect_words(actual, output, "128-bit returned words, compare failure/success and output guards");
         std::copy(value.begin(), value.end(), state.begin() + guards);
         std::vector<uint32_t> actual_state(state.size());
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual_state.data(), storage.value, actual_state.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(actual_state.data(), storage.value, actual_state.size() * 4));
         expect_words(actual_state, state, "128-bit replacement and target neighbor preservation");
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), inputs.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), inputs.value, preserved.size() * 4));
         expect_words(preserved, operations, "wide CAS operation input preservation");
     }
     for (unsigned threads : {1u, 13u, 32u, 64u}) for (unsigned rounds : {0u, 1u, 4u}) {
@@ -50,11 +50,11 @@ void execute_wide_atomics(const loaded_program& program) {
         std::vector<uint32_t> expected(guards * 2 + (count + 2) * 4, guard), actual(expected.size());
         device_buffer storage(state.size() * 4), result(expected.size() * 4);
         auto pointer = storage.value + guards * 4, to = result.value + guards * 4;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(storage.value, state.data(), state.size() * 4));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(result.value, expected.data(), expected.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(storage.value, state.data(), state.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(result.value, expected.data(), expected.size() * 4));
         void* args[]{&to, &pointer, &rounds};
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function("wide_tickets"), blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), result.value, actual.size() * 4));
+        TEST_CUDA(cuLaunchKernel(program.function("wide_tickets"), blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), result.value, actual.size() * 4));
         std::vector<uint32_t> tickets;
         for (unsigned row = 0; row < count; ++row) {
             auto ticket = actual[guards + row * 4 + 1]; tickets.push_back(ticket);
@@ -65,11 +65,11 @@ void execute_wide_atomics(const loaded_program& program) {
         std::sort(tickets.begin(), tickets.end());
         for (unsigned rank = 0; rank < count; ++rank) require(tickets[rank] == rank, "one indivisible successful update per wide CAS ticket");
         auto final = wide_ticket(count); std::copy(final.begin(), final.end(), state.begin() + guards);
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual_state.data(), storage.value, actual_state.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(actual_state.data(), storage.value, actual_state.size() * 4));
         expect_words(actual_state, state, "wide atomic final state and allocation neighbors");
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_wide_atomics);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_wide_atomics);
 }

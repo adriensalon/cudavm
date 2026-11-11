@@ -35,15 +35,15 @@ void mma_f16_case(const loaded_program& program, unsigned warps, unsigned rounds
     }
     device_buffer left(a.size() * 2), right(b.size() * 2), accumulator(initial.size() * 4), destination(initial.size() * 4);
     std::vector<uint32_t> empty(initial.size(), float_guard), actual(initial.size()), preserved(initial.size());
-    CONFORMANCE_CUDA(cuMemcpyHtoD(left.value, a.data(), a.size() * 2));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(right.value, b.data(), b.size() * 2));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(accumulator.value, initial.data(), initial.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, empty.data(), empty.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(left.value, a.data(), a.size() * 2));
+    TEST_CUDA(cuMemcpyHtoD(right.value, b.data(), b.size() * 2));
+    TEST_CUDA(cuMemcpyHtoD(accumulator.value, initial.data(), initial.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(destination.value, empty.data(), empty.size() * 4));
     auto ap = left.value + half_guards * 2, bp = right.value + half_guards * 2;
     auto cp = accumulator.value + float_guards * 4, out = destination.value + float_guards * 4;
     void* arguments[]{&out, &ap, &bp, &cp, &half_stride, &float_stride, &rounds};
-    CONFORMANCE_CUDA(cuLaunchKernel(program.function("mma_f16"), blocks, 1, 1, 16, warps * 2, 1, 0, nullptr, arguments, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+    TEST_CUDA(cuLaunchKernel(program.function("mma_f16"), blocks, 1, 1, 16, warps * 2, 1, 0, nullptr, arguments, nullptr));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
     // The instruction does not prescribe the sign of an exact accumulated zero.
     if (rounds) for (size_t i = 0; i < actual.size(); ++i)
         if (!expected[i] && !(actual[i] & 0x7fffffffu)) actual[i] = 0;
@@ -51,10 +51,10 @@ void mma_f16_case(const loaded_program& program, unsigned warps, unsigned rounds
         + " warps=" + std::to_string(warps) + (fractional ? " fractional accumulator" : ""));
     for (auto pair : {std::pair{left.value, &a}, std::pair{right.value, &b}}) {
         std::vector<uint16_t> copy(pair.second->size());
-        CONFORMANCE_CUDA(cuMemcpyDtoH(copy.data(), pair.first, copy.size() * 2));
+        TEST_CUDA(cuMemcpyDtoH(copy.data(), pair.first, copy.size() * 2));
         require(copy == *pair.second, "MMA half sources, row padding and guards are preserved");
     }
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), accumulator.value, preserved.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), accumulator.value, preserved.size() * 4));
     expect_words(preserved, initial, "MMA initial accumulator, padding and guards are preserved");
 }
 void execute_mma_operations(const loaded_program& program) {
@@ -65,5 +65,5 @@ void execute_mma_operations(const loaded_program& program) {
 }
 int main(int argc, char** argv) {
     if (argc == 4) { cudavm::mma_profile = argv[3]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_mma_operations);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_mma_operations);
 }

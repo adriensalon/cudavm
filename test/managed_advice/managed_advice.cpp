@@ -26,7 +26,7 @@ struct advice_storage {
 #endif
         require(page_size && !(page_size & (page_size - 1)), "CPU page size");
         bytes = page_size * 6;
-        CONFORMANCE_CUDA(cuMemAllocManaged(&allocation, bytes, CU_MEM_ATTACH_GLOBAL));
+        TEST_CUDA(cuMemAllocManaged(&allocation, bytes, CU_MEM_ATTACH_GLOBAL));
         page = (allocation + page_size - 1) & ~(CUdeviceptr(page_size) - 1);
         expected.resize(bytes);
         for (size_t i = 0; i < bytes; ++i) expected[i] = static_cast<unsigned char>(i * 37 + 29);
@@ -35,7 +35,7 @@ struct advice_storage {
     unsigned char* host() const { return reinterpret_cast<unsigned char*>(uintptr_t(allocation)); }
     ~advice_storage() { if (allocation) cuMemFree(allocation); }
     void verify() const {
-        CONFORMANCE_CUDA(cuCtxSynchronize());
+        TEST_CUDA(cuCtxSynchronize());
         require(std::equal(expected.begin(), expected.end(), host()), "advice/query preserves all managed payload bytes");
     }
 };
@@ -46,12 +46,12 @@ void advice_apply(bool runtime, CUdeviceptr pointer, size_t bytes, CUmem_advise 
     if (runtime) {
         cudaMemLocation value{}; value.type = static_cast<cudaMemLocationType>(location.type); value.id = location.id;
         advice_runtime(cudaMemAdvise(reinterpret_cast<void*>(uintptr_t(pointer)), bytes, static_cast<cudaMemoryAdvise>(advice), value));
-    } else CONFORMANCE_CUDA(cuMemAdvise(pointer, bytes, advice, location));
+    } else TEST_CUDA(cuMemAdvise(pointer, bytes, advice, location));
 }
 std::vector<int> advice_query(bool runtime, CUdeviceptr pointer, size_t bytes, CUmem_range_attribute attribute, size_t count = 1) {
     std::vector<int> guarded(count + 4, 0x31715926);
     if (runtime) advice_runtime(cudaMemRangeGetAttribute(guarded.data() + 2, count * sizeof(int), static_cast<cudaMemRangeAttribute>(attribute), reinterpret_cast<void*>(uintptr_t(pointer)), bytes));
-    else CONFORMANCE_CUDA(cuMemRangeGetAttribute(guarded.data() + 2, count * sizeof(int), attribute, pointer, bytes));
+    else TEST_CUDA(cuMemRangeGetAttribute(guarded.data() + 2, count * sizeof(int), attribute, pointer, bytes));
     require(guarded[0] == 0x31715926 && guarded[1] == 0x31715926 && guarded[count + 2] == 0x31715926 && guarded[count + 3] == 0x31715926, "range query exact output guards");
     return {guarded.begin() + 2, guarded.end() - 2};
 }
@@ -74,7 +74,7 @@ void advice_read_mostly() {
     }
 }
 void advice_preferred(bool device) {
-    int ordinal = 0; CONFORMANCE_CUDA(cuCtxGetDevice(&ordinal));
+    int ordinal = 0; TEST_CUDA(cuCtxGetDevice(&ordinal));
     const auto location = device ? advice_location(CU_MEM_LOCATION_TYPE_DEVICE, ordinal) : advice_location(CU_MEM_LOCATION_TYPE_HOST, 12345);
     for (bool runtime : {false, true}) {
         advice_storage storage;
@@ -88,7 +88,7 @@ void advice_preferred(bool device) {
     }
 }
 void advice_accessed_by(bool device) {
-    int ordinal = 0; CONFORMANCE_CUDA(cuCtxGetDevice(&ordinal));
+    int ordinal = 0; TEST_CUDA(cuCtxGetDevice(&ordinal));
     const auto location = device ? advice_location(CU_MEM_LOCATION_TYPE_DEVICE, ordinal) : advice_location();
     for (bool runtime : {false, true}) {
         advice_storage storage;
@@ -114,7 +114,7 @@ void advice_queries() {
             std::array<cudaMemRangeAttribute, 4> types{};
             std::transform(kinds.begin(), kinds.end(), types.begin(), [](auto value) { return static_cast<cudaMemRangeAttribute>(value); });
             advice_runtime(cudaMemRangeGetAttributes(data.data(), sizes.data(), types.data(), 4, reinterpret_cast<void*>(uintptr_t(pointer)), storage.page_size));
-        } else CONFORMANCE_CUDA(cuMemRangeGetAttributes(data.data(), sizes.data(), kinds.data(), 4, pointer, storage.page_size));
+        } else TEST_CUDA(cuMemRangeGetAttributes(data.data(), sizes.data(), kinds.data(), 4, pointer, storage.page_size));
         for (size_t i = 0; i < outputs.size(); ++i) {
             require(outputs[i][0] == 0x19375928 && outputs[i][2] == 0x29183745, "multiple range query output guards");
             const int expected = i == 0 ? 0 : CU_DEVICE_INVALID;
@@ -154,10 +154,10 @@ void advice_validation() {
 }
 void execute_managed_advice() {
     CUdevice device{}; int managed = 0, concurrent = 0;
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&managed, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, device));
+    TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuDeviceGetAttribute(&managed, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, device));
     require_capability(managed != 0, "managed advice requires managed memory");
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&concurrent, CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS, device));
+    TEST_CUDA(cuDeviceGetAttribute(&concurrent, CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS, device));
     if (advice_case != "queries" && advice_case != "validation")
         require_capability(concurrent != 0, "advisory state-change profile requires concurrent managed access; basic managed behavior remains open");
     if (advice_case == "queries") advice_queries();
@@ -171,5 +171,5 @@ void execute_managed_advice() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::advice_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_managed_advice);
+    return cudavm::run_test(argc, argv, cudavm::execute_managed_advice);
 }

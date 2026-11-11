@@ -186,7 +186,7 @@ void jit_composition_execute_image(const loaded_program& program) {
     constexpr uint32_t guard = 0xa95b371d;
     const auto bias_address = program.global("composition_bias", sizeof(uint32_t));
     std::array<uint32_t, 3> bias_words{guard, guard, guard};
-    CONFORMANCE_CUDA(cuMemcpyDtoH(bias_words.data() + 1, bias_address, sizeof(uint32_t)));
+    TEST_CUDA(cuMemcpyDtoH(bias_words.data() + 1, bias_address, sizeof(uint32_t)));
     require(bias_words == std::array<uint32_t, 3>{guard, jit_composition_bias, guard}, "linked storage initializer and host guards");
     std::vector<uint32_t> input(capacity + 2 * guards, guard), preserved(input.size());
     std::vector<uint32_t> expected(capacity * fields + 2 * guards, guard), actual(expected.size());
@@ -194,18 +194,18 @@ void jit_composition_execute_image(const loaded_program& program) {
     auto in = source.value + guards * 4, out = output.value + guards * 4;
     for (unsigned phase = 0; phase < 2; ++phase) {
         const uint32_t bias = phase ? 0xfffffff1u : jit_composition_bias;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(bias_address, &bias, sizeof(bias)));
+        TEST_CUDA(cuMemcpyHtoD(bias_address, &bias, sizeof(bias)));
         constexpr std::array<uint32_t, 8> edges{0, 1, 0x7fffffff, 0x80000000, 0xffffffff, 0xfffffffe, 0x193759bd, 0xabcdef01};
         for (unsigned i = 0; i < capacity; ++i) input[guards + i] = i < edges.size()
             ? edges[(i + phase) % edges.size()] : i * 0x7654321u + phase * 0x193759bdu;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (unsigned threads : {32u, 47u}) for (unsigned count : {0u, 1u, 33u, capacity}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
             void* arguments[]{&out, &in, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(program.function("composition_results"), (capacity + threads - 1) / threads,
+            TEST_CUDA(cuLaunchKernel(program.function("composition_results"), (capacity + threads - 1) / threads,
                 1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
             for (unsigned i = 0; i < count; ++i) {
                 const uint32_t value = input[guards + i];
                 const std::array<uint32_t, 4> row{value * 9u + 23u, value ^ bias,
@@ -213,10 +213,10 @@ void jit_composition_execute_image(const loaded_program& program) {
                 std::copy(row.begin(), row.end(), expected.begin() + guards + i * fields);
             }
             expect_words(actual, expected, "composition values, inactive capacity and output guards");
-            CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
             expect_words(preserved, input, "composition input and guards preserved");
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(bias_words.data() + 1, bias_address, sizeof(uint32_t)));
+        TEST_CUDA(cuMemcpyDtoH(bias_words.data() + 1, bias_address, sizeof(uint32_t)));
         require(bias_words == std::array<uint32_t, 3>{guard, bias, guard}, "linked input storage preserved after execution");
     }
 }
@@ -225,7 +225,7 @@ void execute_jit_composition() {
         const auto image = jit_composition_link(jit_composition_case, reverse, automatic);
         for (bool library : {false, true}) {
             loaded_program program(image.data(), library); jit_composition_execute_image(program);
-            CONFORMANCE_CUDA(cuCtxSynchronize());
+            TEST_CUDA(cuCtxSynchronize());
         }
     }
 }
@@ -236,7 +236,7 @@ void jit_composition_inputs() {
 }
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "inputs")
-        return cudavm::run_host_conformance(argc, argv, cudavm::jit_composition_inputs);
+        return cudavm::run_host_test(argc, argv, cudavm::jit_composition_inputs);
     if (argc == 3) { cudavm::jit_composition_case = argv[2]; argc = 2; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_jit_composition, 0, cudavm::probe_execution);
+    return cudavm::run_test(argc, argv, cudavm::execute_jit_composition, 0, cudavm::probe_execution);
 }

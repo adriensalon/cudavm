@@ -22,14 +22,14 @@ struct recording_event {
             cudaEvent_t event{};
             RECORDING_RUNTIME(cudaEventCreateWithFlags(&event, flags));
             value = reinterpret_cast<CUevent>(event);
-        } else CONFORMANCE_CUDA(cuEventCreate(&value, flags));
+        } else TEST_CUDA(cuEventCreate(&value, flags));
     }
     ~recording_event() { if (value) cuEventDestroy(value); }
     cudaEvent_t runtime_value() const { return reinterpret_cast<cudaEvent_t>(value); }
     void record(CUstream stream, unsigned api) {
-        if (api == 0) CONFORMANCE_CUDA(cuEventRecord(value, stream));
+        if (api == 0) TEST_CUDA(cuEventRecord(value, stream));
         else if (api == 1) RECORDING_RUNTIME(cudaEventRecord(runtime_value(), reinterpret_cast<cudaStream_t>(stream)));
-        else if (api == 2) CONFORMANCE_CUDA(cuEventRecordWithFlags(value, stream, 0));
+        else if (api == 2) TEST_CUDA(cuEventRecordWithFlags(value, stream, 0));
         else RECORDING_RUNTIME(cudaEventRecordWithFlags(runtime_value(), reinterpret_cast<cudaStream_t>(stream), 0));
     }
     void expect_ready(bool ready) const {
@@ -38,23 +38,23 @@ struct recording_event {
     }
     void synchronize(bool use_runtime) const {
         if (use_runtime) RECORDING_RUNTIME(cudaEventSynchronize(runtime_value()));
-        else CONFORMANCE_CUDA(cuEventSynchronize(value));
+        else TEST_CUDA(cuEventSynchronize(value));
     }
     void destroy() {
-        if (runtime) CONFORMANCE_CUDA(cuEventDestroy(value));
+        if (runtime) TEST_CUDA(cuEventDestroy(value));
         else RECORDING_RUNTIME(cudaEventDestroy(runtime_value()));
         value = nullptr;
     }
 };
 struct recording_stream {
     CUstream value{};
-    recording_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    recording_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~recording_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct recording_readback {
     static constexpr size_t payload_size = 512, size = payload_size + 32;
     void* value{};
-    recording_readback() { CONFORMANCE_CUDA(cuMemAllocHost(&value, size)); std::memset(value, 0xd3, size); }
+    recording_readback() { TEST_CUDA(cuMemAllocHost(&value, size)); std::memset(value, 0xd3, size); }
     ~recording_readback() { if (value) cuMemFreeHost(value); }
     void expect(std::span<const unsigned char> expected) const {
         require(expected.size() == size, "event readback oracle extent");
@@ -74,10 +74,10 @@ void recording_fill_readback(CUstream stream, CUdeviceptr device, recording_read
     if (runtime) {
         RECORDING_RUNTIME(cudaMemsetAsync(reinterpret_cast<void*>(static_cast<uintptr_t>(device + offset)),
             value, bytes, reinterpret_cast<cudaStream_t>(stream)));
-        CONFORMANCE_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(destination.value) + 16,
+        TEST_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(destination.value) + 16,
             device, recording_readback::payload_size, stream));
     } else {
-        CONFORMANCE_CUDA(cuMemsetD8Async(device + offset, value, bytes, stream));
+        TEST_CUDA(cuMemsetD8Async(device + offset, value, bytes, stream));
         RECORDING_RUNTIME(cudaMemcpyAsync(static_cast<unsigned char*>(destination.value) + 16,
             reinterpret_cast<void*>(static_cast<uintptr_t>(device)), recording_readback::payload_size,
             cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(stream)));
@@ -123,12 +123,12 @@ void event_recording_snapshot() {
         recording_readback first, later;
         recording_stream stream;
         recording_event event(runtime, flags);
-        CONFORMANCE_CUDA(cuMemsetD8(device.value, 0xa9, recording_readback::payload_size));
+        TEST_CUDA(cuMemsetD8(device.value, 0xa9, recording_readback::payload_size));
         recording_fill_readback(stream.value, device.value, first, 17, 257, 0x5b, runtime);
         event.record(stream.value, api);
         recording_gate gate;
         recording_cleanup cleanup{gate};
-        CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, recording_gate::call, &gate)); gate.await();
+        TEST_CUDA(cuLaunchHostFunc(stream.value, recording_gate::call, &gate)); gate.await();
         recording_fill_readback(stream.value, device.value, later, 23, 73, 0x91, !runtime);
         event.expect_ready(true);
         event.synchronize(!runtime);
@@ -139,7 +139,7 @@ void event_recording_snapshot() {
         later.expect(std::vector<unsigned char>(recording_readback::size, 0xd3));
         event.expect_ready(true);
         gate.release();
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+        TEST_CUDA(cuStreamSynchronize(stream.value));
         require(!gate.expired, "event snapshot gate deadline");
         auto changed = expected;
         std::fill_n(changed.begin() + 16 + 23, 73, 0x91);
@@ -155,23 +155,23 @@ void event_recording_rerecord() {
         recording_readback first, second;
         recording_stream blocked, independent;
         recording_event event(runtime, flags);
-        CONFORMANCE_CUDA(cuMemsetD8(first_device.value, 0xa9, recording_readback::payload_size));
-        CONFORMANCE_CUDA(cuMemsetD8(second_device.value, 0xa9, recording_readback::payload_size));
+        TEST_CUDA(cuMemsetD8(first_device.value, 0xa9, recording_readback::payload_size));
+        TEST_CUDA(cuMemsetD8(second_device.value, 0xa9, recording_readback::payload_size));
         recording_gate old_gate, new_gate;
         struct cleanup_gates {
             recording_gate& old_gate;
             recording_gate& new_gate;
             ~cleanup_gates() { old_gate.release(); new_gate.release(); cuCtxSynchronize(); }
         } cleanup{old_gate, new_gate};
-        CONFORMANCE_CUDA(cuLaunchHostFunc(blocked.value, recording_gate::call, &old_gate)); old_gate.await();
+        TEST_CUDA(cuLaunchHostFunc(blocked.value, recording_gate::call, &old_gate)); old_gate.await();
         recording_fill_readback(blocked.value, first_device.value, first, 17, 257, 0x5b, runtime);
         event.record(blocked.value, api);
         event.expect_ready(false);
         // Snapshot the old record before replacing it. Entry to the new gate
         // then proves old work has completed, without requiring GPU progress
         // while any host function depends on unordered outstanding CUDA work.
-        CONFORMANCE_CUDA(cuStreamWaitEvent(independent.value, event.value, 0));
-        CONFORMANCE_CUDA(cuLaunchHostFunc(independent.value, recording_gate::call, &new_gate));
+        TEST_CUDA(cuStreamWaitEvent(independent.value, event.value, 0));
+        TEST_CUDA(cuLaunchHostFunc(independent.value, recording_gate::call, &new_gate));
         recording_fill_readback(independent.value, second_device.value, second, 23, 73, 0x91, !runtime);
         event.record(independent.value, (api + 1) % 4);
         event.expect_ready(false);
@@ -234,5 +234,5 @@ void execute_event_recording() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::event_recording_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_event_recording);
+    return cudavm::run_test(argc, argv, cudavm::execute_event_recording);
 }

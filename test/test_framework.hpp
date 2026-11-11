@@ -1,11 +1,11 @@
 #pragma once
-#ifdef CUDAVM_CONFORMANCE_NVRTC
+#ifdef CUDAVM_TEST_NVRTC
 #include <nvrtc.h>
 #endif
-#ifdef CUDAVM_CONFORMANCE_NVJITLINK
+#ifdef CUDAVM_TEST_NVJITLINK
 #include <nvJitLink.h>
 #endif
-#ifndef CUDAVM_CONFORMANCE_HOST_ONLY
+#ifndef CUDAVM_TEST_HOST_ONLY
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #endif
@@ -23,7 +23,7 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
-#ifdef CUDAVM_CONFORMANCE_REGISTRATION
+#ifdef CUDAVM_TEST_REGISTRATION
 #include <cuda_runtime_api.h>
 // Private compiler ABI declarations belong to the registration fixtures.
 extern "C" {
@@ -41,9 +41,9 @@ namespace cudavm {
 void require(bool condition, const std::string& message);
 // Host/compiler contracts share reporting without GPU initialization or Driver
 // references. HOST_ONLY registration selects this subset of the common runner.
-int run_host_conformance(int argc, char** argv, void (*execute)());
+int run_host_test(int argc, char** argv, void (*execute)());
 
-#if defined(CUDAVM_CONFORMANCE_NVRTC) || defined(CUDAVM_CONFORMANCE_NVJITLINK)
+#if defined(CUDAVM_TEST_NVRTC) || defined(CUDAVM_TEST_NVJITLINK)
 template<class Size, class Get> std::vector<unsigned char> compiler_fixture_bytes(Size query, Get retrieve) {
     struct { size_t before = 0x5917ab3d; size_t value{}; size_t after = 0x93bd175a; } size;
     query(&size.value);
@@ -58,7 +58,7 @@ template<class Size, class Get> std::vector<unsigned char> compiler_fixture_byte
 #endif
 // Compiler helpers own handles and exact output extents. Each slice retains
 // its sources, options and semantic oracle. CMake enables only linked APIs.
-#ifdef CUDAVM_CONFORMANCE_NVRTC
+#ifdef CUDAVM_TEST_NVRTC
 struct compiler_fixture_program {
     nvrtcProgram value{};
     compiler_fixture_program(const std::string& source, const char* name);
@@ -72,7 +72,7 @@ struct compiler_fixture_program {
     std::vector<unsigned char> lto() const;
 };
 #endif
-#ifdef CUDAVM_CONFORMANCE_NVJITLINK
+#ifdef CUDAVM_TEST_NVJITLINK
 struct linker_fixture_program {
     nvJitLinkHandle value{};
     explicit linker_fixture_program(const std::vector<std::string>& options = {"-arch=sm_75", "-lto", "-O0"});
@@ -86,25 +86,25 @@ struct linker_fixture_program {
 };
 #endif
 
-struct conformance_child_result { int status; std::string output; };
+struct test_child_result { int status; std::string output; };
 // Run the same executable with <backend> <case> --worker and inherited stdout
 // capture. The worker has a bounded deadline and propagates skip/failure status.
-conformance_child_result run_conformance_child(const char* executable, const char* backend, const char* case_name,
-                                               bool capture_stderr = false);
+test_child_result run_test_child(const char* executable, const char* backend, const char* case_name,
+                                 bool capture_stderr = false);
 
 // A fresh copy of this executable receives <backend> <case> --peer <read>
 // <write> <partner>. Control bytes and real OS handles use separate operations;
 // GPU payloads never pass through this channel. One thread owns each endpoint.
-class conformance_peer {
+class test_peer {
     struct state;
     std::unique_ptr<state> storage;
-    explicit conformance_peer(std::unique_ptr<state> value);
+    explicit test_peer(std::unique_ptr<state> value);
 public:
-    conformance_peer(const char* executable, const char* backend, const char* case_name);
-    static conformance_peer connect(std::string_view read, std::string_view write, std::string_view partner);
-    ~conformance_peer();
-    conformance_peer(conformance_peer&&) noexcept;
-    conformance_peer(const conformance_peer&) = delete;
+    test_peer(const char* executable, const char* backend, const char* case_name);
+    static test_peer connect(std::string_view read, std::string_view write, std::string_view partner);
+    ~test_peer();
+    test_peer(test_peer&&) noexcept;
+    test_peer(const test_peer&) = delete;
     void send(std::span<const std::byte> bytes);
     void receive(std::span<std::byte> bytes);
     void send_handle(uintptr_t handle);
@@ -120,7 +120,7 @@ struct fixture_data {
     std::string_view architecture_suffix;
     unsigned source_standard = 17;
 };
-inline std::string conformance_architecture(const fixture_data& fixtures) {
+inline std::string test_architecture(const fixture_data& fixtures) {
     return std::to_string(fixtures.architecture) + std::string(fixtures.architecture_suffix);
 }
 
@@ -498,7 +498,7 @@ std::vector<std::array<uint64_t, 3>> numerical_real_conversion_inputs() {
 
 template<class Word> inline constexpr Word numerical_output_guard = Word(0x9b3d715ac6e8294full);
 
-#ifndef CUDAVM_CONFORMANCE_HOST_ONLY
+#ifndef CUDAVM_TEST_HOST_ONLY
 // Only an absent declared device prerequisite is unavailable evidence. API or
 // execution failures on an applicable device must still fail the test.
 void require_capability(bool available, const std::string& reason);
@@ -506,9 +506,9 @@ void require_capability(bool available, const std::string& reason);
 std::string native_cuda_reference_library();
 int native_cuda_version();
 void check_driver(CUresult result, const char* operation);
-#define CONFORMANCE_CUDA(call) ::cudavm::check_driver((call), #call)
+#define TEST_CUDA(call) ::cudavm::check_driver((call), #call)
 
-#ifdef CUDAVM_CONFORMANCE_REGISTRATION
+#ifdef CUDAVM_TEST_REGISTRATION
 struct registration_wrapper { uint32_t magic = 0x466243b1, version = 1; const void* image{}; const void* auxiliary{}; };
 // Independently encode one uncompressed, 64-bit NVIDIA PTX fatbinary member.
 std::vector<unsigned char> registration_ptx_image(std::string_view source, unsigned major, unsigned minor, unsigned architecture);
@@ -517,7 +517,7 @@ std::vector<unsigned char> registration_ptx_image(std::string_view source, unsig
 class device_buffer {
 public:
     CUdeviceptr value{};
-    explicit device_buffer(size_t size) { CONFORMANCE_CUDA(cuMemAlloc(&value, size)); }
+    explicit device_buffer(size_t size) { TEST_CUDA(cuMemAlloc(&value, size)); }
     ~device_buffer() { if (value) cuMemFree(value); }
     device_buffer(const device_buffer&) = delete;
     device_buffer& operator=(const device_buffer&) = delete;
@@ -541,21 +541,21 @@ public:
 // Format-independent Driver API contracts need a device, but no shader compiler
 // or executable-input probe. A boundary slice that owns executable input may
 // supply an independent probe; slice failures never trigger device fallback.
-int run_conformance(int argc, char** argv, void (*execute)(), unsigned context_flags = 0,
-                    void (*probe)() = nullptr);
+int run_test(int argc, char** argv, void (*execute)(), unsigned context_flags = 0,
+             void (*probe)() = nullptr);
 // Compiler/linker boundary slices can reuse the same independent execution
 // prerequisite as embedded-input slices, without adding unrelated fixtures.
 void probe_execution();
 // Fatal-device witnesses own a disposable CTest process. Report and exit without
 // synchronizing or destroying a faulted context, even when an assertion fails.
-[[noreturn]] void run_isolated_fault_conformance(int argc, char** argv, void (*execute)(),
-                                               void (*probe)() = nullptr);
+[[noreturn]] void run_isolated_fault_test(int argc, char** argv, void (*execute)(),
+                                        void (*probe)() = nullptr);
 
 // Execution slices reuse one oracle unchanged by every importer and loader.
 // Context flags declare prerequisites such as host mapping for the slice itself.
-int run_conformance(int argc, char** argv, const fixture_data& fixtures,
-                    void (*execute)(const loaded_program&), unsigned load_repetitions = 1,
-                    unsigned context_flags = 0);
+int run_test(int argc, char** argv, const fixture_data& fixtures,
+             void (*execute)(const loaded_program&), unsigned load_repetitions = 1,
+             unsigned context_flags = 0);
 void expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> expected,
                   const std::string& context);
 
@@ -576,14 +576,14 @@ void execute_numerical_rows(const loaded_program& program, const char* kernel,
         std::copy(row.begin(), row.end(), complete.begin() + guards + size_t(i) * Fields);
     }
     device_buffer source(input.size() * sizeof(Word)), output(initial.size() * sizeof(Word));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * sizeof(Word)));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * sizeof(Word)));
     auto from = source.value + guards * sizeof(Word), to = output.value + guards * sizeof(Word);
     for (unsigned threads : {33u, 128u}) for (unsigned count : {0u, 1u, 37u, capacity}) {
-        CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, initial.data(), initial.size() * sizeof(Word)));
+        TEST_CUDA(cuMemcpyHtoD(output.value, initial.data(), initial.size() * sizeof(Word)));
         void* arguments[]{&to, &from, &count};
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function(kernel), (capacity + threads - 1) / threads, 1, 1,
+        TEST_CUDA(cuLaunchKernel(program.function(kernel), (capacity + threads - 1) / threads, 1, 1,
             threads, 1, 1, 0, nullptr, arguments, nullptr));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * sizeof(Word)));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * sizeof(Word)));
         for (size_t i = 0; i < actual.size(); ++i) {
             const bool active = i >= guards && i < guards + size_t(count) * Fields;
             const auto expected = active ? complete[i] : guard;
@@ -599,7 +599,7 @@ void execute_numerical_rows(const loaded_program& program, const char* kernel,
             throw std::runtime_error(std::string(kernel) + position + " threads=" + std::to_string(threads)
                 + " count=" + std::to_string(count) + " got=" + std::to_string(actual[i]) + " expected=" + std::to_string(expected));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * sizeof(Word)));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * sizeof(Word)));
         require(preserved == input, std::string(kernel) + " preserves every source byte and guard");
     }
 }
@@ -610,11 +610,11 @@ inline void virtual_runtime(cudaError_t result) {
 inline CUmemAllocationProp virtual_memory_properties() {
     CUmemAllocationProp properties{}; properties.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     properties.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    CONFORMANCE_CUDA(cuCtxGetDevice(&properties.location.id));
+    TEST_CUDA(cuCtxGetDevice(&properties.location.id));
     return properties;
 }
 inline size_t virtual_memory_granularity(const CUmemAllocationProp& properties) {
-    size_t result{}; CONFORMANCE_CUDA(cuMemGetAllocationGranularity(&result, &properties, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    size_t result{}; TEST_CUDA(cuMemGetAllocationGranularity(&result, &properties, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
     require(result && result <= std::numeric_limits<size_t>::max() / 16, "bounded virtual memory granularity");
     return result;
 }
@@ -623,18 +623,18 @@ struct virtual_physical_memory {
     size_t bytes;
     virtual_physical_memory(size_t size, const CUmemAllocationProp& properties) : bytes(size) {
         struct { uint64_t before = 0x19375928abcdef01; CUmemGenericAllocationHandle value{}; uint64_t after = 0xfedcba0129183745; } output;
-        CONFORMANCE_CUDA(cuMemCreate(&output.value, bytes, &properties, 0));
+        TEST_CUDA(cuMemCreate(&output.value, bytes, &properties, 0));
         value = output.value;
         require(value && output.before == 0x19375928abcdef01 && output.after == 0xfedcba0129183745, "physical allocation output guards");
     }
     ~virtual_physical_memory() { if (value) cuMemRelease(value); }
     virtual_physical_memory(const virtual_physical_memory&) = delete;
-    void close() { CONFORMANCE_CUDA(cuMemRelease(value)); value = 0; }
+    void close() { TEST_CUDA(cuMemRelease(value)); value = 0; }
 };
 struct virtual_memory_reservation {
     CUdeviceptr value{};
     size_t bytes;
-    explicit virtual_memory_reservation(size_t size) : bytes(size) { CONFORMANCE_CUDA(cuMemAddressReserve(&value, bytes, 0, 0, 0)); }
+    explicit virtual_memory_reservation(size_t size) : bytes(size) { TEST_CUDA(cuMemAddressReserve(&value, bytes, 0, 0, 0)); }
     ~virtual_memory_reservation() { if (value) cuMemAddressFree(value, bytes); }
     virtual_memory_reservation(const virtual_memory_reservation&) = delete;
 };
@@ -642,14 +642,14 @@ struct virtual_memory_mapping {
     CUdeviceptr value{};
     size_t bytes;
     virtual_memory_mapping(CUdeviceptr pointer, size_t size, CUmemGenericAllocationHandle physical) : value(pointer), bytes(size) {
-        CONFORMANCE_CUDA(cuMemMap(value, bytes, 0, physical, 0));
+        TEST_CUDA(cuMemMap(value, bytes, 0, physical, 0));
     }
     ~virtual_memory_mapping() { if (value) cuMemUnmap(value, bytes); }
     virtual_memory_mapping(const virtual_memory_mapping&) = delete;
     void grant(CUmemLocation location, CUmemAccess_flags flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE) const {
-        CUmemAccessDesc access{location, flags}; CONFORMANCE_CUDA(cuMemSetAccess(value, bytes, &access, 1));
+        CUmemAccessDesc access{location, flags}; TEST_CUDA(cuMemSetAccess(value, bytes, &access, 1));
     }
-    void close() { CONFORMANCE_CUDA(cuMemUnmap(value, bytes)); value = 0; }
+    void close() { TEST_CUDA(cuMemUnmap(value, bytes)); value = 0; }
 };
 inline std::vector<unsigned char> virtual_memory_pattern(size_t bytes, unsigned seed) {
     std::vector<unsigned char> values(bytes);
@@ -658,12 +658,12 @@ inline std::vector<unsigned char> virtual_memory_pattern(size_t bytes, unsigned 
 }
 inline void virtual_memory_write(CUdeviceptr pointer, std::span<const unsigned char> values, bool runtime = false) {
     if (runtime) virtual_runtime(cudaMemcpy(reinterpret_cast<void*>(uintptr_t(pointer)), values.data(), values.size(), cudaMemcpyHostToDevice));
-    else CONFORMANCE_CUDA(cuMemcpyHtoD(pointer, values.data(), values.size()));
+    else TEST_CUDA(cuMemcpyHtoD(pointer, values.data(), values.size()));
 }
 inline void virtual_memory_expect(CUdeviceptr pointer, std::span<const unsigned char> expected, const char* label, bool runtime = false) {
     std::vector<unsigned char> values(expected.size() + 32, 0xa7);
     if (runtime) virtual_runtime(cudaMemcpy(values.data() + 16, reinterpret_cast<void*>(uintptr_t(pointer)), expected.size(), cudaMemcpyDeviceToHost));
-    else CONFORMANCE_CUDA(cuMemcpyDtoH(values.data() + 16, pointer, expected.size()));
+    else TEST_CUDA(cuMemcpyDtoH(values.data() + 16, pointer, expected.size()));
     for (size_t i = 0; i < values.size(); ++i) {
         const auto wanted = i < 16 || i >= expected.size() + 16 ? 0xa7 : expected[i - 16];
         if (values[i] != wanted) require(false, std::string(label) + " byte " + std::to_string(i));
@@ -671,8 +671,8 @@ inline void virtual_memory_expect(CUdeviceptr pointer, std::span<const unsigned 
 }
 inline void require_virtual_memory() {
     CUdevice device{}; int supported{};
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device));
+    TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device));
     require_capability(supported != 0, "virtual memory requires advertised VMM support");
 }
 
@@ -702,11 +702,11 @@ struct image_test_storage {
                     array_flags & CUDA_ARRAY3D_SURFACE_LDST ? cudaArraySurfaceLoadStore : 0)); array = reinterpret_cast<CUarray>(result);
             } else {
                 CUDA_ARRAY3D_DESCRIPTOR descriptor{width, height, 0, format, channels, array_flags};
-                CONFORMANCE_CUDA(cuArray3DCreate(&array, &descriptor));
+                TEST_CUDA(cuArray3DCreate(&array, &descriptor));
             }
         } else if (type == CU_RESOURCE_TYPE_PITCH2D) {
-            CONFORMANCE_CUDA(cuMemAllocPitch(&pointer, &pitch, pitch, height, 16));
-        } else CONFORMANCE_CUDA(cuMemAlloc(&pointer, pitch * height));
+            TEST_CUDA(cuMemAllocPitch(&pointer, &pitch, pitch, height, 16));
+        } else TEST_CUDA(cuMemAlloc(&pointer, pitch * height));
         bytes.assign(pitch * height, 0xa7);
     }
     ~image_test_storage() { if (array) cuArrayDestroy(array); if (pointer) cuMemFree(pointer); }
@@ -730,14 +730,14 @@ struct image_test_storage {
     }
     void transfer(std::vector<unsigned char>& host, bool upload) const {
         if (pointer) {
-            if (upload) CONFORMANCE_CUDA(cuMemcpyHtoD(pointer, host.data(), host.size()));
-            else CONFORMANCE_CUDA(cuMemcpyDtoH(host.data(), pointer, host.size()));
+            if (upload) TEST_CUDA(cuMemcpyHtoD(pointer, host.data(), host.size()));
+            else TEST_CUDA(cuMemcpyDtoH(host.data(), pointer, host.size()));
         } else {
             CUDA_MEMCPY2D copy{}; copy.WidthInBytes = pitch; copy.Height = height;
             copy.srcMemoryType = upload ? CU_MEMORYTYPE_HOST : CU_MEMORYTYPE_ARRAY;
             copy.dstMemoryType = upload ? CU_MEMORYTYPE_ARRAY : CU_MEMORYTYPE_HOST;
             copy.srcHost = host.data(); copy.dstHost = host.data(); copy.srcArray = array; copy.dstArray = array;
-            copy.srcPitch = copy.dstPitch = pitch; CONFORMANCE_CUDA(cuMemcpy2D(&copy));
+            copy.srcPitch = copy.dstPitch = pitch; TEST_CUDA(cuMemcpy2D(&copy));
         }
     }
     void upload() { transfer(bytes, true); }
@@ -765,7 +765,7 @@ struct image_test_texture {
             sampler.filterMode = filter; sampler.maxAnisotropy = 1;
             sampler.flags = (normalized_coordinates ? CU_TRSF_NORMALIZED_COORDINATES : 0) | (normalized_read ? 0 : CU_TRSF_READ_AS_INTEGER);
             std::copy(border.begin(), border.end(), sampler.borderColor);
-            CONFORMANCE_CUDA(cuTexObjectCreate(&value, &resource, &sampler, nullptr));
+            TEST_CUDA(cuTexObjectCreate(&value, &resource, &sampler, nullptr));
         }
     }
     ~image_test_texture() { if (value) cuTexObjectDestroy(value); }

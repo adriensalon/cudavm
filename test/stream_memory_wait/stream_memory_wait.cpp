@@ -9,27 +9,27 @@ namespace cudavm {
 constexpr size_t memory_wait_bytes = 96, memory_wait_host_bytes = 137, memory_wait_host_offset = 17;
 constexpr uint64_t memory_wait_marker = 0x8123456789abcdefull;
 struct memory_wait_stream {
-    CUstream value{}; memory_wait_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    CUstream value{}; memory_wait_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~memory_wait_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
     void complete() const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10); CUresult status;
         do { status = cuStreamQuery(value); if (status != CUDA_ERROR_NOT_READY) break; std::this_thread::yield(); }
         while (std::chrono::steady_clock::now() < deadline);
-        CONFORMANCE_CUDA(status);
+        TEST_CUDA(status);
     }
 };
 struct memory_wait_storage {
     device_buffer device{memory_wait_bytes}; void* host{}; std::vector<unsigned char> initial;
     memory_wait_storage() : initial(memory_wait_bytes) {
         for (size_t i = 0; i < initial.size(); ++i) initial[i] = static_cast<unsigned char>(i * 37 + 13);
-        CONFORMANCE_CUDA(cuMemAllocHost(&host, memory_wait_host_bytes));
+        TEST_CUDA(cuMemAllocHost(&host, memory_wait_host_bytes));
     }
     ~memory_wait_storage() { if (host) { cuCtxSynchronize(); cuMemFreeHost(host); } }
     void reset(size_t offset, uint64_t value, bool wide) {
         for (size_t i = 0; i < initial.size(); ++i) initial[i] = static_cast<unsigned char>(i * 37 + 13);
         const auto narrow = static_cast<uint32_t>(value);
         std::memcpy(initial.data() + offset, wide ? static_cast<const void*>(&value) : static_cast<const void*>(&narrow), wide ? 8 : 4);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size())); std::memset(host, 0xd3, memory_wait_host_bytes);
+        TEST_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size())); std::memset(host, 0xd3, memory_wait_host_bytes);
     }
     CUresult read(CUstream stream) const { return cuMemcpyDtoHAsync(static_cast<unsigned char*>(host) + memory_wait_host_offset, device.value, memory_wait_bytes, stream); }
     void expect(size_t offset, uint64_t value, bool wide, bool marker = true) const {
@@ -62,8 +62,8 @@ void memory_wait_check(memory_wait_storage& storage, const memory_wait_stream& w
         while (std::chrono::steady_clock::now() < observation_end);
     }
     const auto release_status = input.blocked ? memory_wait_publish(producer.value, storage.device.value + offset, input.release, wide) : CUDA_SUCCESS;
-    CONFORMANCE_CUDA(release_status); producer.complete(); waiter.complete();
-    CONFORMANCE_CUDA(wait_status); CONFORMANCE_CUDA(marker_status); CONFORMANCE_CUDA(read_status);
+    TEST_CUDA(release_status); producer.complete(); waiter.complete();
+    TEST_CUDA(wait_status); TEST_CUDA(marker_status); TEST_CUDA(read_status);
     if (input.blocked) require(pending == CUDA_ERROR_NOT_READY, "unsatisfied wait holds downstream work until the producer publishes");
     storage.expect(offset, input.blocked ? input.release : input.initial, wide);
 }
@@ -103,7 +103,7 @@ void memory_wait_validation() {
              storage.device.value + memory_wait_bytes - (wide ? 4 : 2)})
             require(memory_wait_submit(waiter.value, address, 0, wide, CU_STREAM_WAIT_VALUE_EQ) == CUDA_ERROR_INVALID_VALUE, "invalid wait addresses reject before work publication");
         require(memory_wait_submit(waiter.value, storage.device.value + 8, 0, wide, 4) == CUDA_ERROR_INVALID_VALUE, "invalid wait predicate flags reject");
-        CONFORMANCE_CUDA(storage.read(waiter.value)); waiter.complete(); storage.expect(8, 0, wide, false);
+        TEST_CUDA(storage.read(waiter.value)); waiter.complete(); storage.expect(8, 0, wide, false);
         memory_wait_check(storage, waiter, producer, {0, 17, 17, CU_STREAM_WAIT_VALUE_EQ, true}, wide);
     }
 }
@@ -117,5 +117,5 @@ void execute_memory_wait() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc != 3) return 1; cudavm::memory_wait_selected_case = argv[2]; return cudavm::run_conformance(2, argv, cudavm::execute_memory_wait);
+    if (argc != 3) return 1; cudavm::memory_wait_selected_case = argv[2]; return cudavm::run_test(2, argv, cudavm::execute_memory_wait);
 }

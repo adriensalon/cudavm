@@ -17,8 +17,8 @@ struct reuse_pool {
     bool runtime;
     reuse_pool(bool use_runtime, size_t maximum = 0) : runtime(use_runtime) {
         CUdevice device{}; int supported = 0;
-        CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-        CONFORMANCE_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, device));
+        TEST_CUDA(cuCtxGetDevice(&device));
+        TEST_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, device));
         require(supported != 0, "pool reuse profile requires advertised memory-pool support");
         if (runtime) {
             cudaMemPoolProps props{}; props.allocType = cudaMemAllocationTypePinned;
@@ -27,17 +27,17 @@ struct reuse_pool {
         } else {
             CUmemPoolProps props{}; props.allocType = CU_MEM_ALLOCATION_TYPE_PINNED;
             props.location.type = CU_MEM_LOCATION_TYPE_DEVICE; props.location.id = device; props.maxSize = maximum;
-            CONFORMANCE_CUDA(cuMemPoolCreate(&value, &props));
+            TEST_CUDA(cuMemPoolCreate(&value, &props));
         }
         uint64_t threshold = UINT64_MAX;
-        CONFORMANCE_CUDA(cuMemPoolSetAttribute(value, CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, &threshold));
+        TEST_CUDA(cuMemPoolSetAttribute(value, CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, &threshold));
     }
     ~reuse_pool() { if (value) cuMemPoolDestroy(value); }
     cudaMemPool_t runtime_value() const { return reinterpret_cast<cudaMemPool_t>(value); }
     int get_policy(CUmemPool_attribute attribute) const {
         alignas(int) std::array<unsigned char, sizeof(int) + 32> driver, runtime;
         driver.fill(0xe7); runtime.fill(0xe7);
-        CONFORMANCE_CUDA(cuMemPoolGetAttribute(value, attribute, driver.data() + 16));
+        TEST_CUDA(cuMemPoolGetAttribute(value, attribute, driver.data() + 16));
         REUSE_RUNTIME(cudaMemPoolGetAttribute(runtime_value(), static_cast<cudaMemPoolAttr>(attribute), runtime.data() + 16));
         for (size_t i = 0; i < driver.size(); ++i)
             if (i < 16 || i >= 16 + sizeof(int)) require(driver[i] == 0xe7 && runtime[i] == 0xe7, "reuse-policy output width guards");
@@ -47,17 +47,17 @@ struct reuse_pool {
     }
     void policy(CUmemPool_attribute attribute, int setting, bool use_runtime) const {
         if (use_runtime) REUSE_RUNTIME(cudaMemPoolSetAttribute(runtime_value(), static_cast<cudaMemPoolAttr>(attribute), &setting));
-        else CONFORMANCE_CUDA(cuMemPoolSetAttribute(value, attribute, &setting));
+        else TEST_CUDA(cuMemPoolSetAttribute(value, attribute, &setting));
         require(get_policy(attribute) == setting, "reuse-policy roundtrip");
     }
     uint64_t get(CUmemPool_attribute attribute) const {
         uint64_t driver = 0, runtime = 0;
-        CONFORMANCE_CUDA(cuMemPoolGetAttribute(value, attribute, &driver));
+        TEST_CUDA(cuMemPoolGetAttribute(value, attribute, &driver));
         REUSE_RUNTIME(cudaMemPoolGetAttribute(runtime_value(), static_cast<cudaMemPoolAttr>(attribute), &runtime));
         require(driver == runtime, "pool reuse reservation/usage agreement"); return driver;
     }
     void destroy() {
-        if (runtime) CONFORMANCE_CUDA(cuMemPoolDestroy(value));
+        if (runtime) TEST_CUDA(cuMemPoolDestroy(value));
         else REUSE_RUNTIME(cudaMemPoolDestroy(runtime_value()));
         value = nullptr;
     }
@@ -66,7 +66,7 @@ constexpr std::array<CUmemPool_attribute, 3> reuse_policies{CU_MEMPOOL_ATTR_REUS
     CU_MEMPOOL_ATTR_REUSE_ALLOW_OPPORTUNISTIC, CU_MEMPOOL_ATTR_REUSE_ALLOW_INTERNAL_DEPENDENCIES};
 struct reuse_stream {
     CUstream value{};
-    reuse_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    reuse_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~reuse_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct reused_allocation {
@@ -76,12 +76,12 @@ struct reused_allocation {
         if (runtime) {
             void* pointer{}; REUSE_RUNTIME(cudaMallocFromPoolAsync(&pointer, size, pool.runtime_value(), reinterpret_cast<cudaStream_t>(stream)));
             value = reinterpret_cast<uintptr_t>(pointer);
-        } else CONFORMANCE_CUDA(cuMemAllocFromPoolAsync(&value, size, pool.value, stream));
+        } else TEST_CUDA(cuMemAllocFromPoolAsync(&value, size, pool.value, stream));
         require(value != 0, "reuse allocation publishes a nonempty pointer");
     }
     void retire(CUstream stream, bool runtime) {
         if (runtime) REUSE_RUNTIME(cudaFreeAsync(reinterpret_cast<void*>(static_cast<uintptr_t>(value)), reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuMemFreeAsync(value, stream));
+        else TEST_CUDA(cuMemFreeAsync(value, stream));
         value = 0;
     }
 };
@@ -90,13 +90,13 @@ struct reuse_snapshot {
     size_t chunk, stride, size;
     explicit reuse_snapshot(size_t capacity) : chunk(std::min<size_t>(64, capacity / 3)), stride(chunk + 32), size(stride * 3) {
         require(chunk != 0, "positive snapshot chunk");
-        CONFORMANCE_CUDA(cuMemAllocHost(&value, size)); std::memset(value, 0xd3, size);
+        TEST_CUDA(cuMemAllocHost(&value, size)); std::memset(value, 0xd3, size);
     }
     ~reuse_snapshot() { if (value) cuMemFreeHost(value); }
     void capture(CUdeviceptr pointer, size_t capacity, CUstream stream) const {
         const std::array<size_t, 3> offsets{0, (capacity - chunk) / 2, capacity - chunk};
         for (size_t row = 0; row < offsets.size(); ++row)
-            CONFORMANCE_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(value) + row * stride + 16, pointer + offsets[row], chunk, stream));
+            TEST_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(value) + row * stride + 16, pointer + offsets[row], chunk, stream));
     }
     void verify(unsigned char pattern) const {
         const auto* bytes = static_cast<unsigned char*>(value);
@@ -112,10 +112,10 @@ size_t reuse_capacity(bool runtime) {
     reused_allocation allocation;
     struct drain { ~drain() { cuCtxSynchronize(); } } cleanup;
     allocation.allocate(pool, stream.value, 7, runtime);
-    CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+    TEST_CUDA(cuStreamSynchronize(stream.value));
     const auto reserved = pool.get(CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT);
     require(reserved >= 7 && reserved <= std::numeric_limits<size_t>::max(), "measured pool backing capacity");
-    allocation.retire(stream.value, !runtime); CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+    allocation.retire(stream.value, !runtime); TEST_CUDA(cuStreamSynchronize(stream.value));
     pool.destroy();
     return size_t(reserved);
 }
@@ -148,26 +148,26 @@ void memory_pool_reuse_route(reuse_route route) {
         reused_allocation old, next;
         struct retained_event {
             CUevent value{};
-            retained_event() { CONFORMANCE_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
+            retained_event() { TEST_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
             ~retained_event() { if (value) cuEventDestroy(value); }
         } freed;
         struct drain { ~drain() { cuCtxSynchronize(); } } cleanup;
         old.allocate(pool, producer.value, capacity, runtime);
-        for (unsigned repeat = 0; repeat < 4; ++repeat) CONFORMANCE_CUDA(cuMemsetD8Async(old.value, 0x39, capacity, producer.value));
+        for (unsigned repeat = 0; repeat < 4; ++repeat) TEST_CUDA(cuMemsetD8Async(old.value, 0x39, capacity, producer.value));
         first.capture(old.value, capacity, producer.value);
         old.retire(producer.value, !runtime);
         if (route == reuse_route::events) {
-            CONFORMANCE_CUDA(cuEventRecord(freed.value, producer.value));
+            TEST_CUDA(cuEventRecord(freed.value, producer.value));
             REUSE_RUNTIME(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(consumer.value), reinterpret_cast<cudaEvent_t>(freed.value), 0));
         } else if (route == reuse_route::opportunistic) {
-            CONFORMANCE_CUDA(cuStreamSynchronize(producer.value)); first.verify(0x39);
+            TEST_CUDA(cuStreamSynchronize(producer.value)); first.verify(0x39);
         }
         const auto target = route == reuse_route::same_stream ? producer.value : consumer.value;
         next.allocate(pool, target, capacity, !runtime);
         REUSE_RUNTIME(cudaMemsetAsync(reinterpret_cast<void*>(static_cast<uintptr_t>(next.value)), 0x5b, capacity, reinterpret_cast<cudaStream_t>(target)));
         second.capture(next.value, capacity, target);
         next.retire(target, runtime);
-        CONFORMANCE_CUDA(cuStreamSynchronize(producer.value));
+        TEST_CUDA(cuStreamSynchronize(producer.value));
         REUSE_RUNTIME(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(target)));
         first.verify(0x39); second.verify(0x5b);
         require(pool.get(CU_MEMPOOL_ATTR_USED_MEM_CURRENT) == 0, "completed reused lifetimes retire application usage");
@@ -194,5 +194,5 @@ void execute_memory_pool_reuse() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::memory_pool_reuse_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_memory_pool_reuse);
+    return cudavm::run_test(argc, argv, cudavm::execute_memory_pool_reuse);
 }

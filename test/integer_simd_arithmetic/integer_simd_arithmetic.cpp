@@ -71,21 +71,21 @@ void execute_integer_simd_arithmetic(const loaded_program& program) {
         }
         device_buffer source(input.size() * 4), destination(complete.size() * 4);
         auto in = source.value + 8, out = destination.value + 8;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
             void* args[]{&out, &in, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(kernel, grid_x, grid_y, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+            TEST_CUDA(cuLaunchKernel(kernel, grid_x, grid_y, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
             std::copy_n(complete.begin() + 2, std::min(total, count) * simd_arithmetic_fields, expected.begin() + 2);
             expect_words(actual, expected, "SIMD arithmetic threads=" + std::to_string(threads) + " count=" + std::to_string(count));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "SIMD arithmetic source preservation");
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_integer_simd_arithmetic);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_integer_simd_arithmetic);
 }

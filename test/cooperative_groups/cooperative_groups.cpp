@@ -44,18 +44,18 @@ void group_case(const loaded_program& program, bool tiles, unsigned width,
     device_buffer source(input.size() * 4), output(expected.size() * 4), temporary(scratch.size() * 4);
     auto from = source.value + guards * 4, to = output.value + guards * 4, temp = temporary.value + guards * 4;
     std::vector<uint32_t> initialized(expected.size(), guard), empty(scratch.size(), guard);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, initialized.data(), initialized.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(temporary.value, empty.data(), empty.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(output.value, initialized.data(), initialized.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(temporary.value, empty.data(), empty.size() * 4));
     void* args[]{&to, &from, &temp, &rounds, &width};
     const auto name = tiles ? "cooperative_tile_" + std::to_string(width) : std::string("cooperative_block");
-    CONFORMANCE_CUDA(cuLaunchKernel(program.function(name.c_str()),
+    TEST_CUDA(cuLaunchKernel(program.function(name.c_str()),
         grid[0], grid[1], grid[2], shape[0], shape[1], shape[2], 0, nullptr, args, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
     expect_words(actual, expected, tiles ? "tile metadata, publication, shuffle, scan, reduction and guards" : "block geometry, ranks, publication and guards");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual_scratch.data(), temporary.value, actual_scratch.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual_scratch.data(), temporary.value, actual_scratch.size() * 4));
     expect_words(actual_scratch, scratch, "cooperative publication scratch and guards");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
     expect_words(preserved, input, "cooperative source preservation");
 }
 void execute_cooperative_groups(const loaded_program& program) {
@@ -68,5 +68,5 @@ void execute_cooperative_groups(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_cooperative_groups);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_cooperative_groups);
 }

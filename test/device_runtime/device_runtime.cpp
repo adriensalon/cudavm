@@ -15,5 +15,5 @@ void execute_device_runtime(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_device_runtime);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_device_runtime);
 }

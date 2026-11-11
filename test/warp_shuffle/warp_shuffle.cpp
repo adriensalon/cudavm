@@ -16,7 +16,7 @@ void execute_warp_shuffle(const loaded_program& program) {
         auto in = source.value + sizeof(uint32_t), out = destination.value + sizeof(uint32_t);
         const auto shape = " threads=" + std::to_string(threads);
         auto fetch = [&](unsigned words, const std::string& context) {
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * sizeof(uint32_t)));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * sizeof(uint32_t)));
             require(actual.front() == guard, context + ": prefix guard");
             for (size_t i = words + 1; i < actual.size(); ++i)
                 require(actual[i] == guard, context + ": tail guard " + std::to_string(i));
@@ -24,7 +24,7 @@ void execute_warp_shuffle(const loaded_program& program) {
         for (uint32_t seed : {0u, 0xfffffff1u}) {
             for (unsigned i = 0; i < total; ++i)
                 input[i + 1] = seed + i * 0x07654321u;
-            CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * sizeof(uint32_t)));
+            TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * sizeof(uint32_t)));
             for (unsigned width : {1u, 2u, 8u, 16u, 32u}) {
                 std::vector<unsigned> distances{0u, 1u, width - 1, width, 31u};
                 std::sort(distances.begin(), distances.end());
@@ -32,9 +32,9 @@ void execute_warp_shuffle(const loaded_program& program) {
                 for (unsigned distance : distances) {
                     const auto context = "shuffle" + shape + " width=" + std::to_string(width)
                         + " distance=" + std::to_string(distance) + " seed=" + std::to_string(seed);
-                    CONFORMANCE_CUDA(cuMemsetD32(destination.value, guard, actual.size()));
+                    TEST_CUDA(cuMemsetD32(destination.value, guard, actual.size()));
                     void* args[]{&out, &in, &width, &distance};
-                    CONFORMANCE_CUDA(cuLaunchKernel(modes, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+                    TEST_CUDA(cuLaunchKernel(modes, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
                     fetch(total * 4, context);
                     for (unsigned i = 0; i < total; ++i) {
                         const unsigned local = i % threads, lane = local % 32;
@@ -55,9 +55,9 @@ void execute_warp_shuffle(const loaded_program& program) {
                     }
                 }
             }
-            CONFORMANCE_CUDA(cuMemsetD32(destination.value, guard, actual.size()));
+            TEST_CUDA(cuMemsetD32(destination.value, guard, actual.size()));
             void* args[]{&out, &in};
-            CONFORMANCE_CUDA(cuLaunchKernel(scan, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuLaunchKernel(scan, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
             fetch(total * 2, "scan" + shape);
             for (unsigned i = 0; i < total; ++i) {
                 const unsigned local = i % threads, lane = local % 32;
@@ -72,7 +72,7 @@ void execute_warp_shuffle(const loaded_program& program) {
                 expect_words(std::span(actual).subspan(i * 2 + 1, 2), expected,
                     "inclusive scan and total broadcast" + shape + " thread=" + std::to_string(i));
             }
-            CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * sizeof(uint32_t)));
+            TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * sizeof(uint32_t)));
             expect_words(preserved, input, "shuffle input preservation" + shape);
         }
     }
@@ -80,5 +80,5 @@ void execute_warp_shuffle(const loaded_program& program) {
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_warp_shuffle);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_warp_shuffle);
 }

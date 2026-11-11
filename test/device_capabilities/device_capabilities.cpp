@@ -9,7 +9,7 @@ void capability_runtime(cudaError_t result, const char* operation) {
 #define CAPABILITY_RUNTIME(call) ::cudavm::capability_runtime((call), #call)
 int capability_attribute(CUdevice device, CUdevice_attribute attribute) {
     struct { uint32_t before = 0x12345678; int value = -1; uint32_t after = 0x87654321; } output;
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&output.value, attribute, device));
+    TEST_CUDA(cuDeviceGetAttribute(&output.value, attribute, device));
     require(output.before == 0x12345678 && output.after == 0x87654321, "device attribute output width");
     require(output.value > 0, "geometry capability is positive"); return output.value;
 }
@@ -22,10 +22,10 @@ void capability_launch(CUfunction function, capability_shape grid, capability_sh
     CUdeviceptr destination = output.value + 4;
     for (unsigned count : {total - 1, total}) {
         std::fill(expected.begin(), expected.end(), guard);
-        CONFORMANCE_CUDA(cuMemsetD32(output.value, guard, expected.size()));
+        TEST_CUDA(cuMemsetD32(output.value, guard, expected.size()));
         void* arguments[]{&destination, &count};
-        CONFORMANCE_CUDA(cuLaunchKernel(function, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, nullptr, arguments, nullptr));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+        TEST_CUDA(cuLaunchKernel(function, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, nullptr, arguments, nullptr));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
         unsigned index = 0, block_rank = 0;
         for (unsigned bz = 0; bz < grid[2]; ++bz)
         for (unsigned by = 0; by < grid[1]; ++by)
@@ -46,22 +46,22 @@ void capability_launch(CUfunction function, capability_shape grid, capability_sh
 void capability_rejection(CUfunction function, capability_shape grid, capability_shape block) {
     constexpr uint32_t guard = 0xa1b2c3d4;
     std::array<uint32_t, 20> actual{}, expected; expected.fill(guard);
-    device_buffer output(sizeof(expected)); CONFORMANCE_CUDA(cuMemsetD32(output.value, guard, expected.size()));
+    device_buffer output(sizeof(expected)); TEST_CUDA(cuMemsetD32(output.value, guard, expected.size()));
     CUdeviceptr destination = output.value + 4; unsigned count = 1;
     void* arguments[]{&destination, &count};
     require(cuLaunchKernel(function, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, nullptr, arguments, nullptr) == CUDA_ERROR_INVALID_VALUE,
             "geometry outside the reported device limit is rejected before execution");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
     expect_words(actual, expected, "rejected geometry preserves initialized output");
-    CONFORMANCE_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, nullptr, arguments, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
+    TEST_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, nullptr, arguments, nullptr));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
     const std::array<uint32_t, 16> row{0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 32, 0, 0};
     std::copy(row.begin(), row.end(), expected.begin() + 1);
     expect_words(actual, expected, "legal launch after admission failure");
 }
 void execute_device_capabilities(const loaded_program& program) {
     CUdevice device{}; CUcontext before{}, after{};
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device)); CONFORMANCE_CUDA(cuCtxGetCurrent(&before));
+    TEST_CUDA(cuCtxGetDevice(&device)); TEST_CUDA(cuCtxGetCurrent(&before));
     const unsigned maximum = capability_attribute(device, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK);
     require(capability_attribute(device, CU_DEVICE_ATTRIBUTE_WARP_SIZE) == 32, "reported logical CUDA warp width");
     const std::array<CUdevice_attribute, 3> block_attributes{CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X, CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y, CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z};
@@ -70,7 +70,7 @@ void execute_device_capabilities(const loaded_program& program) {
     for (unsigned axis = 0; axis < 3; ++axis) {
         limits[axis] = capability_attribute(device, block_attributes[axis]); grid_limits[axis] = capability_attribute(device, grid_attributes[axis]);
     }
-    CUdevprop legacy{}; CONFORMANCE_CUDA(cuDeviceGetProperties(&legacy, device));
+    CUdevprop legacy{}; TEST_CUDA(cuDeviceGetProperties(&legacy, device));
     cudaDeviceProp runtime{}; CAPABILITY_RUNTIME(cudaGetDeviceProperties(&runtime, device));
     require(legacy.maxThreadsPerBlock == maximum && runtime.maxThreadsPerBlock == maximum && runtime.warpSize == 32 && legacy.SIMDWidth == 32,
             "Driver, legacy and Runtime thread/warp limits agree");
@@ -78,7 +78,7 @@ void execute_device_capabilities(const loaded_program& program) {
         require(legacy.maxThreadsDim[axis] == limits[axis] && runtime.maxThreadsDim[axis] == limits[axis]
             && legacy.maxGridSize[axis] == grid_limits[axis] && runtime.maxGridSize[axis] == grid_limits[axis], "per-axis query surfaces agree");
     const auto function = program.function("record_builtins");
-    int function_maximum = 0; CONFORMANCE_CUDA(cuFuncGetAttribute(&function_maximum, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function));
+    int function_maximum = 0; TEST_CUDA(cuFuncGetAttribute(&function_maximum, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function));
     require(function_maximum >= maximum, "geometry fixture admits the reported maximum block thread count");
     std::vector<capability_shape> shapes{{1, 1, 1}};
     for (unsigned axis = 0; axis < 3; ++axis) { capability_shape shape{1, 1, 1}; shape[axis] = std::min(limits[axis], maximum); shapes.push_back(shape); }
@@ -115,7 +115,7 @@ void execute_device_capabilities(const loaded_program& program) {
     }
     require(checked_total || uint64_t(limits[0]) * limits[1] * limits[2] == maximum,
             "total-thread admission boundary checked independently of per-axis limits where applicable");
-    CONFORMANCE_CUDA(cuCtxGetCurrent(&after)); require(before == after, "capability queries/execution preserve current context");
+    TEST_CUDA(cuCtxGetCurrent(&after)); require(before == after, "capability queries/execution preserve current context");
 }
 }
-int main(int argc, char** argv) { return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_device_capabilities); }
+int main(int argc, char** argv) { return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_device_capabilities); }

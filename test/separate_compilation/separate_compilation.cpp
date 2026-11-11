@@ -122,10 +122,10 @@ void separate_execute_program(const loaded_program& program) {
     if (separate_compilation_case == "globals") {
         global_words = program.global("separate_words", sizeof(table)); global_bias = program.global("separate_bias", sizeof(bias));
         std::array<uint32_t, 8> actual; actual.fill(guard);
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data() + 2, global_words, sizeof(table)));
+        TEST_CUDA(cuMemcpyDtoH(actual.data() + 2, global_words, sizeof(table)));
         require(actual[0] == guard && actual[1] == guard && actual[6] == guard && actual[7] == guard
             && std::equal(table.begin(), table.end(), actual.begin() + 2), "separately defined global initializer and host guards");
-        uint32_t initial_bias{}; CONFORMANCE_CUDA(cuMemcpyDtoH(&initial_bias, global_bias, sizeof(initial_bias)));
+        uint32_t initial_bias{}; TEST_CUDA(cuMemcpyDtoH(&initial_bias, global_bias, sizeof(initial_bias)));
         require(initial_bias == bias, "separately defined constant initializer");
     }
     std::vector<uint32_t> input(capacity + guards * 2, guard), preserved(input.size());
@@ -136,25 +136,25 @@ void separate_execute_program(const loaded_program& program) {
         if (global_words) {
             for (unsigned i = 0; i < table.size(); ++i) table[i] = (0x193759bdu * (i + 1)) ^ (phase * 0xabcdef01u);
             bias = phase ? 0xffffffefu : 71u;
-            CONFORMANCE_CUDA(cuMemcpyHtoD(global_words, table.data(), sizeof(table)));
-            CONFORMANCE_CUDA(cuMemcpyHtoD(global_bias, &bias, sizeof(bias)));
+            TEST_CUDA(cuMemcpyHtoD(global_words, table.data(), sizeof(table)));
+            TEST_CUDA(cuMemcpyHtoD(global_bias, &bias, sizeof(bias)));
         }
         for (unsigned i = 0; i < capacity; ++i)
             input[guards + i] = i < edges.size() ? edges[(i + phase) % edges.size()] : i * 0x7654321u + phase * 0x193759bdu;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (unsigned threads : {32u, 61u}) for (unsigned count : {0u, 1u, 33u, capacity}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
             void* arguments[]{&to, &from, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(program.function("separate_results"), (capacity + threads - 1) / threads, 1, 1,
+            TEST_CUDA(cuLaunchKernel(program.function("separate_results"), (capacity + threads - 1) / threads, 1, 1,
                 threads, 1, 1, 0, nullptr, arguments, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
             for (unsigned i = 0; i < count; ++i) {
                 const auto row = separate_compilation_oracle(separate_compilation_case, input[guards + i], i, table, bias);
                 std::copy(row.begin(), row.end(), expected.begin() + guards + i * fields);
             }
             expect_words(actual, expected, "separate compilation linked values and complete output guards");
-            CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
             expect_words(preserved, input, "separate compilation preserves input and guards");
         }
     }
@@ -166,7 +166,7 @@ void execute_separate_compilation() {
         for (bool library : {false, true}) {
             loaded_program program(image.data(), library);
             separate_execute_program(program);
-            CONFORMANCE_CUDA(cuCtxSynchronize());
+            TEST_CUDA(cuCtxSynchronize());
         }
     }
 }
@@ -199,9 +199,9 @@ void separate_compilation_abi_validation() {
 }
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "sources")
-        return cudavm::run_host_conformance(argc, argv, cudavm::separate_compilation_source_check);
+        return cudavm::run_host_test(argc, argv, cudavm::separate_compilation_source_check);
     if (argc == 2 && std::string_view(argv[1]) == "abi_validation")
-        return cudavm::run_host_conformance(argc, argv, cudavm::separate_compilation_abi_validation);
+        return cudavm::run_host_test(argc, argv, cudavm::separate_compilation_abi_validation);
     if (argc == 3) { cudavm::separate_compilation_case = argv[2]; argc = 2; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_separate_compilation, 0, cudavm::probe_execution);
+    return cudavm::run_test(argc, argv, cudavm::execute_separate_compilation, 0, cudavm::probe_execution);
 }

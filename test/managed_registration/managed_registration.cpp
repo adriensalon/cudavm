@@ -59,7 +59,7 @@ void managed_contents(const managed_slot& slot, std::span<const uint32_t> expect
         require(address == slot.pointer && bytes == expected.size_bytes(), "managed slot and pointer symbol aliases");
     }
     unsigned is_managed = 0;
-    CONFORMANCE_CUDA(cuPointerGetAttribute(&is_managed, CU_POINTER_ATTRIBUTE_IS_MANAGED, reinterpret_cast<uintptr_t>(slot.pointer)));
+    TEST_CUDA(cuPointerGetAttribute(&is_managed, CU_POINTER_ATTRIBUTE_IS_MANAGED, reinterpret_cast<uintptr_t>(slot.pointer)));
     require(is_managed == 1, "Driver identifies managed compiler storage");
     cudaPointerAttributes attributes{}; MANAGED_RUNTIME(cudaPointerGetAttributes(&attributes, slot.pointer));
     require(attributes.type == cudaMemoryTypeManaged && attributes.devicePointer == slot.pointer && attributes.hostPointer == slot.pointer,
@@ -70,12 +70,12 @@ void managed_launch(const managed_slot& slot, const managed_tokens& tokens, std:
     constexpr unsigned active = 17, threads = 26, fields = 5;
     constexpr uint32_t guard = 0xa1b2c3d4;
     std::vector<uint32_t> output(threads * fields + 2), oracle(output.size(), guard);
-    device_buffer buffer(output.size() * 4); CONFORMANCE_CUDA(cuMemsetD32(buffer.value, guard, output.size()));
+    device_buffer buffer(output.size() * 4); TEST_CUDA(cuMemsetD32(buffer.value, guard, output.size()));
     void* destination = reinterpret_cast<void*>(static_cast<uintptr_t>(buffer.value + 4));
     void* arguments[]{&destination, &salt};
     MANAGED_RUNTIME(cudaLaunchKernel(&tokens.kernel, dim3(2), dim3(13), arguments, 0, nullptr));
     MANAGED_RUNTIME(cudaDeviceSynchronize());
-    CONFORMANCE_CUDA(cuMemcpyDtoH(output.data(), buffer.value, output.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(output.data(), buffer.value, output.size() * 4));
     for (unsigned i = 0; i < active; ++i) {
         const auto old = expected[i + 1], next = old + (salt ^ (i * 0x1234567u));
         const uint64_t address = reinterpret_cast<uintptr_t>(slot.pointer) + (i + 1) * 4;
@@ -131,25 +131,25 @@ void managed_contexts(unsigned version) {
     MANAGED_RUNTIME(cudaMemcpyToSymbol(&tokens.ordinary, &original_ordinary, 4, 0, cudaMemcpyHostToDevice));
     managed_launch(slot, tokens, expected, 0x12345678, original_ordinary);
     CUcontext original{}, separate{}; CUdevice device{};
-    CONFORMANCE_CUDA(cuCtxGetCurrent(&original)); CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuCtxCreate(&separate, nullptr, 0, device));
+    TEST_CUDA(cuCtxGetCurrent(&original)); TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuCtxCreate(&separate, nullptr, 0, device));
     try {
         image.initialize(slot); require(slot.pointer == identity, "second context retains managed address");
         managed_launch(slot, tokens, expected, 0x89abcdef);
-        CONFORMANCE_CUDA(cuCtxSetCurrent(original)); managed_launch(slot, tokens, expected, 0x23456789, original_ordinary);
+        TEST_CUDA(cuCtxSetCurrent(original)); managed_launch(slot, tokens, expected, 0x23456789, original_ordinary);
     } catch (...) { cuCtxSetCurrent(original); cuCtxDestroy(separate); throw; }
-    CONFORMANCE_CUDA(cuCtxDestroy(separate)); require(slot.pointer == identity, "foreign context destruction preserves managed compiler storage");
+    TEST_CUDA(cuCtxDestroy(separate)); require(slot.pointer == identity, "foreign context destruction preserves managed compiler storage");
     managed_contents(slot, expected);
-    device_buffer survivor(4); CONFORMANCE_CUDA(cuMemsetD32(survivor.value, 0xabcdef01, 1));
+    device_buffer survivor(4); TEST_CUDA(cuMemsetD32(survivor.value, 0xabcdef01, 1));
     MANAGED_RUNTIME(cudaDeviceReset());
     require(slot.pointer == identity, "reset retains managed address"); managed_contents(slot, expected);
     managed_launch(slot, tokens, expected, 0x456789ab);
-    uint32_t actual{}; CONFORMANCE_CUDA(cuMemcpyDtoH(&actual, survivor.value, 4));
+    uint32_t actual{}; TEST_CUDA(cuMemcpyDtoH(&actual, survivor.value, 4));
     require(actual == 0xabcdef01, "explicit reset preserves independent Driver storage");
 }
 void execute_managed_registration() {
     CUdevice device{}; int supported = 0;
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device)); CONFORMANCE_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, device));
+    TEST_CUDA(cuCtxGetDevice(&device)); TEST_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, device));
     require_capability(supported != 0, "managed compiler storage requires managed-memory capability; this profile remains open on this endpoint");
     for (unsigned version : {1u, 2u}) {
         managed_ownership(version); managed_coalescing(version, false); managed_coalescing(version, true); managed_contexts(version);
@@ -159,5 +159,5 @@ void execute_managed_registration() {
 int main(int argc, char** argv) {
     if (argc != 3) return 1;
     cudavm::managed_case = argv[2];
-    return cudavm::run_conformance(2, argv, cudavm::execute_managed_registration);
+    return cudavm::run_test(2, argv, cudavm::execute_managed_registration);
 }

@@ -154,5 +154,5 @@ int main(int argc, char** argv) {
     cudavm::bfloat162_profile = unsigned(selected - profiles.begin());
     const auto source = "#define CUDAVM_BFLOAT162_PROFILE " + std::to_string(cudavm::bfloat162_profile) + "\n" + std::string(cudavm::fixtures.source);
     auto fixtures = cudavm::fixtures; fixtures.source = source;
-    return cudavm::run_conformance(3, argv, fixtures, cudavm::execute_bfloat162_operations);
+    return cudavm::run_test(3, argv, fixtures, cudavm::execute_bfloat162_operations);
 }

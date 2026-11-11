@@ -30,8 +30,8 @@ struct graph_external_fences {
         auto factory_function = reinterpret_cast<decltype(&CreateDXGIFactory1)>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
         auto create = reinterpret_cast<decltype(&D3D12CreateDevice)>(GetProcAddress(directx, "D3D12CreateDevice"));
         require(factory_function && create, "independent D3D12 entry points");
-        CUdevice selected{}; CONFORMANCE_CUDA(cuCtxGetDevice(&selected)); char luid[8]{}; unsigned mask{};
-        CONFORMANCE_CUDA(cuDeviceGetLuid(luid, &mask, selected));
+        CUdevice selected{}; TEST_CUDA(cuCtxGetDevice(&selected)); char luid[8]{}; unsigned mask{};
+        TEST_CUDA(cuDeviceGetLuid(luid, &mask, selected));
         pointer<IDXGIFactory1> factory; check(factory_function(IID_PPV_ARGS(&factory)));
         for (UINT i = 0; ; ++i) {
             pointer<IDXGIAdapter1> adapter; auto status = factory->EnumAdapters1(i, &adapter);

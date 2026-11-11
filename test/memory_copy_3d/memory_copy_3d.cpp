@@ -17,13 +17,13 @@ struct copy_3d_endpoint {
     std::vector<unsigned char> expected;
     explicit copy_3d_endpoint(unsigned type)
         : kind(type), pitch(type == 0 ? 60 : copy_3d_width), slice_rows(type == 0 ? 7 : type == 1 ? 9 : copy_3d_rows), prefix(type == 0 ? 16 : 0) {
-        if (kind == 0) CONFORMANCE_CUDA(cuMemAllocHost(&host, pitch * slice_rows * copy_3d_slices + 32));
-        else if (kind == 1) CONFORMANCE_CUDA(cuMemAllocPitch(&device, &pitch, copy_3d_width, slice_rows * copy_3d_slices, 4));
+        if (kind == 0) TEST_CUDA(cuMemAllocHost(&host, pitch * slice_rows * copy_3d_slices + 32));
+        else if (kind == 1) TEST_CUDA(cuMemAllocPitch(&device, &pitch, copy_3d_width, slice_rows * copy_3d_slices, 4));
         else {
             CUDA_ARRAY3D_DESCRIPTOR descriptor{};
             descriptor.Width = copy_3d_width / 4; descriptor.Height = copy_3d_rows; descriptor.Depth = copy_3d_slices;
             descriptor.Format = CU_AD_FORMAT_UNSIGNED_INT16; descriptor.NumChannels = 2;
-            CONFORMANCE_CUDA(cuArray3DCreate(&array, &descriptor));
+            TEST_CUDA(cuArray3DCreate(&array, &descriptor));
         }
         require(pitch >= copy_3d_width && pitch <= (std::numeric_limits<size_t>::max() - 32) / slice_rows / copy_3d_slices, "3D endpoint extent");
         expected.resize(pitch * slice_rows * copy_3d_slices + prefix * 2);
@@ -59,40 +59,40 @@ struct copy_3d_endpoint {
         for (size_t x = 0; x < copy_3d_width; ++x)
             expected[prefix + (z * slice_rows + y) * pitch + x] = copy_3d_pattern(x, y, z, is_source);
         if (kind == 0) std::copy(expected.begin(), expected.end(), static_cast<unsigned char*>(host));
-        else if (kind == 1) CONFORMANCE_CUDA(cuMemcpyHtoD(device, expected.data(), expected.size()));
+        else if (kind == 1) TEST_CUDA(cuMemcpyHtoD(device, expected.data(), expected.size()));
         else {
             CUDA_MEMCPY3D operation{};
             operation.srcMemoryType = CU_MEMORYTYPE_HOST; operation.srcHost = expected.data();
             operation.srcPitch = pitch; operation.srcHeight = slice_rows;
             destination(operation);
             operation.WidthInBytes = copy_3d_width; operation.Height = copy_3d_rows; operation.Depth = copy_3d_slices;
-            CONFORMANCE_CUDA(cuMemcpy3D(&operation));
+            TEST_CUDA(cuMemcpy3D(&operation));
         }
     }
     void verify(const std::string& context) const {
         std::vector<unsigned char> actual(expected.size(), copy_3d_guard);
         if (kind == 0) std::copy_n(static_cast<unsigned char*>(host), actual.size(), actual.begin());
-        else if (kind == 1) CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), device, actual.size()));
+        else if (kind == 1) TEST_CUDA(cuMemcpyDtoH(actual.data(), device, actual.size()));
         else {
             CUDA_MEMCPY3D operation{};
             source(operation); operation.dstMemoryType = CU_MEMORYTYPE_HOST; operation.dstHost = actual.data();
             operation.dstPitch = pitch; operation.dstHeight = slice_rows;
             operation.WidthInBytes = copy_3d_width; operation.Height = copy_3d_rows; operation.Depth = copy_3d_slices;
-            CONFORMANCE_CUDA(cuMemcpy3D(&operation));
+            TEST_CUDA(cuMemcpy3D(&operation));
         }
         for (size_t i = 0; i < actual.size(); ++i)
             if (actual[i] != expected[i]) throw std::runtime_error(context + ": byte " + std::to_string(i)
                 + " got " + std::to_string(actual[i]) + ", expected " + std::to_string(expected[i]));
     }
     void close() {
-        if (host) { CONFORMANCE_CUDA(cuMemFreeHost(host)); host = nullptr; }
-        if (device) { CONFORMANCE_CUDA(cuMemFree(device)); device = 0; }
-        if (array) { CONFORMANCE_CUDA(cuArrayDestroy(array)); array = nullptr; }
+        if (host) { TEST_CUDA(cuMemFreeHost(host)); host = nullptr; }
+        if (device) { TEST_CUDA(cuMemFree(device)); device = 0; }
+        if (array) { TEST_CUDA(cuArrayDestroy(array)); array = nullptr; }
     }
 };
 struct copy_3d_stream {
     CUstream value{};
-    copy_3d_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    copy_3d_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~copy_3d_stream() { if (value) cuStreamDestroy(value); }
 };
 void execute_memory_copy_3d() {
@@ -120,9 +120,9 @@ void execute_memory_copy_3d() {
             operation.dstXInBytes = destination_x; operation.dstY = destination_y; operation.dstZ = destination_z;
             operation.WidthInBytes = width; operation.Height = height; operation.Depth = depth;
             if (asynchronous) {
-                CONFORMANCE_CUDA(cuMemcpy3DAsync(&operation, stream.value));
-                CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
-            } else CONFORMANCE_CUDA(cuMemcpy3D(&operation));
+                TEST_CUDA(cuMemcpy3DAsync(&operation, stream.value));
+                TEST_CUDA(cuStreamSynchronize(stream.value));
+            } else TEST_CUDA(cuMemcpy3D(&operation));
             const auto context = "3D copy source=" + std::to_string(source_kind) + " destination=" + std::to_string(destination_kind)
                 + " sx=" + std::to_string(source_x) + " sy=" + std::to_string(source_y) + " sz=" + std::to_string(source_z)
                 + " dx=" + std::to_string(destination_x) + " dy=" + std::to_string(destination_y) + " dz=" + std::to_string(destination_z)
@@ -132,9 +132,9 @@ void execute_memory_copy_3d() {
         }
         destination.close(); source.close();
     }
-    CONFORMANCE_CUDA(cuStreamDestroy(stream.value)); stream.value = nullptr;
+    TEST_CUDA(cuStreamDestroy(stream.value)); stream.value = nullptr;
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::execute_memory_copy_3d);
+    return cudavm::run_test(argc, argv, cudavm::execute_memory_copy_3d);
 }

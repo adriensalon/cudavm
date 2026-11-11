@@ -50,28 +50,28 @@ struct lifetime_object {
             cudaUserObject_t object{};
             LIFETIME_RUNTIME(cudaUserObjectCreate(&object, payload.get(), destroy, count, cudaUserObjectNoDestructorSync));
             value = reinterpret_cast<CUuserObject>(object);
-        } else CONFORMANCE_CUDA(cuUserObjectCreate(&value, payload.get(), destroy, count, CU_USER_OBJECT_NO_DESTRUCTOR_SYNC));
+        } else TEST_CUDA(cuUserObjectCreate(&value, payload.get(), destroy, count, CU_USER_OBJECT_NO_DESTRUCTOR_SYNC));
         payload.release();
     }
     ~lifetime_object() { if (caller_count) cuUserObjectRelease(value, caller_count); }
     void retain(unsigned count, bool runtime) {
         if (runtime) LIFETIME_RUNTIME(cudaUserObjectRetain(reinterpret_cast<cudaUserObject_t>(value), count));
-        else CONFORMANCE_CUDA(cuUserObjectRetain(value, count)); caller_count += count;
+        else TEST_CUDA(cuUserObjectRetain(value, count)); caller_count += count;
     }
     void release(unsigned count, bool runtime) {
         require(count <= caller_count, "fixture releases only its owned caller references");
         if (runtime) LIFETIME_RUNTIME(cudaUserObjectRelease(reinterpret_cast<cudaUserObject_t>(value), count));
-        else CONFORMANCE_CUDA(cuUserObjectRelease(value, count)); caller_count -= count;
+        else TEST_CUDA(cuUserObjectRelease(value, count)); caller_count -= count;
     }
     void attach(CUgraph graph, unsigned count, bool move, bool runtime) {
         require(!move || count <= caller_count, "fixture transfers only owned caller references");
         if (runtime) LIFETIME_RUNTIME(cudaGraphRetainUserObject(reinterpret_cast<cudaGraph_t>(graph), reinterpret_cast<cudaUserObject_t>(value), count, move ? cudaGraphUserObjectMove : 0));
-        else CONFORMANCE_CUDA(cuGraphRetainUserObject(graph, value, count, move ? CU_GRAPH_USER_OBJECT_MOVE : 0));
+        else TEST_CUDA(cuGraphRetainUserObject(graph, value, count, move ? CU_GRAPH_USER_OBJECT_MOVE : 0));
         if (move) caller_count -= count;
     }
     void detach(CUgraph graph, unsigned count, bool runtime) const {
         if (runtime) LIFETIME_RUNTIME(cudaGraphReleaseUserObject(reinterpret_cast<cudaGraph_t>(graph), reinterpret_cast<cudaUserObject_t>(value), count));
-        else CONFORMANCE_CUDA(cuGraphReleaseUserObject(graph, value, count));
+        else TEST_CUDA(cuGraphReleaseUserObject(graph, value, count));
     }
     void alive() const { std::lock_guard lock(state->mutex); require(state->calls == 0, "user object remains alive through its last retained use"); }
     void prove_retained(bool runtime) { retain(1, runtime); release(1, !runtime); alive(); }
@@ -89,8 +89,8 @@ struct lifetime_storage {
     std::vector<uint32_t> initial;
     lifetime_storage() : initial(lifetime_words) {
         for (size_t i = 0; i < initial.size(); ++i) initial[i] = 0xa9a90000u + uint32_t(i) * 0x10101u;
-        CONFORMANCE_CUDA(cuMemAllocHost(&host, lifetime_slots * lifetime_slot_words * sizeof(uint32_t)));
-        try { CONFORMANCE_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size() * sizeof(uint32_t))); }
+        TEST_CUDA(cuMemAllocHost(&host, lifetime_slots * lifetime_slot_words * sizeof(uint32_t)));
+        try { TEST_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size() * sizeof(uint32_t))); }
         catch (...) { cuMemFreeHost(host); host = nullptr; throw; }
         std::memset(host, 0xd3, lifetime_slots * lifetime_slot_words * sizeof(uint32_t));
     }
@@ -109,9 +109,9 @@ struct lifetime_storage {
 };
 struct lifetime_stream {
     CUstream value{};
-    lifetime_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    lifetime_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~lifetime_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
-    void synchronize() const { CONFORMANCE_CUDA(cuStreamSynchronize(value)); }
+    void synchronize() const { TEST_CUDA(cuStreamSynchronize(value)); }
 };
 struct lifetime_gate {
     std::mutex mutex; std::condition_variable changed;
@@ -133,27 +133,27 @@ struct lifetime_graph {
     CUgraph value{}; CUcontext context{};
     CUgraphNode kernel{}, read{}, marker{};
     explicit lifetime_graph(bool runtime) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        TEST_CUDA(cuCtxGetCurrent(&context));
         if (runtime) { cudaGraph_t graph{}; LIFETIME_RUNTIME(cudaGraphCreate(&graph, 0)); value = reinterpret_cast<CUgraph>(graph); }
-        else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        else TEST_CUDA(cuGraphCreate(&value, 0));
     }
     lifetime_graph(const lifetime_graph& original, bool runtime) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        TEST_CUDA(cuCtxGetCurrent(&context));
         if (runtime) { cudaGraph_t graph{}; LIFETIME_RUNTIME(cudaGraphClone(&graph, reinterpret_cast<cudaGraph_t>(original.value))); value = reinterpret_cast<CUgraph>(graph); }
-        else CONFORMANCE_CUDA(cuGraphClone(&value, original.value));
+        else TEST_CUDA(cuGraphClone(&value, original.value));
     }
     lifetime_graph(const lifetime_graph&) = delete;
     lifetime_graph& operator=(const lifetime_graph&) = delete;
     ~lifetime_graph() { if (value) cuGraphDestroy(value); }
     void destroy(bool runtime) {
         if (runtime) LIFETIME_RUNTIME(cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(value)));
-        else CONFORMANCE_CUDA(cuGraphDestroy(value));
+        else TEST_CUDA(cuGraphDestroy(value));
         value = nullptr;
     }
     void child(CUgraph source, bool runtime) const {
         if (runtime) {
             cudaGraphNode_t node{}; LIFETIME_RUNTIME(cudaGraphAddChildGraphNode(&node, reinterpret_cast<cudaGraph_t>(value), nullptr, 0, reinterpret_cast<cudaGraph_t>(source)));
-        } else { CUgraphNode node{}; CONFORMANCE_CUDA(cuGraphAddChildGraphNode(&node, value, nullptr, 0, source)); }
+        } else { CUgraphNode node{}; TEST_CUDA(cuGraphAddChildGraphNode(&node, value, nullptr, 0, source)); }
     }
     void configure(CUfunction function, lifetime_storage& storage, unsigned slot, uint32_t color, lifetime_state* state, bool runtime) {
         auto output = storage.device.value + lifetime_guard * sizeof(uint32_t);
@@ -169,8 +169,8 @@ struct lifetime_graph {
         } else {
             CUDA_KERNEL_NODE_PARAMS p{}; p.func = function; p.gridDimX = 3; p.gridDimY = p.gridDimZ = 1;
             p.blockDimX = 32; p.blockDimY = p.blockDimZ = 1; p.kernelParams = arguments.data();
-            if (kernel) CONFORMANCE_CUDA(cuGraphKernelNodeSetParams(kernel, &p));
-            else CONFORMANCE_CUDA(cuGraphAddKernelNode(&kernel, value, nullptr, 0, &p));
+            if (kernel) TEST_CUDA(cuGraphKernelNodeSetParams(kernel, &p));
+            else TEST_CUDA(cuGraphAddKernelNode(&kernel, value, nullptr, 0, &p));
         }
         const size_t bytes = lifetime_words * sizeof(uint32_t);
         auto destination = storage.slot(slot) + lifetime_guard;
@@ -192,11 +192,11 @@ struct lifetime_graph {
             CUDA_MEMCPY3D p{}; p.srcMemoryType = CU_MEMORYTYPE_DEVICE; p.srcDevice = storage.device.value;
             p.dstMemoryType = CU_MEMORYTYPE_HOST; p.dstHost = destination;
             p.srcPitch = p.dstPitch = p.WidthInBytes = bytes; p.srcHeight = p.dstHeight = p.Height = p.Depth = 1;
-            if (read) CONFORMANCE_CUDA(cuGraphMemcpyNodeSetParams(read, &p));
-            else CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&read, value, &kernel, 1, &p, context));
+            if (read) TEST_CUDA(cuGraphMemcpyNodeSetParams(read, &p));
+            else TEST_CUDA(cuGraphAddMemcpyNode(&read, value, &kernel, 1, &p, context));
             CUDA_HOST_NODE_PARAMS host{lifetime_state::publish, state};
-            if (marker) CONFORMANCE_CUDA(cuGraphHostNodeSetParams(marker, &host));
-            else CONFORMANCE_CUDA(cuGraphAddHostNode(&marker, value, &read, 1, &host));
+            if (marker) TEST_CUDA(cuGraphHostNodeSetParams(marker, &host));
+            else TEST_CUDA(cuGraphAddHostNode(&marker, value, &read, 1, &host));
         }
     }
 };
@@ -204,17 +204,17 @@ struct lifetime_executable {
     CUgraphExec value{};
     lifetime_executable(CUgraph graph, bool runtime) {
         if (runtime) { cudaGraphExec_t executable{}; LIFETIME_RUNTIME(cudaGraphInstantiateWithFlags(&executable, reinterpret_cast<cudaGraph_t>(graph), 0)); value = reinterpret_cast<CUgraphExec>(executable); }
-        else CONFORMANCE_CUDA(cuGraphInstantiate(&value, graph, 0));
+        else TEST_CUDA(cuGraphInstantiate(&value, graph, 0));
     }
     ~lifetime_executable() { if (value) cuGraphExecDestroy(value); }
     void destroy(bool runtime) {
         if (runtime) LIFETIME_RUNTIME(cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(value)));
-        else CONFORMANCE_CUDA(cuGraphExecDestroy(value));
+        else TEST_CUDA(cuGraphExecDestroy(value));
         value = nullptr;
     }
     void launch(CUstream stream, bool runtime) const {
         if (runtime) LIFETIME_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(value), reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuGraphLaunch(value, stream));
+        else TEST_CUDA(cuGraphLaunch(value, stream));
     }
     void update(CUgraph source, bool runtime) const {
         if (runtime) {
@@ -222,17 +222,17 @@ struct lifetime_executable {
             LIFETIME_RUNTIME(cudaGraphExecUpdate(reinterpret_cast<cudaGraphExec_t>(value), reinterpret_cast<cudaGraph_t>(source), &info));
             require(info.result == cudaGraphExecUpdateSuccess && !info.errorNode && !info.errorFromNode, "successful Runtime lifetime update diagnostics");
         } else {
-            CUgraphExecUpdateResultInfo info{}; CONFORMANCE_CUDA(cuGraphExecUpdate(value, source, &info));
+            CUgraphExecUpdateResultInfo info{}; TEST_CUDA(cuGraphExecUpdate(value, source, &info));
             require(info.result == CU_GRAPH_EXEC_UPDATE_SUCCESS && !info.errorNode && !info.errorFromNode, "successful Driver lifetime update diagnostics");
         }
     }
 };
 struct lifetime_event {
     CUevent value{};
-    lifetime_event() { CONFORMANCE_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
+    lifetime_event() { TEST_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
     ~lifetime_event() { if (value) cuEventDestroy(value); }
-    void record(CUstream stream) const { CONFORMANCE_CUDA(cuEventRecord(value, stream)); }
-    void synchronize() const { CONFORMANCE_CUDA(cuEventSynchronize(value)); }
+    void record(CUstream stream) const { TEST_CUDA(cuEventRecord(value, stream)); }
+    void synchronize() const { TEST_CUDA(cuEventSynchronize(value)); }
 };
 void lifetime_references(CUfunction function, bool runtime) {
     lifetime_object object(2, runtime, 0x1111222233334444);
@@ -273,7 +273,7 @@ void lifetime_queued(CUfunction function, bool runtime) {
     lifetime_graph source(runtime); source.configure(function, storage, 0, 0x10203040, object.state.get(), runtime);
     object.attach(source.value, 1, true, !runtime); lifetime_executable executable(source.value, !runtime);
     lifetime_gate_cleanup cleanup{gate};
-    CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, lifetime_gate::call, &gate)); gate.await();
+    TEST_CUDA(cuLaunchHostFunc(stream.value, lifetime_gate::call, &gate)); gate.await();
     executable.launch(stream.value, runtime); done.record(stream.value);
     source.destroy(!runtime); executable.destroy(runtime);
     object.prove_retained(runtime); storage.untouched(); gate.held();
@@ -286,7 +286,7 @@ void lifetime_updates(CUfunction function, bool runtime) {
     lifetime_graph source(runtime); source.configure(function, storage, 0, 0xfffffff1, old_object.state.get(), runtime);
     old_object.attach(source.value, 1, true, !runtime); lifetime_executable executable(source.value, runtime);
     lifetime_gate_cleanup cleanup{gate};
-    CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, lifetime_gate::call, &gate)); gate.await();
+    TEST_CUDA(cuLaunchHostFunc(stream.value, lifetime_gate::call, &gate)); gate.await();
     executable.launch(stream.value, !runtime);
     new_object.attach(source.value, 1, true, runtime); old_object.detach(source.value, 1, !runtime);
     source.configure(function, storage, 1, 0x13579bdf, new_object.state.get(), !runtime);
@@ -328,4 +328,4 @@ void execute_graph_lifetime(const loaded_program& program) {
     }
 }
 }
-int main(int argc, char** argv) { return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_graph_lifetime); }
+int main(int argc, char** argv) { return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_graph_lifetime); }

@@ -18,14 +18,14 @@ void execute_memory_model_litmus(const loaded_program& program) {
         device_buffer source(input.size() * 4), output(expected.size() * 4), flags_storage(flags.size() * 4), payload(values.size() * 4);
         auto from = source.value + guards * 4, to = output.value + guards * 4;
         auto flag_pointer = flags_storage.value + guards * 4, value_pointer = payload.value + guards * 4;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(flags_storage.value, flags.data(), flags.size() * 4));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(payload.value, values.data(), values.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(flags_storage.value, flags.data(), flags.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(payload.value, values.data(), values.size() * 4));
         void* args[]{&to, &from, &flag_pointer, &value_pointer, &trials, &forced};
         const auto name = std::string(fenced ? "mp_fenced_" : "mp_ordered_") + profile;
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function(name.c_str()), blocks, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+        TEST_CUDA(cuLaunchKernel(program.function(name.c_str()), blocks, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
         std::array<unsigned, 3> outcomes{};
         for (unsigned trial = 0; trial < trials; ++trial) for (unsigned id = 0; id < pairs; ++id) {
             unsigned row = guards + (trial * pairs + id) * 4;
@@ -40,11 +40,11 @@ void execute_memory_model_litmus(const loaded_program& program) {
             if (!shared) { flags[guards + id] = 1; values[guards + id] = published; }
         }
         expect_words(actual, expected, "litmus observation extents, inactive fields and all output guards");
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual_flags.data(), flags_storage.value, actual_flags.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(actual_flags.data(), flags_storage.value, actual_flags.size() * 4));
         expect_words(actual_flags, flags, "litmus final flags and neighboring words");
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual_values.data(), payload.value, actual_values.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(actual_values.data(), payload.value, actual_values.size() * 4));
         expect_words(actual_values, values, "litmus final payload and allocation guards");
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "litmus source preservation");
         std::cout << name << " forced=" << forced << " trials=" << trials
             << " outcomes=" << outcomes[0] << ',' << outcomes[1] << ',' << outcomes[2] << '\n';
@@ -52,5 +52,5 @@ void execute_memory_model_litmus(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_memory_model_litmus);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_memory_model_litmus);
 }

@@ -18,23 +18,23 @@ void tensor_load_case(const loaded_program& program, unsigned pitch, unsigned th
                 ? input[guards + unsigned(source_y) * pitch + unsigned(source_x)] : 0;
         }
     device_buffer source(input.size() * 4), destination(initial.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
     auto from = source.value + guards * 4, to = destination.value + guards * 4;
     struct { std::array<unsigned char, 128> before; CUtensorMap value; std::array<unsigned char, 128> after; } descriptor;
     descriptor.before.fill(0x93); descriptor.after.fill(0x57); std::memset(&descriptor.value, 0xa5, sizeof(descriptor.value));
     const cuuint64_t dimensions[]{width, height}, strides[]{pitch * 4};
     const cuuint32_t box[]{8, 4}, elements[]{1, 1};
-    CONFORMANCE_CUDA(cuTensorMapEncodeTiled(&descriptor.value, CU_TENSOR_MAP_DATA_TYPE_UINT32, 2,
+    TEST_CUDA(cuTensorMapEncodeTiled(&descriptor.value, CU_TENSOR_MAP_DATA_TYPE_UINT32, 2,
         reinterpret_cast<void*>(static_cast<uintptr_t>(from)), dimensions, strides, box, elements,
         CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     const auto original = descriptor;
     void* arguments[]{&descriptor.value, &to, &rounds, &x, &y};
-    CONFORMANCE_CUDA(cuLaunchKernel(program.function("tensor_load"), blocks, 1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+    TEST_CUDA(cuLaunchKernel(program.function("tensor_load"), blocks, 1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
     expect_words(actual, expected, "TMA tile, shared/output guards and inactive phases pitch=" + std::to_string(pitch)
         + " threads=" + std::to_string(threads) + " rounds=" + std::to_string(rounds) + " x=" + std::to_string(x) + " y=" + std::to_string(y));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
     expect_words(preserved, input, "TMA source, row padding and allocation guards");
     require(std::all_of(descriptor.before.begin(), descriptor.before.end(), [](auto b) { return b == 0x93; })
         && std::all_of(descriptor.after.begin(), descriptor.after.end(), [](auto b) { return b == 0x57; })
@@ -48,5 +48,5 @@ void execute_tensor_memory_transfer(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_tensor_memory_transfer);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_tensor_memory_transfer);
 }

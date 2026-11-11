@@ -20,7 +20,7 @@ struct system_host_page {
     CUdeviceptr alias{};
     system_host_page() {
         void* storage{};
-        CONFORMANCE_CUDA(cuMemHostAlloc(&storage, sizeof(system_page), CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE));
+        TEST_CUDA(cuMemHostAlloc(&storage, sizeof(system_page), CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE));
         value = std::construct_at(static_cast<system_page*>(storage));
         auto status = cuMemHostGetDevicePointer(&alias, value, 0);
         if (status != CUDA_SUCCESS) { std::destroy_at(value); cuMemFreeHost(value); value = nullptr; check_driver(status, "mapped system mailbox alias"); }
@@ -29,7 +29,7 @@ struct system_host_page {
 };
 struct system_stream {
     CUstream value{};
-    system_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    system_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~system_stream() { if (value) cuStreamDestroy(value); }
 };
 // A failure while the GPU waits for another host phase must not enter SDK
@@ -51,7 +51,7 @@ void system_case(const loaded_program& program, unsigned rounds, unsigned seed, 
     require(ready.is_lock_free() && acknowledged.is_lock_free() && counter.is_lock_free(), "CPU system mailbox atomics are lock-free");
     std::vector<uint32_t> expected(guards * 2 + rounds, guard), actual(expected.size()), cpu_tickets(rounds);
     device_buffer output(expected.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
     auto mailbox = page.alias + offsetof(system_page, words), tickets = output.value + guards * 4;
     require(mailbox % std::atomic_ref<uint32_t>::required_alignment == 0, "mapped system word alignment");
     system_stream stream;
@@ -61,7 +61,7 @@ void system_case(const loaded_program& program, unsigned rounds, unsigned seed, 
         auto status = cudaLaunchKernel(reinterpret_cast<const void*>(program.library_kernel("system_handoff")),
             dim3(1), dim3(1), args, 0, reinterpret_cast<cudaStream_t>(stream.value));
         require(status == cudaSuccess, std::string("Runtime system handoff launch: ") + cudaGetErrorString(status));
-    } else CONFORMANCE_CUDA(cuLaunchKernel(program.function("system_handoff"), 1, 1, 1, 1, 1, 1, 0, stream.value, args, nullptr));
+    } else TEST_CUDA(cuLaunchKernel(program.function("system_handoff"), 1, 1, 1, 1, 1, 1, 0, stream.value, args, nullptr));
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     for (unsigned round = 0; round < rounds; ++round) {
         std::array<uint32_t, 4> payload;
@@ -83,12 +83,12 @@ void system_case(const loaded_program& program, unsigned rounds, unsigned seed, 
         system_active_require(counter.load(std::memory_order_acquire) == (rmw ? (round + 1) * 2 : 0), cancel,
             "exact CPU/GPU system atomic counter per phase");
     }
-    CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+    TEST_CUDA(cuStreamSynchronize(stream.value));
     require(ready.load() == rounds && acknowledged.load() == rounds && cancel.load() == 0, "system mailbox terminal generation");
     require(std::all_of(std::begin(page.value->before), std::end(page.value->before), [](auto word) { return word == guard; })
         && std::all_of(std::begin(page.value->after), std::end(page.value->after), [](auto word) { return word == guard; }), "complete mapped mailbox guards");
     if (!rounds) for (unsigned word = 4; word < 12; ++word) require(page.value->words[word] == guard, "empty handoff leaves payload untouched");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
     for (unsigned round = 0; round < rounds; ++round) {
         if (rmw) {
             const auto gpu = actual[guards + round], cpu = cpu_tickets[round];
@@ -100,13 +100,13 @@ void system_case(const loaded_program& program, unsigned rounds, unsigned seed, 
 }
 void execute_system_atomics(const loaded_program& program) {
     require(system_profile == "load_store" || system_profile == "rmw", "known system atomic profile");
-    CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    int mapped = 0; CONFORMANCE_CUDA(cuDeviceGetAttribute(&mapped, CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY, device));
+    CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device));
+    int mapped = 0; TEST_CUDA(cuDeviceGetAttribute(&mapped, CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY, device));
     require_capability(mapped != 0, "native mapped host memory is unavailable");
     require_capability(std::atomic_ref<uint32_t>::is_always_lock_free, "host ABI lacks lock-free 32-bit atomic references");
     const bool rmw = system_profile == "rmw";
     if (rmw) {
-        int native = 0; CONFORMANCE_CUDA(cuDeviceGetAttribute(&native, CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED, device));
+        int native = 0; TEST_CUDA(cuDeviceGetAttribute(&native, CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED, device));
         require_capability(native != 0, "native link does not support system RMW atomics on mapped memory");
     }
     for (unsigned rounds : {0u, 1u, 64u}) for (unsigned seed : {0u, 0x87654321u}) {
@@ -118,5 +118,5 @@ void execute_system_atomics(const loaded_program& program) {
 int main(int argc, char** argv) {
     if (argc != 4) { std::cerr << "usage: <executable> <backend> cu <load_store|rmw>\n"; return 1; }
     cudavm::system_profile = argv[3];
-    return cudavm::run_conformance(3, argv, cudavm::fixtures, cudavm::execute_system_atomics, 1, CU_CTX_MAP_HOST);
+    return cudavm::run_test(3, argv, cudavm::fixtures, cudavm::execute_system_atomics, 1, CU_CTX_MAP_HOST);
 }

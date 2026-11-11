@@ -16,5 +16,5 @@ int main(int argc, char** argv) {
     const auto selected = std::find(profiles.begin(), profiles.end(), std::string_view(argv[3]));
     if (selected == profiles.end()) return 1;
     cudavm::fast_math_profile = unsigned(selected - profiles.begin());
-    return cudavm::run_conformance(3, argv, cudavm::fixtures, cudavm::execute_fast_math_intrinsics);
+    return cudavm::run_test(3, argv, cudavm::fixtures, cudavm::execute_fast_math_intrinsics);
 }

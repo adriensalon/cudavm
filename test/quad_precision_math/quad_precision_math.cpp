@@ -73,5 +73,5 @@ void execute_quad_precision_math() {
 }
 int main(int argc, char** argv) {
     if (argc == 2) cudavm::quad_precision_case = argv[1];
-    return cudavm::run_host_conformance(argc, argv, cudavm::execute_quad_precision_math);
+    return cudavm::run_host_test(argc, argv, cudavm::execute_quad_precision_math);
 }

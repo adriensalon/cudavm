@@ -17,11 +17,11 @@ void execute_device_builtins(const loaded_program& program) {
         auto out = allocation.value + sizeof(uint32_t);
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(allocation.value, expected.data(), expected.size() * sizeof(uint32_t)));
+            TEST_CUDA(cuMemcpyHtoD(allocation.value, expected.data(), expected.size() * sizeof(uint32_t)));
             void* args[]{&out, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(kernel, shape[0], shape[1], shape[2],
+            TEST_CUDA(cuLaunchKernel(kernel, shape[0], shape[1], shape[2],
                 shape[3], shape[4], shape[5], 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), allocation.value, actual.size() * sizeof(uint32_t)));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), allocation.value, actual.size() * sizeof(uint32_t)));
             unsigned block = 0, index = 0;
             // Count the x-fastest coordinates independently of device flattening.
             for (unsigned bz = 0; bz < shape[2]; ++bz)
@@ -49,5 +49,5 @@ void execute_device_builtins(const loaded_program& program) {
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_device_builtins);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_device_builtins);
 }

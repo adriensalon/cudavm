@@ -16,7 +16,7 @@ template<class T> struct kernel_node_guarded {
 };
 template<class T> T kernel_node_procedure(const char* name, int version) {
     void* address{}; CUdriverProcAddressQueryResult status{};
-    CONFORMANCE_CUDA(cuGetProcAddress(name, &address, version, CU_GET_PROC_ADDRESS_DEFAULT, &status));
+    TEST_CUDA(cuGetProcAddress(name, &address, version, CU_GET_PROC_ADDRESS_DEFAULT, &status));
     require(address && status == CU_GET_PROC_ADDRESS_SUCCESS, "legacy graph-kernel procedure lookup");
     return reinterpret_cast<T>(address);
 }
@@ -45,16 +45,16 @@ struct kernel_node_storage {
     device_buffer device{kernel_node_words * sizeof(uint32_t)}; void* host{}; std::vector<uint32_t> initial;
     explicit kernel_node_storage(unsigned seed) : initial(kernel_node_words) {
         for (size_t i = 0; i < initial.size(); ++i) initial[i] = 0xcafe0000u + uint32_t(i) * 0x10203u + seed;
-        CONFORMANCE_CUDA(cuMemAllocHost(&host, kernel_node_slots * kernel_node_slot_words * sizeof(uint32_t)));
+        TEST_CUDA(cuMemAllocHost(&host, kernel_node_slots * kernel_node_slot_words * sizeof(uint32_t)));
         try { reset(); } catch (...) { cuMemFreeHost(host); host = nullptr; throw; }
     }
     ~kernel_node_storage() { if (host) { cuCtxSynchronize(); cuMemFreeHost(host); } }
     void reset() {
-        CONFORMANCE_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size() * sizeof(uint32_t)));
+        TEST_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size() * sizeof(uint32_t)));
         std::memset(host, 0xd3, kernel_node_slots * kernel_node_slot_words * sizeof(uint32_t));
     }
     uint32_t* slot(unsigned index) const { require(index < kernel_node_slots, "valid kernel-node readback slot"); return static_cast<uint32_t*>(host) + index * kernel_node_slot_words; }
-    void read(CUstream stream, unsigned index) const { CONFORMANCE_CUDA(cuMemcpyDtoHAsync(slot(index) + kernel_node_guard, device.value, kernel_node_words * sizeof(uint32_t), stream)); }
+    void read(CUstream stream, unsigned index) const { TEST_CUDA(cuMemcpyDtoHAsync(slot(index) + kernel_node_guard, device.value, kernel_node_words * sizeof(uint32_t), stream)); }
     void expect(unsigned index, std::span<const uint32_t> state) const {
         std::vector<uint32_t> expected(kernel_node_slot_words, 0xd3d3d3d3);
         std::copy(state.begin(), state.end(), expected.begin() + kernel_node_guard);
@@ -77,7 +77,7 @@ struct kernel_node_input {
           shape(geometry), shared(geometry.block.x * geometry.block.y * geometry.block.z * sizeof(uint32_t) + 16), packed(use_extra) {}
     CUDA_KERNEL_NODE_PARAMS driver(const kernel_node_route& route) const {
         CUDA_KERNEL_NODE_PARAMS p{};
-        if (route.contextless()) { p.kern = route.kernel; CONFORMANCE_CUDA(cuCtxGetCurrent(&p.ctx)); } else p.func = route.function;
+        if (route.contextless()) { p.kern = route.kernel; TEST_CUDA(cuCtxGetCurrent(&p.ctx)); } else p.func = route.function;
         p.gridDimX = shape.grid.x; p.gridDimY = shape.grid.y; p.gridDimZ = shape.grid.z;
         p.blockDimX = shape.block.x; p.blockDimY = shape.block.y; p.blockDimZ = shape.block.z; p.sharedMemBytes = shared;
         if (packed) p.extra = const_cast<void**>(extra.data()); else p.kernelParams = const_cast<void**>(arguments.data());
@@ -120,12 +120,12 @@ struct kernel_node_graph {
     CUgraph value{}; CUgraphNode node{};
     explicit kernel_node_graph(bool runtime) {
         if (runtime) { cudaGraph_t result{}; KERNEL_NODE_RUNTIME(cudaGraphCreate(&result, 0)); value = reinterpret_cast<CUgraph>(result); }
-        else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        else TEST_CUDA(cuGraphCreate(&value, 0));
     }
     ~kernel_node_graph() { if (value) cuGraphDestroy(value); }
     void configure(const kernel_node_route& route, kernel_node_input& input) {
         auto status = kernel_node_configure(value, node, route, input, !node);
-        CONFORMANCE_CUDA(static_cast<CUresult>(status)); require(node, "valid kernel-node construction/setter publishes a node"); input.expire();
+        TEST_CUDA(static_cast<CUresult>(status)); require(node, "valid kernel-node construction/setter publishes a node"); input.expire();
     }
 };
 void kernel_node_shape_check(dim3 grid, dim3 block, unsigned shared, const kernel_node_input& expected) {
@@ -150,18 +150,18 @@ void kernel_node_arguments_check(void** arguments, void** extra, const kernel_no
     require(actual.pointer == expected.bytes.pointer && actual.count == expected.bytes.count && actual.seed == expected.bytes.seed, "node-owned arguments survive caller storage retirement");
 }
 void kernel_node_query(CUgraphNode node, const kernel_node_route& route, const kernel_node_input& expected) {
-    kernel_node_guarded<CUDA_KERNEL_NODE_PARAMS> typed; CONFORMANCE_CUDA(cuGraphKernelNodeGetParams(node, &typed.value)); typed.check();
+    kernel_node_guarded<CUDA_KERNEL_NODE_PARAMS> typed; TEST_CUDA(cuGraphKernelNodeGetParams(node, &typed.value)); typed.check();
     auto check_driver = [&](const CUDA_KERNEL_NODE_PARAMS& p) {
         require(route.contextless() ? !p.func && p.kern == route.kernel : p.func == route.function, "queried Driver kernel identity");
         kernel_node_shape_check({p.gridDimX, p.gridDimY, p.gridDimZ}, {p.blockDimX, p.blockDimY, p.blockDimZ}, p.sharedMemBytes, expected);
         kernel_node_arguments_check(p.kernelParams, p.extra, expected);
     };
     check_driver(typed.value);
-    kernel_node_guarded<CUgraphNodeParams> generic; CONFORMANCE_CUDA(cuGraphNodeGetParams(node, &generic.value)); generic.check();
+    kernel_node_guarded<CUgraphNodeParams> generic; TEST_CUDA(cuGraphNodeGetParams(node, &generic.value)); generic.check();
     require(generic.value.type == CU_GRAPH_NODE_TYPE_KERNEL, "generic Driver kernel node type");
     CUDA_KERNEL_NODE_PARAMS driver{}; std::memcpy(&driver, &generic.value.kernel, sizeof(driver)); check_driver(driver);
     kernel_node_guarded<CUDA_KERNEL_NODE_PARAMS_v1> legacy;
-    CONFORMANCE_CUDA(kernel_node_procedure<CUresult (CUDAAPI*)(CUgraphNode, CUDA_KERNEL_NODE_PARAMS_v1*)>("cuGraphKernelNodeGetParams", 10000)(node, &legacy.value));
+    TEST_CUDA(kernel_node_procedure<CUresult (CUDAAPI*)(CUgraphNode, CUDA_KERNEL_NODE_PARAMS_v1*)>("cuGraphKernelNodeGetParams", 10000)(node, &legacy.value));
     legacy.check(); require(legacy.value.func == route.function, "legacy getter resolves the kernel's context-bound function");
     auto& old = legacy.value;
     kernel_node_shape_check({old.gridDimX, old.gridDimY, old.gridDimZ}, {old.blockDimX, old.blockDimY, old.blockDimZ}, old.sharedMemBytes, expected);
@@ -180,20 +180,20 @@ void kernel_node_query(CUgraphNode node, const kernel_node_route& route, const k
     }
 }
 struct kernel_node_stream {
-    CUstream value{}; kernel_node_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    CUstream value{}; kernel_node_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~kernel_node_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
-    void synchronize() const { CONFORMANCE_CUDA(cuStreamSynchronize(value)); }
+    void synchronize() const { TEST_CUDA(cuStreamSynchronize(value)); }
 };
 struct kernel_node_executable {
     CUgraphExec value{};
     kernel_node_executable(CUgraph graph, bool runtime, unsigned long long flags = 0) {
         if (runtime) { cudaGraphExec_t result{}; KERNEL_NODE_RUNTIME(cudaGraphInstantiateWithFlags(&result, reinterpret_cast<cudaGraph_t>(graph), flags)); value = reinterpret_cast<CUgraphExec>(result); }
-        else CONFORMANCE_CUDA(cuGraphInstantiate(&value, graph, flags));
+        else TEST_CUDA(cuGraphInstantiate(&value, graph, flags));
     }
     ~kernel_node_executable() { if (value) cuGraphExecDestroy(value); }
     void read(const kernel_node_storage& storage, const kernel_node_stream& stream, unsigned slot, bool runtime) const {
         if (runtime) KERNEL_NODE_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(value), reinterpret_cast<cudaStream_t>(stream.value)));
-        else CONFORMANCE_CUDA(cuGraphLaunch(value, stream.value)); storage.read(stream.value, slot);
+        else TEST_CUDA(cuGraphLaunch(value, stream.value)); storage.read(stream.value, slot);
     }
 };
 void kernel_node_construction(const kernel_node_route& route) {
@@ -221,29 +221,29 @@ void kernel_node_parameters(const kernel_node_route& route) {
 void kernel_node_clones(const kernel_node_route& route) {
     kernel_node_storage original(59), changed(83); kernel_node_stream stream; kernel_node_graph source(route.runtime()), clone(!route.runtime());
     kernel_node_input first(original, kernel_node_shapes[2], 157, 0x13579bdf, true), expected_first(original, kernel_node_shapes[2], 157, 0x13579bdf, true);
-    source.configure(route, first); CONFORMANCE_CUDA(cuGraphDestroy(clone.value)); clone.value = nullptr;
+    source.configure(route, first); TEST_CUDA(cuGraphDestroy(clone.value)); clone.value = nullptr;
     if (route.runtime()) {
         cudaGraph_t result{}; KERNEL_NODE_RUNTIME(cudaGraphClone(&result, reinterpret_cast<cudaGraph_t>(source.value))); clone.value = reinterpret_cast<CUgraph>(result);
         cudaGraphNode_t node{}; KERNEL_NODE_RUNTIME(cudaGraphNodeFindInClone(&node, reinterpret_cast<cudaGraphNode_t>(source.node), result)); clone.node = reinterpret_cast<CUgraphNode>(node);
-    } else { CONFORMANCE_CUDA(cuGraphClone(&clone.value, source.value)); CONFORMANCE_CUDA(cuGraphNodeFindInClone(&clone.node, source.node, clone.value)); }
+    } else { TEST_CUDA(cuGraphClone(&clone.value, source.value)); TEST_CUDA(cuGraphNodeFindInClone(&clone.node, source.node, clone.value)); }
     kernel_node_query(clone.node, route, expected_first);
     kernel_node_input second(changed, kernel_node_shapes[1], 1, 0x2468ace0, false), expected_second(changed, kernel_node_shapes[1], 1, 0x2468ace0, false);
     source.configure(route, second); kernel_node_query(source.node, route, expected_second); kernel_node_query(clone.node, route, expected_first);
     kernel_node_executable before(clone.value, route.runtime()), after(source.value, !route.runtime());
     before.read(original, stream, 0, !route.runtime()); after.read(changed, stream, 0, route.runtime()); stream.synchronize();
-    CONFORMANCE_CUDA(cuGraphDestroy(source.value)); source.value = nullptr;
+    TEST_CUDA(cuGraphDestroy(source.value)); source.value = nullptr;
     kernel_node_query(clone.node, route, expected_first); before.read(original, stream, 1, route.runtime()); stream.synchronize();
     auto a = original.initial, b = changed.initial; kernel_node_apply(a, expected_first.shape, 157, expected_first.bytes.seed); kernel_node_apply(b, expected_second.shape, 1, expected_second.bytes.seed);
     original.expect(0, a); original.expect(1, a); changed.expect(0, b); original.untouched(2); changed.untouched(1);
 }
 void kernel_node_priority(CUgraphNode node, int priority, bool runtime) {
     if (runtime) { cudaKernelNodeAttrValue p{}; p.priority = priority; KERNEL_NODE_RUNTIME(cudaGraphKernelNodeSetAttribute(reinterpret_cast<cudaGraphNode_t>(node), cudaKernelNodeAttributePriority, &p)); }
-    else { CUkernelNodeAttrValue p{}; p.priority = priority; CONFORMANCE_CUDA(cuGraphKernelNodeSetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_PRIORITY, &p)); }
+    else { CUkernelNodeAttrValue p{}; p.priority = priority; TEST_CUDA(cuGraphKernelNodeSetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_PRIORITY, &p)); }
 }
 void kernel_node_priority_check(CUgraphNode node, int request) {
-    int least{}, greatest{}; CONFORMANCE_CUDA(cuCtxGetStreamPriorityRange(&least, &greatest)); int expected = std::clamp(request, greatest, least);
+    int least{}, greatest{}; TEST_CUDA(cuCtxGetStreamPriorityRange(&least, &greatest)); int expected = std::clamp(request, greatest, least);
     kernel_node_guarded<CUkernelNodeAttrValue> driver; driver.value.priority = std::numeric_limits<int>::max();
-    CONFORMANCE_CUDA(cuGraphKernelNodeGetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_PRIORITY, &driver.value)); driver.check(); require(driver.value.priority == expected, "Driver priority query uses device clamping");
+    TEST_CUDA(cuGraphKernelNodeGetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_PRIORITY, &driver.value)); driver.check(); require(driver.value.priority == expected, "Driver priority query uses device clamping");
     kernel_node_guarded<cudaKernelNodeAttrValue> runtime; runtime.value.priority = std::numeric_limits<int>::max();
     KERNEL_NODE_RUNTIME(cudaGraphKernelNodeGetAttribute(reinterpret_cast<cudaGraphNode_t>(node), cudaKernelNodeAttributePriority, &runtime.value)); runtime.check(); require(runtime.value.priority == expected, "Runtime priority query uses device clamping");
 }
@@ -257,7 +257,7 @@ void kernel_node_attributes(const kernel_node_route& route) {
     kernel_node_executable executable(target.value, route.runtime(), CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY);
     const auto copy = [&](CUgraphNode from) {
         if (route.runtime()) KERNEL_NODE_RUNTIME(cudaGraphKernelNodeCopyAttributes(reinterpret_cast<cudaGraphNode_t>(target.node), reinterpret_cast<cudaGraphNode_t>(from)));
-        else CONFORMANCE_CUDA(cuGraphKernelNodeCopyAttributes(target.node, from));
+        else TEST_CUDA(cuGraphKernelNodeCopyAttributes(target.node, from));
     };
     const auto reject = [&] {
         kernel_node_guarded<CUgraphExecUpdateResultInfo> info; info.value.result = CU_GRAPH_EXEC_UPDATE_ERROR;
@@ -271,21 +271,21 @@ void kernel_node_attributes(const kernel_node_route& route) {
     auto expected = storage.initial; kernel_node_apply(expected, initial_expected.shape, 97, 17); storage.expect(0, expected);
     copy(zero.node); kernel_node_priority_check(target.node, 0); kernel_node_priority_check(source.node, 17); kernel_node_query(source.node, route, initial_expected); kernel_node_query(target.node, route, changed_expected);
     kernel_node_guarded<CUgraphExecUpdateResultInfo> info; info.value.result = CU_GRAPH_EXEC_UPDATE_ERROR;
-    CONFORMANCE_CUDA(cuGraphExecUpdate(executable.value, target.value, &info.value)); info.check(); require(info.value.result == CU_GRAPH_EXEC_UPDATE_SUCCESS, "restoring copied attributes permits a valid update");
+    TEST_CUDA(cuGraphExecUpdate(executable.value, target.value, &info.value)); info.check(); require(info.value.result == CU_GRAPH_EXEC_UPDATE_SUCCESS, "restoring copied attributes permits a valid update");
     executable.read(storage, stream, 1, route.runtime()); stream.synchronize(); kernel_node_apply(expected, changed_expected.shape, 173, changed_expected.bytes.seed);
     storage.expect(1, expected); storage.untouched(2);
 }
 void kernel_node_validation(const kernel_node_route& route) {
     kernel_node_storage storage(127); kernel_node_stream stream; kernel_node_graph graph(route.runtime());
     kernel_node_input original(storage, kernel_node_shapes[2], 129, 0xabcdef01, false), expected_original(storage, kernel_node_shapes[2], 129, 0xabcdef01, false);
-    graph.configure(route, original); CUgraphNode empty{}; CONFORMANCE_CUDA(cuGraphAddEmptyNode(&empty, graph.value, nullptr, 0));
+    graph.configure(route, original); CUgraphNode empty{}; TEST_CUDA(cuGraphAddEmptyNode(&empty, graph.value, nullptr, 0));
     for (bool add : {false, true}) for (bool both : {false, true}) {
         kernel_node_input invalid(storage, kernel_node_shapes[1], 1, 7, false);
         if (both) invalid.simultaneous = true; else invalid.shape.block.y = 0;
         CUgraphNode attempted = graph.node;
         require(kernel_node_configure(graph.value, attempted, route, invalid, add) == int(CUDA_ERROR_INVALID_VALUE),
             both ? "simultaneous graph-kernel argument forms reject without mutation" : "zero graph-kernel dimensions reject without mutation");
-        kernel_node_query(graph.node, route, expected_original); size_t count = 0; CONFORMANCE_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(count == 2, "rejected additions leave graph membership intact");
+        kernel_node_query(graph.node, route, expected_original); size_t count = 0; TEST_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(count == 2, "rejected additions leave graph membership intact");
     }
     require(cuGraphKernelNodeGetParams(graph.node, nullptr) == CUDA_ERROR_INVALID_VALUE, "null Driver kernel output");
     require(cudaGraphNodeGetParams(reinterpret_cast<cudaGraphNode_t>(graph.node), nullptr) == cudaErrorInvalidValue, "null generic Runtime output");
@@ -313,4 +313,4 @@ void execute_graph_kernel_nodes(const loaded_program& program) {
     }
 }
 }
-int main(int argc, char** argv) { return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_graph_kernel_nodes); }
+int main(int argc, char** argv) { return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_graph_kernel_nodes); }

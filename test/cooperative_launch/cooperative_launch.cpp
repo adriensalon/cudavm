@@ -9,7 +9,7 @@ void cooperative_runtime(cudaError_t status, const char* operation) {
 #define COOPERATIVE_RUNTIME(call) ::cudavm::cooperative_runtime((call), #call)
 struct cooperative_stream {
     CUstream value{};
-    cooperative_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    cooperative_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~cooperative_stream() { if (value) cuStreamDestroy(value); }
 };
 void cooperative_launch_case(const loaded_program& program, unsigned threads, unsigned shared, unsigned rounds,
@@ -36,9 +36,9 @@ void cooperative_launch_case(const loaded_program& program, unsigned threads, un
     device_buffer source(input.size() * 4), output(expected.size() * 4), temporary(scratch.size() * 4);
     auto from = source.value + guards * 4, to = output.value + guards * 4, temp = temporary.value + guards * 4;
     std::vector<uint32_t> initialized(expected.size(), guard), empty(scratch.size(), guard);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, initialized.data(), initialized.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(temporary.value, empty.data(), empty.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(output.value, initialized.data(), initialized.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(temporary.value, empty.data(), empty.size() * 4));
     cooperative_stream stream;
     void* args[]{&to, &from, &temp, &rounds};
     if (api < 2) {
@@ -68,26 +68,26 @@ void cooperative_launch_case(const loaded_program& program, unsigned threads, un
         if (reject) require(status == cudaErrorCooperativeLaunchTooLarge && cudaGetLastError() == cudaErrorCooperativeLaunchTooLarge,
             "Runtime translates and records oversized cooperative admission");
         else cooperative_runtime(status, "Runtime cooperative launch");
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+        TEST_CUDA(cuStreamSynchronize(stream.value));
     }
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
     expect_words(actual, expected, "cooperative grid metadata, cross-block publication, repeated phases and output guards");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual_scratch.data(), temporary.value, actual_scratch.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual_scratch.data(), temporary.value, actual_scratch.size() * 4));
     expect_words(actual_scratch, scratch, "cooperative admission and scratch guards");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
     expect_words(preserved, input, "cooperative source preservation");
 }
 void execute_cooperative_launch(const loaded_program& program) {
-    CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+    CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device));
     int supported = 0, multiprocessors = 0;
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device));
+    TEST_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device));
     require_capability(supported != 0, "native device does not advertise cooperative launch");
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
+    TEST_CUDA(cuDeviceGetAttribute(&multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
     require(multiprocessors > 0, "cooperative launch requires positive native residency");
     const auto function = program.function("cooperative_grid");
     for (unsigned shared : {0u, 16384u}) {
         unsigned threads = shared ? 64u : 32u;
-        int active = 0; CONFORMANCE_CUDA(cuOccupancyMaxActiveBlocksPerMultiprocessor(&active, function, threads, shared));
+        int active = 0; TEST_CUDA(cuOccupancyMaxActiveBlocksPerMultiprocessor(&active, function, threads, shared));
         require(active > 0 && uint64_t(active) * unsigned(multiprocessors) < UINT32_MAX / threads,
             "positive cooperative residency fits the fixture's rank representation");
         unsigned capacity = unsigned(active) * unsigned(multiprocessors);
@@ -102,5 +102,5 @@ void execute_cooperative_launch(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_cooperative_launch);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_cooperative_launch);
 }

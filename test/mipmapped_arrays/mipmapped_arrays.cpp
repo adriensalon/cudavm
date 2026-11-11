@@ -75,7 +75,7 @@ struct mipmap_allocation {
             value = reinterpret_cast<CUmipmappedArray>(result);
         } else {
             auto descriptor = mipmap_level_descriptor(shape, format, 0);
-            CONFORMANCE_CUDA(cuMipmappedArrayCreate(&value, &descriptor, levels));
+            TEST_CUDA(cuMipmappedArrayCreate(&value, &descriptor, levels));
         }
         require(value != nullptr, "mipmap allocation publishes a handle");
     }
@@ -89,14 +89,14 @@ struct mipmap_allocation {
     mipmap_allocation& operator=(const mipmap_allocation&) = delete;
     void destroy(bool use_runtime) {
         if (use_runtime) MIPMAP_RUNTIME(cudaFreeMipmappedArray(reinterpret_cast<cudaMipmappedArray_t>(value)));
-        else CONFORMANCE_CUDA(cuMipmappedArrayDestroy(value));
+        else TEST_CUDA(cuMipmappedArrayDestroy(value));
         value = nullptr;
     }
     CUarray level(unsigned index) const {
         CUarray first{}, again{};
         cudaArray_t other{};
-        CONFORMANCE_CUDA(cuMipmappedArrayGetLevel(&first, value, index));
-        CONFORMANCE_CUDA(cuMipmappedArrayGetLevel(&again, value, index));
+        TEST_CUDA(cuMipmappedArrayGetLevel(&first, value, index));
+        TEST_CUDA(cuMipmappedArrayGetLevel(&again, value, index));
         MIPMAP_RUNTIME(cudaGetMipmappedArrayLevel(&other, reinterpret_cast<cudaMipmappedArray_t>(value), index));
         require(first && first == again && first == reinterpret_cast<CUarray>(other),
             "repeated Driver/Runtime queries return the same level handle");
@@ -107,7 +107,7 @@ struct mipmap_allocation {
 void verify_mipmap_level(CUarray level, const CUDA_ARRAY3D_DESCRIPTOR& expected,
                           const mipmap_format& format) {
     CUDA_ARRAY3D_DESCRIPTOR actual{};
-    CONFORMANCE_CUDA(cuArray3DGetDescriptor(&actual, level));
+    TEST_CUDA(cuArray3DGetDescriptor(&actual, level));
     require(actual.Width == expected.Width && actual.Height == expected.Height && actual.Depth == expected.Depth
         && actual.Format == expected.Format && actual.NumChannels == expected.NumChannels && actual.Flags == expected.Flags,
         "Driver level dimensions, format, channels and flags");
@@ -169,7 +169,7 @@ struct mipmap_host_storage {
           depth(std::max(size_t(1), descriptor.Depth)), pitch(width * element_bytes + (upload ? 13 : 21)),
           slice_height(height + (upload ? 2 : 3)), expected(32 + pitch * slice_height * depth, mipmap_guard) {
         void* pointer{};
-        CONFORMANCE_CUDA(cuMemAllocHost(&pointer, expected.size()));
+        TEST_CUDA(cuMemAllocHost(&pointer, expected.size()));
         value = static_cast<unsigned char*>(pointer);
         for (size_t z = 0; z < depth; ++z) for (size_t y = 0; y < height; ++y)
         for (size_t x = 0; x < width * element_bytes; ++x)
@@ -188,7 +188,7 @@ struct mipmap_host_storage {
 };
 struct mipmap_stream {
     CUstream value{};
-    mipmap_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    mipmap_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~mipmap_stream() {
         if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); }
     }
@@ -218,8 +218,8 @@ void copy_mipmap_host(CUarray level, mipmap_host_storage& host, unsigned element
             copy.dstPitch = host.pitch; copy.dstHeight = host.slice_height;
         }
         copy.WidthInBytes = host.width * element_bytes; copy.Height = host.height; copy.Depth = host.depth;
-        if (stream) CONFORMANCE_CUDA(cuMemcpy3DAsync(&copy, stream));
-        else CONFORMANCE_CUDA(cuMemcpy3D(&copy));
+        if (stream) TEST_CUDA(cuMemcpy3DAsync(&copy, stream));
+        else TEST_CUDA(cuMemcpy3D(&copy));
     }
 }
 unsigned mipmap_seed(unsigned level, bool second) { return 3 + level * 7 + (second ? 41 : 0); }
@@ -240,7 +240,7 @@ void copy_mipmap_corner(CUarray source, CUarray destination, const CUDA_ARRAY3D_
         copy.dstMemoryType = CU_MEMORYTYPE_ARRAY; copy.dstArray = destination;
         copy.dstXInBytes = (to.Width - 1) * element_bytes; copy.dstY = dy; copy.dstZ = dz;
         copy.WidthInBytes = element_bytes; copy.Height = copy.Depth = 1;
-        CONFORMANCE_CUDA(cuMemcpy3D(&copy));
+        TEST_CUDA(cuMemcpy3D(&copy));
     }
 }
 void mipmap_transfers() {
@@ -311,7 +311,7 @@ void mipmap_validation() {
         auto descriptor = mipmap_level_descriptor(invalid, format, 0);
         output = nullptr;
         auto status = cuMipmappedArrayCreate(&output, &descriptor, 3);
-        if (status == CUDA_SUCCESS) CONFORMANCE_CUDA(cuMipmappedArrayDestroy(output));
+        if (status == CUDA_SUCCESS) TEST_CUDA(cuMipmappedArrayDestroy(output));
         require(status == CUDA_ERROR_INVALID_VALUE, std::string("invalid Driver mipmap shape: ") + invalid.name);
         runtime_output = nullptr;
         auto result = cudaMallocMipmappedArray(&runtime_output, &format.channel,
@@ -361,7 +361,7 @@ void mipmap_lifetime() {
         // No explicit synchronization before destroying the owner of all levels.
         const auto old_parent = parent.value;
         parent.destroy(!runtime);
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+        TEST_CUDA(cuStreamSynchronize(stream.value));
         for (unsigned i = 0; i < count; ++i) {
             sources[i]->verify("retired parent upload source and guards");
             outputs[i]->verify("retired parent queued level readback and guards");
@@ -403,5 +403,5 @@ void execute_mipmapped_arrays() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::mipmap_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_mipmapped_arrays);
+    return cudavm::run_test(argc, argv, cudavm::execute_mipmapped_arrays);
 }

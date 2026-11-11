@@ -45,67 +45,67 @@ struct module_loading_program {
         auto temporary = image; module_loading_output<CUmodule> output;
         if (route == 1) {
             module_loading_file file(temporary); auto path = file.path.string();
-            CONFORMANCE_CUDA(cuModuleLoad(&output.value, path.c_str())); value = output.value;
+            TEST_CUDA(cuModuleLoad(&output.value, path.c_str())); value = output.value;
             std::fill(path.begin(), path.end(), '!'); require(std::filesystem::remove(file.path), "retire module file before lookup/execution");
-        } else if (route == 2) CONFORMANCE_CUDA(cuModuleLoadDataEx(&output.value, temporary.data(), 0, nullptr, nullptr));
+        } else if (route == 2) TEST_CUDA(cuModuleLoadDataEx(&output.value, temporary.data(), 0, nullptr, nullptr));
         else if (route == 3) {
             CUjit_option option = CU_JIT_OPTIMIZATION_LEVEL; void* setting = reinterpret_cast<void*>(uintptr_t(optimization));
-            CONFORMANCE_CUDA(cuModuleLoadDataEx(&output.value, temporary.data(), 1, &option, &setting));
-        } else CONFORMANCE_CUDA(cuModuleLoadData(&output.value, temporary.data()));
+            TEST_CUDA(cuModuleLoadDataEx(&output.value, temporary.data(), 1, &option, &setting));
+        } else TEST_CUDA(cuModuleLoadData(&output.value, temporary.data()));
         value = output.value; require(output.get() != nullptr, "module load publishes guarded handle");
         std::fill(temporary.begin(), temporary.end(), 0x57);
     }
     ~module_loading_program() { if (value) cuModuleUnload(value); }
     module_loading_program(const module_loading_program&) = delete;
     CUfunction function(const char* name) const {
-        module_loading_output<CUfunction> output; CONFORMANCE_CUDA(cuModuleGetFunction(&output.value, value, name));
+        module_loading_output<CUfunction> output; TEST_CUDA(cuModuleGetFunction(&output.value, value, name));
         require(output.get() != nullptr, "module function lookup publishes nonnull handle"); return output.value;
     }
     CUdeviceptr global(const char* name) const {
         module_loading_output<CUdeviceptr> pointer; module_loading_output<size_t> size;
-        CONFORMANCE_CUDA(cuModuleGetGlobal(&pointer.value, &size.value, value, name));
+        TEST_CUDA(cuModuleGetGlobal(&pointer.value, &size.value, value, name));
         require(pointer.get() != 0 && size.get() == 4, "module symbol address/extent agrees with declared scalar"); return pointer.value;
     }
-    void close() { CONFORMANCE_CUDA(cuModuleUnload(value)); value = nullptr; }
+    void close() { TEST_CUDA(cuModuleUnload(value)); value = nullptr; }
 };
 void module_loading_execute(const module_loading_program& program, uint32_t expected_seed = 13) {
     constexpr uint32_t guard = 0xa95b371d; constexpr unsigned capacity = 67, guards = 9;
     const auto seed_address = program.global("module_seed"), bias_address = program.global("module_bias");
     std::array<uint32_t, 3> seed{guard, guard, guard}, bias{guard, guard, guard};
-    CONFORMANCE_CUDA(cuMemcpyDtoH(seed.data() + 1, seed_address, 4)); CONFORMANCE_CUDA(cuMemcpyDtoH(bias.data() + 1, bias_address, 4));
+    TEST_CUDA(cuMemcpyDtoH(seed.data() + 1, seed_address, 4)); TEST_CUDA(cuMemcpyDtoH(bias.data() + 1, bias_address, 4));
     require(seed == std::array<uint32_t, 3>{guard, expected_seed, guard} && bias == std::array<uint32_t, 3>{guard, 29, guard},
         "module independent storage initialization and host guards");
     std::vector<uint32_t> input(capacity + guards * 2, guard), expected(input.size(), guard), actual(input.size()), preserved(input.size());
     for (unsigned i = 0; i < capacity; ++i) input[guards + i] = i < 4 ? std::array<uint32_t, 4>{0, 0xffffffff, 0x80000000, 0x7fffffff}[i]
         : i * 0x193759bdu;
     device_buffer source(input.size() * 4), output(expected.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
     auto in = source.value + guards * 4, out = output.value + guards * 4;
     for (unsigned phase = 0; phase < 2; ++phase) {
         const uint32_t seed_value = phase ? 0xfffffff1u : expected_seed;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(seed_address, &seed_value, 4));
+        TEST_CUDA(cuMemcpyHtoD(seed_address, &seed_value, 4));
         for (bool beta : {false, true}) for (unsigned count : {0u, 1u, 33u, capacity}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
             void* parameters[]{&out, &in, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(program.function(beta ? "module_beta" : "module_alpha"), 2, 1, 1, 47, 1, 1,
+            TEST_CUDA(cuLaunchKernel(program.function(beta ? "module_beta" : "module_alpha"), 2, 1, 1, 47, 1, 1,
                 0, nullptr, parameters, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
             for (unsigned i = 0; i < count; ++i) expected[guards + i] = module_boundary_expected(beta, input[guards + i], seed_value, i);
             expect_words(actual, expected, "module entry execution, untouched capacity and output guards");
-            CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
             expect_words(preserved, input, "module execution preserves input and all guards");
         }
     }
 }
 void module_loading_queries(const module_loading_program& program) {
-    module_loading_output<unsigned> count; CONFORMANCE_CUDA(cuModuleGetFunctionCount(&count.value, program.value));
+    module_loading_output<unsigned> count; TEST_CUDA(cuModuleGetFunctionCount(&count.value, program.value));
     require(count.get() == 2, "module function inventory has the two declared kernel entries");
     const auto alpha = program.function("module_alpha"), beta = program.function("module_beta");
     require(alpha != beta && alpha == program.function("module_alpha"), "module function identities are distinct and lookup is stable");
     for (unsigned capacity : {0u, 1u, 2u, 3u}) {
         struct { uint64_t before = 0x193759bd; std::array<CUfunction, 3> values{}; uint64_t after = 0xabcdef01; } output;
-        CONFORMANCE_CUDA(cuModuleEnumerateFunctions(output.values.data(), capacity, program.value));
+        TEST_CUDA(cuModuleEnumerateFunctions(output.values.data(), capacity, program.value));
         require(output.before == 0x193759bd && output.after == 0xabcdef01, "module enumeration output guards");
         for (unsigned i = 0; i < output.values.size(); ++i)
             require(i < std::min(capacity, 2u) ? output.values[i] == alpha || output.values[i] == beta : output.values[i] == nullptr,
@@ -114,20 +114,20 @@ void module_loading_queries(const module_loading_program& program) {
     }
     for (const auto& [function, name] : std::array<std::pair<CUfunction, const char*>, 2>{{{alpha, "module_alpha"}, {beta, "module_beta"}}}) {
         module_loading_output<CUmodule> owner; module_loading_output<const char*> text;
-        CONFORMANCE_CUDA(cuFuncGetModule(&owner.value, function)); CONFORMANCE_CUDA(cuFuncGetName(&text.value, function));
+        TEST_CUDA(cuFuncGetModule(&owner.value, function)); TEST_CUDA(cuFuncGetName(&text.value, function));
         require(owner.get() == program.value && text.get() && std::string_view(text.value) == name, "function name and module owner agree with lookup");
-        module_loading_output<size_t> parameters; CONFORMANCE_CUDA(cuFuncGetParamCount(function, &parameters.value));
+        module_loading_output<size_t> parameters; TEST_CUDA(cuFuncGetParamCount(function, &parameters.value));
         require(parameters.get() == 3, "declared three-parameter module kernel ABI");
         for (size_t index = 0; index < 3; ++index) {
             module_loading_output<size_t> offset, bytes;
-            CONFORMANCE_CUDA(cuFuncGetParamInfo(function, index, &offset.value, &bytes.value));
+            TEST_CUDA(cuFuncGetParamInfo(function, index, &offset.value, &bytes.value));
             require(offset.get() == index * 8 && bytes.get() == (index < 2 ? 8u : 4u), "independent module parameter offsets and extents");
         }
     }
     for (const char* name : {"module_seed", "module_bias"}) {
         module_loading_output<CUdeviceptr> pointer; module_loading_output<size_t> bytes;
-        CONFORMANCE_CUDA(cuModuleGetGlobal(&pointer.value, nullptr, program.value, name));
-        CONFORMANCE_CUDA(cuModuleGetGlobal(nullptr, &bytes.value, program.value, name));
+        TEST_CUDA(cuModuleGetGlobal(&pointer.value, nullptr, program.value, name));
+        TEST_CUDA(cuModuleGetGlobal(nullptr, &bytes.value, program.value, name));
         require(pointer.get() == program.global(name) && bytes.get() == 4, "module global single-output query variants");
     }
 }
@@ -150,7 +150,7 @@ void module_loading_validation(const module_loading_program& program, const modu
 }
 void execute_module_loading() {
     module_loading_output<CUmoduleLoadingMode> before, after;
-    CONFORMANCE_CUDA(cuModuleGetLoadingMode(&before.value));
+    TEST_CUDA(cuModuleGetLoadingMode(&before.value));
     require(before.get() == CU_MODULE_EAGER_LOADING || before.value == CU_MODULE_LAZY_LOADING, "module loading mode is a defined value");
     for (bool source : {false, true}) {
         const auto image = module_loading_image(source);
@@ -158,9 +158,9 @@ void execute_module_loading() {
             module_loading_program first(image), second(image);
             const auto first_seed = first.global("module_seed"), second_seed = second.global("module_seed");
             require(first_seed != second_seed, "simultaneous module loads own separate live storage");
-            uint32_t changed = 71; CONFORMANCE_CUDA(cuMemcpyHtoD(first_seed, &changed, 4));
+            uint32_t changed = 71; TEST_CUDA(cuMemcpyHtoD(first_seed, &changed, 4));
             module_loading_execute(second); first.close();
-            uint32_t actual{}; CONFORMANCE_CUDA(cuMemcpyDtoH(&actual, second_seed, 4));
+            uint32_t actual{}; TEST_CUDA(cuMemcpyDtoH(&actual, second_seed, 4));
             require(actual == 0xfffffff1u, "unloading another module preserves the live module's storage");
             module_loading_program fresh(image); module_loading_execute(fresh); fresh.close(); second.close(); continue;
         }
@@ -171,15 +171,15 @@ void execute_module_loading() {
             if (module_loading_case == "queries") module_loading_queries(program);
             else if (module_loading_case == "validation") module_loading_validation(program, image);
             else require(module_loading_case == "memory" || module_loading_case == "files" || module_loading_case == "options", "known module loading case");
-            module_loading_execute(program); CONFORMANCE_CUDA(cuCtxSynchronize()); program.close();
+            module_loading_execute(program); TEST_CUDA(cuCtxSynchronize()); program.close();
         }
     }
-    CONFORMANCE_CUDA(cuModuleGetLoadingMode(&after.value)); require(after.get() == before.value, "module loading mode query is stable across loads/unloads");
+    TEST_CUDA(cuModuleGetLoadingMode(&after.value)); require(after.get() == before.value, "module loading mode query is stable across loads/unloads");
 }
 void module_loading_sources() { module_loading_image(true); }
 }
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "sources") return cudavm::run_host_conformance(argc, argv, cudavm::module_loading_sources);
+    if (argc == 2 && std::string_view(argv[1]) == "sources") return cudavm::run_host_test(argc, argv, cudavm::module_loading_sources);
     if (argc == 3) { cudavm::module_loading_case = argv[2]; argc = 2; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_module_loading, 0, cudavm::probe_execution);
+    return cudavm::run_test(argc, argv, cudavm::execute_module_loading, 0, cudavm::probe_execution);
 }

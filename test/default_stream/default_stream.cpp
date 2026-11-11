@@ -20,7 +20,7 @@ template<class T> struct default_stream_guarded {
 };
 template<class T> T default_stream_procedure(const char* name, bool per_thread) {
     void* address{}; CUdriverProcAddressQueryResult status{};
-    CONFORMANCE_CUDA(cuGetProcAddress(name, &address, 12000, per_thread ? CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM : CU_GET_PROC_ADDRESS_LEGACY_STREAM, &status));
+    TEST_CUDA(cuGetProcAddress(name, &address, 12000, per_thread ? CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM : CU_GET_PROC_ADDRESS_LEGACY_STREAM, &status));
     require(address && status == CU_GET_PROC_ADDRESS_SUCCESS, "default-stream procedure mode lookup"); return reinterpret_cast<T>(address);
 }
 struct default_stream_route {
@@ -37,45 +37,45 @@ struct default_stream_route {
     CUstream selected() const { return runtime ? (per_thread ? CU_STREAM_PER_THREAD : CU_STREAM_LEGACY) : nullptr; }
     void fill(CUstream stream, CUdeviceptr address, unsigned char byte, size_t count) const {
         if (runtime) DEFAULT_STREAM_RUNTIME(cudaMemsetAsync(reinterpret_cast<void*>(static_cast<uintptr_t>(address)), byte, count, reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(fill_call(address, byte, count, stream));
+        else TEST_CUDA(fill_call(address, byte, count, stream));
     }
     void read(CUstream stream, void* host, CUdeviceptr address, size_t bytes) const {
         if (runtime) DEFAULT_STREAM_RUNTIME(cudaMemcpyAsync(host, reinterpret_cast<void*>(static_cast<uintptr_t>(address)), bytes, cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(read_call(host, address, bytes, stream));
+        else TEST_CUDA(read_call(host, address, bytes, stream));
     }
     void hold(CUstream stream, CUhostFn function, void* data) const {
         if (runtime) DEFAULT_STREAM_RUNTIME(cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream), function, data));
-        else CONFORMANCE_CUDA(host_call(stream, function, data));
+        else TEST_CUDA(host_call(stream, function, data));
     }
     CUresult query(CUstream stream) const { return runtime ? static_cast<CUresult>(cudaStreamQuery(reinterpret_cast<cudaStream_t>(stream))) : query_call(stream); }
     void synchronize(CUstream stream) const {
-        if (runtime) DEFAULT_STREAM_RUNTIME(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream))); else CONFORMANCE_CUDA(synchronize_call(stream));
+        if (runtime) DEFAULT_STREAM_RUNTIME(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream))); else TEST_CUDA(synchronize_call(stream));
     }
     unsigned long long id(CUstream stream) const {
         default_stream_guarded<unsigned long long> output;
-        if (runtime) DEFAULT_STREAM_RUNTIME(cudaStreamGetId(reinterpret_cast<cudaStream_t>(stream), &output.value)); else CONFORMANCE_CUDA(id_call(stream, &output.value));
+        if (runtime) DEFAULT_STREAM_RUNTIME(cudaStreamGetId(reinterpret_cast<cudaStream_t>(stream), &output.value)); else TEST_CUDA(id_call(stream, &output.value));
         output.check(); return output.value;
     }
 };
 struct default_stream_explicit {
-    CUstream value{}; explicit default_stream_explicit(bool nonblocking) { CONFORMANCE_CUDA(cuStreamCreate(&value, nonblocking ? CU_STREAM_NON_BLOCKING : CU_STREAM_DEFAULT)); }
+    CUstream value{}; explicit default_stream_explicit(bool nonblocking) { TEST_CUDA(cuStreamCreate(&value, nonblocking ? CU_STREAM_NON_BLOCKING : CU_STREAM_DEFAULT)); }
     ~default_stream_explicit() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct default_stream_event {
-    CUevent value{}; default_stream_event() { CONFORMANCE_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
+    CUevent value{}; default_stream_event() { TEST_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
     ~default_stream_event() { if (value) cuEventDestroy(value); }
     void complete() const {
         const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5); CUresult status;
         do { status = cuEventQuery(value); if (status != CUDA_ERROR_NOT_READY) break; std::this_thread::yield(); } while (std::chrono::steady_clock::now() < end);
-        CONFORMANCE_CUDA(status);
+        TEST_CUDA(status);
     }
 };
 struct default_stream_storage {
     static constexpr size_t bytes = 293, slot_bytes = 337, offset = 19;
     device_buffer first{bytes}, second{bytes}; void* host{};
     default_stream_storage() {
-        CONFORMANCE_CUDA(cuMemAllocHost(&host, 2 * slot_bytes));
-        try { CONFORMANCE_CUDA(cuMemsetD8(first.value, 0x91, bytes)); CONFORMANCE_CUDA(cuMemsetD8(second.value, 0x91, bytes)); }
+        TEST_CUDA(cuMemAllocHost(&host, 2 * slot_bytes));
+        try { TEST_CUDA(cuMemsetD8(first.value, 0x91, bytes)); TEST_CUDA(cuMemsetD8(second.value, 0x91, bytes)); }
         catch (...) { cuMemFreeHost(host); host = nullptr; throw; }
         std::memset(host, 0xd3, 2 * slot_bytes);
     }
@@ -122,13 +122,13 @@ void default_stream_barriers() {
         default_stream_gate gate; default_stream_gate_cleanup cleanup{gate}; route.hold(producer, default_stream_gate::call, &gate); gate.await();
         route.fill(producer, storage.first.value + 23, 0x47, 197);
         route.read(consumer, static_cast<unsigned char*>(storage.host) + default_stream_storage::offset, storage.first.value, default_stream_storage::bytes);
-        storage.produce(route, independent.value, true); CONFORMANCE_CUDA(cuEventRecord(completed.value, independent.value)); completed.complete(); storage.expect(true);
+        storage.produce(route, independent.value, true); TEST_CUDA(cuEventRecord(completed.value, independent.value)); completed.complete(); storage.expect(true);
         const auto pending = route.query(consumer); gate.release(); route.synchronize(producer); route.synchronize(consumer); gate.check();
         require(pending == CUDA_ERROR_NOT_READY, "implicit default stream dependency holds the consumer while nonblocking work completes"); storage.expect(false);
     }
 }
 void default_stream_threading() {
-    CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+    CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
     for (bool runtime : {false, true}) for (bool per_thread : {false, true}) {
         std::cout << "default_stream threading runtime=" << runtime << " per_thread=" << per_thread << std::endl;
         default_stream_storage storage; default_stream_route route(runtime, per_thread); const auto main_id = route.id(route.selected());
@@ -136,8 +136,8 @@ void default_stream_threading() {
         std::promise<unsigned long long> completion; auto future = completion.get_future();
         std::thread worker([&] {
             try {
-                CONFORMANCE_CUDA(cuCtxSetCurrent(context)); const auto id = route.id(route.selected()); storage.produce(route, route.selected(), true); route.synchronize(route.selected());
-                CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr)); completion.set_value(id);
+                TEST_CUDA(cuCtxSetCurrent(context)); const auto id = route.id(route.selected()); storage.produce(route, route.selected(), true); route.synchronize(route.selected());
+                TEST_CUDA(cuCtxSetCurrent(nullptr)); completion.set_value(id);
             } catch (...) { cuCtxSetCurrent(nullptr); completion.set_exception(std::current_exception()); }
         });
         default_stream_thread_cleanup joined{gate, worker};
@@ -156,5 +156,5 @@ void execute_default_stream() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc != 3) return 1; cudavm::default_stream_case = argv[2]; return cudavm::run_conformance(2, argv, cudavm::execute_default_stream);
+    if (argc != 3) return 1; cudavm::default_stream_case = argv[2]; return cudavm::run_test(2, argv, cudavm::execute_default_stream);
 }

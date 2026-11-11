@@ -113,5 +113,5 @@ void execute_api_errors() {
 }
 int main(int argc, char** argv) {
     if (argc == 2) cudavm::api_errors_case = argv[1];
-    return cudavm::run_host_conformance(argc, argv, cudavm::execute_api_errors);
+    return cudavm::run_host_test(argc, argv, cudavm::execute_api_errors);
 }

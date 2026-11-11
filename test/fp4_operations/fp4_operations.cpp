@@ -105,6 +105,6 @@ int main(int argc, char** argv) {
     cudavm::fp4_profile = unsigned(found - names.begin());
     const auto source = "#define CUDAVM_FP4_PROFILE " + std::to_string(cudavm::fp4_profile) + "\n" + std::string(cudavm::fixtures.source);
     auto fixtures = cudavm::fixtures; fixtures.source = source;
-    return cudavm::run_conformance(3, argv, fixtures, cudavm::execute_fp4);
+    return cudavm::run_test(3, argv, fixtures, cudavm::execute_fp4);
 }
 

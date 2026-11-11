@@ -99,12 +99,12 @@ void last_error_driver() {
     clear_runtime_error(cudaSuccess);
     produce_runtime_error(cudaErrorInvalidDevice);
     CUcontext context{};
-    CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+    TEST_CUDA(cuCtxGetCurrent(&context));
     require(context != nullptr, "Driver context remains current");
     expect_runtime_error(cudaErrorInvalidDevice, "successful Driver query");
     require(cuMemAlloc(nullptr, 64) == CUDA_ERROR_INVALID_VALUE, "defined Driver validation failure");
     expect_runtime_error(cudaErrorInvalidDevice, "Driver failure preserves Runtime last error");
-    CONFORMANCE_CUDA(cuCtxSynchronize());
+    TEST_CUDA(cuCtxSynchronize());
     expect_runtime_error(cudaErrorInvalidDevice, "Driver synchronization preserves Runtime last error");
     clear_runtime_error(cudaErrorInvalidDevice);
     require(cuMemAlloc(nullptr, 64) == CUDA_ERROR_INVALID_VALUE, "Driver failure after Runtime clear");
@@ -183,5 +183,5 @@ void execute_last_error() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::last_error_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_last_error);
+    return cudavm::run_test(argc, argv, cudavm::execute_last_error);
 }

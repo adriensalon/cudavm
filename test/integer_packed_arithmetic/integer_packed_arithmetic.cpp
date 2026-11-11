@@ -110,14 +110,14 @@ void execute_integer_packed_arithmetic(const loaded_program& program) {
         }
         device_buffer source(input.size() * 4), destination(complete.size() * 4);
         auto in = source.value + 8, out = destination.value + 8;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
             void* args[]{&out, &in, &count};
             try {
-                CONFORMANCE_CUDA(cuLaunchKernel(kernel, grid_x, grid_y, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-                CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+                TEST_CUDA(cuLaunchKernel(kernel, grid_x, grid_y, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+                TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
             } catch (const std::exception& error) {
                 throw std::runtime_error("packed launch threads=" + std::to_string(threads) + " count="
                     + std::to_string(count) + ": " + error.what());
@@ -125,11 +125,11 @@ void execute_integer_packed_arithmetic(const loaded_program& program) {
             std::copy_n(complete.begin() + 2, std::min(total, count) * packed_fields, expected.begin() + 2);
             expect_words(actual, expected, "packed arithmetic threads=" + std::to_string(threads) + " count=" + std::to_string(count));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "packed arithmetic source preservation");
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_integer_packed_arithmetic);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_integer_packed_arithmetic);
 }

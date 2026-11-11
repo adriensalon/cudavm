@@ -16,12 +16,12 @@ template<class T> struct capture_guarded {
 };
 struct capture_stream {
     CUstream value{};
-    explicit capture_stream(unsigned flags = CU_STREAM_NON_BLOCKING) { CONFORMANCE_CUDA(cuStreamCreate(&value, flags)); }
+    explicit capture_stream(unsigned flags = CU_STREAM_NON_BLOCKING) { TEST_CUDA(cuStreamCreate(&value, flags)); }
     ~capture_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct capture_event {
     CUevent value{};
-    capture_event() { CONFORMANCE_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
+    capture_event() { TEST_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
     ~capture_event() { if (value) cuEventDestroy(value); }
 };
 struct capture_graph {
@@ -29,13 +29,13 @@ struct capture_graph {
     ~capture_graph() { if (executable) cuGraphExecDestroy(executable); if (value) cuGraphDestroy(value); }
     void instantiate(bool runtime) {
         if (runtime) { cudaGraphExec_t result{}; CAPTURE_RUNTIME(cudaGraphInstantiateWithFlags(&result, reinterpret_cast<cudaGraph_t>(value), 0)); executable = reinterpret_cast<CUgraphExec>(result); }
-        else CONFORMANCE_CUDA(cuGraphInstantiate(&executable, value, 0));
+        else TEST_CUDA(cuGraphInstantiate(&executable, value, 0));
     }
-    void retire() { CONFORMANCE_CUDA(cuGraphDestroy(value)); value = nullptr; }
+    void retire() { TEST_CUDA(cuGraphDestroy(value)); value = nullptr; }
     void run(CUstream stream, bool runtime) const {
         if (runtime) CAPTURE_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(executable), reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuGraphLaunch(executable, stream));
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream));
+        else TEST_CUDA(cuGraphLaunch(executable, stream));
+        TEST_CUDA(cuStreamSynchronize(stream));
     }
 };
 struct capture_snapshot { CUstreamCaptureStatus status{}; cuuint64_t id{}; CUgraph graph{}; std::vector<CUgraphNode> dependencies; };
@@ -56,7 +56,7 @@ struct capture_route {
         if (runtime) {
             capture_guarded<cudaStreamCaptureStatus> result;
             CAPTURE_RUNTIME(cudaStreamIsCapturing(stream(value), &result.value)); result.check(); output.value = static_cast<CUstreamCaptureStatus>(result.value);
-        } else CONFORMANCE_CUDA(cuStreamIsCapturing(value, &output.value));
+        } else TEST_CUDA(cuStreamIsCapturing(value, &output.value));
         output.check(); return output.value;
     }
     capture_snapshot info(CUstream value) const {
@@ -69,7 +69,7 @@ struct capture_route {
             rt_status.check(); rt_id.check(); rt_graph.check(); rt_nodes.check(); rt_edges.check();
             status.value = static_cast<CUstreamCaptureStatus>(rt_status.value); id.value = rt_id.value; graph.value = reinterpret_cast<CUgraph>(rt_graph.value);
             nodes.value = reinterpret_cast<const CUgraphNode*>(rt_nodes.value); edges.value = reinterpret_cast<const CUgraphEdgeData*>(rt_edges.value);
-        } else CONFORMANCE_CUDA(cuStreamGetCaptureInfo(value, &status.value, &id.value, &graph.value, &nodes.value, &edges.value, &count.value));
+        } else TEST_CUDA(cuStreamGetCaptureInfo(value, &status.value, &id.value, &graph.value, &nodes.value, &edges.value, &count.value));
         status.check(); id.check(); graph.check(); nodes.check(); edges.check(); count.check();
         capture_snapshot result{status.value};
         // Other outputs are unspecified outside active capture.
@@ -86,22 +86,22 @@ struct capture_route {
         return result;
     }
     void host(CUstream value, CUhostFn function, void* data) const {
-        if (runtime) CAPTURE_RUNTIME(cudaLaunchHostFunc(stream(value), function, data)); else CONFORMANCE_CUDA(cuLaunchHostFunc(value, function, data));
+        if (runtime) CAPTURE_RUNTIME(cudaLaunchHostFunc(stream(value), function, data)); else TEST_CUDA(cuLaunchHostFunc(value, function, data));
     }
     void fill(CUstream value, CUdeviceptr address, unsigned char byte, size_t size) const {
-        if (runtime) CAPTURE_RUNTIME(cudaMemsetAsync(pointer(address), byte, size, stream(value))); else CONFORMANCE_CUDA(cuMemsetD8Async(address, byte, size, value));
+        if (runtime) CAPTURE_RUNTIME(cudaMemsetAsync(pointer(address), byte, size, stream(value))); else TEST_CUDA(cuMemsetD8Async(address, byte, size, value));
     }
     void upload(CUstream value, CUdeviceptr device, const void* host, size_t size) const {
-        if (runtime) CAPTURE_RUNTIME(cudaMemcpyAsync(pointer(device), host, size, cudaMemcpyHostToDevice, stream(value))); else CONFORMANCE_CUDA(cuMemcpyHtoDAsync(device, host, size, value));
+        if (runtime) CAPTURE_RUNTIME(cudaMemcpyAsync(pointer(device), host, size, cudaMemcpyHostToDevice, stream(value))); else TEST_CUDA(cuMemcpyHtoDAsync(device, host, size, value));
     }
     void copy(CUstream value, CUdeviceptr destination, CUdeviceptr source, size_t size) const {
-        if (runtime) CAPTURE_RUNTIME(cudaMemcpyAsync(pointer(destination), pointer(source), size, cudaMemcpyDeviceToDevice, stream(value))); else CONFORMANCE_CUDA(cuMemcpyDtoDAsync(destination, source, size, value));
+        if (runtime) CAPTURE_RUNTIME(cudaMemcpyAsync(pointer(destination), pointer(source), size, cudaMemcpyDeviceToDevice, stream(value))); else TEST_CUDA(cuMemcpyDtoDAsync(destination, source, size, value));
     }
     void read(CUstream value, void* host, CUdeviceptr device, size_t size) const {
-        if (runtime) CAPTURE_RUNTIME(cudaMemcpyAsync(host, pointer(device), size, cudaMemcpyDeviceToHost, stream(value))); else CONFORMANCE_CUDA(cuMemcpyDtoHAsync(host, device, size, value));
+        if (runtime) CAPTURE_RUNTIME(cudaMemcpyAsync(host, pointer(device), size, cudaMemcpyDeviceToHost, stream(value))); else TEST_CUDA(cuMemcpyDtoHAsync(host, device, size, value));
     }
     void record(CUevent event, CUstream value) const {
-        if (runtime) CAPTURE_RUNTIME(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event), stream(value))); else CONFORMANCE_CUDA(cuEventRecord(event, value));
+        if (runtime) CAPTURE_RUNTIME(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event), stream(value))); else TEST_CUDA(cuEventRecord(event, value));
     }
     CUresult wait(CUstream value, CUevent event) const {
         return runtime ? static_cast<CUresult>(cudaStreamWaitEvent(stream(value), reinterpret_cast<cudaEvent_t>(event), 0)) : cuStreamWaitEvent(value, event, 0);
@@ -114,7 +114,7 @@ struct capture_route {
 };
 struct capture_session {
     capture_route route; CUstream stream; bool active = true;
-    capture_session(capture_route selected, CUstream value, CUstreamCaptureMode mode) : route(selected), stream(value) { CONFORMANCE_CUDA(route.begin(stream, mode)); }
+    capture_session(capture_route selected, CUstream value, CUstreamCaptureMode mode) : route(selected), stream(value) { TEST_CUDA(route.begin(stream, mode)); }
     ~capture_session() { if (active) { CUgraph discarded{}; if (route.end(stream, &discarded) == CUDA_SUCCESS && discarded) cuGraphDestroy(discarded); } }
     CUresult end(CUgraph* output) { const auto result = route.end(stream, output); active = false; return result; }
 };
@@ -122,8 +122,8 @@ struct capture_storage {
     static constexpr size_t bytes = 613, host_bytes = 659;
     device_buffer source{bytes}, destination{bytes}; void* input{}; void* output{}; unsigned calls = 0;
     capture_storage() {
-        CONFORMANCE_CUDA(cuMemAllocHost(&input, host_bytes));
-        try { CONFORMANCE_CUDA(cuMemAllocHost(&output, host_bytes)); } catch (...) { cuMemFreeHost(input); throw; }
+        TEST_CUDA(cuMemAllocHost(&input, host_bytes));
+        try { TEST_CUDA(cuMemAllocHost(&output, host_bytes)); } catch (...) { cuMemFreeHost(input); throw; }
     }
     ~capture_storage() { cuCtxSynchronize(); if (output) cuMemFreeHost(output); if (input) cuMemFreeHost(input); }
     static void CUDA_CB callback(void* data) { ++static_cast<capture_storage*>(data)->calls; }
@@ -133,7 +133,7 @@ struct capture_storage {
         return result;
     }
     void reset(unsigned seed) {
-        CONFORMANCE_CUDA(cuMemsetD8(source.value, 0xa7, bytes)); CONFORMANCE_CUDA(cuMemsetD8(destination.value, 0x91, bytes));
+        TEST_CUDA(cuMemsetD8(source.value, 0xa7, bytes)); TEST_CUDA(cuMemsetD8(destination.value, 0x91, bytes));
         const auto data = input_bytes(seed); std::memcpy(input, data.data(), data.size()); std::memset(output, 0xd3, host_bytes); calls = 0;
     }
     void first(const capture_route& route, CUstream stream) { route.upload(stream, source.value + 31, static_cast<unsigned char*>(input) + 17, 419); }
@@ -149,8 +149,8 @@ struct capture_storage {
             std::copy_n(host_input.begin() + 17, 419, a.begin() + 31); std::copy_n(host_input.begin() + 17, 419, b.begin() + 13);
             std::fill_n(b.begin() + 87, 97, 0x53); std::copy(b.begin(), b.end(), host_output.begin() + 19);
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), source.value, bytes)); require(actual == a, "capture source bytes and device guards");
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, bytes)); require(actual == b, "capture destination bytes and device guards");
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), source.value, bytes)); require(actual == a, "capture source bytes and device guards");
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, bytes)); require(actual == b, "capture destination bytes and device guards");
         require(std::memcmp(input, host_input.data(), host_bytes) == 0 && std::memcmp(output, host_output.data(), host_bytes) == 0 && calls == unsigned(executed),
             "capture/replay exact host payload, guards, input preservation and callback count");
     }
@@ -164,8 +164,8 @@ void capture_transitions() {
         require(first.status == CU_STREAM_CAPTURE_STATUS_ACTIVE && first.dependencies.empty() && first.id == repeated.id && first.graph == repeated.graph,
             "empty active capture has stable identity, graph and empty frontier");
         require(std::find(identities.begin(), identities.end(), first.id) == identities.end(), "capture identity is process unique"); identities.push_back(first.id);
-        CONFORMANCE_CUDA(session.end(&graph.value)); require(graph.value == first.graph && route.status(stream.value) == CU_STREAM_CAPTURE_STATUS_NONE, "end returns queried graph and clears status");
-        size_t count = 99; CONFORMANCE_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(count == 0, "empty capture has no nodes");
+        TEST_CUDA(session.end(&graph.value)); require(graph.value == first.graph && route.status(stream.value) == CU_STREAM_CAPTURE_STATUS_NONE, "end returns queried graph and clears status");
+        size_t count = 99; TEST_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(count == 0, "empty capture has no nodes");
         graph.instantiate(!runtime); graph.run(stream.value, runtime);
     }
 }
@@ -176,38 +176,38 @@ void capture_replay(bool joined) {
         storage.first(route, origin.value); const auto first = route.info(origin.value);
         require(first.id == initial.id && first.graph == initial.graph && first.dependencies.size() == 1, "upload advances capture frontier");
         if (joined) {
-            route.record(fork.value, origin.value); CONFORMANCE_CUDA(route.wait(branch.value, fork.value));
+            route.record(fork.value, origin.value); TEST_CUDA(route.wait(branch.value, fork.value));
             const auto member = route.info(branch.value); require(member.id == initial.id && member.graph == initial.graph && member.dependencies == first.dependencies, "event wait joins shared capture and frontier");
-            storage.middle(route, branch.value); route.record(join.value, branch.value); CONFORMANCE_CUDA(route.wait(origin.value, join.value));
+            storage.middle(route, branch.value); route.record(join.value, branch.value); TEST_CUDA(route.wait(origin.value, join.value));
         } else storage.middle(route, origin.value);
         storage.last(route, origin.value); const auto last = route.info(origin.value);
         require(last.dependencies.size() == 1 && last.dependencies != first.dependencies, "final host operation advances capture frontier");
-        CONFORMANCE_CUDA(session.end(&graph.value)); require(graph.value == initial.graph && route.status(branch.value) == CU_STREAM_CAPTURE_STATUS_NONE, "end detaches every member");
-        size_t count{}; CONFORMANCE_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(count == 5, "ordinary event records/waits encode edges without event nodes");
+        TEST_CUDA(session.end(&graph.value)); require(graph.value == initial.graph && route.status(branch.value) == CU_STREAM_CAPTURE_STATUS_NONE, "end detaches every member");
+        size_t count{}; TEST_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(count == 5, "ordinary event records/waits encode edges without event nodes");
         storage.expect(29, false); graph.instantiate(!runtime); graph.retire();
         // Dependency-only capture events need not survive graph execution.
-        CONFORMANCE_CUDA(cuEventDestroy(fork.value)); fork.value = nullptr; CONFORMANCE_CUDA(cuEventDestroy(join.value)); join.value = nullptr;
+        TEST_CUDA(cuEventDestroy(fork.value)); fork.value = nullptr; TEST_CUDA(cuEventDestroy(join.value)); join.value = nullptr;
         for (unsigned seed : {0u, 71u, 255u, 0xffffffffu}) { storage.reset(seed); graph.run(launch.value, runtime); storage.expect(seed, true); }
     }
 }
 void capture_dependencies() {
     for (bool runtime : {false, true}) {
         capture_route route{runtime}; capture_storage storage; capture_stream stream; capture_graph graph; storage.reset(43);
-        CONFORMANCE_CUDA(cuGraphCreate(&graph.value, 0)); CUgraphNode root{}; CONFORMANCE_CUDA(cuGraphAddEmptyNode(&root, graph.value, nullptr, 0));
+        TEST_CUDA(cuGraphCreate(&graph.value, 0)); CUgraphNode root{}; TEST_CUDA(cuGraphAddEmptyNode(&root, graph.value, nullptr, 0));
         if (runtime) { auto dependency = reinterpret_cast<cudaGraphNode_t>(root); CAPTURE_RUNTIME(cudaStreamBeginCaptureToGraph(capture_route::stream(stream.value), reinterpret_cast<cudaGraph_t>(graph.value), &dependency, nullptr, 1, cudaStreamCaptureModeThreadLocal)); }
-        else CONFORMANCE_CUDA(cuStreamBeginCaptureToGraph(stream.value, graph.value, &root, nullptr, 1, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
+        else TEST_CUDA(cuStreamBeginCaptureToGraph(stream.value, graph.value, &root, nullptr, 1, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
         // The source graph remains caller-owned even if capture is aborted.
         struct cleanup { capture_route route; CUstream stream; bool active = true; ~cleanup() { if (active) { CUgraph output{}; route.end(stream, &output); } } } end{route, stream.value};
         auto initial = route.info(stream.value); require(initial.graph == graph.value && initial.dependencies == std::vector<CUgraphNode>{root}, "capture-to-graph starts at caller dependencies");
         storage.first(route, stream.value); const auto upload = route.info(stream.value); CUgraphNode inserted{};
-        CONFORMANCE_CUDA(cuGraphAddEmptyNode(&inserted, graph.value, upload.dependencies.data(), upload.dependencies.size()));
-        CONFORMANCE_CUDA(route.update(stream.value, {inserted}, CU_STREAM_SET_CAPTURE_DEPENDENCIES));
+        TEST_CUDA(cuGraphAddEmptyNode(&inserted, graph.value, upload.dependencies.data(), upload.dependencies.size()));
+        TEST_CUDA(route.update(stream.value, {inserted}, CU_STREAM_SET_CAPTURE_DEPENDENCIES));
         require(route.info(stream.value).dependencies == std::vector<CUgraphNode>{inserted}, "SET replaces capture frontier");
-        CONFORMANCE_CUDA(route.update(stream.value, {root}, CU_STREAM_ADD_CAPTURE_DEPENDENCIES));
+        TEST_CUDA(route.update(stream.value, {root}, CU_STREAM_ADD_CAPTURE_DEPENDENCIES));
         auto added = route.info(stream.value); require(added.dependencies.size() == 2 && std::find(added.dependencies.begin(), added.dependencies.end(), root) != added.dependencies.end(), "ADD extends frontier");
         // Inputs are copied: the temporary caller vectors above have already died.
         storage.middle(route, stream.value); storage.last(route, stream.value); CUgraph output{};
-        CONFORMANCE_CUDA(route.end(stream.value, &output)); end.active = false; require(output == graph.value, "capture-to-graph returns original caller graph");
+        TEST_CUDA(route.end(stream.value, &output)); end.active = false; require(output == graph.value, "capture-to-graph returns original caller graph");
         graph.instantiate(!runtime); storage.expect(43, false); graph.run(stream.value, runtime); storage.expect(43, true);
     }
 }
@@ -224,21 +224,21 @@ void capture_invalidation() {
         require(session.end(&output.value) == CUDA_ERROR_STREAM_CAPTURE_INVALIDATED && output.value == nullptr, "invalidated end rejects graph and clears output"); output.check();
         require(route.status(stream.value) == CU_STREAM_CAPTURE_STATUS_NONE, "failed end releases capture state"); storage.expect(61, false);
         capture_graph graph; capture_session again(route, stream.value, CU_STREAM_CAPTURE_MODE_GLOBAL);
-        storage.first(route, stream.value); storage.middle(route, stream.value); storage.last(route, stream.value); CONFORMANCE_CUDA(again.end(&graph.value));
+        storage.first(route, stream.value); storage.middle(route, stream.value); storage.last(route, stream.value); TEST_CUDA(again.end(&graph.value));
         graph.instantiate(!runtime); graph.run(stream.value, runtime); storage.expect(61, true);
     }
 }
 void capture_isolation() {
     for (bool runtime : {false, true}) for (unsigned scenario : {0u, 1u, 2u}) {
         capture_route route{runtime}; capture_stream origin, branch; capture_event event; capture_storage storage; storage.reset(83);
-        if (scenario == 0) { route.record(event.value, branch.value); CONFORMANCE_CUDA(cuStreamSynchronize(branch.value)); }
+        if (scenario == 0) { route.record(event.value, branch.value); TEST_CUDA(cuStreamSynchronize(branch.value)); }
         capture_session first(route, origin.value, CU_STREAM_CAPTURE_MODE_GLOBAL); route.host(origin.value, capture_storage::callback, &storage);
         if (scenario == 0) {
             require(route.wait(origin.value, event.value) == CUDA_ERROR_STREAM_CAPTURE_ISOLATION, "capture cannot depend on uncaptured event");
         } else {
             route.record(event.value, origin.value);
             if (scenario == 1) {
-                CONFORMANCE_CUDA(route.wait(branch.value, event.value)); route.host(branch.value, capture_storage::callback, &storage);
+                TEST_CUDA(route.wait(branch.value, event.value)); route.host(branch.value, capture_storage::callback, &storage);
             } else {
                 capture_session second(route, branch.value, CU_STREAM_CAPTURE_MODE_GLOBAL);
                 require(route.wait(branch.value, event.value) == CUDA_ERROR_STREAM_CAPTURE_MERGE, "independent captures cannot merge");
@@ -249,7 +249,7 @@ void capture_isolation() {
         CUgraph discarded{}; require(first.end(&discarded) == (scenario == 1 ? CUDA_ERROR_STREAM_CAPTURE_UNJOINED : CUDA_ERROR_STREAM_CAPTURE_INVALIDATED) && !discarded,
             "isolated/merged/unjoined capture returns no executable graph");
         require(route.status(origin.value) == CU_STREAM_CAPTURE_STATUS_NONE && route.status(branch.value) == CU_STREAM_CAPTURE_STATUS_NONE, "failed end detaches all streams"); storage.expect(83, false);
-        capture_graph valid; capture_session again(route, branch.value, CU_STREAM_CAPTURE_MODE_GLOBAL); CONFORMANCE_CUDA(again.end(&valid.value)); valid.instantiate(!runtime); valid.run(origin.value, runtime);
+        capture_graph valid; capture_session again(route, branch.value, CU_STREAM_CAPTURE_MODE_GLOBAL); TEST_CUDA(again.end(&valid.value)); valid.instantiate(!runtime); valid.run(origin.value, runtime);
     }
 }
 void capture_legacy() {
@@ -266,29 +266,29 @@ void capture_legacy() {
         require(cudaStreamGetCaptureInfo(cudaStreamLegacy, &runtime_status) == cudaErrorStreamCaptureImplicit,
             "Runtime legacy capture-info query detects implicit dependency");
         require(route.info(blocking.value).status == CU_STREAM_CAPTURE_STATUS_ACTIVE, "Runtime legacy query also preserves capture");
-        CONFORMANCE_CUDA(session.end(&graph.value)); graph.instantiate(!runtime); graph.run(blocking.value, runtime);
-        capture_graph per_thread; capture_session pt(route, CU_STREAM_PER_THREAD, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL); CONFORMANCE_CUDA(pt.end(&per_thread.value));
+        TEST_CUDA(session.end(&graph.value)); graph.instantiate(!runtime); graph.run(blocking.value, runtime);
+        capture_graph per_thread; capture_session pt(route, CU_STREAM_PER_THREAD, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL); TEST_CUDA(pt.end(&per_thread.value));
         per_thread.instantiate(!runtime); per_thread.run(CU_STREAM_PER_THREAD, runtime);
     }
 }
 void capture_threading() {
     for (bool runtime : {false, true}) {
         capture_route route{runtime}; capture_stream stream; capture_storage storage; capture_graph graph; storage.reset(107);
-        CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
         capture_session session(route, stream.value, CU_STREAM_CAPTURE_MODE_RELAXED); storage.first(route, stream.value); storage.middle(route, stream.value); storage.last(route, stream.value);
         CUresult result = CUDA_ERROR_UNKNOWN; std::exception_ptr failure;
-        std::thread worker([&] { try { CONFORMANCE_CUDA(cuCtxSetCurrent(context)); result = session.end(&graph.value); CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr)); } catch (...) { failure = std::current_exception(); } });
-        worker.join(); if (failure) std::rethrow_exception(failure); CONFORMANCE_CUDA(result);
+        std::thread worker([&] { try { TEST_CUDA(cuCtxSetCurrent(context)); result = session.end(&graph.value); TEST_CUDA(cuCtxSetCurrent(nullptr)); } catch (...) { failure = std::current_exception(); } });
+        worker.join(); if (failure) std::rethrow_exception(failure); TEST_CUDA(result);
         require(route.status(stream.value) == CU_STREAM_CAPTURE_STATUS_NONE, "relaxed capture can end on a different bound host thread");
         graph.instantiate(!runtime); graph.run(stream.value, runtime); storage.expect(107, true);
         // Exchange mode is thread-local and interoperable across both public facades.
-        CUstreamCaptureMode mode = CU_STREAM_CAPTURE_MODE_RELAXED; CONFORMANCE_CUDA(cuThreadExchangeStreamCaptureMode(&mode));
+        CUstreamCaptureMode mode = CU_STREAM_CAPTURE_MODE_RELAXED; TEST_CUDA(cuThreadExchangeStreamCaptureMode(&mode));
         const auto original = mode; CUstreamCaptureMode observed = CU_STREAM_CAPTURE_MODE_GLOBAL;
-        std::thread independent([&] { observed = CU_STREAM_CAPTURE_MODE_THREAD_LOCAL; result = cuThreadExchangeStreamCaptureMode(&observed); }); independent.join(); CONFORMANCE_CUDA(result);
+        std::thread independent([&] { observed = CU_STREAM_CAPTURE_MODE_THREAD_LOCAL; result = cuThreadExchangeStreamCaptureMode(&observed); }); independent.join(); TEST_CUDA(result);
         require(observed == CU_STREAM_CAPTURE_MODE_GLOBAL, "new host thread starts with independent global capture mode");
         cudaStreamCaptureMode rt_mode = cudaStreamCaptureModeThreadLocal; CAPTURE_RUNTIME(cudaThreadExchangeStreamCaptureMode(&rt_mode));
         require(rt_mode == cudaStreamCaptureModeRelaxed, "Runtime exchange observes Driver thread mode");
-        mode = original; CONFORMANCE_CUDA(cuThreadExchangeStreamCaptureMode(&mode)); require(mode == CU_STREAM_CAPTURE_MODE_THREAD_LOCAL, "Driver restores previous mode from Runtime exchange");
+        mode = original; TEST_CUDA(cuThreadExchangeStreamCaptureMode(&mode)); require(mode == CU_STREAM_CAPTURE_MODE_THREAD_LOCAL, "Driver restores previous mode from Runtime exchange");
     }
 }
 void capture_validation() {
@@ -303,7 +303,7 @@ void capture_validation() {
         require(route.update(stream.value, {}, 0xff) == CUDA_ERROR_INVALID_VALUE, "invalid capture dependency flags");
         require(cuStreamEndCapture(stream.value, nullptr) == CUDA_ERROR_INVALID_VALUE && cudaStreamEndCapture(capture_route::stream(stream.value), nullptr) == cudaErrorInvalidValue, "null end output is rejected without ending capture");
         const auto after = route.info(stream.value); require(after.status == CU_STREAM_CAPTURE_STATUS_ACTIVE && initial.id == after.id && initial.graph == after.graph && after.dependencies.empty(), "argument rejections preserve active capture");
-        CONFORMANCE_CUDA(session.end(&graph.value)); graph.instantiate(!runtime); graph.run(stream.value, runtime);
+        TEST_CUDA(session.end(&graph.value)); graph.instantiate(!runtime); graph.run(stream.value, runtime);
     }
 }
 std::string capture_case = "all";
@@ -318,5 +318,5 @@ void execute_stream_capture() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::capture_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_stream_capture);
+    return cudavm::run_test(argc, argv, cudavm::execute_stream_capture);
 }

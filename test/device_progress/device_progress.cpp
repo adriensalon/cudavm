@@ -24,11 +24,11 @@ std::vector<uint32_t> progress_oracle(std::span<const uint32_t> input, unsigned 
 }
 void execute_device_progress(const loaded_program& program) {
     CUdevice device{};
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuCtxGetDevice(&device));
     int multiprocessors = 0, resident_threads = 0, grid_limit = 0;
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&resident_threads, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&grid_limit, CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X, device));
+    TEST_CUDA(cuDeviceGetAttribute(&multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
+    TEST_CUDA(cuDeviceGetAttribute(&resident_threads, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, device));
+    TEST_CUDA(cuDeviceGetAttribute(&grid_limit, CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X, device));
     require(multiprocessors >= 0 && resident_threads >= 0, "reported residency attributes are nonnegative");
     constexpr uint32_t guard = 0xa1b2c3d4;
     constexpr unsigned guards = 4;
@@ -49,31 +49,31 @@ void execute_device_progress(const loaded_program& program) {
             auto ticket = ticket_buffer.value + guards * 4, done = completed.value + guards * 4;
             for (unsigned seed : {0u, 197u}) {
                 for (unsigned i = 0; i < total; ++i) input[guards + i] = i * 0x7654321u + seed * 0x89abcdefu;
-                CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+                TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
                 const auto values = progress_oracle(std::span(input).subspan(guards, total), blocks, lanes, seed);
                 for (unsigned count : {0u, total / 2 + 1, total}) {
                     std::fill(expected.begin(), expected.end(), guard);
                     counter.fill(guard); counter[guards] = 0;
-                    CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
-                    CONFORMANCE_CUDA(cuMemcpyHtoD(ticket_buffer.value, tickets.data(), tickets.size() * 4));
-                    CONFORMANCE_CUDA(cuMemcpyHtoD(completed.value, counter.data(), counter.size() * 4));
+                    TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+                    TEST_CUDA(cuMemcpyHtoD(ticket_buffer.value, tickets.data(), tickets.size() * 4));
+                    TEST_CUDA(cuMemcpyHtoD(completed.value, counter.data(), counter.size() * 4));
                     void* args[]{&to, &from, &ticket, &done, &count, &seed};
-                    CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, lanes, 1, 1, 0, nullptr, args, nullptr));
-                    CONFORMANCE_CUDA(cuCtxSynchronize());
+                    TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, lanes, 1, 1, 0, nullptr, args, nullptr));
+                    TEST_CUDA(cuCtxSynchronize());
                     std::copy_n(values.begin(), count, expected.begin() + guards);
-                    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+                    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
                     expect_words(actual, expected, "finite divergent/barrier progress and output guards");
-                    CONFORMANCE_CUDA(cuMemcpyDtoH(observed_tickets.data(), ticket_buffer.value, observed_tickets.size() * 4));
+                    TEST_CUDA(cuMemcpyDtoH(observed_tickets.data(), ticket_buffer.value, observed_tickets.size() * 4));
                     for (unsigned i = 0; i < guards; ++i)
                         require(observed_tickets[i] == guard && observed_tickets[guards + blocks + i] == guard, "completion ticket guards");
                     auto first = observed_tickets.begin() + guards, last = first + blocks;
                     std::sort(first, last);
                     for (unsigned i = 0; i < blocks; ++i) require(first[i] == i, "every block completes exactly once without a prescribed order");
                     counter[guards] = blocks;
-                    CONFORMANCE_CUDA(cuMemcpyDtoH(observed_counter.data(), completed.value, sizeof(counter)));
+                    TEST_CUDA(cuMemcpyDtoH(observed_counter.data(), completed.value, sizeof(counter)));
                     expect_words(observed_counter, counter, "completed block count and counter guards");
                 }
-                CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), source.value, actual.size() * 4));
+                TEST_CUDA(cuMemcpyDtoH(actual.data(), source.value, actual.size() * 4));
                 expect_words(actual, input, "progress source/allocation preservation");
             }
         }
@@ -81,5 +81,5 @@ void execute_device_progress(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_device_progress);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_device_progress);
 }

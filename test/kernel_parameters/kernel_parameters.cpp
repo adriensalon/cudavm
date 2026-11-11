@@ -23,7 +23,7 @@ void execute_kernel_parameters(const loaded_program& program) {
     constexpr std::array<size_t, 7> sizes{8, 1, 32, 2, 16, 8, 4};
     for (size_t index = 0; index < offsets.size(); ++index) {
         size_t offset = 999, size = 999;
-        CONFORMANCE_CUDA(cuFuncGetParamInfo(kernel, index, &offset, &size));
+        TEST_CUDA(cuFuncGetParamInfo(kernel, index, &offset, &size));
         require(offset == offsets[index] && size == sizes[index],
             "aggregate parameter layout index=" + std::to_string(index));
     }
@@ -68,10 +68,10 @@ void execute_kernel_parameters(const loaded_program& program) {
                     CU_LAUNCH_PARAM_BUFFER_SIZE, &packed_size, CU_LAUNCH_PARAM_END};
                 for (bool use_packed : {false, true}) {
                     std::vector<uint32_t> initial(expected.size(), guard);
-                    CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
-                    CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0,
+                    TEST_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
+                    TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0,
                         nullptr, use_packed ? nullptr : args, use_packed ? extra : nullptr));
-                    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+                    TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
                     expect_words(actual, expected, "kernel parameters threads=" + std::to_string(threads)
                         + " variant=" + std::to_string(variant) + " count=" + std::to_string(count)
                         + (use_packed ? " packed" : " pointer list"));
@@ -86,5 +86,5 @@ void execute_kernel_parameters(const loaded_program& program) {
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_kernel_parameters);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_kernel_parameters);
 }

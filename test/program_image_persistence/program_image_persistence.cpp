@@ -5,15 +5,15 @@ std::string_view program_image_persistence_case;
 const char* program_image_persistence_executable{};
 const char* program_image_persistence_backend{};
 std::filesystem::path program_image_persistence_export_directory;
-std::unique_ptr<conformance_peer> program_image_persistence_peer;
+std::unique_ptr<test_peer> program_image_persistence_peer;
 struct program_image_cache_message {
     std::array<char, 768> path{};
     uint64_t size{}, digest{};
 };
-void program_image_cache_send(conformance_peer& peer, const program_image_cache_message& message) {
+void program_image_cache_send(test_peer& peer, const program_image_cache_message& message) {
     peer.send(std::as_bytes(std::span(&message, 1)));
 }
-program_image_cache_message program_image_cache_receive(conformance_peer& peer) {
+program_image_cache_message program_image_cache_receive(test_peer& peer) {
     program_image_cache_message message;
     peer.receive(std::as_writable_bytes(std::span(&message, 1)));
     require(message.path.back() == 0 && message.path.front() != 0, "bounded cache path in process control message");
@@ -60,7 +60,7 @@ program_image_cache_message program_image_persistence_cache(program_image_file& 
     std::copy(original_path.begin(), original_path.end(), message.path.begin());
     const auto child_case = "produce." + std::string(producer);
     {
-        conformance_peer child(program_image_persistence_executable, program_image_persistence_backend, child_case.c_str());
+        test_peer child(program_image_persistence_executable, program_image_persistence_backend, child_case.c_str());
         program_image_cache_send(child, message); message = program_image_cache_receive(child);
         require(child.wait() == 0, "producer process exits successfully before cache consumption");
     }
@@ -84,7 +84,7 @@ void program_image_persistence_consumer() {
     const bool first = program_image_persistence_case == "load_first";
     require(first || program_image_persistence_case == "load_second", "known fresh loader group");
     for (unsigned route = first ? 0 : 4; route < (first ? 4u : 7u); ++route) {
-        program_image_loaded program(image, route); program_image_execute(program); CONFORMANCE_CUDA(cuCtxSynchronize());
+        program_image_loaded program(image, route); program_image_execute(program); TEST_CUDA(cuCtxSynchronize());
         program_image_cache_send(*program_image_persistence_peer, message);
     }
     require(program_image_cache_read(message.path.data()) == image, "execution and module storage updates preserve the persistent cache");
@@ -94,7 +94,7 @@ void execute_program_image_persistence() {
     program_image_file cache({});
     const auto message = program_image_persistence_cache(cache, program_image_persistence_case);
     for (const char* group : {"load_first", "load_second"}) {
-        conformance_peer child(program_image_persistence_executable, program_image_persistence_backend, group);
+        test_peer child(program_image_persistence_executable, program_image_persistence_backend, group);
         program_image_cache_send(child, message);
         const auto count = std::string_view(group) == "load_first" ? 4u : 3u;
         for (unsigned i = 0; i < count; ++i) {
@@ -135,19 +135,19 @@ int main(int argc, char** argv) {
     cudavm::program_image_persistence_backend = argc >= 2 ? argv[1] : "host";
     if (argc == 3 && std::string_view(argv[1]) == "--cache-files") {
         cudavm::program_image_persistence_export_directory = argv[2];
-        return cudavm::run_host_conformance(1, argv, cudavm::program_image_persistence_export);
+        return cudavm::run_host_test(1, argv, cudavm::program_image_persistence_export);
     }
     if (argc == 7 && std::string_view(argv[3]) == "--peer") {
-        cudavm::program_image_persistence_peer = std::make_unique<cudavm::conformance_peer>(cudavm::conformance_peer::connect(argv[4], argv[5], argv[6]));
+        cudavm::program_image_persistence_peer = std::make_unique<cudavm::test_peer>(cudavm::test_peer::connect(argv[4], argv[5], argv[6]));
         cudavm::program_image_persistence_case = argv[2];
         if (cudavm::program_image_persistence_case.starts_with("produce."))
-            return cudavm::run_host_conformance(1, argv, cudavm::program_image_persistence_producer);
+            return cudavm::run_host_test(1, argv, cudavm::program_image_persistence_producer);
         argc = 3;
     }
     if (argc == 2 && std::string_view(argv[1]) == "copies") {
         cudavm::program_image_persistence_backend = "host";
-        return cudavm::run_host_conformance(argc, argv, cudavm::program_image_persistence_copies);
+        return cudavm::run_host_test(argc, argv, cudavm::program_image_persistence_copies);
     }
     if (argc == 3) { cudavm::program_image_persistence_case = argv[2]; argc = 2; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_program_image_persistence, 0, cudavm::probe_execution);
+    return cudavm::run_test(argc, argv, cudavm::execute_program_image_persistence, 0, cudavm::probe_execution);
 }

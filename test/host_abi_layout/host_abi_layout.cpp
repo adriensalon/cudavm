@@ -110,5 +110,5 @@ void execute_host_abi_layout() {
 }
 int main(int argc, char** argv) {
     if (argc == 2) cudavm::host_abi_layout_case = argv[1];
-    return cudavm::run_host_conformance(argc, argv, cudavm::execute_host_abi_layout);
+    return cudavm::run_host_test(argc, argv, cudavm::execute_host_abi_layout);
 }

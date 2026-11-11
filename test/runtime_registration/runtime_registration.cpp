@@ -84,10 +84,10 @@ void registration_read(const registration_tokens& tokens, std::span<const uint32
     void* output = reinterpret_cast<void*>(static_cast<uintptr_t>(buffer.value + 4));
     unsigned active = count;
     for (const char* token : {&tokens.read, &tokens.alias}) {
-        CONFORMANCE_CUDA(cuMemsetD32(buffer.value, guard, expected.size()));
+        TEST_CUDA(cuMemsetD32(buffer.value, guard, expected.size()));
         void* arguments[]{&output, &active};
         REGISTRATION_RUNTIME(cudaLaunchKernel(token, dim3(2), dim3(13), arguments, 0, nullptr));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), buffer.value, actual.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), buffer.value, actual.size() * 4));
         for (unsigned i = 0; i < count; ++i) {
             const unsigned slot = i % 17 + 1, constant_slot = i % 7;
             const uint64_t address = reinterpret_cast<uintptr_t>(global) + slot * 4;
@@ -110,13 +110,13 @@ void registration_retired(const registration_tokens& tokens) {
 void registration_probe() {
     constexpr char source[] = ".version 6.5\n.target sm_75\n.address_size 64\n.visible .entry registration_probe(.param .u64 out) { .reg .b64 %p; .reg .b32 %v; ld.param.u64 %p,[out]; mov.u32 %v,0x43564d31; st.global.u32 [%p],%v; ret; }\n";
     CUmodule module{};
-    CONFORMANCE_CUDA(cuModuleLoadData(&module, source));
+    TEST_CUDA(cuModuleLoadData(&module, source));
     struct retire { CUmodule value; ~retire() { cuModuleUnload(value); } } owner{module};
-    CUfunction function{}; CONFORMANCE_CUDA(cuModuleGetFunction(&function, module, "registration_probe"));
-    device_buffer output(4); CONFORMANCE_CUDA(cuMemsetD32(output.value, 0, 1));
+    CUfunction function{}; TEST_CUDA(cuModuleGetFunction(&function, module, "registration_probe"));
+    device_buffer output(4); TEST_CUDA(cuMemsetD32(output.value, 0, 1));
     void* arguments[]{&output.value};
-    CONFORMANCE_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, nullptr, arguments, nullptr));
-    uint32_t actual{}; CONFORMANCE_CUDA(cuMemcpyDtoH(&actual, output.value, 4));
+    TEST_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, nullptr, arguments, nullptr));
+    uint32_t actual{}; TEST_CUDA(cuMemcpyDtoH(&actual, output.value, 4));
     require(actual == 0x43564d31, "registration availability probe exact result");
 }
 void execute_runtime_registration() {
@@ -136,19 +136,19 @@ void execute_runtime_registration() {
         }
         registration_storage(tokens, expected); registration_read(tokens, expected);
         CUcontext original{}, separate{}; CUdevice device{};
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&original)); CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-        CONFORMANCE_CUDA(cuCtxCreate(&separate, nullptr, 0, device));
+        TEST_CUDA(cuCtxGetCurrent(&original)); TEST_CUDA(cuCtxGetDevice(&device));
+        TEST_CUDA(cuCtxCreate(&separate, nullptr, 0, device));
         try {
             auto independent = registration_initial(); registration_storage(tokens, independent);
             registration_mutate(tokens, independent, 0xdeadbeef); registration_read(tokens, independent);
-            CONFORMANCE_CUDA(cuCtxSetCurrent(original)); registration_storage(tokens, expected);
-            CONFORMANCE_CUDA(cuCtxSetCurrent(separate)); registration_storage(tokens, independent);
+            TEST_CUDA(cuCtxSetCurrent(original)); registration_storage(tokens, expected);
+            TEST_CUDA(cuCtxSetCurrent(separate)); registration_storage(tokens, independent);
         } catch (...) { cuCtxSetCurrent(original); cuCtxDestroy(separate); throw; }
-        CONFORMANCE_CUDA(cuCtxSetCurrent(original)); CONFORMANCE_CUDA(cuCtxDestroy(separate));
-        device_buffer survivor(4); CONFORMANCE_CUDA(cuMemsetD32(survivor.value, 0x10293847, 1));
+        TEST_CUDA(cuCtxSetCurrent(original)); TEST_CUDA(cuCtxDestroy(separate));
+        device_buffer survivor(4); TEST_CUDA(cuMemsetD32(survivor.value, 0x10293847, 1));
         REGISTRATION_RUNTIME(cudaDeviceReset()); expected = registration_initial();
         registration_storage(tokens, expected); registration_read(tokens, expected);
-        uint32_t preserved{}; CONFORMANCE_CUDA(cuMemcpyDtoH(&preserved, survivor.value, 4));
+        uint32_t preserved{}; TEST_CUDA(cuMemcpyDtoH(&preserved, survivor.value, 4));
         require(preserved == 0x10293847, "explicit-context Runtime reset preserves Driver allocation");
         first.close(); registration_retired(tokens);
         { registered_image replacement(tokens, version); registration_storage(tokens, registration_initial()); registration_read(tokens, registration_initial()); }
@@ -159,5 +159,5 @@ void execute_runtime_registration() {
 int main(int argc, char** argv) {
     if (argc != 3) return 1;
     cudavm::registration_case = argv[2];
-    return cudavm::run_conformance(2, argv, cudavm::execute_runtime_registration, 0, cudavm::registration_probe);
+    return cudavm::run_test(2, argv, cudavm::execute_runtime_registration, 0, cudavm::registration_probe);
 }

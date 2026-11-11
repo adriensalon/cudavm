@@ -34,5 +34,5 @@ int main(int argc, char** argv) {
     cudavm::double_transcendental_profile = unsigned(selected - profiles.begin());
     const auto source = "#define CUDAVM_DOUBLE_TRANSCENDENTAL_PROFILE " + std::to_string(cudavm::double_transcendental_profile) + "\n" + std::string(cudavm::fixtures.source);
     auto fixtures = cudavm::fixtures; fixtures.source = source;
-    return cudavm::run_conformance(3, argv, fixtures, cudavm::execute_double_transcendental_math);
+    return cudavm::run_test(3, argv, fixtures, cudavm::execute_double_transcendental_math);
 }

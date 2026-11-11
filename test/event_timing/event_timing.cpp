@@ -22,18 +22,18 @@ struct timing_event {
             cudaEvent_t event{};
             TIMING_RUNTIME(cudaEventCreateWithFlags(&event, flags));
             value = reinterpret_cast<CUevent>(event);
-        } else CONFORMANCE_CUDA(cuEventCreate(&value, flags));
+        } else TEST_CUDA(cuEventCreate(&value, flags));
     }
     ~timing_event() { if (value) cuEventDestroy(value); }
     cudaEvent_t runtime_value() const { return reinterpret_cast<cudaEvent_t>(value); }
     void record(CUstream stream, bool runtime) {
         if (runtime) TIMING_RUNTIME(cudaEventRecord(runtime_value(), reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuEventRecord(value, stream));
+        else TEST_CUDA(cuEventRecord(value, stream));
     }
     void synchronize(bool runtime) {
         if (runtime) TIMING_RUNTIME(cudaEventSynchronize(runtime_value()));
-        else CONFORMANCE_CUDA(cuEventSynchronize(value));
-        CONFORMANCE_CUDA(cuEventQuery(value));
+        else TEST_CUDA(cuEventSynchronize(value));
+        TEST_CUDA(cuEventQuery(value));
         TIMING_RUNTIME(cudaEventQuery(runtime_value()));
     }
 };
@@ -44,7 +44,7 @@ struct timing_stream {
             cudaStream_t stream{};
             TIMING_RUNTIME(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
             value = reinterpret_cast<CUstream>(stream);
-        } else CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING));
+        } else TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING));
     }
     ~timing_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
@@ -80,7 +80,7 @@ struct timing_delay {
     }
     void enqueue(CUstream stream, bool runtime) {
         if (runtime) TIMING_RUNTIME(cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream), call, this));
-        else CONFORMANCE_CUDA(cuLaunchHostFunc(stream, call, this));
+        else TEST_CUDA(cuLaunchHostFunc(stream, call, this));
     }
     void check(float elapsed) const {
         require(completed && observed >= milliseconds * 0.8, "ordered host delay completed");
@@ -90,7 +90,7 @@ struct timing_delay {
 struct timing_readback {
     static constexpr size_t payload = 512, device_size = payload + 32, size = device_size + 32;
     void* value{};
-    timing_readback() { CONFORMANCE_CUDA(cuMemAllocHost(&value, size)); std::memset(value, 0xd3, size); }
+    timing_readback() { TEST_CUDA(cuMemAllocHost(&value, size)); std::memset(value, 0xd3, size); }
     ~timing_readback() { if (value) cuMemFreeHost(value); }
     void expect(bool second) const {
         std::vector<unsigned char> expected(size, 0xd3);
@@ -107,10 +107,10 @@ void timing_stage(CUstream stream, CUdeviceptr device, timing_readback& destinat
     if (runtime) {
         TIMING_RUNTIME(cudaMemsetAsync(reinterpret_cast<void*>(static_cast<uintptr_t>(device + 16 + offset)),
             byte, count, reinterpret_cast<cudaStream_t>(stream)));
-        CONFORMANCE_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(destination.value) + 16,
+        TEST_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(destination.value) + 16,
             device, timing_readback::device_size, stream));
     } else {
-        CONFORMANCE_CUDA(cuMemsetD8Async(device + 16 + offset, byte, count, stream));
+        TEST_CUDA(cuMemsetD8Async(device + 16 + offset, byte, count, stream));
         TIMING_RUNTIME(cudaMemcpyAsync(static_cast<unsigned char*>(destination.value) + 16,
             reinterpret_cast<void*>(static_cast<uintptr_t>(device)), timing_readback::device_size,
             cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(stream)));
@@ -124,8 +124,8 @@ void event_timing_completed() {
         timing_event start(runtime), middle(!runtime, CU_EVENT_BLOCKING_SYNC), end(runtime);
         // Streams drain before the events, arguments and pinned destinations die.
         timing_stream producer(runtime), consumer(!runtime);
-        CONFORMANCE_CUDA(cuMemsetD8(storage.value, 0xa7, timing_readback::device_size));
-        CONFORMANCE_CUDA(cuMemsetD8(storage.value + 16, 0x39, timing_readback::payload));
+        TEST_CUDA(cuMemsetD8(storage.value, 0xa7, timing_readback::device_size));
+        TEST_CUDA(cuMemsetD8(storage.value + 16, 0x39, timing_readback::payload));
         const auto begin = std::chrono::steady_clock::now();
         start.record(producer.value, !runtime);
         first_delay.enqueue(producer.value, runtime);
@@ -178,7 +178,7 @@ void event_timing_pending() {
         timing_stream stream(runtime);
         timing_gate_cleanup cleanup{gate};
         if (!both_pending) { start.record(stream.value, runtime); start.synchronize(!runtime); }
-        CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, timing_gate::call, &gate));
+        TEST_CUDA(cuLaunchHostFunc(stream.value, timing_gate::call, &gate));
         if (both_pending) start.record(stream.value, !runtime);
         end.record(stream.value, runtime);
         gate.await();
@@ -240,5 +240,5 @@ void execute_event_timing() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::timing_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_event_timing);
+    return cudavm::run_test(argc, argv, cudavm::execute_event_timing);
 }

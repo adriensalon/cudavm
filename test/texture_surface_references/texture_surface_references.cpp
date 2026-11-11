@@ -13,20 +13,20 @@ template<class T> struct reference_output {
 };
 struct reference_module {
     CUmodule value{};
-    reference_module() { CONFORMANCE_CUDA(cuModuleLoadData(&value, reference_image)); }
+    reference_module() { TEST_CUDA(cuModuleLoadData(&value, reference_image)); }
     ~reference_module() { if (value) cuModuleUnload(value); }
-    void close() { CONFORMANCE_CUDA(cuModuleUnload(value)); value = nullptr; }
-    CUfunction function(const char* name) const { CUfunction result{}; CONFORMANCE_CUDA(cuModuleGetFunction(&result, value, name)); return result; }
+    void close() { TEST_CUDA(cuModuleUnload(value)); value = nullptr; }
+    CUfunction function(const char* name) const { CUfunction result{}; TEST_CUDA(cuModuleGetFunction(&result, value, name)); return result; }
     CUtexref texture() const {
         reference_output<CUtexref> first, again;
-        CONFORMANCE_CUDA(cuModuleGetTexRef(&first.value, value, "reference_texture"));
-        CONFORMANCE_CUDA(cuModuleGetTexRef(&again.value, value, "reference_texture"));
+        TEST_CUDA(cuModuleGetTexRef(&first.value, value, "reference_texture"));
+        TEST_CUDA(cuModuleGetTexRef(&again.value, value, "reference_texture"));
         require(first.get() && first.get() == again.get(), "repeated texture reference lookup identity"); return first.get();
     }
     CUsurfref surface() const {
         reference_output<CUsurfref> first, again;
-        CONFORMANCE_CUDA(cuModuleGetSurfRef(&first.value, value, "reference_surface"));
-        CONFORMANCE_CUDA(cuModuleGetSurfRef(&again.value, value, "reference_surface"));
+        TEST_CUDA(cuModuleGetSurfRef(&first.value, value, "reference_surface"));
+        TEST_CUDA(cuModuleGetSurfRef(&again.value, value, "reference_surface"));
         require(first.get() && first.get() == again.get(), "repeated surface reference lookup identity"); return first.get();
     }
 };
@@ -40,22 +40,22 @@ void reference_initialize(image_test_storage& storage, unsigned seed) {
     storage.upload();
 }
 void reference_bind(CUtexref texture, CUsurfref surface, const image_test_storage& storage) {
-    CONFORMANCE_CUDA(cuTexRefSetArray(texture, storage.array, CU_TRSA_OVERRIDE_FORMAT));
-    CONFORMANCE_CUDA(cuSurfRefSetArray(surface, storage.array, 0));
+    TEST_CUDA(cuTexRefSetArray(texture, storage.array, CU_TRSA_OVERRIDE_FORMAT));
+    TEST_CUDA(cuSurfRefSetArray(surface, storage.array, 0));
     reference_output<CUarray> texture_array, surface_array;
-    CONFORMANCE_CUDA(cuTexRefGetArray(&texture_array.value, texture)); CONFORMANCE_CUDA(cuSurfRefGetArray(&surface_array.value, surface));
+    TEST_CUDA(cuTexRefGetArray(&texture_array.value, texture)); TEST_CUDA(cuSurfRefGetArray(&surface_array.value, surface));
     require(texture_array.get() == storage.array && surface_array.get() == storage.array, "reference binding queries preserve public array identity");
-    CONFORMANCE_CUDA(cuTexRefSetFlags(texture, 0)); CONFORMANCE_CUDA(cuTexRefSetFilterMode(texture, CU_TR_FILTER_MODE_POINT));
-    for (int axis = 0; axis < 3; ++axis) CONFORMANCE_CUDA(cuTexRefSetAddressMode(texture, axis, CU_TR_ADDRESS_MODE_CLAMP));
+    TEST_CUDA(cuTexRefSetFlags(texture, 0)); TEST_CUDA(cuTexRefSetFilterMode(texture, CU_TR_FILTER_MODE_POINT));
+    for (int axis = 0; axis < 3; ++axis) TEST_CUDA(cuTexRefSetAddressMode(texture, axis, CU_TR_ADDRESS_MODE_CLAMP));
 }
 void reference_sample(reference_module& module, const char* name, unsigned seed, bool retire = false) {
     constexpr unsigned guards = 16;
     std::vector<uint32_t> result(guards + 32 * 4 + guards, 0xa7b96351);
-    device_buffer output(result.size() * 4); CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, result.data(), result.size() * 4));
+    device_buffer output(result.size() * 4); TEST_CUDA(cuMemcpyHtoD(output.value, result.data(), result.size() * 4));
     auto pointer = output.value + guards * 4; void* args[]{&pointer};
-    CONFORMANCE_CUDA(cuLaunchKernel(module.function(name), 1, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
-    if (retire) module.close(); else CONFORMANCE_CUDA(cuCtxSynchronize());
-    CONFORMANCE_CUDA(cuMemcpyDtoH(result.data(), output.value, result.size() * 4));
+    TEST_CUDA(cuLaunchKernel(module.function(name), 1, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
+    if (retire) module.close(); else TEST_CUDA(cuCtxSynchronize());
+    TEST_CUDA(cuMemcpyDtoH(result.data(), output.value, result.size() * 4));
     for (unsigned i = 0; i < result.size(); ++i) {
         const auto expected = i < guards || i >= result.size() - guards ? 0xa7b96351 : reference_word((i - guards) / 4, (i - guards) % 4, seed);
         require(result[i] == expected, std::string(name) + " reference output/guard word=" + std::to_string(i));
@@ -65,32 +65,32 @@ void reference_store(reference_module& module, image_test_storage& storage, unsi
     constexpr unsigned guards = 16;
     std::vector<uint32_t> input(guards + 32 * 4 + guards, 0xa7b96351);
     for (unsigned i = 0; i < 32 * 4; ++i) input[guards + i] = reference_word(i / 4, i % 4, seed);
-    device_buffer source(input.size() * 4); CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    device_buffer source(input.size() * 4); TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
     auto pointer = source.value + guards * 4; void* args[]{&pointer};
-    CONFORMANCE_CUDA(cuLaunchKernel(module.function("reference_write"), 1, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
-    CONFORMANCE_CUDA(cuCtxSynchronize()); std::vector<uint32_t> preserved(input.size());
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4)); expect_words(preserved, input, "reference stores preserve source and guards");
+    TEST_CUDA(cuLaunchKernel(module.function("reference_write"), 1, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
+    TEST_CUDA(cuCtxSynchronize()); std::vector<uint32_t> preserved(input.size());
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4)); expect_words(preserved, input, "reference stores preserve source and guards");
     for (unsigned i = 0; i < 32 * 4; ++i) std::memcpy(storage.bytes.data() + i * 4, &input[guards + i], 4);
     storage.verify();
 }
 void reference_state(CUtexref texture) {
     for (auto format : {CU_AD_FORMAT_UNSIGNED_INT8, CU_AD_FORMAT_SIGNED_INT16, CU_AD_FORMAT_FLOAT}) for (int channels : {1, 2, 4}) {
-        CONFORMANCE_CUDA(cuTexRefSetFormat(texture, format, channels));
+        TEST_CUDA(cuTexRefSetFormat(texture, format, channels));
         reference_output<CUarray_format> actual; reference_output<int> count;
-        CONFORMANCE_CUDA(cuTexRefGetFormat(&actual.value, &count.value, texture));
+        TEST_CUDA(cuTexRefGetFormat(&actual.value, &count.value, texture));
         require(actual.get() == format && count.get() == channels, "reference format/channel state");
     }
     for (int axis = 0; axis < 3; ++axis) for (auto mode : {CU_TR_ADDRESS_MODE_WRAP, CU_TR_ADDRESS_MODE_MIRROR, CU_TR_ADDRESS_MODE_CLAMP, CU_TR_ADDRESS_MODE_BORDER}) {
-        CONFORMANCE_CUDA(cuTexRefSetAddressMode(texture, axis, mode)); reference_output<CUaddress_mode> actual;
-        CONFORMANCE_CUDA(cuTexRefGetAddressMode(&actual.value, texture, axis)); require(actual.get() == mode, "reference address mode state");
+        TEST_CUDA(cuTexRefSetAddressMode(texture, axis, mode)); reference_output<CUaddress_mode> actual;
+        TEST_CUDA(cuTexRefGetAddressMode(&actual.value, texture, axis)); require(actual.get() == mode, "reference address mode state");
     }
     for (auto filter : {CU_TR_FILTER_MODE_POINT, CU_TR_FILTER_MODE_LINEAR}) {
-        CONFORMANCE_CUDA(cuTexRefSetFilterMode(texture, filter)); reference_output<CUfilter_mode> actual;
-        CONFORMANCE_CUDA(cuTexRefGetFilterMode(&actual.value, texture)); require(actual.get() == filter, "reference filter state");
+        TEST_CUDA(cuTexRefSetFilterMode(texture, filter)); reference_output<CUfilter_mode> actual;
+        TEST_CUDA(cuTexRefGetFilterMode(&actual.value, texture)); require(actual.get() == filter, "reference filter state");
     }
     for (unsigned flags : {0u, unsigned(CU_TRSF_READ_AS_INTEGER), unsigned(CU_TRSF_NORMALIZED_COORDINATES), unsigned(CU_TRSF_READ_AS_INTEGER | CU_TRSF_NORMALIZED_COORDINATES)}) {
-        CONFORMANCE_CUDA(cuTexRefSetFlags(texture, flags)); reference_output<unsigned> actual;
-        CONFORMANCE_CUDA(cuTexRefGetFlags(&actual.value, texture)); require(actual.get() == flags, "reference flags state");
+        TEST_CUDA(cuTexRefSetFlags(texture, flags)); reference_output<unsigned> actual;
+        TEST_CUDA(cuTexRefGetFlags(&actual.value, texture)); require(actual.get() == flags, "reference flags state");
     }
 }
 void reference_validation(reference_module& module, CUtexref texture, CUsurfref surface, const image_test_storage& storage) {
@@ -132,20 +132,20 @@ void reference_probe() {
 .target sm_75
 .address_size 64
 .visible .entry probe(.param .u64 output) { .reg .u64 %out; ld.param.u64 %out,[output]; st.global.u32 [%out],0x19375928; ret; })ptx";
-    CUmodule module{}; CONFORMANCE_CUDA(cuModuleLoadData(&module, probe));
+    CUmodule module{}; TEST_CUDA(cuModuleLoadData(&module, probe));
     struct module_cleanup { CUmodule value; ~module_cleanup() { cuModuleUnload(value); } } cleanup{module};
-    CUfunction function{}; CONFORMANCE_CUDA(cuModuleGetFunction(&function, module, "probe"));
+    CUfunction function{}; TEST_CUDA(cuModuleGetFunction(&function, module, "probe"));
     device_buffer output(4); auto pointer = output.value; void* args[]{&pointer};
-    CONFORMANCE_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr)); CONFORMANCE_CUDA(cuCtxSynchronize());
-    unsigned actual{}; CONFORMANCE_CUDA(cuMemcpyDtoH(&actual, pointer, 4)); require(actual == 0x19375928, "independent reference execution probe");
+    TEST_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr)); TEST_CUDA(cuCtxSynchronize());
+    unsigned actual{}; TEST_CUDA(cuMemcpyDtoH(&actual, pointer, 4)); require(actual == 0x19375928, "independent reference execution probe");
 }
 void reference_discovery() {
     for (auto [name, version] : std::array<std::pair<const char*, int>, 6>{{{"cuModuleGetTexRef", 2000}, {"cuModuleGetSurfRef", 3000},
         {"cuTexRefSetArray", 2000}, {"cuSurfRefSetArray", 3000}, {"cuTexRefGetFlags", 2000}, {"cuTexRefGetFormat", 2000}}}) {
         void* driver{}; CUdriverProcAddressQueryResult query{};
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &driver, version - 1, CU_GET_PROC_ADDRESS_LEGACY_STREAM, &query));
+        TEST_CUDA(cuGetProcAddress(name, &driver, version - 1, CU_GET_PROC_ADDRESS_LEGACY_STREAM, &query));
         require(!driver && query == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "legacy reference introduction boundary");
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &driver, version, CU_GET_PROC_ADDRESS_LEGACY_STREAM, &query));
+        TEST_CUDA(cuGetProcAddress(name, &driver, version, CU_GET_PROC_ADDRESS_LEGACY_STREAM, &query));
         require(driver && query == CU_GET_PROC_ADDRESS_SUCCESS, "legacy reference discovery at introduction");
         void* runtime{}; cudaDriverEntryPointQueryResult other{};
         image_runtime(cudaGetDriverEntryPointByVersion(name, &runtime, version, cudaEnableLegacyStream, &other));
@@ -154,7 +154,7 @@ void reference_discovery() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_conformance(argc, argv, cudavm::reference_discovery);
+    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_test(argc, argv, cudavm::reference_discovery);
     if (argc == 3) { cudavm::reference_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_image_references, 0, cudavm::reference_probe);
+    return cudavm::run_test(argc, argv, cudavm::execute_image_references, 0, cudavm::reference_probe);
 }

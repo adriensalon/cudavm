@@ -247,8 +247,8 @@ void execute_program_image_validation() {
 int main(int argc, char** argv) {
     if (argc == 2) {
         cudavm::program_image_validation_case = argv[1];
-        return cudavm::run_host_conformance(argc, argv, cudavm::program_image_validation_host);
+        return cudavm::run_host_test(argc, argv, cudavm::program_image_validation_host);
     }
     if (argc == 3) { cudavm::program_image_validation_case = argv[2]; argc = 2; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_program_image_validation, 0, cudavm::probe_execution);
+    return cudavm::run_test(argc, argv, cudavm::execute_program_image_validation, 0, cudavm::probe_execution);
 }

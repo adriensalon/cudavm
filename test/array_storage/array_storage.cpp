@@ -80,7 +80,7 @@ struct stored_array {
     }
     void destroy() {
         if (runtime) ARRAY_RUNTIME(cudaFreeArray(reinterpret_cast<cudaArray_t>(value)));
-        else CONFORMANCE_CUDA(cuArrayDestroy(value));
+        else TEST_CUDA(cuArrayDestroy(value));
         value = nullptr;
     }
 };
@@ -100,13 +100,13 @@ void create_stored_array(stored_array& array, const CUDA_ARRAY3D_DESCRIPTOR& des
     } else if (legacy) {
         CUDA_ARRAY_DESCRIPTOR request{descriptor.Width, descriptor.Height, descriptor.Format, descriptor.NumChannels};
         CUarray value{};
-        CONFORMANCE_CUDA(cuArrayCreate(&value, &request));
+        TEST_CUDA(cuArrayCreate(&value, &request));
         array.value = value;
         request = {};
     } else {
         auto request = descriptor;
         CUarray value{};
-        CONFORMANCE_CUDA(cuArray3DCreate(&value, &request));
+        TEST_CUDA(cuArray3DCreate(&value, &request));
         array.value = value;
         request = {};
     }
@@ -115,14 +115,14 @@ void create_stored_array(stored_array& array, const CUDA_ARRAY3D_DESCRIPTOR& des
 
 void verify_driver_array_descriptors(CUarray array, const CUDA_ARRAY3D_DESCRIPTOR& expected) {
     CUDA_ARRAY3D_DESCRIPTOR actual{};
-    CONFORMANCE_CUDA(cuArray3DGetDescriptor(&actual, array));
+    TEST_CUDA(cuArray3DGetDescriptor(&actual, array));
     require(actual.Width == expected.Width && actual.Height == expected.Height && actual.Depth == expected.Depth,
         "3D descriptor preserves logical extents, including zeros and unit dimensions");
     require(actual.Format == expected.Format && actual.NumChannels == expected.NumChannels
         && actual.Flags == expected.Flags, "Driver format, channel count and flags");
     if (!expected.Depth) {
         CUDA_ARRAY_DESCRIPTOR legacy{};
-        CONFORMANCE_CUDA(cuArrayGetDescriptor(&legacy, array));
+        TEST_CUDA(cuArrayGetDescriptor(&legacy, array));
         require(legacy.Width == expected.Width && legacy.Height == expected.Height
             && legacy.Format == expected.Format && legacy.NumChannels == expected.NumChannels,
             "legacy descriptor agreement");
@@ -183,7 +183,7 @@ void transfer_array_storage(CUarray array, const CUDA_ARRAY3D_DESCRIPTOR& descri
             copy.dstPitch = pitch; copy.dstHeight = slice_height;
         }
         copy.WidthInBytes = row_bytes; copy.Height = height; copy.Depth = depth;
-        CONFORMANCE_CUDA(cuMemcpy3D(&copy));
+        TEST_CUDA(cuMemcpy3D(&copy));
     }
     for (size_t i = 0; i < expected.size(); ++i)
         if (host[i] != expected[i])
@@ -242,7 +242,7 @@ void reject_array_descriptor(const CUDA_ARRAY3D_DESCRIPTOR& descriptor, bool leg
     CUarray rejected{};
     CUDA_ARRAY_DESCRIPTOR request{descriptor.Width, descriptor.Height, descriptor.Format, descriptor.NumChannels};
     const auto status = legacy ? cuArrayCreate(&rejected, &request) : cuArray3DCreate(&rejected, &descriptor);
-    if (status == CUDA_SUCCESS) CONFORMANCE_CUDA(cuArrayDestroy(rejected));
+    if (status == CUDA_SUCCESS) TEST_CUDA(cuArrayDestroy(rejected));
     require(status == CUDA_ERROR_INVALID_VALUE, "invalid Driver array descriptor format="
         + std::to_string(unsigned(descriptor.Format)) + " channels=" + std::to_string(descriptor.NumChannels)
         + " flags=" + std::to_string(descriptor.Flags) + ": status=" + std::to_string(status));
@@ -332,7 +332,7 @@ void encoded_array_storage() {
                         copy.dstPitch = pitch; copy.dstHeight = slice_height;
                     }
                     copy.WidthInBytes = row_bytes; copy.Height = rows; copy.Depth = depth;
-                    CONFORMANCE_CUDA(cuMemcpy3D(&copy));
+                    TEST_CUDA(cuMemcpy3D(&copy));
                 } else {
                     cudaMemcpy3DParms copy{};
                     const cudaPitchedPtr pointer{host + 16, pitch, row_bytes, slice_height};
@@ -452,7 +452,7 @@ void array_validation() {
     require(cuArray3DGetDescriptor(&invalid_3d, nullptr) == CUDA_ERROR_INVALID_HANDLE, "null 3D array handle");
     require(cuArrayDestroy(nullptr) == CUDA_ERROR_INVALID_HANDLE, "null destruction handle");
     CUdevice device{};
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuCtxGetDevice(&device));
     CUDA_ARRAY_MEMORY_REQUIREMENTS requirements{};
     require(cuArrayGetMemoryRequirements(&requirements, array.value, device) == CUDA_ERROR_INVALID_VALUE,
         "ordinary arrays have no deferred-mapping memory requirements");
@@ -472,7 +472,7 @@ struct array_host_storage {
     unsigned char* value{};
     explicit array_host_storage(size_t bytes) {
         void* pointer{};
-        CONFORMANCE_CUDA(cuMemAllocHost(&pointer, bytes));
+        TEST_CUDA(cuMemAllocHost(&pointer, bytes));
         value = static_cast<unsigned char*>(pointer);
     }
     ~array_host_storage() { if (value) cuMemFreeHost(value); }
@@ -481,7 +481,7 @@ struct array_host_storage {
 };
 struct array_transfer_stream {
     CUstream value{};
-    array_transfer_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    array_transfer_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~array_transfer_stream() { if (value) cuStreamDestroy(value); }
     array_transfer_stream(const array_transfer_stream&) = delete;
     array_transfer_stream& operator=(const array_transfer_stream&) = delete;
@@ -511,14 +511,14 @@ void queued_array_retirement() {
             download.dstMemoryType = CU_MEMORYTYPE_HOST; download.dstHost = output.value + 16;
             download.dstPitch = row_bytes; download.dstHeight = 3;
             download.WidthInBytes = row_bytes; download.Height = 3; download.Depth = 2;
-            CONFORMANCE_CUDA(cuMemcpy3DAsync(&download, stream.value));
+            TEST_CUDA(cuMemcpy3DAsync(&download, stream.value));
         } else {
             CUDA_MEMCPY3D upload{};
             upload.srcMemoryType = CU_MEMORYTYPE_HOST; upload.srcHost = source.value + 16;
             upload.srcPitch = row_bytes; upload.srcHeight = 3;
             upload.dstMemoryType = CU_MEMORYTYPE_ARRAY; upload.dstArray = array.value;
             upload.WidthInBytes = row_bytes; upload.Height = 3; upload.Depth = 2;
-            CONFORMANCE_CUDA(cuMemcpy3DAsync(&upload, stream.value));
+            TEST_CUDA(cuMemcpy3DAsync(&upload, stream.value));
             cudaMemcpy3DParms download{};
             download.srcArray = reinterpret_cast<cudaArray_t>(array.value);
             download.dstPtr = {output.value + 16, row_bytes, row_bytes, 3};
@@ -528,22 +528,22 @@ void queued_array_retirement() {
         // No stream/context synchronization precedes retirement. Observe the
         // accepted transfers only after the stream's defined completion point.
         array.destroy();
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+        TEST_CUDA(cuStreamSynchronize(stream.value));
         require(std::equal(expected.begin(), expected.end(), output.value), "queued array retirement preserves readback and guards");
         require(std::equal(expected.begin(), expected.end(), source.value), "queued array upload preserves source and guards");
-        CONFORMANCE_CUDA(cuStreamDestroy(stream.value)); stream.value = nullptr;
-        CONFORMANCE_CUDA(cuMemFreeHost(source.value)); source.value = nullptr;
-        CONFORMANCE_CUDA(cuMemFreeHost(output.value)); output.value = nullptr;
+        TEST_CUDA(cuStreamDestroy(stream.value)); stream.value = nullptr;
+        TEST_CUDA(cuMemFreeHost(source.value)); source.value = nullptr;
+        TEST_CUDA(cuMemFreeHost(output.value)); output.value = nullptr;
     }
 }
 
 struct array_test_context {
     CUcontext previous{}, value{};
     array_test_context() {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&previous));
+        TEST_CUDA(cuCtxGetCurrent(&previous));
         CUdevice device{};
-        CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-        CONFORMANCE_CUDA(cuCtxCreate(&value, nullptr, 0, device));
+        TEST_CUDA(cuCtxGetDevice(&device));
+        TEST_CUDA(cuCtxCreate(&value, nullptr, 0, device));
     }
     ~array_test_context() {
         if (value) cuCtxDestroy(value);
@@ -552,8 +552,8 @@ struct array_test_context {
     array_test_context(const array_test_context&) = delete;
     array_test_context& operator=(const array_test_context&) = delete;
     void destroy() {
-        CONFORMANCE_CUDA(cuCtxDestroy(value)); value = nullptr;
-        CONFORMANCE_CUDA(cuCtxSetCurrent(previous));
+        TEST_CUDA(cuCtxDestroy(value)); value = nullptr;
+        TEST_CUDA(cuCtxSetCurrent(previous));
     }
 };
 void context_array_retirement() {
@@ -628,7 +628,7 @@ void planar_array_storage() {
             stored_array parent;
             create_stored_array(parent, descriptor, channel, legacy, runtime);
             CUDA_ARRAY3D_DESCRIPTOR actual{};
-            CONFORMANCE_CUDA(cuArray3DGetDescriptor(&actual, parent.value));
+            TEST_CUDA(cuArray3DGetDescriptor(&actual, parent.value));
             require(actual.Width == 16 && actual.Height == 12 && actual.Depth == layers
                 && actual.Format == format.format && actual.NumChannels == 3 && actual.Flags == flags,
                 "parent planar descriptor");
@@ -636,7 +636,7 @@ void planar_array_storage() {
             std::vector<CUarray> planes;
             for (unsigned plane = 0; plane < format.planes; ++plane) {
                 CUarray handle{};
-                CONFORMANCE_CUDA(cuArrayGetPlane(&handle, parent.value, plane));
+                TEST_CUDA(cuArrayGetPlane(&handle, parent.value, plane));
                 planes.push_back(handle);
                 cudaArray_t runtime_handle{};
                 ARRAY_RUNTIME(cudaArrayGetPlane(&runtime_handle, reinterpret_cast<cudaArray_t>(parent.value), plane));
@@ -652,7 +652,7 @@ void planar_array_storage() {
             // Read all planes again after every neighbor has been updated.
             for (unsigned plane = 0; plane < planes.size(); ++plane) {
                 CUDA_ARRAY3D_DESCRIPTOR expected{};
-                CONFORMANCE_CUDA(cuArray3DGetDescriptor(&expected, planes[plane]));
+                TEST_CUDA(cuArray3DGetDescriptor(&expected, planes[plane]));
                 transfer_array_storage(planes[plane], expected, format.bytes, 20 + plane, false, false);
             }
             CUarray rejected{};
@@ -684,10 +684,10 @@ void deferred_array_storage_contract() {
         create_stored_array(array, descriptor, channel, false, runtime);
         verify_array_descriptors(array.value, descriptor, channel);
         CUdevice device{};
-        CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+        TEST_CUDA(cuCtxGetDevice(&device));
         CUDA_ARRAY_MEMORY_REQUIREMENTS first{}, again{};
-        CONFORMANCE_CUDA(cuArrayGetMemoryRequirements(&first, array.value, device));
-        CONFORMANCE_CUDA(cuArrayGetMemoryRequirements(&again, array.value, device));
+        TEST_CUDA(cuArrayGetMemoryRequirements(&first, array.value, device));
+        TEST_CUDA(cuArrayGetMemoryRequirements(&again, array.value, device));
         require(first.size >= payload && first.alignment && (first.alignment & (first.alignment - 1)) == 0
             && first.size % first.alignment == 0, "deferred allocation size and mapping alignment");
         require(first.size == again.size && first.alignment == again.alignment, "stable deferred memory requirements");
@@ -735,15 +735,15 @@ void mipmap_memory_requirements() {
         const CUDA_ARRAY3D_DESCRIPTOR descriptor{16,8,0,CU_AD_FORMAT_UNSIGNED_INT16,2,
             deferred ? CUDA_ARRAY3D_DEFERRED_MAPPING : 0u};
         CUmipmappedArray parent{};
-        CONFORMANCE_CUDA(cuMipmappedArrayCreate(&parent, &descriptor, 4));
+        TEST_CUDA(cuMipmappedArrayCreate(&parent, &descriptor, 4));
         try {
             CUdevice device{};
-            CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+            TEST_CUDA(cuCtxGetDevice(&device));
             CUDA_ARRAY_MEMORY_REQUIREMENTS requirements{};
             const auto status = cuMipmappedArrayGetMemoryRequirements(&requirements, parent, device);
             if (!deferred) require(status == CUDA_ERROR_INVALID_VALUE, "ordinary mipmap has no deferred requirements");
             else {
-                CONFORMANCE_CUDA(status);
+                TEST_CUDA(status);
                 const size_t payload = (16 * 8 + 8 * 4 + 4 * 2 + 2 * 1) * 4;
                 require(requirements.size >= payload && requirements.alignment
                     && !(requirements.alignment & (requirements.alignment - 1))
@@ -756,7 +756,7 @@ void mipmap_memory_requirements() {
                 require(actual.size == requirements.size && actual.alignment == requirements.alignment,
                     "Runtime whole-mipmap requirements agreement");
             }
-            CONFORMANCE_CUDA(cuMipmappedArrayDestroy(parent)); parent = nullptr;
+            TEST_CUDA(cuMipmappedArrayDestroy(parent)); parent = nullptr;
         } catch (...) {
             if (parent) cuMipmappedArrayDestroy(parent);
             throw;
@@ -780,9 +780,9 @@ void array_usage_flags() {
         array.destroy();
     }
     CUdevice device{};
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuCtxGetDevice(&device));
     int sparse = 0;
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&sparse, CU_DEVICE_ATTRIBUTE_SPARSE_CUDA_ARRAY_SUPPORTED, device));
+    TEST_CUDA(cuDeviceGetAttribute(&sparse, CU_DEVICE_ATTRIBUTE_SPARSE_CUDA_ARRAY_SUPPORTED, device));
     const CUDA_ARRAY3D_DESCRIPTOR descriptor{64,64,0,CU_AD_FORMAT_UNSIGNED_INT8,1,CUDA_ARRAY3D_SPARSE};
     for (unsigned api : {0u,1u,2u}) {
         stored_array array;
@@ -795,7 +795,7 @@ void array_usage_flags() {
                 require(status == CUDA_ERROR_NOT_SUPPORTED, "Driver sparse admission must match endpoint capability");
                 continue;
             }
-            CONFORMANCE_CUDA(status);
+            TEST_CUDA(status);
         } else {
             cudaArray_t candidate{};
             const auto channel = array_channel(array_formats[0], 1);
@@ -810,7 +810,7 @@ void array_usage_flags() {
         }
         verify_array_descriptors(array.value, descriptor, array_channel(array_formats[0], 1));
         CUDA_ARRAY_SPARSE_PROPERTIES properties{};
-        CONFORMANCE_CUDA(cuArrayGetSparseProperties(&properties, array.value));
+        TEST_CUDA(cuArrayGetSparseProperties(&properties, array.value));
         require(properties.tileExtent.width && properties.tileExtent.height && properties.tileExtent.depth
             && properties.miptailFirstLevel == 0
             && !(properties.flags & ~CU_ARRAY_SPARSE_PROPERTIES_SINGLE_MIPTAIL), "sparse allocation layout properties");
@@ -847,10 +847,10 @@ void array_limit_boundaries() {
         {CUDA_ARRAY3D_SURFACE_LDST|CUDA_ARRAY3D_CUBEMAP|CUDA_ARRAY3D_LAYERED,2,CU_DEVICE_ATTRIBUTE_MAXIMUM_SURFACECUBEMAP_LAYERED_WIDTH,{},CU_DEVICE_ATTRIBUTE_MAXIMUM_SURFACECUBEMAP_LAYERED_LAYERS}
     };
     CUdevice device{};
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuCtxGetDevice(&device));
     auto maximum = [&](CUdevice_attribute attribute) {
         int result = 0;
-        CONFORMANCE_CUDA(cuDeviceGetAttribute(&result, attribute, device));
+        TEST_CUDA(cuDeviceGetAttribute(&result, attribute, device));
         require(result > 0, "array allocation limit must admit its array shape");
         return size_t(result);
     };
@@ -893,7 +893,7 @@ void planar_array_retirement() {
         stored_array parent;
         create_stored_array(parent, descriptor, {8,8,8,0,cudaChannelFormatKindNV12}, false, runtime);
         CUarray luma{};
-        CONFORMANCE_CUDA(cuArrayGetPlane(&luma, parent.value, 0));
+        TEST_CUDA(cuArrayGetPlane(&luma, parent.value, 0));
         transfer_array_storage(luma, {16,12,0,CU_AD_FORMAT_UNSIGNED_INT8,1,0}, 1, 51, true, runtime);
         std::vector<unsigned char> expected(16 * 12 + 32, array_guard);
         for (size_t y = 0; y < 12; ++y) for (size_t x = 0; x < 16; ++x)
@@ -905,14 +905,14 @@ void planar_array_retirement() {
         copy.srcMemoryType = CU_MEMORYTYPE_ARRAY; copy.srcArray = luma;
         copy.dstMemoryType = CU_MEMORYTYPE_HOST; copy.dstHost = output.value + 16; copy.dstPitch = 16;
         copy.WidthInBytes = 16; copy.Height = 12;
-        CONFORMANCE_CUDA(cuMemcpy2DAsync(&copy, stream.value));
+        TEST_CUDA(cuMemcpy2DAsync(&copy, stream.value));
         parent.destroy();
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+        TEST_CUDA(cuStreamSynchronize(stream.value));
         require(std::equal(expected.begin(), expected.end(), output.value), "parent retirement retains queued plane storage");
         CUDA_ARRAY3D_DESCRIPTOR retired{};
         require(cuArray3DGetDescriptor(&retired, luma) == CUDA_ERROR_INVALID_HANDLE, "queued plane retirement invalidates handle");
-        CONFORMANCE_CUDA(cuStreamDestroy(stream.value)); stream.value = nullptr;
-        CONFORMANCE_CUDA(cuMemFreeHost(output.value)); output.value = nullptr;
+        TEST_CUDA(cuStreamDestroy(stream.value)); stream.value = nullptr;
+        TEST_CUDA(cuMemFreeHost(output.value)); output.value = nullptr;
     }
 }
 std::string_view array_storage_group = "all";
@@ -947,5 +947,5 @@ int main(int argc, char** argv) {
         cudavm::array_storage_group = argv[2];
         --argc;
     }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_array_storage);
+    return cudavm::run_test(argc, argv, cudavm::execute_array_storage);
 }

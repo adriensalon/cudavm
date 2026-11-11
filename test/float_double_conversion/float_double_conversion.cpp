@@ -72,5 +72,5 @@ void execute_float_double_conversion(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_float_double_conversion);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_float_double_conversion);
 }

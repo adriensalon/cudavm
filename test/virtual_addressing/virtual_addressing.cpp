@@ -8,13 +8,13 @@ CUmemAllocationProp virtual_properties() {
     CUmemAllocationProp properties{};
     properties.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     properties.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    CONFORMANCE_CUDA(cuCtxGetDevice(&properties.location.id));
+    TEST_CUDA(cuCtxGetDevice(&properties.location.id));
     return properties;
 }
 size_t virtual_granularity(CUmemAllocationGranularity_flags option) {
     struct { uint64_t before = 0x19375928abcdef01; size_t value = 0; uint64_t after = 0xfedcba0129183745; } output;
     const auto properties = virtual_properties();
-    CONFORMANCE_CUDA(cuMemGetAllocationGranularity(&output.value, &properties, option));
+    TEST_CUDA(cuMemGetAllocationGranularity(&output.value, &properties, option));
     require(output.before == 0x19375928abcdef01 && output.after == 0xfedcba0129183745, "allocation granularity exact output width");
     require(output.value > 0 && !(output.value & (output.value - 1)), "allocation granularity is a positive power of two");
     return output.value;
@@ -24,14 +24,14 @@ struct virtual_range {
     size_t size;
     virtual_range(size_t bytes, size_t alignment = 0, CUdeviceptr hint = 0) : size(bytes) {
         struct { CUdeviceptr before = 0x123456789abcdef0, value = 0, after = 0xfedcba9876543210; } output;
-        CONFORMANCE_CUDA(cuMemAddressReserve(&output.value, size, alignment, hint, 0));
+        TEST_CUDA(cuMemAddressReserve(&output.value, size, alignment, hint, 0));
         require(output.before == 0x123456789abcdef0 && output.after == 0xfedcba9876543210, "reservation exact output width");
         value = output.value;
         require(value && size <= std::numeric_limits<CUdeviceptr>::max() - value, "reservation nonoverflowing extent");
         require(!alignment || value % alignment == 0, "reservation requested alignment");
     }
     ~virtual_range() { if (value) cuMemAddressFree(value, size); }
-    void close() { CONFORMANCE_CUDA(cuMemAddressFree(value, size)); value = 0; }
+    void close() { TEST_CUDA(cuMemAddressFree(value, size)); value = 0; }
 };
 void virtual_granularities() {
     const auto minimum = virtual_granularity(CU_MEM_ALLOC_GRANULARITY_MINIMUM);
@@ -79,8 +79,8 @@ void virtual_validation() {
 }
 void execute_virtual_addressing() {
     CUdevice device{}; int supported = 0;
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device));
+    TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device));
     require_capability(supported != 0, "virtual addressing requires advertised virtual-memory management");
     if (virtual_case == "granularity") virtual_granularities();
     else if (virtual_case == "reservations") virtual_reservations();
@@ -90,5 +90,5 @@ void execute_virtual_addressing() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::virtual_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_virtual_addressing);
+    return cudavm::run_test(argc, argv, cudavm::execute_virtual_addressing);
 }

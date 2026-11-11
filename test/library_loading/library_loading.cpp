@@ -26,17 +26,17 @@ template<class T> struct library_loading_output {
 };
 struct library_loading_restore {
     CUcontext value{};
-    library_loading_restore() { CONFORMANCE_CUDA(cuCtxGetCurrent(&value)); }
+    library_loading_restore() { TEST_CUDA(cuCtxGetCurrent(&value)); }
     ~library_loading_restore() { cuCtxSetCurrent(value); }
 };
 void library_loading_current(CUcontext expected) {
-    library_loading_output<CUcontext> output; CONFORMANCE_CUDA(cuCtxGetCurrent(&output.value));
+    library_loading_output<CUcontext> output; TEST_CUDA(cuCtxGetCurrent(&output.value));
     require(output.get() == expected, "library operation preserves public current context");
 }
 struct library_loading_context {
     CUcontext value{}, previous{};
     explicit library_loading_context(CUdevice device) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&previous)); CONFORMANCE_CUDA(cuCtxCreate(&value, nullptr, 0, device));
+        TEST_CUDA(cuCtxGetCurrent(&previous)); TEST_CUDA(cuCtxCreate(&value, nullptr, 0, device));
     }
     ~library_loading_context() { if (value) { cuCtxSetCurrent(value); cuCtxDestroy(value); cuCtxSetCurrent(previous); } }
     library_loading_context(const library_loading_context&) = delete;
@@ -72,10 +72,10 @@ struct library_loading_program {
         if (file) {
             library_loading_file input(bytes); auto path = input.path.string();
             if (runtime) library_loading_runtime(cudaLibraryLoadFromFile(&runtime_output.value, path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
-            else CONFORMANCE_CUDA(cuLibraryLoadFromFile(&output.value, path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+            else TEST_CUDA(cuLibraryLoadFromFile(&output.value, path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
             std::fill(path.begin(), path.end(), '!'); require(std::filesystem::remove(input.path), "retire library file before lookup");
         } else if (runtime) library_loading_runtime(cudaLibraryLoadData(&runtime_output.value, bytes.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
-        else CONFORMANCE_CUDA(cuLibraryLoadData(&output.value, bytes.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+        else TEST_CUDA(cuLibraryLoadData(&output.value, bytes.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
         value = runtime ? reinterpret_cast<CUlibrary>(runtime_output.get()) : output.get();
         require(value != nullptr, "library load publishes guarded handle"); std::fill(bytes.begin(), bytes.end(), 0x57);
     }
@@ -84,26 +84,26 @@ struct library_loading_program {
     cudaLibrary_t runtime_value() const { return reinterpret_cast<cudaLibrary_t>(value); }
     CUkernel kernel(const char* name) const {
         library_loading_output<CUkernel> first; library_loading_output<cudaKernel_t> second;
-        CONFORMANCE_CUDA(cuLibraryGetKernel(&first.value, value, name));
+        TEST_CUDA(cuLibraryGetKernel(&first.value, value, name));
         library_loading_runtime(cudaLibraryGetKernel(&second.value, runtime_value(), name));
         require(first.get() && first.value == reinterpret_cast<CUkernel>(second.get()), "Driver/Runtime library kernel identity agrees"); return first.value;
     }
     CUdeviceptr global(const char* name) const {
         library_loading_output<CUdeviceptr> pointer; library_loading_output<size_t> size, runtime_size;
         library_loading_output<void*> runtime_pointer;
-        CONFORMANCE_CUDA(cuLibraryGetGlobal(&pointer.value, &size.value, value, name));
+        TEST_CUDA(cuLibraryGetGlobal(&pointer.value, &size.value, value, name));
         library_loading_runtime(cudaLibraryGetGlobal(&runtime_pointer.value, &runtime_size.value, runtime_value(), name));
         require(pointer.get() && size.get() == 4 && runtime_size.get() == 4
             && pointer.value == uintptr_t(runtime_pointer.get()), "Driver/Runtime library global address and extent agree"); return pointer.value;
     }
     void close() {
-        if (runtime) library_loading_runtime(cudaLibraryUnload(runtime_value())); else CONFORMANCE_CUDA(cuLibraryUnload(value));
+        if (runtime) library_loading_runtime(cudaLibraryUnload(runtime_value())); else TEST_CUDA(cuLibraryUnload(value));
         value = nullptr;
     }
 };
 void library_loading_metadata(const library_loading_program& program) {
     library_loading_output<unsigned> count, runtime_count;
-    CONFORMANCE_CUDA(cuLibraryGetKernelCount(&count.value, program.value));
+    TEST_CUDA(cuLibraryGetKernelCount(&count.value, program.value));
     library_loading_runtime(cudaLibraryGetKernelCount(&runtime_count.value, program.runtime_value()));
     require(count.get() == 2 && runtime_count.get() == 2, "both library inventories match the two declared kernels");
     const auto alpha = program.kernel("module_alpha"), beta = program.kernel("module_beta");
@@ -112,7 +112,7 @@ void library_loading_metadata(const library_loading_program& program) {
         library_loading_output<std::array<CUkernel, 3>> output;
         library_loading_output<std::array<cudaKernel_t, 3>> runtime_output;
         if (runtime) library_loading_runtime(cudaLibraryEnumerateKernels(runtime_output.value.data(), capacity, program.runtime_value()));
-        else CONFORMANCE_CUDA(cuLibraryEnumerateKernels(output.value.data(), capacity, program.value));
+        else TEST_CUDA(cuLibraryEnumerateKernels(output.value.data(), capacity, program.value));
         auto values = output.get(); const auto runtime_values = runtime_output.get();
         if (runtime) std::transform(runtime_values.begin(), runtime_values.end(), values.begin(), [](auto kernel) { return reinterpret_cast<CUkernel>(kernel); });
         for (unsigned i = 0; i < values.size(); ++i)
@@ -122,13 +122,13 @@ void library_loading_metadata(const library_loading_program& program) {
     }
     for (const auto& [kernel, name] : std::array<std::pair<CUkernel, const char*>, 2>{{{alpha, "module_alpha"}, {beta, "module_beta"}}}) {
         library_loading_output<CUlibrary> owner; library_loading_output<const char*> text;
-        CONFORMANCE_CUDA(cuKernelGetLibrary(&owner.value, kernel)); CONFORMANCE_CUDA(cuKernelGetName(&text.value, kernel));
+        TEST_CUDA(cuKernelGetLibrary(&owner.value, kernel)); TEST_CUDA(cuKernelGetName(&text.value, kernel));
         require(owner.get() == program.value && text.get() && std::string_view(text.value) == name, "contextless kernel name and parent library");
-        library_loading_output<size_t> parameters; CONFORMANCE_CUDA(cuKernelGetParamCount(kernel, &parameters.value));
+        library_loading_output<size_t> parameters; TEST_CUDA(cuKernelGetParamCount(kernel, &parameters.value));
         require(parameters.get() == 3, "library declared parameter count");
         for (size_t index = 0; index < 3; ++index) {
             library_loading_output<size_t> offset, bytes;
-            CONFORMANCE_CUDA(cuKernelGetParamInfo(kernel, index, &offset.value, &bytes.value));
+            TEST_CUDA(cuKernelGetParamInfo(kernel, index, &offset.value, &bytes.value));
             require(offset.get() == index * 8 && bytes.get() == (index < 2 ? 8u : 4u), "library parameter metadata agrees with independent ABI");
         }
     }
@@ -137,36 +137,36 @@ void library_loading_execute(const library_loading_program& program, uint32_t ex
     constexpr uint32_t guard = 0xa95b371d; constexpr unsigned capacity = 41, guards = 9;
     const auto seed_address = program.global("module_seed"), bias_address = program.global("module_bias");
     std::array<uint32_t, 3> seed{guard, guard, guard}, bias{guard, guard, guard};
-    CONFORMANCE_CUDA(cuMemcpyDtoH(seed.data() + 1, seed_address, 4)); CONFORMANCE_CUDA(cuMemcpyDtoH(bias.data() + 1, bias_address, 4));
+    TEST_CUDA(cuMemcpyDtoH(seed.data() + 1, seed_address, 4)); TEST_CUDA(cuMemcpyDtoH(bias.data() + 1, bias_address, 4));
     require(seed == std::array<uint32_t, 3>{guard, expected_seed, guard} && bias == std::array<uint32_t, 3>{guard, 29, guard},
         "library context storage and host guards");
     std::vector<uint32_t> input(capacity + guards * 2, guard), expected(input.size()), actual(input.size()), preserved(input.size());
     constexpr std::array<uint32_t, 4> edges{0, 0xffffffff, 0x80000000, 0x7fffffff};
     for (unsigned i = 0; i < capacity; ++i) input[guards + i] = i < edges.size() ? edges[i] : i * 0x193759bdu;
     device_buffer source(input.size() * 4), output(input.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
     auto in = source.value + guards * 4, out = output.value + guards * 4;
     struct stream_owner { CUstream value{}; ~stream_owner() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } } } stream;
-    CONFORMANCE_CUDA(cuStreamCreate(&stream.value, CU_STREAM_NON_BLOCKING));
+    TEST_CUDA(cuStreamCreate(&stream.value, CU_STREAM_NON_BLOCKING));
     library_loading_restore restore;
     for (bool beta : {false, true}) for (bool runtime : {false, true}) for (unsigned count : {0u, 1u, 33u, capacity}) {
         std::fill(expected.begin(), expected.end(), guard);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
         const auto kernel = program.kernel(beta ? "module_beta" : "module_alpha");
         void* parameters[]{&out, &in, &count};
-        if (no_current) CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr));
+        if (no_current) TEST_CUDA(cuCtxSetCurrent(nullptr));
         if (runtime) library_loading_runtime(cudaLaunchKernel(reinterpret_cast<const void*>(kernel), dim3(2), dim3(31), parameters, 0, reinterpret_cast<cudaStream_t>(stream.value)));
-        else CONFORMANCE_CUDA(cuLaunchKernel(reinterpret_cast<CUfunction>(kernel), 2, 1, 1, 31, 1, 1, 0, stream.value, parameters, nullptr));
+        else TEST_CUDA(cuLaunchKernel(reinterpret_cast<CUfunction>(kernel), 2, 1, 1, 31, 1, 1, 0, stream.value, parameters, nullptr));
         library_loading_current(no_current ? nullptr : restore.value);
-        if (no_current) CONFORMANCE_CUDA(cuCtxSetCurrent(restore.value));
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+        if (no_current) TEST_CUDA(cuCtxSetCurrent(restore.value));
+        TEST_CUDA(cuStreamSynchronize(stream.value));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
         for (unsigned i = 0; i < count; ++i) expected[guards + i] = module_boundary_expected(beta, input[guards + i], expected_seed, i);
         expect_words(actual, expected, "library public launches and entire guarded output");
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "library launches preserve all input bytes");
     }
-    CONFORMANCE_CUDA(cuMemcpyDtoH(seed.data() + 1, seed_address, 4)); CONFORMANCE_CUDA(cuMemcpyDtoH(bias.data() + 1, bias_address, 4));
+    TEST_CUDA(cuMemcpyDtoH(seed.data() + 1, seed_address, 4)); TEST_CUDA(cuMemcpyDtoH(bias.data() + 1, bias_address, 4));
     require(seed == std::array<uint32_t, 3>{guard, expected_seed, guard} && bias == std::array<uint32_t, 3>{guard, 29, guard},
         "library launches preserve context storage and host guards");
 }
@@ -174,13 +174,13 @@ void library_loading_contexts(const library_loading_program& program, CUdevice d
     library_loading_restore restore;
     const auto kernel = program.kernel("module_alpha"); const auto first_seed = program.global("module_seed");
     library_loading_output<CUmodule> first_module; library_loading_output<CUfunction> first_function;
-    CONFORMANCE_CUDA(cuLibraryGetModule(&first_module.value, program.value)); CONFORMANCE_CUDA(cuKernelGetFunction(&first_function.value, kernel));
-    first_module.get(); first_function.get(); uint32_t value = 71; CONFORMANCE_CUDA(cuMemcpyHtoD(first_seed, &value, 4));
+    TEST_CUDA(cuLibraryGetModule(&first_module.value, program.value)); TEST_CUDA(cuKernelGetFunction(&first_function.value, kernel));
+    first_module.get(); first_function.get(); uint32_t value = 71; TEST_CUDA(cuMemcpyHtoD(first_seed, &value, 4));
     {
         library_loading_context second(device); library_loading_output<CUmodule> module; library_loading_output<CUfunction> function;
-        CONFORMANCE_CUDA(cuLibraryGetModule(&module.value, program.value)); CONFORMANCE_CUDA(cuKernelGetFunction(&function.value, kernel));
+        TEST_CUDA(cuLibraryGetModule(&module.value, program.value)); TEST_CUDA(cuKernelGetFunction(&function.value, kernel));
         require(module.get() != first_module.value && function.get() != first_function.value, "simultaneous contexts own distinct module/function bindings");
-        CUfunction alias{}; CONFORMANCE_CUDA(cuModuleGetFunction(&alias, module.value, "module_alpha"));
+        CUfunction alias{}; TEST_CUDA(cuModuleGetFunction(&alias, module.value, "module_alpha"));
         require(alias == function.value && kernel == program.kernel("module_alpha"), "contextless identity selects its context's bound function");
         require(cuModuleUnload(module.value) == CUDA_ERROR_NOT_PERMITTED, "borrowed library module cannot be unloaded directly");
         library_loading_execute(program);
@@ -193,19 +193,19 @@ void library_loading_contexts(const library_loading_program& program, CUdevice d
     library_loading_current(restore.value); library_loading_execute(program, 71);
 }
 int library_loading_dynamic(CUfunction function) {
-    library_loading_output<int> output; CONFORMANCE_CUDA(cuFuncGetAttribute(&output.value, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, function)); return output.get();
+    library_loading_output<int> output; TEST_CUDA(cuFuncGetAttribute(&output.value, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, function)); return output.get();
 }
 void library_loading_resources(const library_loading_program& program, CUdevice device) {
     const auto kernel = program.kernel("module_alpha");
-    CONFORMANCE_CUDA(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 64, kernel, device));
-    CUfunction first{}; CONFORMANCE_CUDA(cuKernelGetFunction(&first, kernel)); require(library_loading_dynamic(first) == 64, "device-wide setting reaches current binding");
-    CONFORMANCE_CUDA(cuFuncSetAttribute(first, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 128));
+    TEST_CUDA(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 64, kernel, device));
+    CUfunction first{}; TEST_CUDA(cuKernelGetFunction(&first, kernel)); require(library_loading_dynamic(first) == 64, "device-wide setting reaches current binding");
+    TEST_CUDA(cuFuncSetAttribute(first, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 128));
     library_loading_runtime(cudaKernelSetAttributeForDevice(reinterpret_cast<cudaKernel_t>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, 96, device));
     require(library_loading_dynamic(first) == 128, "local function setting survives a later Runtime device-wide update");
     {
-        library_loading_context second(device); CUfunction function{}; CONFORMANCE_CUDA(cuKernelGetFunction(&function, kernel));
+        library_loading_context second(device); CUfunction function{}; TEST_CUDA(cuKernelGetFunction(&function, kernel));
         require(library_loading_dynamic(function) == 96, "device-wide setting reaches a future context binding");
-        CONFORMANCE_CUDA(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 80, kernel, device));
+        TEST_CUDA(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 80, kernel, device));
         require(library_loading_dynamic(function) == 80, "device-wide setting updates existing binding without override");
         library_loading_execute(program);
     }
@@ -227,16 +227,16 @@ void library_loading_retirement(library_loading_program& program) {
     constexpr uint32_t guard = 0xa95b371d; std::array<uint32_t, 17> input, expected, actual;
     input.fill(guard); expected.fill(guard); input[8] = 0xfffffff1u;
     device_buffer source(sizeof(input)), output(sizeof(expected));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), sizeof(input))); CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), sizeof(expected)));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), sizeof(input))); TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), sizeof(expected)));
     auto in = source.value + 32, out = output.value + 32; unsigned count = 1; void* parameters[]{&out, &in, &count};
-    CUstream stream{}; CONFORMANCE_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+    CUstream stream{}; TEST_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
     // Materialize this exact launch shape before holding accepted work.
-    CONFORMANCE_CUDA(cuLaunchKernel(reinterpret_cast<CUfunction>(kernel), 1, 1, 1, 1, 1, 1, 0, stream, parameters, nullptr));
-    CONFORMANCE_CUDA(cuStreamSynchronize(stream)); CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), sizeof(expected)));
+    TEST_CUDA(cuLaunchKernel(reinterpret_cast<CUfunction>(kernel), 1, 1, 1, 1, 1, 1, 0, stream, parameters, nullptr));
+    TEST_CUDA(cuStreamSynchronize(stream)); TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), sizeof(expected)));
     library_loading_gate gate;
     struct cleanup { library_loading_gate& gate; CUstream& stream; ~cleanup() { gate.release(); if (stream) { cuStreamSynchronize(stream); cuStreamDestroy(stream); } } } cleanup{gate, stream};
-    CONFORMANCE_CUDA(cuLaunchHostFunc(stream, library_loading_gate::hold, &gate)); gate.await();
-    CONFORMANCE_CUDA(cuLaunchKernel(reinterpret_cast<CUfunction>(kernel), 1, 1, 1, 1, 1, 1, 0, stream, parameters, nullptr));
+    TEST_CUDA(cuLaunchHostFunc(stream, library_loading_gate::hold, &gate)); gate.await();
+    TEST_CUDA(cuLaunchKernel(reinterpret_cast<CUfunction>(kernel), 1, 1, 1, 1, 1, 1, 0, stream, parameters, nullptr));
     std::mutex mutex; std::condition_variable changed; bool entered = false, done = false; CUresult status = CUDA_ERROR_UNKNOWN;
     cudaError_t runtime_status = cudaErrorUnknown;
     std::thread worker([&] {
@@ -252,12 +252,12 @@ void library_loading_retirement(library_loading_program& program) {
     { std::unique_lock lock(mutex); started = changed.wait_for(lock, std::chrono::seconds(5), [&] { return entered; });
       if (started) premature = changed.wait_for(lock, std::chrono::milliseconds(40), [&] { return done; }); }
     gate.release(); worker.join();
-    if (program.runtime) library_loading_runtime(runtime_status); else CONFORMANCE_CUDA(status); program.value = nullptr;
+    if (program.runtime) library_loading_runtime(runtime_status); else TEST_CUDA(status); program.value = nullptr;
     bool expired; { std::lock_guard lock(gate.mutex); expired = gate.expired; }
     require(started && !premature && !expired, "library unload waits for accepted gated users");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual))); expected[8] = module_boundary_expected(false, input[8], 13, 0);
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual))); expected[8] = module_boundary_expected(false, input[8], 13, 0);
     expect_words(actual, expected, "library retirement preserves queued result and complete allocation guards");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), source.value, sizeof(actual))); expect_words(actual, input, "library retirement preserves queued input");
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), source.value, sizeof(actual))); expect_words(actual, input, "library retirement preserves queued input");
 }
 void library_loading_validation(const library_loading_program& program, const library_loading_bytes& image) {
     library_loading_output<CUlibrary> output;
@@ -287,14 +287,14 @@ void library_loading_validation(const library_loading_program& program, const li
         "library parameter index boundary"); offset.get(); bytes.get(); library_loading_execute(program);
 }
 void execute_library_loading() {
-    CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device)); library_loading_restore restore;
+    CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device)); library_loading_restore restore;
     for (bool source : {false, true}) {
         const auto image = library_loading_image(source);
         for (bool runtime : {false, true}) {
             if (library_loading_case == "contextless") {
-                CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr)); library_loading_program program(image, runtime);
+                TEST_CUDA(cuCtxSetCurrent(nullptr)); library_loading_program program(image, runtime);
                 library_loading_current(nullptr); library_loading_metadata(program); library_loading_current(nullptr);
-                CONFORMANCE_CUDA(cuCtxSetCurrent(restore.value)); library_loading_execute(program, 13, true); program.close();
+                TEST_CUDA(cuCtxSetCurrent(restore.value)); library_loading_execute(program, 13, true); program.close();
             } else {
                 library_loading_program program(image, runtime, library_loading_case == "files");
                 if (library_loading_case == "files") library_loading_execute(program);
@@ -310,7 +310,7 @@ void execute_library_loading() {
 void library_loading_sources() { library_loading_image(true); }
 }
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "sources") return cudavm::run_host_conformance(argc, argv, cudavm::library_loading_sources);
+    if (argc == 2 && std::string_view(argv[1]) == "sources") return cudavm::run_host_test(argc, argv, cudavm::library_loading_sources);
     if (argc == 3) { cudavm::library_loading_case = argv[2]; argc = 2; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_library_loading, 0, cudavm::probe_execution);
+    return cudavm::run_test(argc, argv, cudavm::execute_library_loading, 0, cudavm::probe_execution);
 }

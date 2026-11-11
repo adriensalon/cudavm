@@ -29,9 +29,9 @@ void cluster_case(const loaded_program& program, std::array<unsigned, 3> cluster
     device_buffer source(input.size() * 4), output(expected.size() * 4), temporary(scratch.size() * 4);
     auto from = source.value + guards * 4, to = output.value + guards * 4, temp = temporary.value + guards * 4;
     std::vector<uint32_t> initialized(expected.size(), guard), empty(scratch.size(), guard);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, initialized.data(), initialized.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(temporary.value, empty.data(), empty.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(output.value, initialized.data(), initialized.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(temporary.value, empty.data(), empty.size() * 4));
     void* args[]{&to, &from, &temp, &rounds};
     if (runtime) {
         cudaLaunchAttribute attribute{}; attribute.id = cudaLaunchAttributeClusterDimension;
@@ -46,25 +46,25 @@ void cluster_case(const loaded_program& program, std::array<unsigned, 3> cluster
         attribute.value.clusterDim = {cluster[0], cluster[1], cluster[2]};
         CUlaunchConfig config{}; config.gridDimX = grid[0]; config.gridDimY = grid[1]; config.gridDimZ = grid[2];
         config.blockDimX = threads; config.blockDimY = config.blockDimZ = 1; config.attrs = &attribute; config.numAttrs = 1;
-        int active = 0; CONFORMANCE_CUDA(cuOccupancyMaxActiveClusters(&active, program.function("cluster_rounds"), &config));
+        int active = 0; TEST_CUDA(cuOccupancyMaxActiveClusters(&active, program.function("cluster_rounds"), &config));
         require(active > 0, "declared portable cluster has positive residency");
-        CONFORMANCE_CUDA(cuLaunchKernelEx(&config, program.function("cluster_rounds"), args, nullptr));
+        TEST_CUDA(cuLaunchKernelEx(&config, program.function("cluster_rounds"), args, nullptr));
     }
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
     expect_words(actual, expected, "cluster membership, repeated barriers, cross-block publication and guards");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual_scratch.data(), temporary.value, actual_scratch.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual_scratch.data(), temporary.value, actual_scratch.size() * 4));
     expect_words(actual_scratch, scratch, "cluster scratch and guards");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
     expect_words(preserved, input, "cluster source preservation");
 }
 void execute_cluster_synchronization(const loaded_program& program) {
-    CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    int supported = 0; CONFORMANCE_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH, device));
+    CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device));
+    int supported = 0; TEST_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH, device));
     require_capability(supported != 0, "native device does not advertise cluster launch");
     CUlaunchConfig configuration{}; configuration.gridDimX = 4; configuration.gridDimY = 2; configuration.gridDimZ = 2;
     configuration.blockDimX = 32; configuration.blockDimY = configuration.blockDimZ = 1;
     int maximum = 0;
-    CONFORMANCE_CUDA(cuOccupancyMaxPotentialClusterSize(&maximum, program.function("cluster_rounds"), &configuration));
+    TEST_CUDA(cuOccupancyMaxPotentialClusterSize(&maximum, program.function("cluster_rounds"), &configuration));
     require_capability(maximum >= 2, "native partition cannot admit the declared two-block cluster profile");
     for (auto cluster : {std::array<unsigned, 3>{1, 1, 1}, {2, 1, 1}, {1, 2, 1}, {1, 1, 2}})
     for (unsigned rounds : {0u, 1u, 3u}) {
@@ -74,5 +74,5 @@ void execute_cluster_synchronization(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_cluster_synchronization);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_cluster_synchronization);
 }

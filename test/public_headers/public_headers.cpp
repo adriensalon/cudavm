@@ -23,7 +23,7 @@
 
 namespace cudavm {
 unsigned public_headers_reverse_profile();
-#ifdef CUDAVM_CONFORMANCE_HAVE_C_HEADERS
+#ifdef CUDAVM_TEST_HAVE_C_HEADERS
 extern "C" unsigned cudavm_public_headers_c_profile(void);
 #endif
 unsigned public_headers_profile() {
@@ -48,7 +48,7 @@ void execute_public_headers() {
         selected = true;
         require(public_headers_reverse_profile() == 127, "independent C++ translation unit accepts reversed/repeated include order");
     }
-#ifdef CUDAVM_CONFORMANCE_HAVE_C_HEADERS
+#ifdef CUDAVM_TEST_HAVE_C_HEADERS
     if (public_headers_case == "all" || public_headers_case == "c") {
         selected = true;
         require(cudavm_public_headers_c_profile() == 127, "independent C11 translation unit exposes compatible public declarations and types");
@@ -59,5 +59,5 @@ void execute_public_headers() {
 }
 int main(int argc, char** argv) {
     if (argc == 2) cudavm::public_headers_case = argv[1];
-    return cudavm::run_host_conformance(argc, argv, cudavm::execute_public_headers);
+    return cudavm::run_host_test(argc, argv, cudavm::execute_public_headers);
 }

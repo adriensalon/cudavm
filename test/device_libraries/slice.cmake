@@ -1,17 +1,17 @@
 if(NOT TARGET cudavm::nvcc)
-    message(VERBOSE "Skipping public device_libraries conformance: SDK compiler tool is unavailable")
+    message(VERBOSE "Skipping public device_libraries test: SDK compiler tool is unavailable")
     return()
 endif()
 
-cudavm_add_conformance_slice(device_libraries API_ONLY CASES chain cycle FAMILY_CHECKS C01.link)
+cudavm_add_test_slice(device_libraries API_ONLY CASES chain cycle FAMILY_CHECKS C01.link)
 
 if(NOT TARGET cudavm_test_device_libraries)
     return()
 endif()
 
-foreach(backend IN LISTS conformance_backends)
+foreach(backend IN LISTS test_backends)
     foreach(profile chain cycle)
-        set_property(TEST "conformance.device_libraries.${backend}.${profile}" APPEND PROPERTY LABELS source_aot)
+        set_property(TEST "test.device_libraries.${backend}.${profile}" APPEND PROPERTY LABELS source_aot)
     endforeach()
 endforeach()
 

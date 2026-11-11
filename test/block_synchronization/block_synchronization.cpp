@@ -14,18 +14,18 @@ void execute_block_synchronization(const loaded_program& program) {
         for (unsigned i = 0; i < total; ++i) input[i + 1] = i * 0x1020305u + 0x80000001u;
         device_buffer source(input.size() * 4), destination(expected.size() * 4), scratch(scratch_expected.size() * 4);
         auto in = source.value + 4, out = destination.value + 4, temporary = scratch.value + 4;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (unsigned rounds : {0u, 1u, 4u})
         for (unsigned pattern = 0; pattern < 4; ++pattern)
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
             std::fill(scratch_expected.begin(), scratch_expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
-            CONFORMANCE_CUDA(cuMemcpyHtoD(scratch.value, scratch_expected.data(), scratch_expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(scratch.value, scratch_expected.data(), scratch_expected.size() * 4));
             void* args[]{&out, &in, &temporary, &count, &rounds, &pattern};
-            CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(scratch_actual.data(), scratch.value, scratch_actual.size() * 4));
+            TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(scratch_actual.data(), scratch.value, scratch_actual.size() * 4));
             for (unsigned block = 0; block < blocks; ++block) {
                 std::vector<std::array<uint32_t, fields>> sums(threads);
                 for (unsigned round = 0; round < rounds; ++round) {
@@ -57,12 +57,12 @@ void execute_block_synchronization(const loaded_program& program) {
             expect_words(actual, expected, "block synchronization" + context);
             expect_words(scratch_actual, scratch_expected, "block publication" + context);
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "block-synchronization source preservation");
     }
 }
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_block_synchronization);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_block_synchronization);
 }

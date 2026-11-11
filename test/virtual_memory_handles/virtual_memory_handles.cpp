@@ -18,7 +18,7 @@
 namespace cudavm {
 std::string_view handles_case;
 const char* handles_executable{};
-std::unique_ptr<conformance_peer> handles_peer;
+std::unique_ptr<test_peer> handles_peer;
 constexpr uint64_t handles_before = 0x19375928abcdef01, handles_after = 0xfedcba0129183745;
 struct physical_reference {
     CUmemGenericAllocationHandle value{};
@@ -26,18 +26,18 @@ struct physical_reference {
     physical_reference(physical_reference&& other) noexcept : value(std::exchange(other.value, 0)) {}
     physical_reference(const physical_reference&) = delete;
     ~physical_reference() { if (value) cuMemRelease(value); }
-    void close() { CONFORMANCE_CUDA(cuMemRelease(value)); value = 0; }
+    void close() { TEST_CUDA(cuMemRelease(value)); value = 0; }
 };
 physical_reference handles_retain(CUdeviceptr pointer, CUmemGenericAllocationHandle expected) {
     struct { uint64_t before = handles_before; CUmemGenericAllocationHandle value{}; uint64_t after = handles_after; } output;
-    CONFORMANCE_CUDA(cuMemRetainAllocationHandle(&output.value, reinterpret_cast<void*>(uintptr_t(pointer))));
+    TEST_CUDA(cuMemRetainAllocationHandle(&output.value, reinterpret_cast<void*>(uintptr_t(pointer))));
     physical_reference reference(output.value);
     require(output.before == handles_before && output.after == handles_after && output.value == expected, "retained handle identity and exact output guards");
     return reference;
 }
 CUmemAllocationProp handles_properties(CUmemGenericAllocationHandle handle, const CUmemAllocationProp& expected, bool imported = false) {
     struct { uint64_t before = handles_before; CUmemAllocationProp value{}; uint64_t after = handles_after; } output;
-    CONFORMANCE_CUDA(cuMemGetAllocationPropertiesFromHandle(&output.value, handle));
+    TEST_CUDA(cuMemGetAllocationPropertiesFromHandle(&output.value, handle));
     require(output.before == handles_before && output.after == handles_after, "allocation properties exact output guards");
     const auto& value = output.value;
     require(value.type == expected.type && value.location.type == expected.location.type && value.location.id == expected.location.id &&
@@ -57,10 +57,10 @@ struct handle_configuration {
     handle_configuration() {
         int available{};
 #ifdef _WIN32
-        CONFORMANCE_CUDA(cuDeviceGetAttribute(&available, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_WIN32_HANDLE_SUPPORTED, properties.location.id));
+        TEST_CUDA(cuDeviceGetAttribute(&available, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_WIN32_HANDLE_SUPPORTED, properties.location.id));
         attributes.Length = sizeof(attributes); properties.win32HandleMetaData = &attributes;
 #else
-        CONFORMANCE_CUDA(cuDeviceGetAttribute(&available, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED, properties.location.id));
+        TEST_CUDA(cuDeviceGetAttribute(&available, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED, properties.location.id));
 #endif
         require_capability(available != 0, "VMM OS sharing requires the advertised platform handle type");
         properties.requestedHandleTypes = type;
@@ -95,7 +95,7 @@ struct physical_os_handle {
 #endif
     }
     physical_os_handle(const physical_os_handle&) = delete;
-    static physical_os_handle receive(conformance_peer& peer) {
+    static physical_os_handle receive(test_peer& peer) {
         physical_os_handle result;
 #ifdef _WIN32
         result.value = reinterpret_cast<HANDLE>(peer.receive_handle());
@@ -108,14 +108,14 @@ struct physical_os_handle {
 physical_os_handle handles_export(CUmemGenericAllocationHandle handle) {
     using guard_type = std::conditional_t<sizeof(physical_os_handle::value) == sizeof(uint32_t), uint32_t, uint64_t>;
     struct { guard_type before = guard_type(handles_before); decltype(physical_os_handle::value) value{}; guard_type after = guard_type(handles_after); } output;
-    CONFORMANCE_CUDA(cuMemExportToShareableHandle(&output.value, handle, handle_configuration::type, 0));
+    TEST_CUDA(cuMemExportToShareableHandle(&output.value, handle, handle_configuration::type, 0));
     physical_os_handle result; result.value = output.value;
     require(output.before == guard_type(handles_before) && output.after == guard_type(handles_after), "OS export exact output width");
     result.alive(); return result;
 }
 physical_reference handles_import(const physical_os_handle& source) {
     struct { uint64_t before = handles_before; CUmemGenericAllocationHandle value{}; uint64_t after = handles_after; } output;
-    CONFORMANCE_CUDA(cuMemImportFromShareableHandle(&output.value, source.argument(), handle_configuration::type));
+    TEST_CUDA(cuMemImportFromShareableHandle(&output.value, source.argument(), handle_configuration::type));
     physical_reference result(output.value);
     require(output.before == handles_before && output.after == handles_after && output.value, "OS import exact output guards");
     source.alive(); return result;
@@ -142,10 +142,10 @@ void handles_retains(bool resurrection) {
         references.push_back(handles_retain(address, identity));
     physical.close();
     if (resurrection) {
-        CUcontext original{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&original)); CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr));
+        CUcontext original{}; TEST_CUDA(cuCtxGetCurrent(&original)); TEST_CUDA(cuCtxSetCurrent(nullptr));
         try { references.push_back(handles_retain(b.value + bytes - 1, identity)); }
         catch (...) { cuCtxSetCurrent(original); throw; }
-        CONFORMANCE_CUDA(cuCtxSetCurrent(original));
+        TEST_CUDA(cuCtxSetCurrent(original));
     }
     for (size_t i = 1; i < references.size(); ++i) references[i].close();
     a.close(); b.close();
@@ -153,7 +153,7 @@ void handles_retains(bool resurrection) {
     virtual_memory_mapping restored(replacement.value, bytes, references.front().value); restored.grant(properties.location);
     references.front().close();
     virtual_memory_expect(restored.value, expected, "retained backing survives complete unmap/remap", true);
-    CONFORMANCE_CUDA(cuMemsetD8(restored.value + 17, 0x9b, 511));
+    TEST_CUDA(cuMemsetD8(restored.value + 17, 0x9b, 511));
     auto changed = expected; std::fill_n(changed.begin() + 17, 511, 0x9b);
     virtual_memory_expect(restored.value, changed, "last mapping owns writable physical storage after all generic releases");
 }
@@ -227,7 +227,7 @@ void handles_validation() {
     require(cuMemExportToShareableHandle(&os, physical.value, handle_configuration::type, 0) == CUDA_ERROR_INVALID_VALUE, "non-exportable backing");
     require(cuMemImportFromShareableHandle(&output, nullptr, CU_MEM_HANDLE_TYPE_NONE) == CUDA_ERROR_INVALID_VALUE, "invalid OS import type");
     auto repaired = handles_retain(mapping.value + bytes - 1, physical.value);
-    CONFORMANCE_CUDA(cuMemGetAllocationPropertiesFromHandle(&queried, repaired.value));
+    TEST_CUDA(cuMemGetAllocationPropertiesFromHandle(&queried, repaired.value));
     virtual_memory_expect(mapping.value, expected, "argument repair preserves complete physical backing");
     repaired.close(); mapping.close();
     require(cuMemRetainAllocationHandle(&output, reinterpret_cast<void*>(uintptr_t(reserved.value))) == CUDA_ERROR_INVALID_VALUE, "retain rejects unbacked reservation");
@@ -240,11 +240,11 @@ struct handles_message {
 static_assert(sizeof(handles_message) == 64);
 handles_message handles_hello(size_t bytes, unsigned seed) {
     handles_message message{1, bytes, seed}; CUuuid uuid{}; CUdevice device{};
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device)); CONFORMANCE_CUDA(cuDeviceGetUuid(&uuid, device));
+    TEST_CUDA(cuCtxGetDevice(&device)); TEST_CUDA(cuDeviceGetUuid(&uuid, device));
     std::memcpy(message.uuid.data(), uuid.bytes, sizeof(uuid.bytes)); return message;
 }
-void handles_send(conformance_peer& peer, const handles_message& message) { peer.send(std::as_bytes(std::span(&message, 1))); }
-handles_message handles_receive(conformance_peer& peer) { handles_message message{}; peer.receive(std::as_writable_bytes(std::span(&message, 1))); return message; }
+void handles_send(test_peer& peer, const handles_message& message) { peer.send(std::as_bytes(std::span(&message, 1))); }
+handles_message handles_receive(test_peer& peer) { handles_message message{}; peer.receive(std::as_writable_bytes(std::span(&message, 1))); return message; }
 void handles_identity(const handles_message& message, const handle_configuration& config) {
     require(message.kind == 1 && message.bytes == virtual_memory_granularity(config.properties) * 2 && message.seed <= UINT32_MAX, "peer allocation metadata");
     require(message.uuid == handles_hello(message.bytes, unsigned(message.seed)).uuid, "peer participants use the same actual device UUID");
@@ -254,8 +254,8 @@ void handles_patch(CUdeviceptr pointer, std::vector<unsigned char>& expected, un
     const size_t count = importer ? 383 + phase * 43 : 257 + phase * 37;
     const auto pattern = static_cast<unsigned char>((importer ? 91 : 17) + phase * 31);
     if (importer) virtual_runtime(cudaMemset(reinterpret_cast<void*>(uintptr_t(pointer + offset)), pattern, count));
-    else CONFORMANCE_CUDA(cuMemsetD8(pointer + offset, pattern, count));
-    std::fill_n(expected.begin() + offset, count, pattern); CONFORMANCE_CUDA(cuCtxSynchronize());
+    else TEST_CUDA(cuMemsetD8(pointer + offset, pattern, count));
+    std::fill_n(expected.begin() + offset, count, pattern); TEST_CUDA(cuCtxSynchronize());
 }
 void handles_expected_patch(std::vector<unsigned char>& expected, unsigned phase, bool importer) {
     const size_t offset = importer ? expected.size() / 2 + phase * 211 : 64 + phase * 173;
@@ -284,7 +284,7 @@ void handles_sharing() {
     virtual_physical_memory physical(bytes, config.properties); virtual_memory_reservation reserved(bytes);
     virtual_memory_mapping mapping(reserved.value, bytes, physical.value); mapping.grant(config.properties.location);
     auto expected = virtual_memory_pattern(bytes, 43); virtual_memory_write(mapping.value, expected);
-    auto os = handles_export(physical.value); conformance_peer peer(handles_executable, "cuda", "importer");
+    auto os = handles_export(physical.value); test_peer peer(handles_executable, "cuda", "importer");
     handles_send(peer, handles_hello(bytes, 43)); peer.send_handle(os.transport());
     require(handles_receive(peer).kind == 2, "independent importer owns its live mapping"); os.close(); physical.close();
     for (unsigned phase = 0; phase < 3; ++phase) {
@@ -308,7 +308,7 @@ void handles_exporter() {
     require(handles_receive(*handles_peer).kind == 2, "importer acquired allocation before exporter exit");
 }
 void handles_exporter_exit() {
-    handle_configuration config; conformance_peer peer(handles_executable, "cuda", "exporter");
+    handle_configuration config; test_peer peer(handles_executable, "cuda", "exporter");
     const auto hello = handles_receive(peer); handles_identity(hello, config);
     auto os = physical_os_handle::receive(peer); auto imported = handles_import(os); os.close();
     virtual_memory_reservation reserved(hello.bytes); virtual_memory_mapping mapping(reserved.value, hello.bytes, imported.value); mapping.grant(config.properties.location);
@@ -322,10 +322,10 @@ void handles_discovery() {
     for (const char* name : {"cuMemCreate", "cuMemRelease", "cuMemExportToShareableHandle", "cuMemImportFromShareableHandle", "cuMemGetAllocationPropertiesFromHandle", "cuMemRetainAllocationHandle"}) {
         const int version = std::string_view(name) == "cuMemRetainAllocationHandle" ? 11000 : 10020;
         void* address{}; CUdriverProcAddressQueryResult status{};
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, version, 0, &status)); require(address && status == CU_GET_PROC_ADDRESS_SUCCESS, "physical handle procedure version");
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, version - 1, 0, &status)); require(!address && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "physical handle introduction boundary");
+        TEST_CUDA(cuGetProcAddress(name, &address, version, 0, &status)); require(address && status == CU_GET_PROC_ADDRESS_SUCCESS, "physical handle procedure version");
+        TEST_CUDA(cuGetProcAddress(name, &address, version - 1, 0, &status)); require(!address && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "physical handle introduction boundary");
     }
-    void* address{}; CONFORMANCE_CUDA(cuGetProcAddress("cuMemImportFromShareableHandle", &address, 10020, 0, nullptr));
+    void* address{}; TEST_CUDA(cuGetProcAddress("cuMemImportFromShareableHandle", &address, 10020, 0, nullptr));
     require(reinterpret_cast<PFN_cuMemImportFromShareableHandle_v10020>(address)(nullptr, nullptr, CU_MEM_HANDLE_TYPE_NONE) == CUDA_ERROR_NOT_INITIALIZED, "discovered import preserves cold Driver behavior");
 }
 void execute_virtual_memory_handles() {
@@ -345,10 +345,10 @@ void execute_virtual_memory_handles() {
 }
 int main(int argc, char** argv) {
     cudavm::handles_executable = argv[0];
-    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_conformance(argc, argv, cudavm::handles_discovery);
+    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_test(argc, argv, cudavm::handles_discovery);
     if (argc == 7 && std::string_view(argv[3]) == "--peer") {
-        cudavm::handles_peer = std::make_unique<cudavm::conformance_peer>(cudavm::conformance_peer::connect(argv[4], argv[5], argv[6])); argc = 3;
+        cudavm::handles_peer = std::make_unique<cudavm::test_peer>(cudavm::test_peer::connect(argv[4], argv[5], argv[6])); argc = 3;
     }
     if (argc == 3) { cudavm::handles_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_virtual_memory_handles);
+    return cudavm::run_test(argc, argv, cudavm::execute_virtual_memory_handles);
 }

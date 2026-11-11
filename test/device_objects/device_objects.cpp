@@ -27,13 +27,13 @@ void execute_device_objects(const loaded_program& program) {
         auto from = source.value + guards * 4, to = output.value + guards * 4;
         for (unsigned phase = 0; phase < 2; ++phase) {
             for (unsigned i = 0; i < total; ++i) input[guards + i] = i < edges.size() ? edges[(i + phase) % edges.size()] : 0xfffffff0u + i * 0x7654321u + phase * 0x89abcdefu;
-            CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
             for (unsigned count : {0u, 1u, total / 2 + 1, total - 1, total, total + 7}) {
                 std::fill(expected.begin(), expected.end(), guard);
-                CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+                TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
                 void* args[]{&to, &from, &count};
-                CONFORMANCE_CUDA(cuLaunchKernel(function, blocks, 1, 1, lanes, 1, 1, 0, nullptr, args, nullptr));
-                CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+                TEST_CUDA(cuLaunchKernel(function, blocks, 1, 1, lanes, 1, 1, 0, nullptr, args, nullptr));
+                TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
                 for (unsigned i = 0; i < std::min(total, count); ++i) {
                     const auto row = object_oracle(input[guards + i]);
                     std::copy(row.begin(), row.end(), expected.begin() + guards + i * fields);
@@ -44,12 +44,12 @@ void execute_device_objects(const loaded_program& program) {
                     differences += " word " + std::to_string(word) + " got " + std::to_string(actual[word]) + " expected " + std::to_string(expected[word]);
                 require(differences.empty(), "device object fields, lifecycle journal and layout:" + differences);
             }
-            CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
             expect_words(preserved, input, "device object source and guard preservation");
         }
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_device_objects);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_device_objects);
 }

@@ -15,7 +15,7 @@
 namespace cudavm {
 std::string_view sharing_case;
 const char* sharing_executable{};
-std::unique_ptr<conformance_peer> sharing_peer;
+std::unique_ptr<test_peer> sharing_peer;
 constexpr uint64_t sharing_before = 0x19375928abcdef01, sharing_after = 0xfedcba0129183745;
 constexpr size_t sharing_bytes = 8197;
 #ifdef _WIN32
@@ -59,7 +59,7 @@ struct sharing_pool {
     ~sharing_pool() { if (value) cuMemPoolDestroy(value); }
     cudaMemPool_t runtime() const { return reinterpret_cast<cudaMemPool_t>(value); }
     void create(bool exported, bool use_runtime) {
-        CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+        CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device));
 #ifdef _WIN32
         SECURITY_ATTRIBUTES security{sizeof(security), nullptr, FALSE};
 #endif
@@ -77,7 +77,7 @@ struct sharing_pool {
 #ifdef _WIN32
             properties.win32SecurityAttributes = exported ? &security : nullptr;
 #endif
-            CONFORMANCE_CUDA(cuMemPoolCreate(&value, &properties));
+            TEST_CUDA(cuMemPoolCreate(&value, &properties));
         }
     }
     void import(sharing_os_handle& os, bool use_runtime) {
@@ -89,13 +89,13 @@ struct sharing_pool {
             value = reinterpret_cast<CUmemoryPool>(result.value);
             require(result.before == sharing_before && result.after == sharing_after, "Runtime pool import output guards");
         } else {
-            CONFORMANCE_CUDA(cuMemPoolImportFromShareableHandle(&output.value, os.argument(), sharing_type, 0)); value = output.value;
+            TEST_CUDA(cuMemPoolImportFromShareableHandle(&output.value, os.argument(), sharing_type, 0)); value = output.value;
             require(output.before == sharing_before && output.after == sharing_after, "Driver pool import output guards");
         }
         os.alive(); require(value, "import publishes a pool");
     }
     void close(bool use_runtime) {
-        if (use_runtime) sharing_runtime(cudaMemPoolDestroy(runtime())); else CONFORMANCE_CUDA(cuMemPoolDestroy(value));
+        if (use_runtime) sharing_runtime(cudaMemPoolDestroy(runtime())); else TEST_CUDA(cuMemPoolDestroy(value));
         value = nullptr;
     }
 };
@@ -105,8 +105,8 @@ struct sharing_pointer {
     void allocate(const sharing_pool& pool, bool runtime, size_t bytes = sharing_bytes) {
         if (runtime) {
             void* pointer{}; sharing_runtime(cudaMallocFromPoolAsync(&pointer, bytes, pool.runtime(), nullptr)); value = reinterpret_cast<uintptr_t>(pointer);
-        } else CONFORMANCE_CUDA(cuMemAllocFromPoolAsync(&value, bytes, pool.value, nullptr));
-        CONFORMANCE_CUDA(cuStreamSynchronize(nullptr)); require(value, "allocated pointer");
+        } else TEST_CUDA(cuMemAllocFromPoolAsync(&value, bytes, pool.value, nullptr));
+        TEST_CUDA(cuStreamSynchronize(nullptr)); require(value, "allocated pointer");
     }
     void import(const sharing_pool& pool, const CUmemPoolPtrExportData& data, bool runtime) {
         auto copy = data;
@@ -117,7 +117,7 @@ struct sharing_pointer {
             require(output.before == sharing_before && output.after == sharing_after, "Runtime pointer import guards");
         } else {
             struct { uint64_t before = sharing_before; CUdeviceptr value{}; uint64_t after = sharing_after; } output;
-            CONFORMANCE_CUDA(cuMemPoolImportPointer(&output.value, pool.value, &copy)); value = output.value;
+            TEST_CUDA(cuMemPoolImportPointer(&output.value, pool.value, &copy)); value = output.value;
             require(output.before == sharing_before && output.after == sharing_after, "Driver pointer import guards");
         }
         require(value, "imported pointer");
@@ -128,8 +128,8 @@ struct sharing_pointer {
             sharing_runtime(asynchronous ? cudaFreeAsync(pointer, nullptr) : cudaFree(pointer));
             if (asynchronous) sharing_runtime(cudaStreamSynchronize(nullptr));
         } else {
-            CONFORMANCE_CUDA(asynchronous ? cuMemFreeAsync(value, nullptr) : cuMemFree(value));
-            if (asynchronous) CONFORMANCE_CUDA(cuStreamSynchronize(nullptr));
+            TEST_CUDA(asynchronous ? cuMemFreeAsync(value, nullptr) : cuMemFree(value));
+            if (asynchronous) TEST_CUDA(cuStreamSynchronize(nullptr));
         }
         value = 0;
     }
@@ -138,7 +138,7 @@ sharing_os_handle sharing_export(const sharing_pool& pool, bool runtime) {
     using guard = std::conditional_t<sizeof(sharing_os_handle::value) == 4, uint32_t, uint64_t>;
     struct { guard before = guard(sharing_before); decltype(sharing_os_handle::value) value{}; guard after = guard(sharing_after); } output;
     if (runtime) sharing_runtime(cudaMemPoolExportToShareableHandle(&output.value, pool.runtime(), static_cast<cudaMemAllocationHandleType>(sharing_type), 0));
-    else CONFORMANCE_CUDA(cuMemPoolExportToShareableHandle(&output.value, pool.value, sharing_type, 0));
+    else TEST_CUDA(cuMemPoolExportToShareableHandle(&output.value, pool.value, sharing_type, 0));
     sharing_os_handle result; result.value = output.value;
     require(output.before == guard(sharing_before) && output.after == guard(sharing_after), "pool OS export exact output guards"); result.alive(); return result;
 }
@@ -148,20 +148,20 @@ CUmemPoolPtrExportData sharing_record(CUdeviceptr pointer, bool runtime) {
         struct { uint64_t before = sharing_before; cudaMemPoolPtrExportData value{}; uint64_t after = sharing_after; } result;
         sharing_runtime(cudaMemPoolExportPointer(&result.value, reinterpret_cast<void*>(uintptr_t(pointer))));
         require(result.before == sharing_before && result.after == sharing_after, "Runtime opaque record output guards"); std::memcpy(&output.value, &result.value, sizeof(output.value));
-    } else CONFORMANCE_CUDA(cuMemPoolExportPointer(&output.value, pointer));
+    } else TEST_CUDA(cuMemPoolExportPointer(&output.value, pointer));
     require(output.before == sharing_before && output.after == sharing_after, "Driver opaque record output guards"); return output.value;
 }
 void sharing_prerequisite(bool exported) {
-    CUdevice device{}; int supported{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, device));
+    CUdevice device{}; int supported{}; TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, device));
     require_capability(supported != 0, "memory pool support is required");
     if (exported) {
-        CONFORMANCE_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES, device));
+        TEST_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES, device));
         require_capability((supported & sharing_type) != 0, "pool sharing needs the advertised platform handle type");
     }
 }
 void sharing_restrictions(const sharing_pool& pool) {
-    CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+    CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device));
     CUdeviceptr pointer{}; void* runtime_pointer{};
     require(cuMemAllocFromPoolAsync(&pointer, 32, pool.value, nullptr) == CUDA_ERROR_INVALID_VALUE, "imported pool cannot allocate");
     require(cudaMallocFromPoolAsync(&runtime_pointer, 32, pool.runtime(), nullptr) == cudaErrorInvalidValue, "Runtime imported pool cannot allocate");
@@ -199,10 +199,10 @@ void sharing_validation() {
         device_buffer ordinary(63);
         require(cuMemPoolExportPointer(&record, ordinary.value) == CUDA_ERROR_INVALID_VALUE, "ordinary allocation has no pool record");
         require(cudaMemPoolExportPointer(&runtime_record, reinterpret_cast<void*>(uintptr_t(ordinary.value))) == cudaErrorInvalidValue, "Runtime ordinary allocation has no pool record");
-        CUmemoryPool default_pool{}; CONFORMANCE_CUDA(cuDeviceGetDefaultMemPool(&default_pool, virtual_memory_properties().location.id));
+        CUmemoryPool default_pool{}; TEST_CUDA(cuDeviceGetDefaultMemPool(&default_pool, virtual_memory_properties().location.id));
         require(cuMemPoolExportToShareableHandle(&os, default_pool, sharing_type, 0) == CUDA_ERROR_INVALID_VALUE, "default pool is not exportable");
         virtual_memory_expect(pointer.value, expected, "failed sharing operations preserve complete bytes", !runtime);
-        CONFORMANCE_CUDA(cuMemsetD8(pointer.value + 31, 0x71, 257)); std::fill_n(expected.begin() + 31, 257, 0x71);
+        TEST_CUDA(cuMemsetD8(pointer.value + 31, 0x71, 257)); std::fill_n(expected.begin() + 31, 257, 0x71);
         virtual_memory_expect(pointer.value, expected, "repaired ordinary pool operations preserve guards", runtime);
         pointer.close(!runtime, true);
     }
@@ -217,14 +217,14 @@ void sharing_roundtrip() {
         std::array<sharing_pointer, 2> originals;
         for (unsigned i = 0; i < originals.size(); ++i) {
             originals[i].allocate(source, runtime); auto expected = virtual_memory_pattern(sharing_bytes, 41 + i);
-            virtual_memory_write(originals[i].value, expected, runtime); CONFORMANCE_CUDA(cuCtxSynchronize());
+            virtual_memory_write(originals[i].value, expected, runtime); TEST_CUDA(cuCtxSynchronize());
             (void)sharing_record(originals[i].value, !runtime);
             virtual_memory_expect(originals[i].value, expected, "pool and pointer export preserve complete original allocation", !runtime);
         }
         source.close(!runtime); imported.close(runtime);
         for (unsigned i = 0; i < originals.size(); ++i) {
             auto expected = virtual_memory_pattern(sharing_bytes, 41 + i);
-            CONFORMANCE_CUDA(cuMemsetD8(originals[i].value + 37, 0xa3 + i, 997)); std::fill_n(expected.begin() + 37, 997, 0xa3 + i);
+            TEST_CUDA(cuMemsetD8(originals[i].value + 37, 0xa3 + i, 997)); std::fill_n(expected.begin() + 37, 997, 0xa3 + i);
             virtual_memory_expect(originals[i].value, expected, "original allocation survives exported pool handle destruction", runtime);
             originals[i].close(!runtime, i == 0);
         }
@@ -234,11 +234,11 @@ struct sharing_message {
     uint64_t kind{}, phase{}, retirement{};
     std::array<unsigned char, 16> uuid{};
 };
-void sharing_send(conformance_peer& peer, const sharing_message& message) { peer.send(std::as_bytes(std::span(&message, 1))); }
-sharing_message sharing_receive(conformance_peer& peer) { sharing_message result{}; peer.receive(std::as_writable_bytes(std::span(&result, 1))); return result; }
+void sharing_send(test_peer& peer, const sharing_message& message) { peer.send(std::as_bytes(std::span(&message, 1))); }
+sharing_message sharing_receive(test_peer& peer) { sharing_message result{}; peer.receive(std::as_writable_bytes(std::span(&result, 1))); return result; }
 sharing_message sharing_hello(bool retirement) {
     sharing_message result{1, 0, uint64_t(retirement)}; CUuuid uuid{}; auto device = virtual_memory_properties().location.id;
-    CONFORMANCE_CUDA(cuDeviceGetUuid(&uuid, device)); std::memcpy(result.uuid.data(), uuid.bytes, sizeof(uuid.bytes)); return result;
+    TEST_CUDA(cuDeviceGetUuid(&uuid, device)); std::memcpy(result.uuid.data(), uuid.bytes, sizeof(uuid.bytes)); return result;
 }
 void sharing_patch(std::vector<unsigned char>& bytes, unsigned phase, bool importer) {
     auto offset = (importer ? 4099 : 43) + phase * 157; auto count = 307 + phase * 29;
@@ -247,8 +247,8 @@ void sharing_patch(std::vector<unsigned char>& bytes, unsigned phase, bool impor
 void sharing_write_patch(CUdeviceptr pointer, std::vector<unsigned char>& expected, unsigned phase, bool importer) {
     sharing_patch(expected, phase, importer); auto offset = (importer ? 4099 : 43) + phase * 157; auto count = 307 + phase * 29;
     if (importer) sharing_runtime(cudaMemset(reinterpret_cast<void*>(uintptr_t(pointer + offset)), (importer ? 113 : 37) + phase * 17, count));
-    else CONFORMANCE_CUDA(cuMemsetD8(pointer + offset, 37 + phase * 17, count));
-    CONFORMANCE_CUDA(cuCtxSynchronize());
+    else TEST_CUDA(cuMemsetD8(pointer + offset, 37 + phase * 17, count));
+    TEST_CUDA(cuCtxSynchronize());
 }
 void sharing_importer() {
     require(sharing_peer != nullptr, "independent importer peer"); auto& peer = *sharing_peer;
@@ -286,7 +286,7 @@ void sharing_processes(bool retirement) {
     for (unsigned i = 0; i < pointers.size(); ++i) {
         pointers[i].allocate(pool, i == 0); expected[i] = virtual_memory_pattern(sharing_bytes, 73 + i); virtual_memory_write(pointers[i].value, expected[i], i != 0);
     }
-    CONFORMANCE_CUDA(cuCtxSynchronize()); auto os = sharing_export(pool, true); conformance_peer peer(sharing_executable, "cuda", "importer");
+    TEST_CUDA(cuCtxSynchronize()); auto os = sharing_export(pool, true); test_peer peer(sharing_executable, "cuda", "importer");
     sharing_send(peer, sharing_hello(retirement)); peer.send_handle(os.transport());
     for (unsigned i = 0; i < pointers.size(); ++i) { auto record = sharing_record(pointers[i].value, i == 0); peer.send(std::as_bytes(std::span(&record, 1))); }
     require(sharing_receive(peer).kind == 2, "importer owns live pointers"); os.close(); if (retirement) pool.close(true);
@@ -310,10 +310,10 @@ void sharing_processes(bool retirement) {
 void sharing_discovery() {
     for (const char* name : {"cuMemPoolExportToShareableHandle", "cuMemPoolImportFromShareableHandle", "cuMemPoolExportPointer", "cuMemPoolImportPointer"}) {
         void* address{}; CUdriverProcAddressQueryResult status{};
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, 11020, 0, &status)); require(address && status == CU_GET_PROC_ADDRESS_SUCCESS, "pool sharing procedure introduction");
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, 11019, 0, &status)); require(!address && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "pool sharing version boundary");
+        TEST_CUDA(cuGetProcAddress(name, &address, 11020, 0, &status)); require(address && status == CU_GET_PROC_ADDRESS_SUCCESS, "pool sharing procedure introduction");
+        TEST_CUDA(cuGetProcAddress(name, &address, 11019, 0, &status)); require(!address && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "pool sharing version boundary");
     }
-    void* address{}; CONFORMANCE_CUDA(cuGetProcAddress("cuMemPoolImportFromShareableHandle", &address, 11020, 0, nullptr));
+    void* address{}; TEST_CUDA(cuGetProcAddress("cuMemPoolImportFromShareableHandle", &address, 11020, 0, nullptr));
     require(reinterpret_cast<PFN_cuMemPoolImportFromShareableHandle_v11020>(address)(nullptr, nullptr, sharing_type, 0) == CUDA_ERROR_NOT_INITIALIZED, "cold discovered sharing API");
 }
 void execute_memory_pool_sharing() {
@@ -328,10 +328,10 @@ void execute_memory_pool_sharing() {
 }
 int main(int argc, char** argv) {
     cudavm::sharing_executable = argv[0];
-    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_conformance(argc, argv, cudavm::sharing_discovery);
+    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_test(argc, argv, cudavm::sharing_discovery);
     if (argc == 7 && std::string_view(argv[3]) == "--peer") {
-        cudavm::sharing_peer = std::make_unique<cudavm::conformance_peer>(cudavm::conformance_peer::connect(argv[4], argv[5], argv[6])); argc = 3;
+        cudavm::sharing_peer = std::make_unique<cudavm::test_peer>(cudavm::test_peer::connect(argv[4], argv[5], argv[6])); argc = 3;
     }
     if (argc == 3) { cudavm::sharing_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_memory_pool_sharing);
+    return cudavm::run_test(argc, argv, cudavm::execute_memory_pool_sharing);
 }

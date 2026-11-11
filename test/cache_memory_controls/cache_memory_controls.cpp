@@ -16,14 +16,14 @@ void cache_case(const loaded_program& program, unsigned x, unsigned y, unsigned 
         expected[base + 13] = input[guards + i] + 0x17u;
     }
     device_buffer source(input.size() * 4), destination(initial.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
     auto in = source.value + guards * 4, out = destination.value + guards * 4;
     void* arguments[]{&out, &in, &count};
-    CONFORMANCE_CUDA(cuLaunchKernel(program.function("cache_access"), blocks, 1, 1, x, y, 1, 0, nullptr, arguments, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+    TEST_CUDA(cuLaunchKernel(program.function("cache_access"), blocks, 1, 1, x, y, 1, 0, nullptr, arguments, nullptr));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
     expect_words(actual, expected, "cache load/store values, same-thread readback, prefetch, padding and inactive records");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
     expect_words(preserved, input, "cache controls preserve source values and guards");
 }
 void execute_cache_memory_controls(const loaded_program& program) {
@@ -34,5 +34,5 @@ void execute_cache_memory_controls(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_cache_memory_controls);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_cache_memory_controls);
 }

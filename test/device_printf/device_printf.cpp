@@ -27,7 +27,7 @@ void execute_device_printf(const loaded_program& program) {
     static bool configured = false;
     if (!configured) {
         constexpr size_t requested = 2 * 1024 * 1024;
-        CONFORMANCE_CUDA(cuCtxSetLimit(CU_LIMIT_PRINTF_FIFO_SIZE, requested));
+        TEST_CUDA(cuCtxSetLimit(CU_LIMIT_PRINTF_FIFO_SIZE, requested));
         size_t effective = 0;
         printf_runtime(cudaDeviceGetLimit(&effective, cudaLimitPrintfFifoSize));
         require(effective >= requested, "effective printf FIFO covers requested bytes");
@@ -36,31 +36,31 @@ void execute_device_printf(const loaded_program& program) {
     std::vector<uint32_t> input(capacity + guards * 2, guard), expected(input), actual(input.size());
     for (unsigned i = 0; i < count; ++i) input[guards + i] = 0xabcdu + i;
     device_buffer source(input.size() * 4), output(input.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
     auto from = source.value + guards * 4, to = output.value + guards * 4;
     CUstream stream{};
-    CONFORMANCE_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+    TEST_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
     struct stream_guard { CUstream value; ~stream_guard() { cuStreamDestroy(value); } } cleanup{stream};
     auto records = program.function("printf_records");
     auto active = count;
     void* args[]{&to, &from, &active};
     for (unsigned mode = 0; mode < 4; ++mode) {
         std::fill(expected.begin(), expected.end(), guard);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
         for (unsigned i = 0; i < count; ++i) expected[guards + i] = 6;
         {
             printf_capture capture("records." + std::to_string(mode));
             if (mode == 3) {
-                CONFORMANCE_CUDA(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_GLOBAL));
-                CONFORMANCE_CUDA(cuLaunchKernel(records, 2, 1, 1, 13, 1, 1, 0, stream, args, nullptr));
+                TEST_CUDA(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_GLOBAL));
+                TEST_CUDA(cuLaunchKernel(records, 2, 1, 1, 13, 1, 1, 0, stream, args, nullptr));
                 CUgraph graph{}; CUgraphExec executable{};
-                CONFORMANCE_CUDA(cuStreamEndCapture(stream, &graph));
-                CONFORMANCE_CUDA(cuGraphInstantiateWithFlags(&executable, graph, 0));
-                CONFORMANCE_CUDA(cuGraphDestroy(graph));
+                TEST_CUDA(cuStreamEndCapture(stream, &graph));
+                TEST_CUDA(cuGraphInstantiateWithFlags(&executable, graph, 0));
+                TEST_CUDA(cuGraphDestroy(graph));
                 struct graph_guard { CUgraphExec value; ~graph_guard() { cuGraphExecDestroy(value); } } release{executable};
                 active = 0; // Captured parameters retain the original extent.
                 for (unsigned repeat = 0; repeat < 2; ++repeat) {
-                    CONFORMANCE_CUDA(cuGraphLaunch(executable, stream));
+                    TEST_CUDA(cuGraphLaunch(executable, stream));
                     printf_runtime(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)));
                 }
                 active = count;
@@ -69,23 +69,23 @@ void execute_device_printf(const loaded_program& program) {
                 if (mode == 1 && kernel)
                     printf_runtime(cudaLaunchKernel(reinterpret_cast<const void*>(kernel), dim3(2), dim3(13), args, 0,
                         reinterpret_cast<cudaStream_t>(stream)));
-                else CONFORMANCE_CUDA(cuLaunchKernel(records, 2, 1, 1, 13, 1, 1, 0, stream, args, nullptr));
-                if (mode == 0) CONFORMANCE_CUDA(cuStreamSynchronize(stream));
+                else TEST_CUDA(cuLaunchKernel(records, 2, 1, 1, 13, 1, 1, 0, stream, args, nullptr));
+                if (mode == 0) TEST_CUDA(cuStreamSynchronize(stream));
                 else if (mode == 1) printf_runtime(cudaDeviceSynchronize());
                 else {
                     CUevent event{};
-                    CONFORMANCE_CUDA(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
+                    TEST_CUDA(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
                     const auto record_status = cuEventRecord(event, stream);
                     const auto sync_status = record_status == CUDA_SUCCESS ? cuEventSynchronize(event) : record_status;
                     cuEventDestroy(event);
-                    CONFORMANCE_CUDA(sync_status);
+                    TEST_CUDA(sync_status);
                 }
             }
             // Observe output at the chosen completion point before a copy or a
             // second synchronization could conceal a missing output flush.
             capture.finish();
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
         expect_words(actual, expected, "printf argument counts and inactive/guard preservation");
     }
     const char* formats[]{"mutable %u|%s\n", "updated %08x|%s\n"};
@@ -94,40 +94,40 @@ void execute_device_printf(const loaded_program& program) {
         const auto text = std::string(formats[phase]);
         std::array<char, 64> bytes{};
         std::copy(text.begin(), text.end(), bytes.begin());
-        CONFORMANCE_CUDA(cuMemcpyHtoD(format.value, bytes.data(), bytes.size()));
+        TEST_CUDA(cuMemcpyHtoD(format.value, bytes.data(), bytes.size()));
         std::fill(expected.begin(), expected.end(), guard);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
         unsigned value = phase ? 9 : 7;
         void* format_args[]{&to, &format.value, &value};
         {
             printf_capture capture("formats." + std::to_string(phase));
-            CONFORMANCE_CUDA(cuLaunchKernel(program.function("printf_formats"), 1, 1, 1, 1, 1, 1, 0, stream, format_args, nullptr));
-            CONFORMANCE_CUDA(cuStreamSynchronize(stream));
+            TEST_CUDA(cuLaunchKernel(program.function("printf_formats"), 1, 1, 1, 1, 1, 1, 0, stream, format_args, nullptr));
+            TEST_CUDA(cuStreamSynchronize(stream));
             capture.finish();
         }
         expected[guards] = 2; expected[guards + 1] = 6; expected[guards + 2] = 0; expected[guards + 3] = ~0u;
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
         expect_words(actual, expected, "mutable printf formats, promotion and null/literal returns");
         std::array<char, 64> preserved{};
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), format.value, preserved.size()));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), format.value, preserved.size()));
         require(preserved == bytes, "format allocation remains byte-exact");
     }
     std::fill(expected.begin(), expected.end(), guard);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
     {
         printf_capture capture("arguments");
         void* argument_args[]{&to};
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function("printf_arguments"), 1, 1, 1, 1, 1, 1, 0, stream, argument_args, nullptr));
-        CONFORMANCE_CUDA(cuCtxSynchronize());
+        TEST_CUDA(cuLaunchKernel(program.function("printf_arguments"), 1, 1, 1, 1, 1, 1, 0, stream, argument_args, nullptr));
+        TEST_CUDA(cuCtxSynchronize());
         capture.finish();
     }
     expected[guards] = 32;
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
     expect_words(actual, expected, "printf 32-argument boundary and guards");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), source.value, actual.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), source.value, actual.size() * 4));
     expect_words(actual, input, "printf input preservation");
     size_t before = 0, after = 0;
-    CONFORMANCE_CUDA(cuCtxGetLimit(&before, CU_LIMIT_PRINTF_FIFO_SIZE));
+    TEST_CUDA(cuCtxGetLimit(&before, CU_LIMIT_PRINTF_FIFO_SIZE));
     require(cuCtxSetLimit(CU_LIMIT_PRINTF_FIFO_SIZE, before * 2) == CUDA_ERROR_INVALID_VALUE,
         "printf FIFO cannot be changed after output launch");
     printf_runtime(cudaDeviceGetLimit(&after, cudaLimitPrintfFifoSize));
@@ -180,12 +180,12 @@ void verify_printf_output(std::string text) {
 }
 int main(int argc, char** argv) {
     if (argc == 4 && std::string_view(argv[3]) == "--worker")
-        return cudavm::run_conformance(argc - 1, argv, cudavm::fixtures, cudavm::execute_device_printf);
+        return cudavm::run_test(argc - 1, argv, cudavm::fixtures, cudavm::execute_device_printf);
     try {
         cudavm::require(argc == 3 && std::string_view(argv[2]) == "cu", "usage: <executable> <backend> cu");
         const std::array<std::string_view, 5> backends{"cuda", "vulkan", "directx", "opencl", "opengl"};
         cudavm::require(std::find(backends.begin(), backends.end(), argv[1]) != backends.end(), "known backend");
-        const auto child = cudavm::run_conformance_child(argv[0], argv[1], argv[2]);
+        const auto child = cudavm::run_test_child(argv[0], argv[1], argv[2]);
         std::cout << child.output;
         if (child.status != 0) return child.status;
         cudavm::verify_printf_output(child.output);

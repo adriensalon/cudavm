@@ -17,7 +17,7 @@ struct surface_access_object {
         if (runtime) {
             auto resource = storage.runtime_descriptor(); image_runtime(cudaCreateSurfaceObject(&value, &resource));
         } else {
-            auto resource = storage.driver_descriptor(); CONFORMANCE_CUDA(cuSurfObjectCreate(&value, &resource));
+            auto resource = storage.driver_descriptor(); TEST_CUDA(cuSurfObjectCreate(&value, &resource));
         }
     }
     ~surface_access_object() { if (value) cuSurfObjectDestroy(value); }
@@ -40,20 +40,20 @@ void execute_surface_access(const loaded_program& program) {
                     | (uint32_t(raw[word * 4 + 2]) << 16) | (uint32_t(raw[word * 4 + 3]) << 24);
         }
         device_buffer source(input.size() * 4), destination((guards + (count + 4) * 4 + guards) * 4);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         auto in = source.value + guards * 4, out = destination.value + guards * 4;
         auto launch = [&](unsigned phase) {
             void* args[]{&surface.value, &in, &out, &phase};
-            CONFORMANCE_CUDA(cuLaunchKernel(program.function(format.kernel), 1, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuCtxSynchronize());
+            TEST_CUDA(cuLaunchKernel(program.function(format.kernel), 1, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuCtxSynchronize());
         };
         launch(0);
         for (bool replaced : {false, true}) {
             if (replaced && !surface_boundaries) break;
             if (replaced) launch(2);
             std::vector<uint32_t> actual(guards + (count + 4) * 4 + guards, 0xa7b96351);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, actual.data(), actual.size() * 4)); launch(1);
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, actual.data(), actual.size() * 4)); launch(1);
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
             for (unsigned i = 0; i < actual.size(); ++i) {
                 uint32_t expected = 0xa7b96351;
                 if (i >= guards && i < actual.size() - guards) {
@@ -76,7 +76,7 @@ void execute_surface_access(const loaded_program& program) {
             }
             storage.verify();
         }
-        std::vector<uint32_t> preserved(input.size()); CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        std::vector<uint32_t> preserved(input.size()); TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "surface access preserves input bytes and both guards");
     }
 }
@@ -85,5 +85,5 @@ int main(int argc, char** argv) {
     if (argc != 4) return 1;
     const std::string_view profile = argv[3]; if (profile != "vectors" && profile != "boundaries") return 1;
     cudavm::surface_boundaries = profile == "boundaries";
-    return cudavm::run_conformance(argc - 1, argv, cudavm::fixtures, cudavm::execute_surface_access);
+    return cudavm::run_test(argc - 1, argv, cudavm::fixtures, cudavm::execute_surface_access);
 }

@@ -38,13 +38,13 @@ void execute_bfloat16_conversion(const loaded_program& program) {
     std::copy(values.begin(), values.end(), input.begin() + guards);
     std::vector<uint32_t> initial((capacity + 3) * fields + guards * 2, guard), actual(initial.size());
     device_buffer source(input.size() * 4), output(initial.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
     auto from = source.value + guards * 4, to = output.value + guards * 4;
     for (unsigned count : {0u, 1u, 37u, capacity}) {
-        CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, initial.data(), initial.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(output.value, initial.data(), initial.size() * 4));
         void* arguments[]{&to, &from, &count};
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function("convert_bfloat16"), blocks, 1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+        TEST_CUDA(cuLaunchKernel(program.function("convert_bfloat16"), blocks, 1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
         for (size_t i = 0; i < actual.size(); ++i) {
             if (i < guards || i >= guards + size_t(count) * fields) {
                 if (actual[i] != guard) throw std::runtime_error("bfloat16 conversion inactive outputs and guards");
@@ -59,11 +59,11 @@ void execute_bfloat16_conversion(const loaded_program& program) {
             if (actual[i] != expected) throw std::runtime_error("bfloat16 conversion input=" + std::to_string(bits) + " field=" + std::to_string(field)
                 + " got=" + std::to_string(actual[i]) + " expected=" + std::to_string(expected));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "bfloat16 conversion preserves complete source and guards");
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_bfloat16_conversion);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_bfloat16_conversion);
 }

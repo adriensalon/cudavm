@@ -44,26 +44,26 @@ struct event_lifetime_stream {
         if (runtime) {
             cudaStream_t stream{}; EVENT_LIFETIME_RUNTIME(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
             value = reinterpret_cast<CUstream>(stream);
-        } else CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING));
+        } else TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING));
     }
     ~event_lifetime_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
     cudaStream_t cast() const { return reinterpret_cast<cudaStream_t>(value); }
     void gate(event_lifetime_gate& state, bool runtime, bool await_entry = true) const {
         if (runtime) EVENT_LIFETIME_RUNTIME(cudaLaunchHostFunc(cast(), event_lifetime_gate::call, &state));
-        else CONFORMANCE_CUDA(cuLaunchHostFunc(value, event_lifetime_gate::call, &state));
+        else TEST_CUDA(cuLaunchHostFunc(value, event_lifetime_gate::call, &state));
         if (await_entry) state.await();
     }
     void wait(CUevent event, bool runtime) const {
         if (runtime) EVENT_LIFETIME_RUNTIME(cudaStreamWaitEvent(cast(), reinterpret_cast<cudaEvent_t>(event), 0));
-        else CONFORMANCE_CUDA(cuStreamWaitEvent(value, event, 0));
+        else TEST_CUDA(cuStreamWaitEvent(value, event, 0));
     }
     void synchronize(bool runtime) const {
         if (runtime) EVENT_LIFETIME_RUNTIME(cudaStreamSynchronize(cast()));
-        else CONFORMANCE_CUDA(cuStreamSynchronize(value));
+        else TEST_CUDA(cuStreamSynchronize(value));
     }
     void destroy(bool runtime) {
         if (runtime) EVENT_LIFETIME_RUNTIME(cudaStreamDestroy(cast()));
-        else CONFORMANCE_CUDA(cuStreamDestroy(value));
+        else TEST_CUDA(cuStreamDestroy(value));
         value = nullptr;
     }
 };
@@ -73,17 +73,17 @@ struct event_lifetime_event {
         if (runtime) {
             cudaEvent_t event{}; EVENT_LIFETIME_RUNTIME(cudaEventCreateWithFlags(&event, flags));
             value = reinterpret_cast<CUevent>(event);
-        } else CONFORMANCE_CUDA(cuEventCreate(&value, flags));
+        } else TEST_CUDA(cuEventCreate(&value, flags));
     }
     ~event_lifetime_event() { if (value) cuEventDestroy(value); }
     cudaEvent_t cast() const { return reinterpret_cast<cudaEvent_t>(value); }
     void record(const event_lifetime_stream& stream, bool runtime) const {
         if (runtime) EVENT_LIFETIME_RUNTIME(cudaEventRecord(cast(), stream.cast()));
-        else CONFORMANCE_CUDA(cuEventRecord(value, stream.value));
+        else TEST_CUDA(cuEventRecord(value, stream.value));
     }
     void destroy(bool runtime) {
         if (runtime) EVENT_LIFETIME_RUNTIME(cudaEventDestroy(cast()));
-        else CONFORMANCE_CUDA(cuEventDestroy(value));
+        else TEST_CUDA(cuEventDestroy(value));
         value = nullptr;
     }
 };
@@ -93,16 +93,16 @@ struct event_lifetime_source {
     std::vector<unsigned char> expected = std::vector<unsigned char>(size);
     explicit event_lifetime_source(unsigned seed) {
         for (size_t i = 0; i < size; ++i) expected[i] = static_cast<unsigned char>(seed + i * 73 + (i >> 3));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(device.value, expected.data(), size));
+        TEST_CUDA(cuMemcpyHtoD(device.value, expected.data(), size));
     }
     void publish(const event_lifetime_stream& stream, unsigned char value, bool runtime) {
         if (runtime) EVENT_LIFETIME_RUNTIME(cudaMemsetAsync(reinterpret_cast<void*>(static_cast<uintptr_t>(device.value + 17)), value, 257, stream.cast()));
-        else CONFORMANCE_CUDA(cuMemsetD8Async(device.value + 17, value, 257, stream.value));
+        else TEST_CUDA(cuMemsetD8Async(device.value + 17, value, 257, stream.value));
         std::fill_n(expected.begin() + 17, 257, value);
     }
     void verify() const {
         std::vector<unsigned char> actual(size);
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), device.value, size));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), device.value, size));
         require(actual == expected, "event producer complete source bytes and guards");
     }
 };
@@ -111,15 +111,15 @@ struct event_lifetime_readback {
     device_buffer device{size};
     void* host{};
     event_lifetime_readback() {
-        CONFORMANCE_CUDA(cuMemsetD8(device.value, 0xa9, size));
-        CONFORMANCE_CUDA(cuMemAllocHost(&host, size + 32)); std::memset(host, 0xd3, size + 32);
+        TEST_CUDA(cuMemsetD8(device.value, 0xa9, size));
+        TEST_CUDA(cuMemAllocHost(&host, size + 32)); std::memset(host, 0xd3, size + 32);
     }
     ~event_lifetime_readback() { if (host) cuMemFreeHost(host); }
     void consume(const event_lifetime_stream& stream, const event_lifetime_source& source, size_t from, size_t to, size_t bytes, bool runtime) {
         if (runtime) EVENT_LIFETIME_RUNTIME(cudaMemcpyAsync(reinterpret_cast<void*>(static_cast<uintptr_t>(device.value + to)),
             reinterpret_cast<const void*>(static_cast<uintptr_t>(source.device.value + from)), bytes, cudaMemcpyDeviceToDevice, stream.cast()));
-        else CONFORMANCE_CUDA(cuMemcpyDtoDAsync(device.value + to, source.device.value + from, bytes, stream.value));
-        CONFORMANCE_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(host) + 16, device.value, size, stream.value));
+        else TEST_CUDA(cuMemcpyDtoDAsync(device.value + to, source.device.value + from, bytes, stream.value));
+        TEST_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(host) + 16, device.value, size, stream.value));
     }
     void untouched() const {
         const auto* data = static_cast<const unsigned char*>(host);
@@ -132,7 +132,7 @@ struct event_lifetime_readback {
         require(std::equal(expected.begin(), expected.end(), static_cast<const unsigned char*>(host)), "retained event exact consumer bytes and pinned guards");
         if (!check_device) return;
         std::vector<unsigned char> actual(size);
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), device.value, size));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), device.value, size));
         require(std::equal(actual.begin(), actual.end(), expected.begin() + 16), "retained event complete destination allocation");
     }
 };
@@ -200,9 +200,9 @@ void event_lifetime_stream_retirement() {
         producer.destroy(!runtime); gate.held(); result.untouched();
         require(cuEventQuery(event.value) == CUDA_ERROR_NOT_READY && cudaEventQuery(event.cast()) == cudaErrorNotReady, "live event retains retired producer completion");
         gate.release();
-        if (runtime) CONFORMANCE_CUDA(cuEventSynchronize(event.value));
+        if (runtime) TEST_CUDA(cuEventSynchronize(event.value));
         else EVENT_LIFETIME_RUNTIME(cudaEventSynchronize(event.cast()));
-        CONFORMANCE_CUDA(cuEventQuery(event.value)); EVENT_LIFETIME_RUNTIME(cudaEventQuery(event.cast()));
+        TEST_CUDA(cuEventQuery(event.value)); EVENT_LIFETIME_RUNTIME(cudaEventQuery(event.cast()));
         result.verify(source, 17, 23, 257); source.verify(); gate.completed(); event.destroy(runtime);
     }
 }
@@ -217,5 +217,5 @@ void execute_event_lifetime() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::event_lifetime_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_event_lifetime);
+    return cudavm::run_test(argc, argv, cudavm::execute_event_lifetime);
 }

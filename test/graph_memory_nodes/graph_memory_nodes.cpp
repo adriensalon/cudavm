@@ -12,7 +12,7 @@ void check_graph_memory_runtime(cudaError_t result, const char* operation) {
 struct graph_memory_host {
     static constexpr size_t bytes = 4128;
     void* value{};
-    graph_memory_host() { CONFORMANCE_CUDA(cuMemAllocHost(&value, bytes)); }
+    graph_memory_host() { TEST_CUDA(cuMemAllocHost(&value, bytes)); }
     ~graph_memory_host() { if (value) { cuCtxSynchronize(); cuMemFreeHost(value); } }
     unsigned char* data() const { return static_cast<unsigned char*>(value); }
     void reset(unsigned char value) { std::memset(data(), value, bytes); }
@@ -36,9 +36,9 @@ cudaMemcpy3DParms graph_memory_runtime_copy(const CUDA_MEMCPY3D& p) {
 struct graph_memory_graph {
     CUgraph value{}; CUcontext context{};
     explicit graph_memory_graph(bool runtime) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        TEST_CUDA(cuCtxGetCurrent(&context));
         if (runtime) { cudaGraph_t result{}; GRAPH_MEMORY_RUNTIME(cudaGraphCreate(&result, 0)); value = reinterpret_cast<CUgraph>(result); }
-        else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        else TEST_CUDA(cuGraphCreate(&value, 0));
     }
     ~graph_memory_graph() { if (value) cuGraphDestroy(value); }
     CUgraphNode fill(const CUDA_MEMSET_NODE_PARAMS& params, bool runtime, CUgraphNode dependency = nullptr) {
@@ -47,7 +47,7 @@ struct graph_memory_graph {
             auto p = graph_memory_runtime_fill(params); auto dep = reinterpret_cast<cudaGraphNode_t>(dependency); cudaGraphNode_t result{};
             GRAPH_MEMORY_RUNTIME(cudaGraphAddMemsetNode(&result, reinterpret_cast<cudaGraph_t>(value), dependency ? &dep : nullptr, dependency ? 1 : 0, &p));
             node = reinterpret_cast<CUgraphNode>(result);
-        } else CONFORMANCE_CUDA(cuGraphAddMemsetNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, &params, context));
+        } else TEST_CUDA(cuGraphAddMemsetNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, &params, context));
         return node;
     }
     CUgraphNode copy(const CUDA_MEMCPY3D& params, bool runtime, CUgraphNode dependency = nullptr) {
@@ -56,7 +56,7 @@ struct graph_memory_graph {
             auto p = graph_memory_runtime_copy(params); auto dep = reinterpret_cast<cudaGraphNode_t>(dependency); cudaGraphNode_t result{};
             GRAPH_MEMORY_RUNTIME(cudaGraphAddMemcpyNode(&result, reinterpret_cast<cudaGraph_t>(value), dependency ? &dep : nullptr, dependency ? 1 : 0, &p));
             node = reinterpret_cast<CUgraphNode>(result);
-        } else CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, &params, context));
+        } else TEST_CUDA(cuGraphAddMemcpyNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, &params, context));
         return node;
     }
 };
@@ -64,13 +64,13 @@ struct graph_memory_executable {
     CUgraphExec value{};
     graph_memory_executable(CUgraph graph, bool runtime) {
         if (runtime) { cudaGraphExec_t result{}; GRAPH_MEMORY_RUNTIME(cudaGraphInstantiateWithFlags(&result, reinterpret_cast<cudaGraph_t>(graph), 0)); value = reinterpret_cast<CUgraphExec>(result); }
-        else CONFORMANCE_CUDA(cuGraphInstantiate(&value, graph, 0));
+        else TEST_CUDA(cuGraphInstantiate(&value, graph, 0));
     }
     ~graph_memory_executable() { if (value) { cuCtxSynchronize(); cuGraphExecDestroy(value); } }
     void launch(bool runtime) {
         if (runtime) GRAPH_MEMORY_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(value), nullptr));
-        else CONFORMANCE_CUDA(cuGraphLaunch(value, nullptr));
-        CONFORMANCE_CUDA(cuCtxSynchronize());
+        else TEST_CUDA(cuGraphLaunch(value, nullptr));
+        TEST_CUDA(cuCtxSynchronize());
     }
 };
 CUDA_MEMSET_NODE_PARAMS graph_memory_fill(CUdeviceptr device, size_t offset, unsigned element, size_t width, size_t height, size_t pitch, unsigned value) {
@@ -83,7 +83,7 @@ CUDA_MEMCPY3D graph_memory_read(CUdeviceptr device, void* host, size_t bytes) {
 }
 void graph_memory_expect_fill(CUgraphNode node, const CUDA_MEMSET_NODE_PARAMS& expected) {
     struct output { uint64_t prefix = 0x123456789abcdef0; CUDA_MEMSET_NODE_PARAMS value{}; uint64_t suffix = 0xfedcba9876543210; } driver;
-    CONFORMANCE_CUDA(cuGraphMemsetNodeGetParams(node, &driver.value));
+    TEST_CUDA(cuGraphMemsetNodeGetParams(node, &driver.value));
     cudaMemsetParams runtime{}; GRAPH_MEMORY_RUNTIME(cudaGraphMemsetNodeGetParams(reinterpret_cast<cudaGraphNode_t>(node), &runtime));
     const auto check = [&](const auto& p, CUdeviceptr destination) {
         require(destination == expected.dst && p.pitch == expected.pitch && p.value == expected.value && p.elementSize == expected.elementSize
@@ -93,7 +93,7 @@ void graph_memory_expect_fill(CUgraphNode node, const CUDA_MEMSET_NODE_PARAMS& e
     require(driver.prefix == 0x123456789abcdef0 && driver.suffix == 0xfedcba9876543210, "fill parameter output guards");
 }
 void graph_memory_expect_copy(CUgraphNode node, const CUDA_MEMCPY3D& expected) {
-    CUDA_MEMCPY3D p{}; CONFORMANCE_CUDA(cuGraphMemcpyNodeGetParams(node, &p));
+    CUDA_MEMCPY3D p{}; TEST_CUDA(cuGraphMemcpyNodeGetParams(node, &p));
     require(p.srcMemoryType == expected.srcMemoryType && p.dstMemoryType == expected.dstMemoryType
         && (p.srcMemoryType == CU_MEMORYTYPE_HOST ? p.srcHost == expected.srcHost : p.srcDevice == expected.srcDevice)
         && (p.dstMemoryType == CU_MEMORYTYPE_HOST ? p.dstHost == expected.dstHost : p.dstDevice == expected.dstDevice)
@@ -117,9 +117,9 @@ void graph_memory_set_fill(CUgraphNode node, const CUDA_MEMSET_NODE_PARAMS& p, b
         if (executable) GRAPH_MEMORY_RUNTIME(cudaGraphExecMemsetNodeSetParams(reinterpret_cast<cudaGraphExec_t>(executable), reinterpret_cast<cudaGraphNode_t>(node), &params));
         else GRAPH_MEMORY_RUNTIME(cudaGraphMemsetNodeSetParams(reinterpret_cast<cudaGraphNode_t>(node), &params));
     } else if (executable) {
-        CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
-        CONFORMANCE_CUDA(cuGraphExecMemsetNodeSetParams(executable, node, &p, context));
-    } else CONFORMANCE_CUDA(cuGraphMemsetNodeSetParams(node, &p));
+        CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
+        TEST_CUDA(cuGraphExecMemsetNodeSetParams(executable, node, &p, context));
+    } else TEST_CUDA(cuGraphMemsetNodeSetParams(node, &p));
 }
 void graph_memory_set_copy(CUgraphNode node, const CUDA_MEMCPY3D& p, bool runtime, CUgraphExec executable = nullptr, bool convenience = false) {
     if (runtime) {
@@ -129,13 +129,13 @@ void graph_memory_set_copy(CUgraphNode node, const CUDA_MEMCPY3D& p, bool runtim
         else if (executable) GRAPH_MEMORY_RUNTIME(cudaGraphExecMemcpyNodeSetParams(reinterpret_cast<cudaGraphExec_t>(executable), reinterpret_cast<cudaGraphNode_t>(node), &params));
         else GRAPH_MEMORY_RUNTIME(cudaGraphMemcpyNodeSetParams(reinterpret_cast<cudaGraphNode_t>(node), &params));
     } else if (executable) {
-        CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
-        CONFORMANCE_CUDA(cuGraphExecMemcpyNodeSetParams(executable, node, &p, context));
-    } else CONFORMANCE_CUDA(cuGraphMemcpyNodeSetParams(node, &p));
+        CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
+        TEST_CUDA(cuGraphExecMemcpyNodeSetParams(executable, node, &p, context));
+    } else TEST_CUDA(cuGraphMemcpyNodeSetParams(node, &p));
 }
 void graph_memory_run_fill(graph_memory_executable& executable, CUdeviceptr device, graph_memory_host& output,
                           const CUDA_MEMSET_NODE_PARAMS& fill, const CUDA_MEMCPY3D& read, unsigned seed, bool runtime) {
-    CONFORMANCE_CUDA(cuMemsetD8(device, static_cast<unsigned char>(seed), 4096)); output.reset(0xd3);
+    TEST_CUDA(cuMemsetD8(device, static_cast<unsigned char>(seed), 4096)); output.reset(0xd3);
     std::vector<unsigned char> expected_device(4096, static_cast<unsigned char>(seed)), expected_host(graph_memory_host::bytes, 0xd3);
     const auto start = size_t(fill.dst - device), pitch = fill.height == 1 ? fill.width * fill.elementSize : fill.pitch;
     for (size_t row = 0; row < fill.height; ++row) for (size_t element = 0; element < fill.width; ++element)
@@ -144,7 +144,7 @@ void graph_memory_run_fill(graph_memory_executable& executable, CUdeviceptr devi
     const auto source = size_t(read.srcDevice - device), destination = size_t(static_cast<unsigned char*>(read.dstHost) - output.data());
     for (size_t i = 0; i < read.WidthInBytes; ++i) expected_host[destination + i] = expected_device[source + i];
     executable.launch(runtime); output.expect(expected_host);
-    std::vector<unsigned char> actual_device(4096); CONFORMANCE_CUDA(cuMemcpyDtoH(actual_device.data(), device, actual_device.size()));
+    std::vector<unsigned char> actual_device(4096); TEST_CUDA(cuMemcpyDtoH(actual_device.data(), device, actual_device.size()));
     require(actual_device == expected_device, "graph typed fill preserves device padding and every untouched byte");
 }
 void graph_memory_nodes_fills() {
@@ -190,8 +190,8 @@ void graph_memory_nodes_copies() {
         const auto c = graph.copy(read, runtime, b); graph_memory_expect_copy(c, read);
         graph_memory_executable executable(graph.value, !runtime);
         for (unsigned seed : {0u, 0x91u, 0xffu}) {
-            CONFORMANCE_CUDA(cuMemsetD8(first.value, static_cast<unsigned char>(seed), 4096));
-            CONFORMANCE_CUDA(cuMemsetD8(second.value, static_cast<unsigned char>(seed ^ 0x5a), 4096)); output.reset(0xd3);
+            TEST_CUDA(cuMemsetD8(first.value, static_cast<unsigned char>(seed), 4096));
+            TEST_CUDA(cuMemsetD8(second.value, static_cast<unsigned char>(seed ^ 0x5a), 4096)); output.reset(0xd3);
             std::vector<unsigned char> expected_a(4096, static_cast<unsigned char>(seed)), expected_b(4096, static_cast<unsigned char>(seed ^ 0x5a)), expected_output(graph_memory_host::bytes, 0xd3);
             for (size_t z = 0; z < 2; ++z) for (size_t y = 0; y < 3; ++y) for (size_t x = 0; x < 37; ++x) {
                 const auto byte = source[16 + (z + 1) * 5 * 83 + (y + 1) * 83 + 5 + x];
@@ -201,8 +201,8 @@ void graph_memory_nodes_copies() {
             }
             executable.launch(runtime); input.expect(source); output.expect(expected_output);
             std::vector<unsigned char> actual(4096);
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), first.value, actual.size())); require(actual == expected_a, "graph HtoD rows, slices and untouched source storage");
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), second.value, actual.size())); require(actual == expected_b, "graph DtoD rows, slices and device padding");
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), first.value, actual.size())); require(actual == expected_a, "graph HtoD rows, slices and untouched source storage");
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), second.value, actual.size())); require(actual == expected_b, "graph DtoD rows, slices and device padding");
         }
     }
 }
@@ -316,5 +316,5 @@ void execute_graph_memory_nodes() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::graph_memory_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_graph_memory_nodes);
+    return cudavm::run_test(argc, argv, cudavm::execute_graph_memory_nodes);
 }

@@ -26,10 +26,10 @@ template<class Word> struct floating_atomic_observation {
           pointer(storage.value + 4 * sizeof(Word)) {}
     void reset() {
         std::fill(values.begin(), values.end(), guard);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(storage.value, values.data(), values.size() * sizeof(Word)));
+        TEST_CUDA(cuMemcpyHtoD(storage.value, values.data(), values.size() * sizeof(Word)));
     }
     void fetch(size_t written, const std::string& context) {
-        CONFORMANCE_CUDA(cuMemcpyDtoH(values.data(), storage.value, values.size() * sizeof(Word)));
+        TEST_CUDA(cuMemcpyDtoH(values.data(), storage.value, values.size() * sizeof(Word)));
         for (size_t i = 0; i < values.size(); ++i)
             if (i < 4 || i >= written + 4)
                 require(values[i] == guard, context + ": output guard/inactive lane " + std::to_string(i));
@@ -64,15 +64,15 @@ template<class Word> void check_floating_global(const loaded_program& program, c
                         + " delta/4=" + std::to_string(delta);
                     const std::array<Word, 6> initial{guard, atomic_quarters<Word>(seed),
                         atomic_quarters<Word>(seed), guard, guard, guard};
-                    CONFORMANCE_CUDA(cuMemcpyHtoD(counters.value, initial.data(), sizeof(initial)));
+                    TEST_CUDA(cuMemcpyHtoD(counters.value, initial.data(), sizeof(initial)));
                     output.reset();
                     Word operand = atomic_quarters<Word>(delta);
                     void* args[]{&output.pointer, &state, &count, &operand};
-                    CONFORMANCE_CUDA(cuLaunchKernel(function, blocks, 1, 1, lanes, 1, 1,
+                    TEST_CUDA(cuLaunchKernel(function, blocks, 1, 1, lanes, 1, 1,
                         0, nullptr, args, nullptr));
                     output.fetch(active, context);
                     std::array<Word, 6> actual{};
-                    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), counters.value, sizeof(actual)));
+                    TEST_CUDA(cuMemcpyDtoH(actual.data(), counters.value, sizeof(actual)));
                     auto expected = initial;
                     expected[1] = expected[2] = atomic_quarters<Word>(seed + delta * active);
                     for (size_t i = 0; i < actual.size(); ++i)
@@ -103,7 +103,7 @@ void check_floating_shared(const loaded_program& program) {
                     uint32_t initial = atomic_quarters<uint32_t>(seed);
                     uint32_t operand = atomic_quarters<uint32_t>(delta);
                     void* args[]{&output.pointer, &totals.pointer, &count, &initial, &operand};
-                    CONFORMANCE_CUDA(cuLaunchKernel(function, blocks, 1, 1, lanes, 1, 1,
+                    TEST_CUDA(cuLaunchKernel(function, blocks, 1, 1, lanes, 1, 1,
                         0, nullptr, args, nullptr));
                     output.fetch(std::min(count, total), context);
                     totals.fetch(blocks * 2, context);
@@ -137,14 +137,14 @@ void check_floating_exchange(const loaded_program& program) {
     auto state = counters.value + sizeof(uint32_t);
     for (unsigned i = 0; i < corpus.size(); ++i) {
         const std::array<uint32_t, 4> initial{guard, corpus[i], guard, guard};
-        CONFORMANCE_CUDA(cuMemcpyHtoD(counters.value, initial.data(), sizeof(initial)));
+        TEST_CUDA(cuMemcpyHtoD(counters.value, initial.data(), sizeof(initial)));
         output.reset();
         uint32_t replacement = corpus[(i * 7 + 3) % corpus.size()];
         void* args[]{&output.pointer, &state, &replacement};
-        CONFORMANCE_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr));
+        TEST_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr));
         output.fetch(1, "float exchange");
         std::array<uint32_t, 4> actual{};
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), counters.value, sizeof(actual)));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), counters.value, sizeof(actual)));
         auto expected = initial;
         expected[1] = replacement;
         require(output.values[4] == corpus[i] && actual == expected,
@@ -161,5 +161,5 @@ void execute_floating_point_atomics(const loaded_program& program) {
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_floating_point_atomics);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_floating_point_atomics);
 }

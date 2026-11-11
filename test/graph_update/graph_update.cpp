@@ -24,10 +24,10 @@ struct update_storage {
     std::vector<uint32_t> initial;
     explicit update_storage(unsigned seed) : initial(update_words) {
         for (size_t i = 0; i < initial.size(); ++i) initial[i] = 0xcafe0000u + uint32_t(i) * 0x10203u + seed;
-        CONFORMANCE_CUDA(cuMemAllocHost(&host, update_slots * update_slot_words * sizeof(uint32_t)));
+        TEST_CUDA(cuMemAllocHost(&host, update_slots * update_slot_words * sizeof(uint32_t)));
         try {
-            CONFORMANCE_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size() * sizeof(uint32_t)));
-            CONFORMANCE_CUDA(cuMemcpyHtoD(sink.value, initial.data(), initial.size() * sizeof(uint32_t)));
+            TEST_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size() * sizeof(uint32_t)));
+            TEST_CUDA(cuMemcpyHtoD(sink.value, initial.data(), initial.size() * sizeof(uint32_t)));
         } catch (...) { cuMemFreeHost(host); host = nullptr; throw; }
         std::memset(host, 0xd3, update_slots * update_slot_words * sizeof(uint32_t));
     }
@@ -48,25 +48,25 @@ struct update_storage {
     }
     void expect_device(std::span<const uint32_t> expected) const {
         std::vector<uint32_t> actual(update_words);
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), device.value, actual.size() * sizeof(uint32_t)));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), device.value, actual.size() * sizeof(uint32_t)));
         expect_words(actual, expected, "updated device data, inactive lanes and allocation guards");
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), sink.value, actual.size() * sizeof(uint32_t)));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), sink.value, actual.size() * sizeof(uint32_t)));
         expect_words(actual, initial, "rejected copy destination remains untouched");
     }
 };
 struct update_stream {
     CUstream value{};
-    update_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    update_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~update_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
-    void synchronize() const { CONFORMANCE_CUDA(cuStreamSynchronize(value)); }
+    void synchronize() const { TEST_CUDA(cuStreamSynchronize(value)); }
 };
 struct update_graph {
     CUgraph value{}; CUcontext context{};
     CUgraphNode root{}, kernel{}, read{}, tail{};
     update_graph(CUfunction function, update_storage& storage, unsigned count, uint32_t color, bool runtime) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        TEST_CUDA(cuCtxGetCurrent(&context));
         if (runtime) { cudaGraph_t result{}; UPDATE_RUNTIME(cudaGraphCreate(&result, 0)); value = reinterpret_cast<CUgraph>(result); }
-        else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        else TEST_CUDA(cuGraphCreate(&value, 0));
         try {
             root = empty({}, runtime); set_kernel(function, storage, count, color, runtime);
             set_read(storage, 0, runtime); tail = empty(std::array{read, root}, runtime);
@@ -80,7 +80,7 @@ struct update_graph {
             for (auto node : dependencies) converted.push_back(reinterpret_cast<cudaGraphNode_t>(node));
             cudaGraphNode_t node{}; UPDATE_RUNTIME(cudaGraphAddEmptyNode(&node, reinterpret_cast<cudaGraph_t>(value), converted.data(), converted.size()));
             result = reinterpret_cast<CUgraphNode>(node);
-        } else CONFORMANCE_CUDA(cuGraphAddEmptyNode(&result, value, dependencies.data(), dependencies.size()));
+        } else TEST_CUDA(cuGraphAddEmptyNode(&result, value, dependencies.data(), dependencies.size()));
         return result;
     }
     void edge(CUgraphNode from, CUgraphNode to, bool add, bool runtime) const {
@@ -88,12 +88,12 @@ struct update_graph {
             auto source = reinterpret_cast<cudaGraphNode_t>(from), target = reinterpret_cast<cudaGraphNode_t>(to);
             if (add) UPDATE_RUNTIME(cudaGraphAddDependencies(reinterpret_cast<cudaGraph_t>(value), &source, &target, nullptr, 1));
             else UPDATE_RUNTIME(cudaGraphRemoveDependencies(reinterpret_cast<cudaGraph_t>(value), &source, &target, nullptr, 1));
-        } else if (add) CONFORMANCE_CUDA(cuGraphAddDependencies(value, &from, &to, nullptr, 1));
-        else CONFORMANCE_CUDA(cuGraphRemoveDependencies(value, &from, &to, nullptr, 1));
+        } else if (add) TEST_CUDA(cuGraphAddDependencies(value, &from, &to, nullptr, 1));
+        else TEST_CUDA(cuGraphRemoveDependencies(value, &from, &to, nullptr, 1));
     }
     void destroy_node(CUgraphNode node, bool runtime) const {
         if (runtime) UPDATE_RUNTIME(cudaGraphDestroyNode(reinterpret_cast<cudaGraphNode_t>(node)));
-        else CONFORMANCE_CUDA(cuGraphDestroyNode(node));
+        else TEST_CUDA(cuGraphDestroyNode(node));
     }
     void set_kernel(CUfunction function, update_storage& storage, unsigned count, uint32_t color, bool runtime,
                     CUgraphExec executable = nullptr, unsigned block = 32) {
@@ -112,9 +112,9 @@ struct update_graph {
         } else {
             CUDA_KERNEL_NODE_PARAMS p{}; p.func = function; p.gridDimX = 96 / block; p.gridDimY = p.gridDimZ = 1;
             p.blockDimX = block; p.blockDimY = p.blockDimZ = 1; p.kernelParams = arguments.data();
-            if (executable) CONFORMANCE_CUDA(cuGraphExecKernelNodeSetParams(executable, kernel, &p));
-            else if (kernel) CONFORMANCE_CUDA(cuGraphKernelNodeSetParams(kernel, &p));
-            else CONFORMANCE_CUDA(cuGraphAddKernelNode(&kernel, value, &root, 1, &p));
+            if (executable) TEST_CUDA(cuGraphExecKernelNodeSetParams(executable, kernel, &p));
+            else if (kernel) TEST_CUDA(cuGraphKernelNodeSetParams(kernel, &p));
+            else TEST_CUDA(cuGraphAddKernelNode(&kernel, value, &root, 1, &p));
         }
         pointer = 0; count = 0; color = 0; // Accepted nodes own argument bytes, not this stack frame.
     }
@@ -142,9 +142,9 @@ struct update_graph {
             if (executable) {
                 auto result = cuGraphExecMemcpyNodeSetParams(executable, read, &p, context);
                 if (reject) require(result == CUDA_ERROR_INVALID_VALUE, "Driver executable copy rejects changed endpoint memory type");
-                else CONFORMANCE_CUDA(result);
-            } else if (read) CONFORMANCE_CUDA(cuGraphMemcpyNodeSetParams(read, &p));
-            else CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&read, value, &kernel, 1, &p, context));
+                else TEST_CUDA(result);
+            } else if (read) TEST_CUDA(cuGraphMemcpyNodeSetParams(read, &p));
+            else TEST_CUDA(cuGraphAddMemcpyNode(&read, value, &kernel, 1, &p, context));
         }
     }
 };
@@ -157,12 +157,12 @@ struct update_executable {
     CUgraphExec value{};
     update_executable(CUgraph graph, bool runtime, unsigned long long flags = 0) {
         if (runtime) { cudaGraphExec_t result{}; UPDATE_RUNTIME(cudaGraphInstantiateWithFlags(&result, reinterpret_cast<cudaGraph_t>(graph), flags)); value = reinterpret_cast<CUgraphExec>(result); }
-        else CONFORMANCE_CUDA(cuGraphInstantiate(&value, graph, flags));
+        else TEST_CUDA(cuGraphInstantiate(&value, graph, flags));
     }
     ~update_executable() { if (value) cuGraphExecDestroy(value); }
     void launch(CUstream stream, bool runtime) const {
         if (runtime) UPDATE_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(value), reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuGraphLaunch(value, stream));
+        else TEST_CUDA(cuGraphLaunch(value, stream));
     }
     update_diagnostic update(CUgraph graph, bool runtime, bool success) const {
         if (runtime) {
@@ -213,7 +213,7 @@ void update_pending(const update_functions& functions, bool runtime) {
     update_graph source(functions[0], original, 65, 0x11112222, runtime);
     update_graph candidate(functions[1], changed, 79, 0xabcdef01, !runtime); update_executable executable(source.value, runtime);
     update_gate_cleanup cleanup{gate};
-    CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, update_gate::call, &gate)); gate.await(); executable.launch(stream.value, runtime);
+    TEST_CUDA(cuLaunchHostFunc(stream.value, update_gate::call, &gate)); gate.await(); executable.launch(stream.value, runtime);
     executable.accept(candidate.value, runtime); executable.launch(stream.value, !runtime);
     candidate.set_kernel(functions[0], changed, 1, 0xfffffffe, runtime); candidate.set_read(changed, 1, !runtime);
     executable.accept(candidate.value, !runtime); executable.launch(stream.value, runtime);
@@ -278,7 +278,7 @@ void update_rejections(const update_functions& functions, bool runtime) {
 }
 void update_priority(CUgraphNode node, int priority, bool runtime) {
     if (runtime) { cudaKernelNodeAttrValue p{}; p.priority = priority; UPDATE_RUNTIME(cudaGraphKernelNodeSetAttribute(reinterpret_cast<cudaGraphNode_t>(node), cudaKernelNodeAttributePriority, &p)); }
-    else { CUkernelNodeAttrValue p{}; p.priority = priority; CONFORMANCE_CUDA(cuGraphKernelNodeSetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_PRIORITY, &p)); }
+    else { CUkernelNodeAttrValue p{}; p.priority = priority; TEST_CUDA(cuGraphKernelNodeSetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_PRIORITY, &p)); }
 }
 void update_attributes(const update_functions& functions, bool runtime) {
     update_storage original(101), changed(131); update_stream stream;
@@ -316,16 +316,16 @@ void update_invalid_nodes(const update_functions& functions, bool runtime) {
             legacy.gridDimX = 3; legacy.gridDimY = legacy.gridDimZ = 1;
             legacy.blockDimX = 32; legacy.blockDimY = legacy.blockDimZ = 1; legacy.kernelParams = arguments.data();
             void* address{};
-            CONFORMANCE_CUDA(cuGetProcAddress("cuGraphExecKernelNodeSetParams", &address, 10010, CU_GET_PROC_ADDRESS_DEFAULT, nullptr));
+            TEST_CUDA(cuGetProcAddress("cuGraphExecKernelNodeSetParams", &address, 10010, CU_GET_PROC_ADDRESS_DEFAULT, nullptr));
             auto exec_set = reinterpret_cast<CUresult (CUDAAPI*)(CUgraphExec, CUgraphNode, const CUDA_KERNEL_NODE_PARAMS_v1*)>(address);
             require(exec_set(executable.value, source.root, &legacy) == CUDA_ERROR_INVALID_VALUE, "legacy executable kernel setter rejects an empty node");
-            CONFORMANCE_CUDA(cuGetProcAddress("cuGraphKernelNodeSetParams", &address, 10000, CU_GET_PROC_ADDRESS_DEFAULT, nullptr));
+            TEST_CUDA(cuGetProcAddress("cuGraphKernelNodeSetParams", &address, 10000, CU_GET_PROC_ADDRESS_DEFAULT, nullptr));
             auto node_set = reinterpret_cast<CUresult (CUDAAPI*)(CUgraphNode, const CUDA_KERNEL_NODE_PARAMS_v1*)>(address);
             require(node_set(source.root, &legacy) == CUDA_ERROR_INVALID_VALUE, "legacy source kernel setter rejects an empty node");
         }
         require(rejected, "executable kernel setter rejects a node of the wrong type");
     }
-    CUgraphNodeType root_type{}; CONFORMANCE_CUDA(cuGraphNodeGetType(source.root, &root_type));
+    CUgraphNodeType root_type{}; TEST_CUDA(cuGraphNodeGetType(source.root, &root_type));
     require(root_type == CU_GRAPH_NODE_TYPE_EMPTY, "rejected source kernel setters preserve the empty-node type");
     executable.launch(stream.value, !runtime); stream.synchronize();
     auto expected = storage.initial; update_apply(expected, 65, 29, false); storage.expect(0, expected); storage.untouched(1); storage.expect_device(expected);
@@ -345,4 +345,4 @@ void execute_graph_update(const loaded_program& program) {
     }
 }
 }
-int main(int argc, char** argv) { return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_graph_update); }
+int main(int argc, char** argv) { return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_graph_update); }

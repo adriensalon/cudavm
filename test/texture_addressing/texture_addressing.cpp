@@ -28,7 +28,7 @@ void execute_texture_addressing(const loaded_program& program) {
     for (auto y : values) for (auto x : values) { coordinates.push_back(x); coordinates.push_back(y); }
     coordinates.resize(coordinates.size() + guards, std::bit_cast<float>(0x4a716395));
     unsigned count = unsigned(values.size() * values.size());
-    device_buffer input(coordinates.size() * 4); CONFORMANCE_CUDA(cuMemcpyHtoD(input.value, coordinates.data(), coordinates.size() * 4));
+    device_buffer input(coordinates.size() * 4); TEST_CUDA(cuMemcpyHtoD(input.value, coordinates.data(), coordinates.size() * 4));
     for (auto resource : {CU_RESOURCE_TYPE_ARRAY, CU_RESOURCE_TYPE_PITCH2D}) for (bool runtime : {false, true})
     for (auto mode : {CU_TR_ADDRESS_MODE_WRAP, CU_TR_ADDRESS_MODE_MIRROR, CU_TR_ADDRESS_MODE_CLAMP, CU_TR_ADDRESS_MODE_BORDER}) {
         image_test_storage storage(resource, CU_AD_FORMAT_FLOAT, cudaChannelFormatKindFloat, 32, 4, width, height, runtime);
@@ -38,11 +38,11 @@ void execute_texture_addressing(const loaded_program& program) {
         storage.upload(); const std::array<float, 4> border{23, -17, 31, -5};
         image_test_texture texture(storage, runtime, mode, CU_TR_FILTER_MODE_POINT, addressing_normalized, false, border);
         std::vector<uint32_t> output(guards + count * 4 + guards, 0xa7b96351);
-        device_buffer destination(output.size() * 4); CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, output.data(), output.size() * 4));
+        device_buffer destination(output.size() * 4); TEST_CUDA(cuMemcpyHtoD(destination.value, output.data(), output.size() * 4));
         auto pointer = destination.value + guards * 4, positions = input.value + guards * 4;
         void* args[]{&texture.value, &pointer, &positions, &count};
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function("address_texture"), (count + 63) / 64, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
-        CONFORMANCE_CUDA(cuCtxSynchronize()); CONFORMANCE_CUDA(cuMemcpyDtoH(output.data(), destination.value, output.size() * 4));
+        TEST_CUDA(cuLaunchKernel(program.function("address_texture"), (count + 63) / 64, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
+        TEST_CUDA(cuCtxSynchronize()); TEST_CUDA(cuMemcpyDtoH(output.data(), destination.value, output.size() * 4));
         for (unsigned i = 0; i < output.size(); ++i) {
             uint32_t expected = 0xa7b96351;
             if (i >= guards && i < guards + count * 4) {
@@ -56,7 +56,7 @@ void execute_texture_addressing(const loaded_program& program) {
         }
         storage.verify();
     }
-    std::vector<float> preserved(coordinates.size()); CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), input.value, preserved.size() * 4));
+    std::vector<float> preserved(coordinates.size()); TEST_CUDA(cuMemcpyDtoH(preserved.data(), input.value, preserved.size() * 4));
     require(std::memcmp(preserved.data(), coordinates.data(), coordinates.size() * 4) == 0, "preserve coordinate bits and both input guards");
 }
 }
@@ -65,5 +65,5 @@ int main(int argc, char** argv) {
     const std::string_view profile = argv[3];
     if (profile != "normalized" && profile != "unnormalized") return 1;
     cudavm::addressing_normalized = profile == "normalized";
-    return cudavm::run_conformance(argc - 1, argv, cudavm::fixtures, cudavm::execute_texture_addressing);
+    return cudavm::run_test(argc - 1, argv, cudavm::fixtures, cudavm::execute_texture_addressing);
 }

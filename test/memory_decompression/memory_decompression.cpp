@@ -40,10 +40,10 @@ void decompression_validate_fixtures() {
 struct decompression_capabilities {
     int mask{}, maximum{};
     decompression_capabilities() {
-        CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+        CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device));
         for (auto attribute : {CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK, CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_MAXIMUM_LENGTH}) {
             struct { int before = 0x19375928, value{}, after = 0x6edcba01; } output;
-            CONFORMANCE_CUDA(cuDeviceGetAttribute(&output.value, attribute, device));
+            TEST_CUDA(cuDeviceGetAttribute(&output.value, attribute, device));
             require(output.before == 0x19375928 && output.after == 0x6edcba01 && output.value >= 0, "decompression capability exact output width");
             (attribute == CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK ? mask : maximum) = output.value;
         }
@@ -55,8 +55,8 @@ bool decompression_capable(CUdeviceptr pointer, bool bulk = false) {
     struct { unsigned char before = 0x37; bool value{}; unsigned char after = 0xa9; } output;
     if (bulk) {
         CUpointer_attribute attribute = CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE; void* destination = &output.value;
-        CONFORMANCE_CUDA(cuPointerGetAttributes(1, &attribute, &destination, pointer));
-    } else CONFORMANCE_CUDA(cuPointerGetAttribute(&output.value, CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE, pointer));
+        TEST_CUDA(cuPointerGetAttributes(1, &attribute, &destination, pointer));
+    } else TEST_CUDA(cuPointerGetAttribute(&output.value, CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE, pointer));
     require(output.before == 0x37 && output.after == 0xa9, "decompression boolean attribute exact output width"); return output.value;
 }
 struct decompression_buffer {
@@ -64,22 +64,22 @@ struct decompression_buffer {
     explicit decompression_buffer(size_t size, bool api = false, CUdeviceptr external = 0) : bytes(size), runtime(api), owns(!external) {
         if (external) value = external;
         else if (runtime) { void* pointer{}; decompression_runtime(cudaMalloc(&pointer, bytes)); value = reinterpret_cast<uintptr_t>(pointer); }
-        else CONFORMANCE_CUDA(cuMemAlloc(&value, bytes));
+        else TEST_CUDA(cuMemAlloc(&value, bytes));
     }
     ~decompression_buffer() { if (value && owns) cuMemFree(value); }
 };
 struct decompression_stream {
     CUstream value{};
-    decompression_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    decompression_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~decompression_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct decompression_host {
     unsigned char* value{}; size_t bytes{};
-    explicit decompression_host(size_t size) : bytes(size) { CONFORMANCE_CUDA(cuMemHostAlloc(reinterpret_cast<void**>(&value), bytes, CU_MEMHOSTALLOC_PORTABLE)); }
+    explicit decompression_host(size_t size) : bytes(size) { TEST_CUDA(cuMemHostAlloc(reinterpret_cast<void**>(&value), bytes, CU_MEMHOSTALLOC_PORTABLE)); }
     ~decompression_host() { if (value) cuMemFreeHost(value); }
 };
 struct decompression_event {
-    CUevent value{}; decompression_event() { CONFORMANCE_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
+    CUevent value{}; decompression_event() { TEST_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
     ~decompression_event() { if (value) cuEventDestroy(value); }
 };
 struct decompression_gate {
@@ -89,7 +89,7 @@ struct decompression_gate {
         gate.expired = !gate.changed.wait_for(lock, std::chrono::seconds(15), [&] { return gate.released; });
     }
     explicit decompression_gate(CUstream value) : stream(value) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&owner)); CONFORMANCE_CUDA(cuLaunchHostFunc(stream, callback, this));
+        TEST_CUDA(cuCtxGetCurrent(&owner)); TEST_CUDA(cuLaunchHostFunc(stream, callback, this));
         std::unique_lock lock(mutex); const auto started = changed.wait_for(lock, std::chrono::seconds(5), [&] { return entered; });
         if (!started) { lock.unlock(); release(); cuStreamSynchronize(stream); throw std::runtime_error("decompression gate entry deadline"); }
     }
@@ -129,13 +129,13 @@ PFN_cuMemBatchDecompressAsync_v12060 decompression_procedure(bool runtime, bool 
     if (runtime) {
         cudaDriverEntryPointQueryResult status{}; decompression_runtime(cudaGetDriverEntryPointByVersion("cuMemBatchDecompressAsync", &address, 12060, flags, &status));
         require(status == cudaDriverEntryPointSuccess && address, "Runtime Driver-entry lookup for decompression");
-    } else CONFORMANCE_CUDA(cuGetProcAddress("cuMemBatchDecompressAsync", &address, 12060, flags, nullptr));
+    } else TEST_CUDA(cuGetProcAddress("cuMemBatchDecompressAsync", &address, 12060, flags, nullptr));
     return reinterpret_cast<PFN_cuMemBatchDecompressAsync_v12060>(address);
 }
 void decompression_submit(std::span<CUmemDecompressParams> records, CUstream stream, bool runtime = false) {
     struct { size_t before = size_t(decompression_before), index{}, after = size_t(decompression_after); } output;
-    if (runtime) CONFORMANCE_CUDA(decompression_procedure(true)(records.data(), records.size(), 0, &output.index, stream));
-    else CONFORMANCE_CUDA(cuMemBatchDecompressAsync(records.data(), records.size(), 0, &output.index, stream));
+    if (runtime) TEST_CUDA(decompression_procedure(true)(records.data(), records.size(), 0, &output.index, stream));
+    else TEST_CUDA(cuMemBatchDecompressAsync(records.data(), records.size(), 0, &output.index, stream));
     require(output.before == size_t(decompression_before) && output.after == size_t(decompression_after), "decompression error-index exact output width");
 }
 void decompression_metadata() {
@@ -146,9 +146,9 @@ void decompression_metadata() {
             require(decompression_capable(allocation.value + offset, bulk) == (capabilities.mask != 0), "ordinary allocation decompression capability agrees with device support");
         virtual_memory_expect(allocation.value, expected, "decompression metadata preserves complete initialized bytes", !runtime);
     }
-    CUdevice device{}; CUmemoryPool pool{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device)); CONFORMANCE_CUDA(cuDeviceGetDefaultMemPool(&pool, device));
+    CUdevice device{}; CUmemoryPool pool{}; TEST_CUDA(cuCtxGetDevice(&device)); TEST_CUDA(cuDeviceGetDefaultMemPool(&pool, device));
     struct { int before = 0x19375928, value = -1, after = 0x6edcba01; } enabled;
-    CONFORMANCE_CUDA(cuMemPoolGetAttribute(pool, CU_MEMPOOL_ATTR_HW_DECOMPRESS_ENABLED, &enabled.value));
+    TEST_CUDA(cuMemPoolGetAttribute(pool, CU_MEMPOOL_ATTR_HW_DECOMPRESS_ENABLED, &enabled.value));
     require(enabled.before == 0x19375928 && enabled.after == 0x6edcba01 && enabled.value == 0, "ordinary default pool hardware-decompression usage and exact width");
 }
 void decompression_rejected(CUmemDecompressParams* records, size_t count, unsigned flags, CUstream stream, CUresult expected, size_t index) {
@@ -172,7 +172,7 @@ void decompression_validation() {
     require(cuMemBatchDecompressAsync(records.data(), records.size(), 1, nullptr, stream.value) == CUDA_ERROR_INVALID_VALUE, "optional error-index output on failure");
     job.verify(true);
     const auto mask = decompression_capabilities{}.mask;
-    if (mask & good.algo) { std::array repaired{good}; decompression_submit(repaired, stream.value, true); CONFORMANCE_CUDA(cuStreamSynchronize(stream.value)); job.verify(); }
+    if (mask & good.algo) { std::array repaired{good}; decompression_submit(repaired, stream.value, true); TEST_CUDA(cuStreamSynchronize(stream.value)); job.verify(); }
     else {
         auto aliased = good;
         require(cuMemBatchDecompressAsync(&aliased, 1, 0, &aliased.srcNumBytes, stream.value) == CUDA_ERROR_NOT_SUPPORTED,
@@ -183,7 +183,7 @@ void decompression_unsupported() {
     const decompression_capabilities capabilities; require_capability(!capabilities.mask, "absence profile needs no advertised decompression algorithms");
     decompression_job job(decompression_fixtures[0]); decompression_stream stream; auto record = job.record();
     decompression_rejected(&record, 1, 0, stream.value, CUDA_ERROR_NOT_SUPPORTED, std::numeric_limits<size_t>::max()); job.verify(true);
-    CUmemPoolProps props{}; CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device)); props.allocType = CU_MEM_ALLOCATION_TYPE_PINNED;
+    CUmemPoolProps props{}; CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device)); props.allocType = CU_MEM_ALLOCATION_TYPE_PINNED;
     props.location = {CU_MEM_LOCATION_TYPE_DEVICE, device}; props.usage = CU_MEM_POOL_CREATE_USAGE_HW_DECOMPRESS; CUmemoryPool pool{};
     require(cuMemPoolCreate(&pool, &props) == CUDA_ERROR_NOT_SUPPORTED, "hardware pool usage does not fabricate unsupported decompression");
 }
@@ -193,7 +193,7 @@ void decompression_formats(CUmemDecompressAlgorithm algorithm) {
         for (size_t hint : {size_t(0), size_t(1), fixture.output_size}) {
             decompression_job job(fixture, position % 2 != 0); decompression_stream stream; std::array records{job.record(hint)};
             decompression_submit(records, position % 2 ? stream.value : nullptr, position % 2 != 0);
-            if (position % 2) CONFORMANCE_CUDA(cuStreamSynchronize(stream.value)); else decompression_runtime(cudaDeviceSynchronize());
+            if (position % 2) TEST_CUDA(cuStreamSynchronize(stream.value)); else decompression_runtime(cudaDeviceSynchronize());
             job.verify(); ++position;
         }
     }
@@ -210,39 +210,39 @@ void decompression_batch() {
         jobs.push_back(std::make_unique<decompression_job>(fixture, jobs.size() % 2 != 0)); records.push_back(jobs.back()->record(jobs.size() % 2 ? 0 : fixture.output_size));
     }
     decompression_submit(records, stream.value, true); std::memset(records.data(), 0xcd, records.size() * sizeof(records[0]));
-    CONFORMANCE_CUDA(cuStreamSynchronize(stream.value)); for (const auto& job : jobs) job->verify();
+    TEST_CUDA(cuStreamSynchronize(stream.value)); for (const auto& job : jobs) job->verify();
 }
 void decompression_ordering(bool ptds) {
     decompression_job job(decompression_available_fixture(), true); decompression_stream explicit_producer, consumer; const auto producer = ptds ? CU_STREAM_PER_THREAD : explicit_producer.value;
     decompression_host input(job.source.bytes), output(job.destination.bytes), count(job.count.bytes);
-    std::copy(job.source_bytes.begin(), job.source_bytes.end(), input.value); CONFORMANCE_CUDA(cuMemsetD8(job.source.value, 0x5d, job.source.bytes));
+    std::copy(job.source_bytes.begin(), job.source_bytes.end(), input.value); TEST_CUDA(cuMemsetD8(job.source.value, 0x5d, job.source.bytes));
     decompression_event ready, completed; decompression_gate gate(producer);
-    CONFORMANCE_CUDA(cuMemcpyHtoDAsync(job.source.value, input.value, input.bytes, producer));
+    TEST_CUDA(cuMemcpyHtoDAsync(job.source.value, input.value, input.bytes, producer));
     std::array records{job.record(1)}; size_t index{};
-    if (ptds) CONFORMANCE_CUDA(decompression_ptds(records.data(), records.size(), 0, &index, nullptr)); else decompression_submit(records, producer, true);
+    if (ptds) TEST_CUDA(decompression_ptds(records.data(), records.size(), 0, &index, nullptr)); else decompression_submit(records, producer, true);
     std::memset(records.data(), 0xd7, sizeof(records));
-    CONFORMANCE_CUDA(cuEventRecord(ready.value, producer)); CONFORMANCE_CUDA(cuStreamWaitEvent(consumer.value, ready.value, 0));
-    CONFORMANCE_CUDA(cuMemcpyDtoHAsync(output.value, job.destination.value, output.bytes, consumer.value));
-    CONFORMANCE_CUDA(cuMemcpyDtoHAsync(count.value, job.count.value, count.bytes, consumer.value)); CONFORMANCE_CUDA(cuEventRecord(completed.value, consumer.value));
+    TEST_CUDA(cuEventRecord(ready.value, producer)); TEST_CUDA(cuStreamWaitEvent(consumer.value, ready.value, 0));
+    TEST_CUDA(cuMemcpyDtoHAsync(output.value, job.destination.value, output.bytes, consumer.value));
+    TEST_CUDA(cuMemcpyDtoHAsync(count.value, job.count.value, count.bytes, consumer.value)); TEST_CUDA(cuEventRecord(completed.value, consumer.value));
     require(cuEventQuery(ready.value) == CUDA_ERROR_NOT_READY && cuEventQuery(completed.value) == CUDA_ERROR_NOT_READY, "decompression and event-ordered consumer remain pending behind input gate");
     if (ptds) {
-        decompression_buffer independent(17); CUcontext owner{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&owner)); std::atomic<bool> done{}; CUresult status = CUDA_ERROR_UNKNOWN;
+        decompression_buffer independent(17); CUcontext owner{}; TEST_CUDA(cuCtxGetCurrent(&owner)); std::atomic<bool> done{}; CUresult status = CUDA_ERROR_UNKNOWN;
         std::thread worker([&] { cuCtxSetCurrent(owner); status = cuMemsetD8Async(independent.value, 0x6d, independent.bytes, CU_STREAM_PER_THREAD); if (status == CUDA_SUCCESS) status = cuStreamSynchronize(CU_STREAM_PER_THREAD); done.store(true, std::memory_order_release); });
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (!done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
-        const auto independent_finished = done.load(std::memory_order_acquire); if (!independent_finished) gate.release(); worker.join(); CONFORMANCE_CUDA(status);
+        const auto independent_finished = done.load(std::memory_order_acquire); if (!independent_finished) gate.release(); worker.join(); TEST_CUDA(status);
         require(independent_finished, "another host thread's per-thread default progresses while decompression is gated");
     }
-    gate.release(); CONFORMANCE_CUDA(cuStreamSynchronize(consumer.value)); gate.verify(); job.verify();
+    gate.release(); TEST_CUDA(cuStreamSynchronize(consumer.value)); gate.verify(); job.verify();
     decompression_expect({output.value, output.bytes}, job.expected_destination, "event consumer sees complete decompressed bytes and guards");
     decompression_expect({count.value, count.bytes}, job.expected_count, "event consumer sees exact 32-bit actual count and guards");
 }
 struct decompression_context {
     CUcontext value{}, previous{};
     decompression_context() {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&previous)); CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-        CONFORMANCE_CUDA(cuCtxCreate(&value, nullptr, 0, device)); CUcontext popped{}; CONFORMANCE_CUDA(cuCtxPopCurrent(&popped));
-        require(popped == value, "decompression context creation stack"); CONFORMANCE_CUDA(cuCtxSetCurrent(value));
+        TEST_CUDA(cuCtxGetCurrent(&previous)); CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device));
+        TEST_CUDA(cuCtxCreate(&value, nullptr, 0, device)); CUcontext popped{}; TEST_CUDA(cuCtxPopCurrent(&popped));
+        require(popped == value, "decompression context creation stack"); TEST_CUDA(cuCtxSetCurrent(value));
     }
     ~decompression_context() { if (value) cuCtxDestroy(value); cuCtxSetCurrent(previous); }
 };
@@ -255,8 +255,8 @@ void decompression_retirement() {
         decompression_context context; decompression_job job(fixture, true); decompression_stream stream;
         decompression_gate gate(stream.value); std::array records{job.record()}; decompression_submit(records, stream.value, true);
         if (destroy_context) {
-            CONFORMANCE_CUDA(cuMemcpyDtoHAsync(output.value, job.destination.value, output.bytes, stream.value));
-            CONFORMANCE_CUDA(cuMemcpyDtoHAsync(count.value, job.count.value, count.bytes, stream.value));
+            TEST_CUDA(cuMemcpyDtoHAsync(output.value, job.destination.value, output.bytes, stream.value));
+            TEST_CUDA(cuMemcpyDtoHAsync(count.value, job.count.value, count.bytes, stream.value));
         }
         std::atomic<bool> started{}, done{}; CUresult status = CUDA_ERROR_UNKNOWN;
         std::thread retire([&] {
@@ -265,12 +265,12 @@ void decompression_retirement() {
         });
         while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
         std::this_thread::sleep_for(std::chrono::milliseconds(100)); const bool blocked = !done.load(std::memory_order_acquire);
-        int version{}; const auto query = cuDriverGetVersion(&version); gate.release(); retire.join(); CONFORMANCE_CUDA(status); CONFORMANCE_CUDA(query);
+        int version{}; const auto query = cuDriverGetVersion(&version); gate.release(); retire.join(); TEST_CUDA(status); TEST_CUDA(query);
         gate.verify(); require(blocked && version > 0, "decompression retirement waits for accepted work while unrelated queries progress");
         job.source.value = 0;
         if (destroy_context) {
             gate.owner = nullptr; stream.value = nullptr; context.value = nullptr; job.destination.value = job.count.value = 0;
-            CONFORMANCE_CUDA(cuCtxSetCurrent(context.previous));
+            TEST_CUDA(cuCtxSetCurrent(context.previous));
             decompression_expect({output.value, output.bytes}, job.expected_destination, "retired context completes accepted decompression and consumer output");
             decompression_expect({count.value, count.bytes}, job.expected_count, "retired context completes exact actual count");
         } else job.verify(false, false);
@@ -285,7 +285,7 @@ void decompression_allocation_probe(CUdeviceptr base, const decompression_fixtur
     auto addresses = decompression_views(base, fixture); decompression_job job(fixture, true, addresses);
     for (auto address : addresses) require(decompression_capable(address) && decompression_capable(address, true), "explicit hardware usage produces capable native backing");
     decompression_stream stream; std::array records{job.record(fixture.output_size)}; decompression_submit(records, stream.value, true);
-    CONFORMANCE_CUDA(cuStreamSynchronize(stream.value)); job.verify();
+    TEST_CUDA(cuStreamSynchronize(stream.value)); job.verify();
 }
 void decompression_allocators() {
     const auto& fixture = decompression_available_fixture();
@@ -295,33 +295,33 @@ void decompression_allocators() {
     {
         virtual_physical_memory physical(bytes, properties); virtual_memory_reservation reservation(bytes);
         virtual_memory_mapping mapping(reservation.value, bytes, physical.value); mapping.grant(properties.location);
-        CUmemAllocationProp actual{}; CONFORMANCE_CUDA(cuMemGetAllocationPropertiesFromHandle(&actual, physical.value));
+        CUmemAllocationProp actual{}; TEST_CUDA(cuMemGetAllocationPropertiesFromHandle(&actual, physical.value));
         require((actual.allocFlags.usage & CU_MEM_CREATE_USAGE_HW_DECOMPRESS) != 0, "VMM hardware-decompression usage survives creation");
         decompression_allocation_probe(mapping.value, fixture);
     }
     for (bool runtime : {false, true}) {
-        CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device)); CUmemoryPool pool{};
+        CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device)); CUmemoryPool pool{};
         if (runtime) {
             cudaMemPoolProps props{}; props.allocType = cudaMemAllocationTypePinned; props.location = {cudaMemLocationTypeDevice, device}; props.usage = cudaMemPoolCreateUsageHwDecompress;
             cudaMemPool_t result{}; decompression_runtime(cudaMemPoolCreate(&result, &props)); pool = reinterpret_cast<CUmemoryPool>(result);
         } else {
             CUmemPoolProps props{}; props.allocType = CU_MEM_ALLOCATION_TYPE_PINNED; props.location = {CU_MEM_LOCATION_TYPE_DEVICE, device}; props.usage = CU_MEM_POOL_CREATE_USAGE_HW_DECOMPRESS;
-            CONFORMANCE_CUDA(cuMemPoolCreate(&pool, &props));
+            TEST_CUDA(cuMemPoolCreate(&pool, &props));
         }
         struct pool_owner { CUmemoryPool value; ~pool_owner() { if (value) cuMemPoolDestroy(value); } } owner{pool};
         struct { int before = 0x19375928, value{}, after = 0x6edcba01; } enabled;
-        CONFORMANCE_CUDA(cuMemPoolGetAttribute(pool, CU_MEMPOOL_ATTR_HW_DECOMPRESS_ENABLED, &enabled.value));
+        TEST_CUDA(cuMemPoolGetAttribute(pool, CU_MEMPOOL_ATTR_HW_DECOMPRESS_ENABLED, &enabled.value));
         require(enabled.before == 0x19375928 && enabled.after == 0x6edcba01 && enabled.value == 1, "native hardware pool attribute and exact width");
         decompression_stream stream; CUdeviceptr pointer{};
-        if (runtime) CONFORMANCE_CUDA(cuMemAllocFromPoolAsync(&pointer, requested, pool, stream.value));
+        if (runtime) TEST_CUDA(cuMemAllocFromPoolAsync(&pointer, requested, pool, stream.value));
         else {
             void* result{}; decompression_runtime(cudaMallocFromPoolAsync(&result, requested, reinterpret_cast<cudaMemPool_t>(pool), reinterpret_cast<cudaStream_t>(stream.value)));
             pointer = reinterpret_cast<uintptr_t>(result);
         }
         struct allocation_owner { CUdeviceptr value; ~allocation_owner() { if (value) cuMemFree(value); } } allocation{pointer};
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value)); decompression_allocation_probe(pointer, fixture);
-        CONFORMANCE_CUDA(cuMemFreeAsync(pointer, stream.value)); CONFORMANCE_CUDA(cuStreamSynchronize(stream.value)); allocation.value = 0;
-        if (runtime) CONFORMANCE_CUDA(cuMemPoolDestroy(pool)); else decompression_runtime(cudaMemPoolDestroy(reinterpret_cast<cudaMemPool_t>(pool)));
+        TEST_CUDA(cuStreamSynchronize(stream.value)); decompression_allocation_probe(pointer, fixture);
+        TEST_CUDA(cuMemFreeAsync(pointer, stream.value)); TEST_CUDA(cuStreamSynchronize(stream.value)); allocation.value = 0;
+        if (runtime) TEST_CUDA(cuMemPoolDestroy(pool)); else decompression_runtime(cudaMemPoolDestroy(reinterpret_cast<cudaMemPool_t>(pool)));
         owner.value = nullptr;
     }
 }
@@ -330,8 +330,8 @@ void decompression_discovery() {
     void* legacy{}, *per_thread{};
     for (unsigned flags : {unsigned(CU_GET_PROC_ADDRESS_LEGACY_STREAM), unsigned(CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM)}) {
         void* address{}; CUdriverProcAddressQueryResult status{};
-        CONFORMANCE_CUDA(cuGetProcAddress("cuMemBatchDecompressAsync", &address, 12059, flags, &status)); require(!address && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "decompression introduction version boundary");
-        CONFORMANCE_CUDA(cuGetProcAddress("cuMemBatchDecompressAsync", &address, 12060, flags, &status)); require(address && status == CU_GET_PROC_ADDRESS_SUCCESS, "decompression procedure introduction");
+        TEST_CUDA(cuGetProcAddress("cuMemBatchDecompressAsync", &address, 12059, flags, &status)); require(!address && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "decompression introduction version boundary");
+        TEST_CUDA(cuGetProcAddress("cuMemBatchDecompressAsync", &address, 12060, flags, &status)); require(address && status == CU_GET_PROC_ADDRESS_SUCCESS, "decompression procedure introduction");
         (flags == CU_GET_PROC_ADDRESS_LEGACY_STREAM ? legacy : per_thread) = address;
     }
     require(legacy != per_thread && decompression_procedure(false) == reinterpret_cast<PFN_cuMemBatchDecompressAsync_v12060>(legacy) &&
@@ -356,7 +356,7 @@ void execute_memory_decompression() {
 }
 int main(int argc, char** argv) {
     if (argc == 2 && (std::string_view(argv[1]) == "discovery" || std::string_view(argv[1]) == "fixtures"))
-        return cudavm::run_host_conformance(argc, argv, std::string_view(argv[1]) == "discovery" ? cudavm::decompression_discovery : cudavm::decompression_validate_fixtures);
+        return cudavm::run_host_test(argc, argv, std::string_view(argv[1]) == "discovery" ? cudavm::decompression_discovery : cudavm::decompression_validate_fixtures);
     if (argc == 3) { cudavm::decompression_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_memory_decompression);
+    return cudavm::run_test(argc, argv, cudavm::execute_memory_decompression);
 }

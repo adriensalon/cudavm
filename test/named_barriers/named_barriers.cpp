@@ -22,17 +22,17 @@ void execute_named_barriers(const loaded_program& program) {
             auto in = source.value + guards * 4, out = output.value + guards * 4, temporary = scratch.value + guards * 4;
             for (unsigned seed : {0u, 0x98765432u}) {
                 for (unsigned i = 0; i < total; ++i) input[guards + i] = i * 0x1020305u + seed;
-                CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+                TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
                 for (unsigned rounds : {0u, 1u, 7u})
                 for (unsigned id : {0u, 1u, 7u, 15u})
                 for (unsigned pattern = 0; pattern < (groups ? 4u : 1u); ++pattern) {
                     if (!whole && id) continue;
                     std::fill(expected.begin(), expected.end(), guard);
                     std::fill(scratch_expected.begin(), scratch_expected.end(), guard);
-                    CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
-                    CONFORMANCE_CUDA(cuMemcpyHtoD(scratch.value, scratch_expected.data(), scratch_expected.size() * 4));
+                    TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+                    TEST_CUDA(cuMemcpyHtoD(scratch.value, scratch_expected.data(), scratch_expected.size() * 4));
                     void* args[]{&out, &in, &temporary, &rounds, &id, &pattern};
-                    CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+                    TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
                     for (unsigned i = 0; i < total; ++i) {
                         const unsigned lane = i % threads, block_base = i - lane;
                         std::array<uint32_t, fields> sums{};
@@ -61,12 +61,12 @@ void execute_named_barriers(const loaded_program& program) {
                     }
                     const auto context = name + " threads=" + std::to_string(threads) + " rounds=" + std::to_string(rounds)
                         + " id=" + std::to_string(id) + " pattern=" + std::to_string(pattern) + " seed=" + std::to_string(seed);
-                    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+                    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
                     expect_words(actual, expected, context + " results and guards");
-                    CONFORMANCE_CUDA(cuMemcpyDtoH(scratch_actual.data(), scratch.value, scratch_actual.size() * 4));
+                    TEST_CUDA(cuMemcpyDtoH(scratch_actual.data(), scratch.value, scratch_actual.size() * 4));
                     expect_words(scratch_actual, scratch_expected, context + " published storage and guards");
                 }
-                CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+                TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
                 expect_words(preserved, input, name + " source preservation");
             }
         }
@@ -75,5 +75,5 @@ void execute_named_barriers(const loaded_program& program) {
 }
 int main(int argc, char** argv) {
     if (argc == 3) cudavm::named_cubin_profile = std::string_view(argv[2]) == "cubin";
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_named_barriers);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_named_barriers);
 }

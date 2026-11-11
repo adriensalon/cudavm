@@ -43,13 +43,13 @@ void execute_integer_arithmetic(const loaded_program& program) {
         }
         device_buffer source(input.size() * 8), destination(expected.size() * 4);
         auto in = source.value + 16, out = destination.value + 8;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 8));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 8));
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
             void* args[]{&out, &in, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+            TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
             for (unsigned i = 0; i < std::min(count, total); ++i) {
                 const uint64_t a = input[2 + i * 2], b = input[3 + i * 2];
                 const uint32_t x = uint32_t(a), y = uint32_t(b);
@@ -70,12 +70,12 @@ void execute_integer_arithmetic(const loaded_program& program) {
             expect_words(actual, expected, "integer arithmetic threads=" + std::to_string(threads)
                 + " count=" + std::to_string(count));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 8));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 8));
         require(preserved == input, "integer-arithmetic source preservation");
     }
 }
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_integer_arithmetic);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_integer_arithmetic);
 }

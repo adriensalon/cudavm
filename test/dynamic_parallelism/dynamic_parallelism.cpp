@@ -78,5 +78,5 @@ void execute_dynamic_parallelism() {
 }
 int main(int argc, char** argv) {
     if (argc == 2) cudavm::parallel_case = argv[1];
-    return cudavm::run_host_conformance(argc, argv, cudavm::execute_dynamic_parallelism);
+    return cudavm::run_host_test(argc, argv, cudavm::execute_dynamic_parallelism);
 }

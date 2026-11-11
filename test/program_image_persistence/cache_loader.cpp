@@ -39,10 +39,10 @@ void program_image_cache_probe() {
     std::fill(image.begin(), image.end(), 0x57);
     device_buffer output(3 * sizeof(uint32_t));
     constexpr uint32_t guard = 0xa95b371d; std::array<uint32_t, 3> words{guard, guard, guard};
-    CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, words.data(), sizeof(words)));
+    TEST_CUDA(cuMemcpyHtoD(output.value, words.data(), sizeof(words)));
     auto address = output.value + sizeof(uint32_t); void* parameters[]{&address};
-    CONFORMANCE_CUDA(cuLaunchKernel(program.function("cached_availability_probe"), 1, 1, 1, 1, 1, 1, 0, nullptr, parameters, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(words.data(), output.value, sizeof(words)));
+    TEST_CUDA(cuLaunchKernel(program.function("cached_availability_probe"), 1, 1, 1, 1, 1, 1, 0, nullptr, parameters, nullptr));
+    TEST_CUDA(cuMemcpyDtoH(words.data(), output.value, sizeof(words)));
     require(words == std::array<uint32_t, 3>{guard, 0x43564d31, guard}, "compiler-independent cached availability probe and complete guards");
 }
 void execute_program_image_cache() {
@@ -71,5 +71,5 @@ int main(int argc, char** argv) {
     cudavm::program_image_cache_directory = argv[2];
     try { cudavm::program_image_cache_compiler_unavailable(); }
     catch (const std::exception& error) { std::cerr << "FAIL: " << error.what() << '\n'; return 1; }
-    return cudavm::run_conformance(2, argv, cudavm::execute_program_image_cache, 0, cudavm::program_image_cache_probe);
+    return cudavm::run_test(2, argv, cudavm::execute_program_image_cache, 0, cudavm::program_image_cache_probe);
 }

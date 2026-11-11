@@ -21,7 +21,7 @@ struct graph_external_graph {
     CUgraph value{};
     explicit graph_external_graph(bool runtime) {
         if (runtime) { cudaGraph_t graph{}; graph_external_runtime(cudaGraphCreate(&graph, 0)); value = graph_external_cast<CUgraph>(graph); }
-        else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        else TEST_CUDA(cuGraphCreate(&value, 0));
     }
     ~graph_external_graph() { if (value) cuGraphDestroy(value); }
 };
@@ -29,13 +29,13 @@ struct graph_external_executable {
     CUgraphExec value{};
     graph_external_executable(CUgraph graph, bool runtime) {
         if (runtime) { cudaGraphExec_t result{}; graph_external_runtime(cudaGraphInstantiateWithFlags(&result, graph_external_cast<cudaGraph_t>(graph), 0)); value = graph_external_cast<CUgraphExec>(result); }
-        else CONFORMANCE_CUDA(cuGraphInstantiate(&value, graph, 0));
+        else TEST_CUDA(cuGraphInstantiate(&value, graph, 0));
     }
     ~graph_external_executable() { if (value) { cuCtxSynchronize(); cuGraphExecDestroy(value); } }
 };
 struct graph_external_stream {
     CUstream value{};
-    graph_external_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    graph_external_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~graph_external_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 template<bool Signal> CUgraphNode graph_external_node(CUgraph graph, CUgraphNode dependency, CUexternalSemaphore semaphore, uint64_t fence, bool runtime) {
@@ -56,11 +56,11 @@ template<bool Signal> CUgraphNode graph_external_node(CUgraph graph, CUgraphNode
     } else if constexpr (Signal) {
         CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS operation{}; operation.params.fence.value = fence;
         CUDA_EXT_SEM_SIGNAL_NODE_PARAMS params{&semaphore, &operation, 1};
-        CONFORMANCE_CUDA(cuGraphAddExternalSemaphoresSignalNode(&result.value, graph, dependency ? &dependency : nullptr, dependency ? 1 : 0, &params));
+        TEST_CUDA(cuGraphAddExternalSemaphoresSignalNode(&result.value, graph, dependency ? &dependency : nullptr, dependency ? 1 : 0, &params));
     } else {
         CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS operation{}; operation.params.fence.value = fence;
         CUDA_EXT_SEM_WAIT_NODE_PARAMS params{&semaphore, &operation, 1};
-        CONFORMANCE_CUDA(cuGraphAddExternalSemaphoresWaitNode(&result.value, graph, dependency ? &dependency : nullptr, dependency ? 1 : 0, &params));
+        TEST_CUDA(cuGraphAddExternalSemaphoresWaitNode(&result.value, graph, dependency ? &dependency : nullptr, dependency ? 1 : 0, &params));
     }
     return result.get();
 }
@@ -81,13 +81,13 @@ template<bool Signal> void graph_external_set(CUgraphNode node, CUexternalSemaph
     } else if constexpr (Signal) {
         CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS operation{}; operation.params.fence.value = fence;
         CUDA_EXT_SEM_SIGNAL_NODE_PARAMS params{&semaphore, &operation, 1};
-        if (executable) CONFORMANCE_CUDA(cuGraphExecExternalSemaphoresSignalNodeSetParams(executable, node, &params));
-        else CONFORMANCE_CUDA(cuGraphExternalSemaphoresSignalNodeSetParams(node, &params));
+        if (executable) TEST_CUDA(cuGraphExecExternalSemaphoresSignalNodeSetParams(executable, node, &params));
+        else TEST_CUDA(cuGraphExternalSemaphoresSignalNodeSetParams(node, &params));
     } else {
         CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS operation{}; operation.params.fence.value = fence;
         CUDA_EXT_SEM_WAIT_NODE_PARAMS params{&semaphore, &operation, 1};
-        if (executable) CONFORMANCE_CUDA(cuGraphExecExternalSemaphoresWaitNodeSetParams(executable, node, &params));
-        else CONFORMANCE_CUDA(cuGraphExternalSemaphoresWaitNodeSetParams(node, &params));
+        if (executable) TEST_CUDA(cuGraphExecExternalSemaphoresWaitNodeSetParams(executable, node, &params));
+        else TEST_CUDA(cuGraphExternalSemaphoresWaitNodeSetParams(node, &params));
     }
 }
 template<bool Signal> void graph_external_query(CUgraphNode node, CUexternalSemaphore handle, uint64_t fence) {
@@ -96,21 +96,21 @@ template<bool Signal> void graph_external_query(CUgraphNode node, CUexternalSema
             && params.paramsArray[0].params.fence.value == fence && !params.paramsArray[0].flags, "owned semaphore graph descriptor snapshot");
     };
     if constexpr (Signal) {
-        graph_external_output<CUDA_EXT_SEM_SIGNAL_NODE_PARAMS> driver; CONFORMANCE_CUDA(cuGraphExternalSemaphoresSignalNodeGetParams(node, &driver.value)); check(driver.get());
+        graph_external_output<CUDA_EXT_SEM_SIGNAL_NODE_PARAMS> driver; TEST_CUDA(cuGraphExternalSemaphoresSignalNodeGetParams(node, &driver.value)); check(driver.get());
         graph_external_output<cudaExternalSemaphoreSignalNodeParams> runtime; graph_external_runtime(cudaGraphExternalSemaphoresSignalNodeGetParams(graph_external_cast<cudaGraphNode_t>(node), &runtime.value)); check(runtime.get());
     } else {
-        graph_external_output<CUDA_EXT_SEM_WAIT_NODE_PARAMS> driver; CONFORMANCE_CUDA(cuGraphExternalSemaphoresWaitNodeGetParams(node, &driver.value)); check(driver.get());
+        graph_external_output<CUDA_EXT_SEM_WAIT_NODE_PARAMS> driver; TEST_CUDA(cuGraphExternalSemaphoresWaitNodeGetParams(node, &driver.value)); check(driver.get());
         graph_external_output<cudaExternalSemaphoreWaitNodeParams> runtime; graph_external_runtime(cudaGraphExternalSemaphoresWaitNodeGetParams(graph_external_cast<cudaGraphNode_t>(node), &runtime.value)); check(runtime.get());
     }
 }
 struct graph_external_storage {
     static constexpr size_t bytes = 1056;
     device_buffer device{bytes}; unsigned char* host{};
-    graph_external_storage() { void* pointer{}; CONFORMANCE_CUDA(cuMemAllocHost(&pointer, bytes + 32)); host = static_cast<unsigned char*>(pointer); }
+    graph_external_storage() { void* pointer{}; TEST_CUDA(cuMemAllocHost(&pointer, bytes + 32)); host = static_cast<unsigned char*>(pointer); }
     ~graph_external_storage() { if (host) { cuCtxSynchronize(); cuMemFreeHost(host); } }
-    void reset() { CONFORMANCE_CUDA(cuMemsetD8(device.value, 0xa7, bytes)); std::fill_n(host, bytes + 32, 0x63); }
+    void reset() { TEST_CUDA(cuMemsetD8(device.value, 0xa7, bytes)); std::fill_n(host, bytes + 32, 0x63); }
     void verify() {
-        std::vector<unsigned char> actual(bytes); CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), device.value, bytes));
+        std::vector<unsigned char> actual(bytes); TEST_CUDA(cuMemcpyDtoH(actual.data(), device.value, bytes));
         for (size_t i = 0; i < bytes; ++i) {
             auto expected = static_cast<unsigned char>(i < 16 || i >= bytes - 16 ? 0xa7 : 0x35);
             require(actual[i] == expected && host[i + 16] == expected, "external semaphore graph complete payload byte=" + std::to_string(i));
@@ -118,7 +118,7 @@ struct graph_external_storage {
         for (size_t i = 0; i < 16; ++i) require(host[i] == 0x63 && host[bytes + 16 + i] == 0x63, "pinned output guards");
     }
     CUgraphNode nodes(CUgraph graph, CUgraphNode dependency, bool runtime) {
-        CUgraphNode fill{}, copy{}; CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        CUgraphNode fill{}, copy{}; CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
         if (runtime) {
             cudaMemsetParams p{}; p.dst = reinterpret_cast<void*>(uintptr_t(device.value + 16)); p.value = 0x35; p.elementSize = 1; p.width = bytes - 32; p.height = 1;
             auto dep = graph_external_cast<cudaGraphNode_t>(dependency); cudaGraphNode_t first{}, last{};
@@ -127,11 +127,11 @@ struct graph_external_storage {
                 reinterpret_cast<void*>(uintptr_t(device.value)), bytes, cudaMemcpyDeviceToHost)); copy = graph_external_cast<CUgraphNode>(last);
         } else {
             CUDA_MEMSET_NODE_PARAMS p{}; p.dst = device.value + 16; p.value = 0x35; p.elementSize = 1; p.width = bytes - 32; p.height = 1;
-            CONFORMANCE_CUDA(cuGraphAddMemsetNode(&fill, graph, &dependency, 1, &p, context));
+            TEST_CUDA(cuGraphAddMemsetNode(&fill, graph, &dependency, 1, &p, context));
             CUDA_MEMCPY3D read{}; read.srcMemoryType = CU_MEMORYTYPE_DEVICE; read.srcDevice = device.value;
             read.dstMemoryType = CU_MEMORYTYPE_HOST; read.dstHost = host + 16; read.WidthInBytes = read.srcPitch = read.dstPitch = bytes;
             read.srcHeight = read.dstHeight = read.Height = read.Depth = 1;
-            CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&copy, graph, &fill, 1, &read, context));
+            TEST_CUDA(cuGraphAddMemcpyNode(&copy, graph, &fill, 1, &read, context));
         }
         return copy;
     }
@@ -146,7 +146,7 @@ struct graph_external_import {
             cudaExternalSemaphore_t semaphore{}; graph_external_runtime(cudaImportExternalSemaphore(&semaphore, &p)); result.value = graph_external_cast<CUexternalSemaphore>(semaphore);
         } else {
             CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC p{}; p.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE; p.handle.win32.handle = handle;
-            CONFORMANCE_CUDA(cuImportExternalSemaphore(&result.value, &p));
+            TEST_CUDA(cuImportExternalSemaphore(&result.value, &p));
         }
         value = result.get();
     }
@@ -160,14 +160,14 @@ void graph_external_execute() {
         graph_external_storage storage; graph_external_stream stream; graph_external_graph graph(runtime);
         CUgraphNode wait{}, signal{};
         if (graph_external_case == "capture") {
-            CONFORMANCE_CUDA(cuStreamBeginCapture(stream.value, CU_STREAM_CAPTURE_MODE_GLOBAL));
+            TEST_CUDA(cuStreamBeginCapture(stream.value, CU_STREAM_CAPTURE_MODE_GLOBAL));
             CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS incoming{}; incoming.params.fence.value = 1;
-            CONFORMANCE_CUDA(cuWaitExternalSemaphoresAsync(&input.value, &incoming, 1, stream.value));
+            TEST_CUDA(cuWaitExternalSemaphoresAsync(&input.value, &incoming, 1, stream.value));
             graph_external_runtime(cudaMemsetAsync(reinterpret_cast<void*>(uintptr_t(storage.device.value + 16)), 0x35, storage.bytes - 32, graph_external_cast<cudaStream_t>(stream.value)));
-            CONFORMANCE_CUDA(cuMemcpyDtoHAsync(storage.host + 16, storage.device.value, storage.bytes, stream.value));
+            TEST_CUDA(cuMemcpyDtoHAsync(storage.host + 16, storage.device.value, storage.bytes, stream.value));
             cudaExternalSemaphoreSignalParams outgoing{}; outgoing.params.fence.value = 2; auto handle = graph_external_cast<cudaExternalSemaphore_t>(output.value);
             graph_external_runtime(cudaSignalExternalSemaphoresAsync(&handle, &outgoing, 1, graph_external_cast<cudaStream_t>(stream.value)));
-            CONFORMANCE_CUDA(cuGraphDestroy(graph.value)); graph.value = nullptr; CONFORMANCE_CUDA(cuStreamEndCapture(stream.value, &graph.value));
+            TEST_CUDA(cuGraphDestroy(graph.value)); graph.value = nullptr; TEST_CUDA(cuStreamEndCapture(stream.value, &graph.value));
         } else {
             wait = graph_external_node<false>(graph.value, nullptr, input.value, 1, runtime);
             auto copy = storage.nodes(graph.value, wait, !runtime);
@@ -187,7 +187,7 @@ void graph_external_execute() {
         const auto run = [&](CUgraphExec executable, uint64_t incoming, uint64_t outgoing, bool retire) {
             storage.reset(); external.prepare(incoming, outgoing);
             if (runtime) graph_external_runtime(cudaGraphLaunch(graph_external_cast<cudaGraphExec_t>(executable), graph_external_cast<cudaStream_t>(stream.value)));
-            else CONFORMANCE_CUDA(cuGraphLaunch(executable, stream.value));
+            else TEST_CUDA(cuGraphLaunch(executable, stream.value));
             // Only early completion is an error here. No minimum GPU speed is
             // assumed; the positive completion deadline starts after release.
             auto inspect_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
@@ -197,11 +197,11 @@ void graph_external_execute() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             } while (std::chrono::steady_clock::now() < inspect_until);
             if (retire) {
-                CONFORMANCE_CUDA(cuGraphDestroy(graph.value)); graph.value = nullptr;
-                CONFORMANCE_CUDA(cuGraphExecDestroy(original.value)); original.value = nullptr;
+                TEST_CUDA(cuGraphDestroy(graph.value)); graph.value = nullptr;
+                TEST_CUDA(cuGraphExecDestroy(original.value)); original.value = nullptr;
             }
             external.release(); external.await();
-            CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+            TEST_CUDA(cuStreamSynchronize(stream.value));
             require(external.output->GetCompletedValue() == outgoing, "exact externally observed graph signal value"); storage.verify();
         };
         run(original.value, 1, 2, graph_external_case == "retirement");
@@ -221,12 +221,12 @@ void graph_external_validation() {
     signal.extSemArray = &invalid; signal.paramsArray = &operation;
     require(cuGraphAddExternalSemaphoresSignalNode(&node.value, graph.value, nullptr, 0, &signal) == CUDA_ERROR_INVALID_HANDLE && !node.get(), "invalid semaphore preserves node output");
     require(cuGraphAddExternalSemaphoresSignalNode(nullptr, graph.value, nullptr, 0, &signal) == CUDA_ERROR_INVALID_VALUE, "null node output");
-    CONFORMANCE_CUDA(cuGraphAddEmptyNode(&node.value, graph.value, nullptr, 0));
+    TEST_CUDA(cuGraphAddEmptyNode(&node.value, graph.value, nullptr, 0));
     require(cuGraphExternalSemaphoresSignalNodeGetParams(node.get(), &signal) == CUDA_ERROR_INVALID_VALUE, "wrong node signal query");
-    signal = {}; CUgraphNode empty{}; CONFORMANCE_CUDA(cuGraphAddExternalSemaphoresSignalNode(&empty, graph.value, nullptr, 0, &signal));
+    signal = {}; CUgraphNode empty{}; TEST_CUDA(cuGraphAddExternalSemaphoresSignalNode(&empty, graph.value, nullptr, 0, &signal));
     auto bad = signal; bad.numExtSems = 1;
     require(cuGraphExternalSemaphoresSignalNodeSetParams(empty, &bad) == CUDA_ERROR_INVALID_VALUE, "failed setter rejects missing arrays");
-    CONFORMANCE_CUDA(cuGraphExternalSemaphoresSignalNodeGetParams(empty, &signal)); require(!signal.numExtSems, "failed setter preserves valid empty descriptor");
+    TEST_CUDA(cuGraphExternalSemaphoresSignalNodeGetParams(empty, &signal)); require(!signal.numExtSems, "failed setter preserves valid empty descriptor");
     require(cuGraphExternalSemaphoresWaitNodeGetParams(empty, nullptr) == CUDA_ERROR_INVALID_VALUE, "null wait query output");
 }
 void graph_external_discovery() {
@@ -235,8 +235,8 @@ void graph_external_discovery() {
     for (auto name : {"cuGraphAddExternalSemaphoresSignalNode", "cuGraphAddExternalSemaphoresWaitNode", "cuGraphExternalSemaphoresSignalNodeGetParams", "cuGraphExternalSemaphoresWaitNodeGetParams",
                       "cuGraphExternalSemaphoresSignalNodeSetParams", "cuGraphExternalSemaphoresWaitNodeSetParams", "cuGraphExecExternalSemaphoresSignalNodeSetParams", "cuGraphExecExternalSemaphoresWaitNodeSetParams"}) {
         void* pointer{}; CUdriverProcAddressQueryResult query{};
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &pointer, 11019, 0, &query)); require(!pointer && query == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "graph semaphore introduction boundary");
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &pointer, 11020, 0, &query)); require(pointer && query == CU_GET_PROC_ADDRESS_SUCCESS, "graph semaphore introduction lookup");
+        TEST_CUDA(cuGetProcAddress(name, &pointer, 11019, 0, &query)); require(!pointer && query == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "graph semaphore introduction boundary");
+        TEST_CUDA(cuGetProcAddress(name, &pointer, 11020, 0, &query)); require(pointer && query == CU_GET_PROC_ADDRESS_SUCCESS, "graph semaphore introduction lookup");
         void* other{}; cudaDriverEntryPointQueryResult runtime{}; graph_external_runtime(cudaGetDriverEntryPointByVersion(name, &other, 11020, 0, &runtime));
         require(other == pointer && runtime == cudaDriverEntryPointSuccess, "Runtime discovers Driver graph semaphore procedure");
     }
@@ -244,7 +244,7 @@ void graph_external_discovery() {
 void execute_graph_external() { if (graph_external_case == "validation") graph_external_validation(); else graph_external_execute(); }
 }
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_conformance(argc, argv, cudavm::graph_external_discovery);
+    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_test(argc, argv, cudavm::graph_external_discovery);
     if (argc == 3) { cudavm::graph_external_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_graph_external);
+    return cudavm::run_test(argc, argv, cudavm::execute_graph_external);
 }

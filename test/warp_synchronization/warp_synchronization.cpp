@@ -15,15 +15,15 @@ void execute_warp_synchronization(const loaded_program& program) {
         for (unsigned i = 0; i < total; ++i) input[i + 2] = 0xfedcba98u ^ (i * 0x07654321u);
         device_buffer source(input.size() * 4), destination(actual.size() * 4), workspace(scratch.size() * 4);
         auto in = source.value + 8, out = destination.value + 8, temporary = workspace.value + 8;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (unsigned mode : {0u, 1u, 2u}) for (unsigned rounds : {0u, 1u, 4u})
         for (uint32_t mask : {UINT32_MAX, 0x55555555u, 0xaaaaaaaau, 0x80010001u, 0x80000000u, 0u}) {
             std::fill(expected.begin(), expected.end(), guard);
             std::fill(expected_scratch.begin(), expected_scratch.end(), guard);
-            CONFORMANCE_CUDA(cuMemsetD32(destination.value, guard, actual.size()));
-            CONFORMANCE_CUDA(cuMemsetD32(workspace.value, guard, scratch.size()));
+            TEST_CUDA(cuMemsetD32(destination.value, guard, actual.size()));
+            TEST_CUDA(cuMemsetD32(workspace.value, guard, scratch.size()));
             void* args[]{&out, &in, &temporary, &mask, &rounds, &mode};
-            CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, shape[0], shape[1], shape[2],
+            TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, shape[0], shape[1], shape[2],
                 0, nullptr, args, nullptr));
             for (unsigned i = 0; i < total; ++i) {
                 const unsigned local = i % threads, lane = local % 32, warp_base = local - lane;
@@ -50,16 +50,16 @@ void execute_warp_synchronization(const loaded_program& program) {
             const auto context = "warp publication threads=" + std::to_string(threads)
                 + " mode=" + std::to_string(mode) + " rounds=" + std::to_string(rounds)
                 + " mask=" + std::to_string(mask);
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
             expect_words(actual, expected, context);
-            CONFORMANCE_CUDA(cuMemcpyDtoH(scratch.data(), workspace.value, scratch.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(scratch.data(), workspace.value, scratch.size() * 4));
             expect_words(scratch, expected_scratch, context + " final scratch and guards");
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "warp publication source preservation");
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_warp_synchronization);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_warp_synchronization);
 }

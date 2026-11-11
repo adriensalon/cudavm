@@ -16,7 +16,7 @@ struct transfer_host {
     static constexpr size_t bytes = 809;
     std::vector<unsigned char> pageable; void* value{}; bool pinned;
     explicit transfer_host(bool use_pinned) : pinned(use_pinned) {
-        if (pinned) CONFORMANCE_CUDA(cuMemAllocHost(&value, bytes)); else { pageable.resize(bytes); value = pageable.data(); }
+        if (pinned) TEST_CUDA(cuMemAllocHost(&value, bytes)); else { pageable.resize(bytes); value = pageable.data(); }
     }
     ~transfer_host() { if (pinned && value) { cuCtxSynchronize(); cuMemFreeHost(value); } }
     unsigned char* data() const { return static_cast<unsigned char*>(value); }
@@ -34,7 +34,7 @@ void transfer_upload(bool runtime, CUdeviceptr to, const void* from, size_t byte
         if (asynchronous) TRANSFER_RUNTIME(cudaMemcpyAsync(transfer_pointer(to), from, bytes, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream)));
         else TRANSFER_RUNTIME(cudaMemcpy(transfer_pointer(to), from, bytes, cudaMemcpyHostToDevice));
     } else {
-        if (asynchronous) CONFORMANCE_CUDA(cuMemcpyHtoDAsync(to, from, bytes, stream)); else CONFORMANCE_CUDA(cuMemcpyHtoD(to, from, bytes));
+        if (asynchronous) TEST_CUDA(cuMemcpyHtoDAsync(to, from, bytes, stream)); else TEST_CUDA(cuMemcpyHtoD(to, from, bytes));
     }
 }
 void transfer_download(bool runtime, void* to, CUdeviceptr from, size_t bytes, CUstream stream = nullptr, bool asynchronous = false) {
@@ -42,7 +42,7 @@ void transfer_download(bool runtime, void* to, CUdeviceptr from, size_t bytes, C
         if (asynchronous) TRANSFER_RUNTIME(cudaMemcpyAsync(to, transfer_pointer(from), bytes, cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(stream)));
         else TRANSFER_RUNTIME(cudaMemcpy(to, transfer_pointer(from), bytes, cudaMemcpyDeviceToHost));
     } else {
-        if (asynchronous) CONFORMANCE_CUDA(cuMemcpyDtoHAsync(to, from, bytes, stream)); else CONFORMANCE_CUDA(cuMemcpyDtoH(to, from, bytes));
+        if (asynchronous) TEST_CUDA(cuMemcpyDtoHAsync(to, from, bytes, stream)); else TEST_CUDA(cuMemcpyDtoH(to, from, bytes));
     }
 }
 void transfer_synchronous() {
@@ -51,7 +51,7 @@ void transfer_synchronous() {
         transfer_host input(pinned_source), output(pinned_destination);
         for (size_t count : {size_t{1}, size_t{7}, size_t{127}, size_t{701}}) {
             const auto source = transfer_pattern(static_cast<unsigned>(count)), initial_device = transfer_pattern(91), initial_host = transfer_pattern(177);
-            input.set(source); output.set(initial_host); CONFORMANCE_CUDA(cuMemcpyHtoD(device.value, initial_device.data(), initial_device.size()));
+            input.set(source); output.set(initial_host); TEST_CUDA(cuMemcpyHtoD(device.value, initial_device.data(), initial_device.size()));
             transfer_upload(runtime, device.value + 31, input.data() + 17, count);
             // Pageable HtoD may retain staging, but cannot retain a live dependency
             // on caller bytes after return. Pinned synchronous HtoD is host complete.
@@ -63,19 +63,19 @@ void transfer_synchronous() {
             // No event, stream or context wait occurs between download and inspection.
             output.expect(expected_output, "synchronous download is host complete on return, with output guards");
             input.expect(std::vector<unsigned char>(transfer_host::bytes, 0x4f), "synchronous upload releases caller source bytes");
-            std::vector<unsigned char> actual(transfer_host::bytes); CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), device.value, actual.size()));
+            std::vector<unsigned char> actual(transfer_host::bytes); TEST_CUDA(cuMemcpyDtoH(actual.data(), device.value, actual.size()));
             require(actual == expected_device, "synchronous upload staging and all device guards");
         }
     }
 }
 struct transfer_stream {
     CUstream value{};
-    transfer_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    transfer_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~transfer_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct transfer_event {
     CUevent value{};
-    transfer_event() { CONFORMANCE_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
+    transfer_event() { TEST_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
     ~transfer_event() { if (value) cuEventDestroy(value); }
 };
 struct transfer_gate {
@@ -100,31 +100,31 @@ void transfer_asynchronous(bool event_completion) {
         for (unsigned seed : {0u, 79u, 255u, 0xffffffffu}) {
             const auto source = transfer_pattern(seed), initial_first = transfer_pattern(33), initial_second = transfer_pattern(91), initial_host = transfer_pattern(177);
             input.set(source); output.set(initial_host);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(first.value, initial_first.data(), initial_first.size())); CONFORMANCE_CUDA(cuMemcpyHtoD(second.value, initial_second.data(), initial_second.size()));
+            TEST_CUDA(cuMemcpyHtoD(first.value, initial_first.data(), initial_first.size())); TEST_CUDA(cuMemcpyHtoD(second.value, initial_second.data(), initial_second.size()));
             transfer_gate gate; transfer_cleanup cleanup{gate};
             if (runtime) TRANSFER_RUNTIME(cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream.value), transfer_gate::call, &gate));
-            else CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, transfer_gate::call, &gate)); gate.await();
+            else TEST_CUDA(cuLaunchHostFunc(stream.value, transfer_gate::call, &gate)); gate.await();
             transfer_upload(runtime, first.value + 31, input.data() + 17, 613, stream.value, true);
             if (runtime) TRANSFER_RUNTIME(cudaMemcpyAsync(transfer_pointer(second.value + 13), transfer_pointer(first.value + 31), 613, cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(stream.value)));
-            else CONFORMANCE_CUDA(cuMemcpyDtoDAsync(second.value + 13, first.value + 31, 613, stream.value));
+            else TEST_CUDA(cuMemcpyDtoDAsync(second.value + 13, first.value + 31, 613, stream.value));
             transfer_download(runtime, output.data() + 19, second.value + 7, 773, stream.value, true);
             if (runtime) TRANSFER_RUNTIME(cudaEventRecord(reinterpret_cast<cudaEvent_t>(completed.value), reinterpret_cast<cudaStream_t>(stream.value)));
-            else CONFORMANCE_CUDA(cuEventRecord(completed.value, stream.value));
+            else TEST_CUDA(cuEventRecord(completed.value, stream.value));
             gate.check_held(); output.expect(initial_host, "pending pinned download has not executed before prior stream gate");
             require(cuEventQuery(completed.value) == CUDA_ERROR_NOT_READY, "completion event is pending while stream is held");
             gate.release();
             if (event_completion) {
-                if (runtime) CONFORMANCE_CUDA(cuEventSynchronize(completed.value)); else TRANSFER_RUNTIME(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(completed.value)));
+                if (runtime) TEST_CUDA(cuEventSynchronize(completed.value)); else TRANSFER_RUNTIME(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(completed.value)));
             } else {
-                if (runtime) CONFORMANCE_CUDA(cuStreamSynchronize(stream.value)); else TRANSFER_RUNTIME(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream.value)));
+                if (runtime) TEST_CUDA(cuStreamSynchronize(stream.value)); else TRANSFER_RUNTIME(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream.value)));
             }
             // Event/stream completion alone permits inspecting the pinned result.
             auto a = initial_first, b = initial_second, h = initial_host;
             std::copy_n(source.begin() + 17, 613, a.begin() + 31); std::copy_n(a.begin() + 31, 613, b.begin() + 13); std::copy_n(b.begin() + 7, 773, h.begin() + 19);
             output.expect(h, "host observes complete payload and guards after specified completion point"); input.expect(source, "async source preserved through completion"); gate.check_complete();
-            std::vector<unsigned char> actual(transfer_host::bytes); CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), first.value, actual.size())); require(actual == a, "async first device allocation guards");
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), second.value, actual.size())); require(actual == b, "async second device allocation guards");
-            CONFORMANCE_CUDA(cuEventQuery(completed.value));
+            std::vector<unsigned char> actual(transfer_host::bytes); TEST_CUDA(cuMemcpyDtoH(actual.data(), first.value, actual.size())); require(actual == a, "async first device allocation guards");
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), second.value, actual.size())); require(actual == b, "async second device allocation guards");
+            TEST_CUDA(cuEventQuery(completed.value));
         }
     }
 }
@@ -150,5 +150,5 @@ void execute_transfer_completion() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::transfer_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_transfer_completion);
+    return cudavm::run_test(argc, argv, cudavm::execute_transfer_completion);
 }

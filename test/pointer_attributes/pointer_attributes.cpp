@@ -27,7 +27,7 @@ template<class T> struct pointer_output {
 };
 template<class T> T pointer_query(CUpointer_attribute attribute, CUdeviceptr address) {
     pointer_output<T> output;
-    CONFORMANCE_CUDA(cuPointerGetAttribute(output.data(), attribute, address));
+    TEST_CUDA(cuPointerGetAttribute(output.data(), attribute, address));
     return output.get();
 }
 cudaPointerAttributes pointer_runtime_query(CUdeviceptr address) {
@@ -58,7 +58,7 @@ pointer_snapshot pointer_bulk_query(CUdeviceptr address) {
         CU_POINTER_ATTRIBUTE_DEVICE_POINTER, CU_POINTER_ATTRIBUTE_HOST_POINTER, CU_POINTER_ATTRIBUTE_BUFFER_ID,
         CU_POINTER_ATTRIBUTE_IS_MANAGED, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, CU_POINTER_ATTRIBUTE_MAPPED};
     void* outputs[]{owner.data(), type.data(), device.data(), host.data(), id.data(), managed.data(), ordinal.data(), mapped.data()};
-    CONFORMANCE_CUDA(cuPointerGetAttributes(unsigned(std::size(attributes)), attributes, outputs, address));
+    TEST_CUDA(cuPointerGetAttributes(unsigned(std::size(attributes)), attributes, outputs, address));
     return {owner.get(), type.get(), device.get(), host.get(), id.get(), managed.get(), ordinal.get(), mapped.get()};
 }
 void pointer_scalar_agreement(CUdeviceptr address, const pointer_snapshot& expected) {
@@ -85,16 +85,16 @@ struct pointer_allocation {
     CUdevice device{};
     std::vector<unsigned char> backing, expected;
     pointer_allocation(unsigned form, size_t bytes, bool portable = false) : kind(form), size(bytes) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&owner));
-        CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-        if (kind == 0) CONFORMANCE_CUDA(cuMemAlloc(&address, bytes));
+        TEST_CUDA(cuCtxGetCurrent(&owner));
+        TEST_CUDA(cuCtxGetDevice(&device));
+        if (kind == 0) TEST_CUDA(cuMemAlloc(&address, bytes));
         else if (kind == 1) {
             void* pointer{};
             POINTER_RUNTIME(cudaMalloc(&pointer, bytes));
             address = reinterpret_cast<uintptr_t>(pointer);
         } else if (kind == 2 || kind == 3) {
             size_t pitch = 0;
-            if (kind == 2) CONFORMANCE_CUDA(cuMemAllocPitch(&address, &pitch, bytes, 3, 4));
+            if (kind == 2) TEST_CUDA(cuMemAllocPitch(&address, &pitch, bytes, 3, 4));
             else {
                 void* pointer{};
                 POINTER_RUNTIME(cudaMallocPitch(&pointer, &pitch, bytes, 3));
@@ -103,39 +103,39 @@ struct pointer_allocation {
             size = pitch * 3;
         } else {
             const unsigned flags = CU_MEMHOSTALLOC_DEVICEMAP | (portable ? CU_MEMHOSTALLOC_PORTABLE : 0);
-            if (kind == 4) CONFORMANCE_CUDA(cuMemHostAlloc(&host, bytes, flags));
+            if (kind == 4) TEST_CUDA(cuMemHostAlloc(&host, bytes, flags));
             else if (kind == 5) POINTER_RUNTIME(cudaHostAlloc(&host, bytes, flags));
             else {
                 constexpr uintptr_t alignment = 65536;
                 backing.resize(alignment * 3, 0xa9);
                 const auto start = reinterpret_cast<uintptr_t>(backing.data());
                 host = reinterpret_cast<void*>(((start + alignment - 1) & ~(alignment - 1)) + 17);
-                if (kind == 6) CONFORMANCE_CUDA(cuMemHostRegister(host, bytes, flags));
+                if (kind == 6) TEST_CUDA(cuMemHostRegister(host, bytes, flags));
                 else POINTER_RUNTIME(cudaHostRegister(host, bytes, flags));
             }
-            CONFORMANCE_CUDA(cuMemHostGetDevicePointer(&address, host, 0));
+            TEST_CUDA(cuMemHostGetDevicePointer(&address, host, 0));
         }
         expected.resize(size);
         for (size_t i = 0; i < size; ++i) expected[i] = static_cast<unsigned char>((i * 73 + kind * 31) ^ (i >> 8));
         if (host) std::memcpy(host, expected.data(), size);
-        else CONFORMANCE_CUDA(cuMemcpyHtoD(address, expected.data(), size));
+        else TEST_CUDA(cuMemcpyHtoD(address, expected.data(), size));
     }
     ~pointer_allocation() { if (host) { if (kind < 6) cuMemFreeHost(host); else cuMemHostUnregister(host); } else if (address) cuMemFree(address); }
     pointer_allocation(const pointer_allocation&) = delete;
     pointer_allocation& operator=(const pointer_allocation&) = delete;
     void release() {
         if (kind == 4) POINTER_RUNTIME(cudaFreeHost(host));
-        else if (kind == 5) CONFORMANCE_CUDA(cuMemFreeHost(host));
+        else if (kind == 5) TEST_CUDA(cuMemFreeHost(host));
         else if (kind == 6) POINTER_RUNTIME(cudaHostUnregister(host));
-        else if (kind == 7) CONFORMANCE_CUDA(cuMemHostUnregister(host));
-        else if (kind % 2) CONFORMANCE_CUDA(cuMemFree(address));
+        else if (kind == 7) TEST_CUDA(cuMemHostUnregister(host));
+        else if (kind % 2) TEST_CUDA(cuMemFree(address));
         else POINTER_RUNTIME(cudaFree(reinterpret_cast<void*>(static_cast<uintptr_t>(address))));
         host = nullptr; address = 0;
     }
     void verify_bytes() const {
         std::vector<unsigned char> actual(size);
         if (host) std::memcpy(actual.data(), host, size);
-        else CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), address, size));
+        else TEST_CUDA(cuMemcpyDtoH(actual.data(), address, size));
         require(actual == expected, "pointer queries preserve allocation bytes");
         if (!backing.empty()) {
             const auto offset = static_cast<const unsigned char*>(host) - backing.data();
@@ -168,7 +168,7 @@ void verify_pointer_allocation(const pointer_allocation& allocation) {
         if (!allocation.host) {
             CUdeviceptr base{};
             size_t extent = 0;
-            CONFORMANCE_CUDA(cuMemGetAddressRange(&base, &extent, device));
+            TEST_CUDA(cuMemGetAddressRange(&base, &extent, device));
             require(base == allocation.address && extent >= allocation.size, "queried allocation range contains requested bytes");
             require(pointer_query<CUdeviceptr>(CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, device) == base, "pointer range base");
             require(pointer_query<size_t>(CU_POINTER_ATTRIBUTE_RANGE_SIZE, device) == extent, "pointer range extent");
@@ -176,7 +176,7 @@ void verify_pointer_allocation(const pointer_allocation& allocation) {
             pointer_output<size_t> bulk_size;
             CUpointer_attribute attributes[]{CU_POINTER_ATTRIBUTE_RANGE_SIZE, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR};
             void* outputs[]{bulk_size.data(), bulk_base.data()};
-            CONFORMANCE_CUDA(cuPointerGetAttributes(2, attributes, outputs, device));
+            TEST_CUDA(cuPointerGetAttributes(2, attributes, outputs, device));
             require(bulk_base.get() == base && bulk_size.get() == extent, "bulk reordered range attributes");
         }
     }
@@ -204,9 +204,9 @@ struct pointer_query_context {
     CUcontext original{}, value{};
     pointer_query_context() {
         CUdevice device{};
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&original));
-        CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-        CONFORMANCE_CUDA(cuCtxCreate(&value, nullptr, CU_CTX_MAP_HOST, device));
+        TEST_CUDA(cuCtxGetCurrent(&original));
+        TEST_CUDA(cuCtxGetDevice(&device));
+        TEST_CUDA(cuCtxCreate(&value, nullptr, CU_CTX_MAP_HOST, device));
     }
     ~pointer_query_context() { if (value) cuCtxDestroy(value); cuCtxSetCurrent(original); }
 };
@@ -221,7 +221,7 @@ void pointer_attributes_ownership() {
                 require(pointer_query<int>(CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, allocation.address + offset) == allocation.device,
                     "foreign-current-context query retains allocation device");
                 CUcontext current{};
-                CONFORMANCE_CUDA(cuCtxGetCurrent(&current));
+                TEST_CUDA(cuCtxGetCurrent(&current));
                 require(current == other.value, "pointer introspection preserves current context");
             }
         }
@@ -255,9 +255,9 @@ void pointer_attributes_lifetime() {
         struct cleanup_registration { void* pointer; ~cleanup_registration() { if (pointer) cuMemHostUnregister(pointer); } } cleanup{host};
         const auto attributes = pointer_runtime_query(reinterpret_cast<uintptr_t>(host + 31));
         require(attributes.type == cudaMemoryTypeHost && attributes.hostPointer == host + 31, "registration changes pointer classification");
-        CONFORMANCE_CUDA(cuMemHostUnregister(host)); cleanup.pointer = nullptr;
+        TEST_CUDA(cuMemHostUnregister(host)); cleanup.pointer = nullptr;
         expect_unregistered_pointer(host + 31);
-        CONFORMANCE_CUDA(cuMemHostRegister(host, 4093, CU_MEMHOSTREGISTER_DEVICEMAP)); cleanup.pointer = host;
+        TEST_CUDA(cuMemHostRegister(host, 4093, CU_MEMHOSTREGISTER_DEVICEMAP)); cleanup.pointer = host;
         require(pointer_runtime_query(reinterpret_cast<uintptr_t>(host)).type == cudaMemoryTypeHost, "opposite API re-registration classification");
         POINTER_RUNTIME(cudaHostUnregister(host)); cleanup.pointer = nullptr;
         expect_unregistered_pointer(host);
@@ -304,5 +304,5 @@ void execute_pointer_attributes() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::pointer_attributes_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_pointer_attributes);
+    return cudavm::run_test(argc, argv, cudavm::execute_pointer_attributes);
 }

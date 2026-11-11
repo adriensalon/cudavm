@@ -24,7 +24,7 @@ std::vector<unsigned char> allocation_node_expected() {
 }
 struct allocation_node_host {
     void* value{};
-    allocation_node_host() { CONFORMANCE_CUDA(cuMemAllocHost(&value, allocation_node_host_bytes)); reset(); }
+    allocation_node_host() { TEST_CUDA(cuMemAllocHost(&value, allocation_node_host_bytes)); reset(); }
     ~allocation_node_host() { if (value) { cuCtxSynchronize(); cuMemFreeHost(value); } }
     void reset() { std::memset(value, 0xd3, allocation_node_host_bytes); }
     void expect(bool copied = true) const {
@@ -34,13 +34,13 @@ struct allocation_node_host {
     }
 };
 struct allocation_node_stream {
-    CUstream value{}; allocation_node_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    CUstream value{}; allocation_node_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~allocation_node_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
-    void synchronize() const { CONFORMANCE_CUDA(cuStreamSynchronize(value)); }
+    void synchronize() const { TEST_CUDA(cuStreamSynchronize(value)); }
 };
 CUDA_MEM_ALLOC_NODE_PARAMS allocation_node_parameters() {
     CUDA_MEM_ALLOC_NODE_PARAMS p{}; p.bytesize = allocation_node_bytes; p.poolProps.allocType = CU_MEM_ALLOCATION_TYPE_PINNED;
-    p.poolProps.location.type = CU_MEM_LOCATION_TYPE_DEVICE; CONFORMANCE_CUDA(cuCtxGetDevice(&p.poolProps.location.id)); return p;
+    p.poolProps.location.type = CU_MEM_LOCATION_TYPE_DEVICE; TEST_CUDA(cuCtxGetDevice(&p.poolProps.location.id)); return p;
 }
 CUresult allocation_node_add(CUgraph graph, CUgraphNode& node, CUDA_MEM_ALLOC_NODE_PARAMS& p, allocation_node_route route) {
     if (route.runtime) {
@@ -97,9 +97,9 @@ void allocation_node_query(CUgraphNode node, CUdeviceptr address, CUdevice devic
             && static_cast<int>(p.accessDescs[0].location.type) == int(CU_MEM_LOCATION_TYPE_DEVICE)
             && static_cast<int>(p.accessDescs[0].flags) == int(CU_MEM_ACCESS_FLAGS_PROT_READWRITE), "allocation owns a copied access descriptor");
     };
-    allocation_node_guarded<CUDA_MEM_ALLOC_NODE_PARAMS> driver; CONFORMANCE_CUDA(cuGraphMemAllocNodeGetParams(node, &driver.value)); driver.check(); check(driver.value);
+    allocation_node_guarded<CUDA_MEM_ALLOC_NODE_PARAMS> driver; TEST_CUDA(cuGraphMemAllocNodeGetParams(node, &driver.value)); driver.check(); check(driver.value);
     require(driver.value.dptr == address, "typed Driver graph allocation address");
-    allocation_node_guarded<CUgraphNodeParams> generic; CONFORMANCE_CUDA(cuGraphNodeGetParams(node, &generic.value)); generic.check();
+    allocation_node_guarded<CUgraphNodeParams> generic; TEST_CUDA(cuGraphNodeGetParams(node, &generic.value)); generic.check();
     require(generic.value.type == CU_GRAPH_NODE_TYPE_MEM_ALLOC && generic.value.alloc.dptr == address, "generic Driver graph allocation identity"); check(generic.value.alloc);
     allocation_node_guarded<cudaMemAllocNodeParams> runtime; ALLOCATION_NODE_RUNTIME(cudaGraphMemAllocNodeGetParams(reinterpret_cast<cudaGraphNode_t>(node), &runtime.value)); runtime.check(); check(runtime.value);
     require(runtime.value.dptr == allocation_node_pointer(address), "typed Runtime graph allocation address");
@@ -107,32 +107,32 @@ void allocation_node_query(CUgraphNode node, CUdeviceptr address, CUdevice devic
     require(runtime_generic.value.type == cudaGraphNodeTypeMemAlloc && runtime_generic.value.alloc.dptr == allocation_node_pointer(address), "generic Runtime graph allocation identity"); check(runtime_generic.value.alloc);
 }
 void allocation_node_free_query(CUgraphNode node, CUdeviceptr address) {
-    allocation_node_guarded<CUdeviceptr> driver; CONFORMANCE_CUDA(cuGraphMemFreeNodeGetParams(node, &driver.value)); driver.check(); require(driver.value == address, "Driver graph free address");
+    allocation_node_guarded<CUdeviceptr> driver; TEST_CUDA(cuGraphMemFreeNodeGetParams(node, &driver.value)); driver.check(); require(driver.value == address, "Driver graph free address");
     allocation_node_guarded<void*> runtime; ALLOCATION_NODE_RUNTIME(cudaGraphMemFreeNodeGetParams(reinterpret_cast<cudaGraphNode_t>(node), &runtime.value)); runtime.check(); require(runtime.value == allocation_node_pointer(address), "Runtime graph free address");
-    allocation_node_guarded<CUgraphNodeParams> generic; CONFORMANCE_CUDA(cuGraphNodeGetParams(node, &generic.value)); generic.check(); require(generic.value.type == CU_GRAPH_NODE_TYPE_MEM_FREE && generic.value.free.dptr == address, "generic Driver free metadata");
+    allocation_node_guarded<CUgraphNodeParams> generic; TEST_CUDA(cuGraphNodeGetParams(node, &generic.value)); generic.check(); require(generic.value.type == CU_GRAPH_NODE_TYPE_MEM_FREE && generic.value.free.dptr == address, "generic Driver free metadata");
     allocation_node_guarded<cudaGraphNodeParams> other; ALLOCATION_NODE_RUNTIME(cudaGraphNodeGetParams(reinterpret_cast<cudaGraphNode_t>(node), &other.value)); other.check(); require(other.value.type == cudaGraphNodeTypeMemFree && other.value.free.dptr == allocation_node_pointer(address), "generic Runtime free metadata");
 }
 struct allocation_node_graph {
     CUgraph value{}; CUgraphNode allocation{}, fill{}, patch{}, read{}, free{}; CUdeviceptr address{}; CUdevice device{}; bool access{};
     explicit allocation_node_graph(bool runtime) {
-        CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+        TEST_CUDA(cuCtxGetDevice(&device));
         if (runtime) { cudaGraph_t result{}; ALLOCATION_NODE_RUNTIME(cudaGraphCreate(&result, 0)); value = reinterpret_cast<CUgraph>(result); }
-        else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        else TEST_CUDA(cuGraphCreate(&value, 0));
     }
     ~allocation_node_graph() { if (value) cuGraphDestroy(value); }
-    void destroy() { CONFORMANCE_CUDA(cuGraphDestroy(value)); value = nullptr; }
+    void destroy() { TEST_CUDA(cuGraphDestroy(value)); value = nullptr; }
     void build(allocation_node_host& host, allocation_node_route route, bool internal_free = true, bool descriptor = false, unsigned missing_edge = 0) {
         access = descriptor; auto p = allocation_node_parameters(); CUmemAccessDesc description{p.poolProps.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE};
         if (descriptor) { p.accessDescs = &description; p.accessDescCount = 1; }
-        CONFORMANCE_CUDA(allocation_node_add(value, allocation, p, route)); address = p.dptr; require(address, "allocation node returns a nonnull address");
+        TEST_CUDA(allocation_node_add(value, allocation, p, route)); address = p.dptr; require(address, "allocation node returns a nonnull address");
         description.flags = CU_MEM_ACCESS_FLAGS_PROT_NONE; p = {}; allocation_node_query(allocation, address, device, descriptor);
         const auto add_fill = [&](CUgraphNode& node, CUdeviceptr pointer, size_t count, unsigned byte, CUgraphNode dependency) {
             if (route.runtime) {
                 cudaMemsetParams params{allocation_node_pointer(pointer), 0, byte, 1, count, 1}; auto dep = reinterpret_cast<cudaGraphNode_t>(dependency); cudaGraphNode_t result{};
                 ALLOCATION_NODE_RUNTIME(cudaGraphAddMemsetNode(&result, reinterpret_cast<cudaGraph_t>(value), dependency ? &dep : nullptr, dependency ? 1 : 0, &params)); node = reinterpret_cast<CUgraphNode>(result);
             } else {
-                CUDA_MEMSET_NODE_PARAMS params{}; params.dst = pointer; params.value = byte; params.elementSize = 1; params.width = count; params.height = 1; CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
-                CONFORMANCE_CUDA(cuGraphAddMemsetNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, &params, context));
+                CUDA_MEMSET_NODE_PARAMS params{}; params.dst = pointer; params.value = byte; params.elementSize = 1; params.width = count; params.height = 1; CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
+                TEST_CUDA(cuGraphAddMemsetNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, &params, context));
             }
         };
         add_fill(fill, address, allocation_node_bytes, 0x9b, missing_edge == 1 ? nullptr : allocation);
@@ -143,33 +143,33 @@ struct allocation_node_graph {
                 static_cast<unsigned char*>(host.value) + allocation_node_host_offset, allocation_node_pointer(address), allocation_node_bytes, cudaMemcpyDeviceToHost)); read = reinterpret_cast<CUgraphNode>(result);
         } else {
             CUDA_MEMCPY3D copy{}; copy.srcMemoryType = CU_MEMORYTYPE_DEVICE; copy.srcDevice = address; copy.dstMemoryType = CU_MEMORYTYPE_HOST; copy.dstHost = static_cast<unsigned char*>(host.value) + allocation_node_host_offset;
-            copy.srcPitch = copy.dstPitch = copy.WidthInBytes = allocation_node_bytes; copy.srcHeight = copy.dstHeight = copy.Height = copy.Depth = 1; CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
-            CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&read, value, &patch, 1, &copy, context));
+            copy.srcPitch = copy.dstPitch = copy.WidthInBytes = allocation_node_bytes; copy.srcHeight = copy.dstHeight = copy.Height = copy.Depth = 1; CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
+            TEST_CUDA(cuGraphAddMemcpyNode(&read, value, &patch, 1, &copy, context));
         }
-        if (internal_free) { CONFORMANCE_CUDA(allocation_node_free(value, free, address, missing_edge == 2 ? allocation : read, route)); allocation_node_free_query(free, address); }
+        if (internal_free) { TEST_CUDA(allocation_node_free(value, free, address, missing_edge == 2 ? allocation : read, route)); allocation_node_free_query(free, address); }
     }
 };
 struct allocation_node_executable {
     CUgraphExec value{};
     allocation_node_executable(CUgraph graph, bool runtime, unsigned long long flags = 0) {
         if (runtime) { cudaGraphExec_t result{}; ALLOCATION_NODE_RUNTIME(cudaGraphInstantiateWithFlags(&result, reinterpret_cast<cudaGraph_t>(graph), flags)); value = reinterpret_cast<CUgraphExec>(result); }
-        else CONFORMANCE_CUDA(cuGraphInstantiate(&value, graph, flags));
+        else TEST_CUDA(cuGraphInstantiate(&value, graph, flags));
     }
     ~allocation_node_executable() { if (value) cuGraphExecDestroy(value); }
-    void destroy() { CONFORMANCE_CUDA(cuGraphExecDestroy(value)); value = nullptr; }
+    void destroy() { TEST_CUDA(cuGraphExecDestroy(value)); value = nullptr; }
     void launch(CUstream stream, bool runtime) const {
         if (runtime) ALLOCATION_NODE_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(value), reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuGraphLaunch(value, stream));
+        else TEST_CUDA(cuGraphLaunch(value, stream));
     }
 };
 uint64_t allocation_node_stat(CUdevice device, CUgraphMem_attribute attribute) {
     allocation_node_guarded<uint64_t> driver, runtime; driver.value = runtime.value = ~uint64_t(0);
-    CONFORMANCE_CUDA(cuDeviceGetGraphMemAttribute(device, attribute, &driver.value)); driver.check();
+    TEST_CUDA(cuDeviceGetGraphMemAttribute(device, attribute, &driver.value)); driver.check();
     ALLOCATION_NODE_RUNTIME(cudaDeviceGetGraphMemAttribute(device, static_cast<cudaGraphMemAttributeType>(attribute), &runtime.value)); runtime.check();
     require(driver.value == runtime.value, "both graph memory statistic surfaces agree"); return driver.value;
 }
 void allocation_node_trim(CUdevice device, bool runtime) {
-    if (runtime) ALLOCATION_NODE_RUNTIME(cudaDeviceGraphMemTrim(device)); else CONFORMANCE_CUDA(cuDeviceGraphMemTrim(device));
+    if (runtime) ALLOCATION_NODE_RUNTIME(cudaDeviceGraphMemTrim(device)); else TEST_CUDA(cuDeviceGraphMemTrim(device));
 }
 void allocation_node_footprint(CUdevice device) {
     auto used = allocation_node_stat(device, CU_GRAPH_MEM_ATTR_USED_MEM_CURRENT), reserved = allocation_node_stat(device, CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT);
@@ -180,7 +180,7 @@ void allocation_node_idle(CUdevice device) {
     require(allocation_node_stat(device, CU_GRAPH_MEM_ATTR_USED_MEM_CURRENT) == 0 && allocation_node_stat(device, CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT) == 0, "trimming releases all idle graph backing");
 }
 void allocation_node_live_bytes(CUdeviceptr pointer) {
-    std::vector<unsigned char> bytes(allocation_node_bytes); CONFORMANCE_CUDA(cuMemcpyDtoH(bytes.data(), pointer, bytes.size())); require(bytes == allocation_node_expected(), "live graph allocation preserves every byte outside its graph");
+    std::vector<unsigned char> bytes(allocation_node_bytes); TEST_CUDA(cuMemcpyDtoH(bytes.data(), pointer, bytes.size())); require(bytes == allocation_node_expected(), "live graph allocation preserves every byte outside its graph");
 }
 void allocation_node_replay(allocation_node_route route) {
     allocation_node_host host; allocation_node_stream stream;
@@ -188,7 +188,7 @@ void allocation_node_replay(allocation_node_route route) {
         host.reset();
         allocation_node_graph graph(route.runtime); graph.build(host, route, true, access); allocation_node_executable executable(graph.value, !route.runtime);
         require(cuMemsetD8(graph.address, 0, 1) == CUDA_ERROR_INVALID_VALUE, "reserved graph address is unavailable before allocation executes");
-        CONFORMANCE_CUDA(cuGraphUpload(executable.value, stream.value)); stream.synchronize(); host.expect(false);
+        TEST_CUDA(cuGraphUpload(executable.value, stream.value)); stream.synchronize(); host.expect(false);
         for (unsigned repeat = 0; repeat < 3; ++repeat) {
             host.reset(); executable.launch(stream.value, route.runtime); stream.synchronize(); host.expect(); allocation_node_footprint(graph.device);
             allocation_node_trim(graph.device, route.runtime); allocation_node_idle(graph.device); allocation_node_query(graph.allocation, graph.address, graph.device, access); allocation_node_free_query(graph.free, graph.address);
@@ -200,12 +200,12 @@ void allocation_node_live(allocation_node_route route) {
     executable.launch(stream.value, !route.runtime); stream.synchronize(); host.expect(); allocation_node_footprint(graph.device);
     const auto reserved = allocation_node_stat(graph.device, CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT); allocation_node_trim(graph.device, route.runtime);
     require(allocation_node_stat(graph.device, CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT) == reserved, "trimming preserves live graph memory"); allocation_node_live_bytes(graph.address);
-    uint64_t zero{}; CONFORMANCE_CUDA(cuDeviceSetGraphMemAttribute(graph.device, CU_GRAPH_MEM_ATTR_USED_MEM_HIGH, &zero));
+    uint64_t zero{}; TEST_CUDA(cuDeviceSetGraphMemAttribute(graph.device, CU_GRAPH_MEM_ATTR_USED_MEM_HIGH, &zero));
     ALLOCATION_NODE_RUNTIME(cudaDeviceSetGraphMemAttribute(graph.device, cudaGraphMemAttrReservedMemHigh, &zero));
     require(allocation_node_stat(graph.device, CU_GRAPH_MEM_ATTR_USED_MEM_HIGH) == allocation_node_stat(graph.device, CU_GRAPH_MEM_ATTR_USED_MEM_CURRENT)
         && allocation_node_stat(graph.device, CU_GRAPH_MEM_ATTR_RESERVED_MEM_HIGH) == reserved, "reset watermarks start at the live footprint");
     executable.destroy(); graph.destroy(); allocation_node_trim(graph.device, !route.runtime); allocation_node_live_bytes(graph.address);
-    if (route.runtime) ALLOCATION_NODE_RUNTIME(cudaFree(allocation_node_pointer(graph.address))); else CONFORMANCE_CUDA(cuMemFree(graph.address));
+    if (route.runtime) ALLOCATION_NODE_RUNTIME(cudaFree(allocation_node_pointer(graph.address))); else TEST_CUDA(cuMemFree(graph.address));
     allocation_node_trim(graph.device, route.runtime); allocation_node_idle(graph.device);
 }
 void allocation_node_auto_free(allocation_node_route route) {
@@ -215,7 +215,7 @@ void allocation_node_auto_free(allocation_node_route route) {
         for (unsigned repeat = 0; repeat < 3; ++repeat) {
             host.reset(); executable.launch(stream.value, !route.runtime); stream.synchronize(); host.expect(); allocation_node_live_bytes(graph.address);
             if (!automatic) require(cuGraphLaunch(executable.value, stream.value) == CUDA_ERROR_INVALID_VALUE, "unfreed graph allocation rejects another ordinary launch");
-            if (!automatic || repeat == 2) { CONFORMANCE_CUDA(cuMemFree(graph.address)); allocation_node_trim(graph.device, route.runtime); allocation_node_idle(graph.device); }
+            if (!automatic || repeat == 2) { TEST_CUDA(cuMemFree(graph.address)); allocation_node_trim(graph.device, route.runtime); allocation_node_idle(graph.device); }
         }
     }
 }
@@ -234,8 +234,8 @@ void allocation_node_pending(allocation_node_route route) {
     allocation_node_host host; allocation_node_stream stream;
     for (bool upload : {false, true}) {
         host.reset(); allocation_node_graph graph(route.runtime); graph.build(host, route); allocation_node_executable executable(graph.value, route.runtime);
-        allocation_node_gate gate; allocation_node_gate_cleanup cleanup{gate}; CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, allocation_node_gate::call, &gate)); gate.await();
-        if (upload) CONFORMANCE_CUDA(cuGraphUpload(executable.value, stream.value)); else executable.launch(stream.value, !route.runtime);
+        allocation_node_gate gate; allocation_node_gate_cleanup cleanup{gate}; TEST_CUDA(cuLaunchHostFunc(stream.value, allocation_node_gate::call, &gate)); gate.await();
+        if (upload) TEST_CUDA(cuGraphUpload(executable.value, stream.value)); else executable.launch(stream.value, !route.runtime);
         auto reserved = allocation_node_stat(graph.device, CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT); require(reserved >= allocation_node_bytes, "accepted graph work retains allocation backing");
         if (!upload) { executable.destroy(); graph.destroy(); }
         allocation_node_trim(graph.device, route.runtime); require(allocation_node_stat(graph.device, CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT) == reserved, "trimming preserves pending graph backing");
@@ -259,7 +259,7 @@ void allocation_node_restrictions(allocation_node_route route) {
         host.reset(); allocation_node_graph graph(route.runtime); graph.build(host, route, true, false, missing);
         allocation_node_guarded<CUgraphExec> failed; require(cuGraphInstantiate(&failed.value, graph.value, 0) == CUDA_ERROR_INVALID_VALUE, "unordered graph allocation use rejects instantiation"); failed.check(); host.expect(false);
         auto from = missing == 1 ? graph.allocation : graph.read, to = missing == 1 ? graph.fill : graph.free;
-        CONFORMANCE_CUDA(cuGraphAddDependencies(graph.value, &from, &to, nullptr, 1)); allocation_node_executable repaired(graph.value, route.runtime);
+        TEST_CUDA(cuGraphAddDependencies(graph.value, &from, &to, nullptr, 1)); allocation_node_executable repaired(graph.value, route.runtime);
         repaired.launch(stream.value, !route.runtime); stream.synchronize(); host.expect(); allocation_node_trim(graph.device, route.runtime); allocation_node_idle(graph.device);
     }
 }
@@ -272,7 +272,7 @@ void allocation_node_validation(allocation_node_route route) {
         if (invalid == 2) p.poolProps.reserved[0] = 1;
         if (invalid == 3) p.accessDescCount = 1;
         require(allocation_node_add(graph.value, node, p, route) == CUDA_ERROR_INVALID_VALUE, "invalid allocation descriptions reject");
-        size_t count{}; CONFORMANCE_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(count == 0, "invalid allocations do not add nodes"); host.expect(false);
+        size_t count{}; TEST_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(count == 0, "invalid allocations do not add nodes"); host.expect(false);
     }
     graph.build(host, route); device_buffer ordinary(allocation_node_bytes); CUgraphNode output{};
     for (auto pointer : {CUdeviceptr(0), ordinary.value, graph.address + 1, graph.address})
@@ -302,5 +302,5 @@ void execute_allocation_nodes() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc != 3) return 1; cudavm::allocation_node_case = argv[2]; return cudavm::run_conformance(2, argv, cudavm::execute_allocation_nodes);
+    if (argc != 3) return 1; cudavm::allocation_node_case = argv[2]; return cudavm::run_test(2, argv, cudavm::execute_allocation_nodes);
 }

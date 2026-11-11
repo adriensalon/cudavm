@@ -12,10 +12,10 @@ struct atomic_observation {
         : values(capacity + 4, atomic_guard), storage(values.size() * 4), pointer(storage.value + 4) {}
     void reset() {
         std::fill(values.begin(), values.end(), atomic_guard);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(storage.value, values.data(), values.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(storage.value, values.data(), values.size() * 4));
     }
     void fetch(size_t written, const std::string& context) {
-        CONFORMANCE_CUDA(cuMemcpyDtoH(values.data(), storage.value, values.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(values.data(), storage.value, values.size() * 4));
         require(values.front() == atomic_guard, context + ": output prefix guard");
         for (size_t i = written + 1; i < values.size(); ++i)
             require(values[i] == atomic_guard, context + ": output tail word " + std::to_string(i));
@@ -44,13 +44,13 @@ void execute_atomic_operations(const loaded_program& program) {
             const auto context = shape + " count=" + std::to_string(count);
             for (uint32_t seed : {0u, 0xfffffffdu}) {
                 const std::array<uint32_t, 6> initial{atomic_guard, seed, seed, seed, seed, atomic_guard};
-                CONFORMANCE_CUDA(cuMemcpyHtoD(counters.value, initial.data(), sizeof(initial)));
+                TEST_CUDA(cuMemcpyHtoD(counters.value, initial.data(), sizeof(initial)));
                 output.reset();
                 void* args[]{&output.pointer, &state, &count};
-                CONFORMANCE_CUDA(cuLaunchKernel(add, blocks, 1, 1, lanes, 1, 1, 0, nullptr, args, nullptr));
+                TEST_CUDA(cuLaunchKernel(add, blocks, 1, 1, lanes, 1, 1, 0, nullptr, args, nullptr));
                 output.fetch(total, "global add" + context);
                 std::array<uint32_t, 6> actual{};
-                CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), counters.value, sizeof(actual)));
+                TEST_CUDA(cuMemcpyDtoH(actual.data(), counters.value, sizeof(actual)));
                 auto expected = initial;
                 for (unsigned bucket = 0; bucket < 2; ++bucket) {
                     std::vector<uint32_t> tickets;
@@ -72,13 +72,13 @@ void execute_atomic_operations(const loaded_program& program) {
             for (uint32_t initial_value : {0u, 0x87654321u, 0xffffffffu}) {
                 const std::array<uint32_t, 6> initial{atomic_guard, initial_value, initial_value,
                     0x12345678, 0x23456789, atomic_guard};
-                CONFORMANCE_CUDA(cuMemcpyHtoD(counters.value, initial.data(), sizeof(initial)));
+                TEST_CUDA(cuMemcpyHtoD(counters.value, initial.data(), sizeof(initial)));
                 output.reset();
                 void* args[]{&output.pointer, &state, &replacement};
-                CONFORMANCE_CUDA(cuLaunchKernel(cas, blocks, 1, 1, lanes, 1, 1, 0, nullptr, args, nullptr));
+                TEST_CUDA(cuLaunchKernel(cas, blocks, 1, 1, lanes, 1, 1, 0, nullptr, args, nullptr));
                 output.fetch(total, "global CAS" + shape);
                 std::array<uint32_t, 6> actual{};
-                CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), counters.value, sizeof(actual)));
+                TEST_CUDA(cuMemcpyDtoH(actual.data(), counters.value, sizeof(actual)));
                 auto expected = initial;
                 expected[1] = expected[2] = initial_value == 0 ? replacement : initial_value;
                 expect_words(actual, expected, "returned/discarded global CAS state" + shape);
@@ -95,7 +95,7 @@ void execute_atomic_operations(const loaded_program& program) {
             output.reset();
             unsigned unused = 0;
             void* args[]{&output.pointer, &replacement, &unused};
-            CONFORMANCE_CUDA(cuLaunchKernel(shared_cas, blocks, 1, 1, lanes, 1, 1, 8, nullptr, args, nullptr));
+            TEST_CUDA(cuLaunchKernel(shared_cas, blocks, 1, 1, lanes, 1, 1, 8, nullptr, args, nullptr));
             output.fetch(total + blocks, "shared CAS" + shape);
             for (unsigned block = 0; block < blocks; ++block) {
                 unsigned zeros = 0;
@@ -116,11 +116,11 @@ void execute_atomic_operations(const loaded_program& program) {
         for (unsigned pattern : {0u, 1u}) {
             for (unsigned i = 0; i < total; ++i)
                 input[i + 1] = pattern ? 0x80000002u : 0xfffffffdu + i * 0x7654321u;
-            CONFORMANCE_CUDA(cuMemcpyHtoD(in.value, input.data(), input.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(in.value, input.data(), input.size() * 4));
             for (unsigned count : {0u, 1u, total / 2 + 1, total}) {
                 output.reset();
                 void* args[]{&output.pointer, &source, &count};
-                CONFORMANCE_CUDA(cuLaunchKernel(histogram, blocks, 1, 1, lanes, 1, 1, 32, nullptr, args, nullptr));
+                TEST_CUDA(cuLaunchKernel(histogram, blocks, 1, 1, lanes, 1, 1, 32, nullptr, args, nullptr));
                 output.fetch(blocks * 8 + total, "shared histogram" + shape);
                 for (unsigned block = 0; block < blocks; ++block) {
                     std::array<uint32_t, 4> bins{};
@@ -144,7 +144,7 @@ void execute_atomic_operations(const loaded_program& program) {
                     }
                 }
             }
-            CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), in.value, preserved.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(preserved.data(), in.value, preserved.size() * 4));
             expect_words(preserved, input, "histogram input preservation");
         }
     }
@@ -152,5 +152,5 @@ void execute_atomic_operations(const loaded_program& program) {
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_atomic_operations);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_atomic_operations);
 }

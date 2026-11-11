@@ -19,13 +19,13 @@ struct mapped_host_buffer {
     mapped_host_buffer(unsigned form, bool portable) : kind(form) {
         const unsigned flags = CU_MEMHOSTALLOC_DEVICEMAP | (portable ? CU_MEMHOSTALLOC_PORTABLE : 0);
         if (kind < 2) {
-            if (kind == 0) CONFORMANCE_CUDA(cuMemHostAlloc(&value, bytes, flags));
+            if (kind == 0) TEST_CUDA(cuMemHostAlloc(&value, bytes, flags));
             else MAPPED_RUNTIME(cudaHostAlloc(&value, bytes, flags));
         } else {
             backing.resize(alignment * 3, 0xa7);
             auto address = reinterpret_cast<uintptr_t>(backing.data());
             value = reinterpret_cast<void*>(((address + alignment - 1) & ~(uintptr_t(alignment) - 1)) + 4);
-            if (kind == 2) CONFORMANCE_CUDA(cuMemHostRegister(value, bytes, flags));
+            if (kind == 2) TEST_CUDA(cuMemHostRegister(value, bytes, flags));
             else MAPPED_RUNTIME(cudaHostRegister(value, bytes, flags));
         }
     }
@@ -34,9 +34,9 @@ struct mapped_host_buffer {
     mapped_host_buffer& operator=(const mapped_host_buffer&) = delete;
     void release() {
         if (kind == 0) MAPPED_RUNTIME(cudaFreeHost(value));
-        else if (kind == 1) CONFORMANCE_CUDA(cuMemFreeHost(value));
+        else if (kind == 1) TEST_CUDA(cuMemFreeHost(value));
         else if (kind == 2) MAPPED_RUNTIME(cudaHostUnregister(value));
-        else CONFORMANCE_CUDA(cuMemHostUnregister(value));
+        else TEST_CUDA(cuMemHostUnregister(value));
         value = nullptr;
     }
     void initialize(std::span<const uint32_t> values) { std::memcpy(value, values.data(), bytes); }
@@ -52,13 +52,13 @@ struct mapped_host_buffer {
         }
     }
     void query_alias() {
-        CONFORMANCE_CUDA(cuMemHostGetDevicePointer(&alias, value, 0));
+        TEST_CUDA(cuMemHostGetDevicePointer(&alias, value, 0));
         require(alias != 0, "mapped device address is nonzero");
         for (size_t offset : {size_t(0), size_t(1), bytes / 2, bytes - 1}) {
             CUdeviceptr driver{};
             void* runtime{};
             auto* pointer = static_cast<unsigned char*>(value) + offset;
-            CONFORMANCE_CUDA(cuMemHostGetDevicePointer(&driver, pointer, 0));
+            TEST_CUDA(cuMemHostGetDevicePointer(&driver, pointer, 0));
             MAPPED_RUNTIME(cudaHostGetDevicePointer(&runtime, pointer, 0));
             require(driver == alias + offset && reinterpret_cast<uintptr_t>(runtime) == driver,
                 "Driver/Runtime mapped interior aliases preserve byte offsets");
@@ -73,18 +73,18 @@ struct mapped_host_buffer {
 };
 struct mapped_stream {
     CUstream value{};
-    mapped_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    mapped_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~mapped_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct mapped_event {
     CUevent value{};
-    mapped_event() { CONFORMANCE_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
+    mapped_event() { TEST_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
     ~mapped_event() { if (value) cuEventDestroy(value); }
 };
 void mapped_launch(CUfunction kernel, CUdeviceptr out, CUdeviceptr in, unsigned count,
                     uint32_t seed, unsigned threads, CUstream stream) {
     void* args[]{&out, &in, &count, &seed};
-    CONFORMANCE_CUDA(cuLaunchKernel(kernel, 3, 1, 1, threads, 1, 1, 0, stream, args, nullptr));
+    TEST_CUDA(cuLaunchKernel(kernel, 3, 1, 1, threads, 1, 1, 0, stream, args, nullptr));
 }
 void mapped_expected(std::vector<uint32_t>& output, size_t destination, const std::vector<uint32_t>& input,
                         size_t source, unsigned count, unsigned threads, uint32_t seed) {
@@ -94,8 +94,8 @@ void mapped_expected(std::vector<uint32_t>& output, size_t destination, const st
 void execute_mapped_host_memory(const loaded_program& program) {
     CUdevice device{};
     int can_map = 0;
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&can_map, CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY, device));
+    TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuDeviceGetAttribute(&can_map, CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY, device));
     require(can_map != 0, "mapped host memory requires advertised support");
     const auto kernel = program.function("mapped_host_transform");
     constexpr size_t source_offset = 17, destination_offset = 23;
@@ -116,8 +116,8 @@ void execute_mapped_host_memory(const loaded_program& program) {
             mapped_expected(expected, destination_offset, input, source_offset, count, threads, seed);
             mapped_launch(kernel, middle.alias + destination_offset * 4, source.alias + source_offset * 4,
                 count, seed, threads, first.value);
-            CONFORMANCE_CUDA(cuEventRecord(event.value, first.value));
-            CONFORMANCE_CUDA(cuStreamWaitEvent(second.value, event.value, 0));
+            TEST_CUDA(cuEventRecord(event.value, first.value));
+            TEST_CUDA(cuStreamWaitEvent(second.value, event.value, 0));
             mapped_expected(final, source_offset, expected, destination_offset, count, threads, seed ^ 0x5a5a5a5a);
             mapped_launch(kernel, destination.alias + source_offset * 4, middle.alias + destination_offset * 4,
                 count, seed ^ 0x5a5a5a5a, threads, second.value);
@@ -130,7 +130,7 @@ void execute_mapped_host_memory(const loaded_program& program) {
             mapped_expected(final, source_offset, before_inplace, source_offset, count, threads, seed + 3);
             mapped_launch(kernel, destination.alias + source_offset * 4, destination.alias + source_offset * 4,
                 count, seed + 3, threads, second.value);
-            CONFORMANCE_CUDA(cuStreamSynchronize(second.value));
+            TEST_CUDA(cuStreamSynchronize(second.value));
             destination.expect(final, "mapped in-place word access and guards");
             source.expect(input, "mapped in-place pass preserves independent input");
             middle.expect(expected, "mapped in-place pass preserves independent producer output");
@@ -140,5 +140,5 @@ void execute_mapped_host_memory(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_mapped_host_memory, 1, CU_CTX_MAP_HOST);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_mapped_host_memory, 1, CU_CTX_MAP_HOST);
 }

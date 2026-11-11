@@ -28,10 +28,10 @@ struct replay_storage {
     void* host{};
     std::vector<uint32_t> initial;
     explicit replay_storage(unsigned seed) : initial(replay_state_words) {
-        CONFORMANCE_CUDA(cuMemAllocHost(&host, replay_slots * replay_slot_words * sizeof(uint32_t)));
+        TEST_CUDA(cuMemAllocHost(&host, replay_slots * replay_slot_words * sizeof(uint32_t)));
         for (size_t i = 0; i < initial.size(); ++i) initial[i] = 0xcafe0000u + uint32_t(i) * 0x20201u;
         for (size_t i = 0; i < replay_lanes; ++i) initial[i + replay_guard_words] = 0xfffffff0u + uint32_t(i) * 0x01020305u + seed * 0x103u;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size() * sizeof(uint32_t)));
+        TEST_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size() * sizeof(uint32_t)));
         std::memset(host, 0xd3, replay_slots * replay_slot_words * sizeof(uint32_t));
     }
     ~replay_storage() { if (host) { cuCtxSynchronize(); cuMemFreeHost(host); } }
@@ -52,15 +52,15 @@ struct replay_storage {
     }
     void expect_device(std::span<const uint32_t> expected) const {
         std::vector<uint32_t> actual(replay_state_words);
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), device.value, actual.size() * sizeof(uint32_t)));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), device.value, actual.size() * sizeof(uint32_t)));
         expect_words(actual, expected, "final replay state and device allocation guards");
     }
 };
 struct replay_stream {
     CUstream value{};
-    replay_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    replay_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~replay_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
-    void synchronize() const { CONFORMANCE_CUDA(cuStreamSynchronize(value)); }
+    void synchronize() const { TEST_CUDA(cuStreamSynchronize(value)); }
 };
 struct replay_gate {
     std::mutex mutex; std::condition_variable changed;
@@ -84,9 +84,9 @@ struct replay_graph {
     CUfunction function{};
     CUcontext context{};
     replay_graph(CUfunction entry, replay_storage& storage, unsigned count, uint32_t add, bool runtime) : function(entry) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        TEST_CUDA(cuCtxGetCurrent(&context));
         if (runtime) { cudaGraph_t graph{}; REPLAY_RUNTIME(cudaGraphCreate(&graph, 0)); value = reinterpret_cast<CUgraph>(graph); }
-        else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        else TEST_CUDA(cuGraphCreate(&value, 0));
         try { configure(storage, 0, count, add, runtime); }
         catch (...) { cuGraphDestroy(value); value = nullptr; throw; }
     }
@@ -105,9 +105,9 @@ struct replay_graph {
             else {
                 cudaGraphNode_t node{}; REPLAY_RUNTIME(cudaGraphAddNode(&node, reinterpret_cast<cudaGraph_t>(value), nullptr, nullptr, 0, &p)); kernel = reinterpret_cast<CUgraphNode>(node);
             }
-        } else if (executable) CONFORMANCE_CUDA(cuGraphExecKernelNodeSetParams(executable, kernel, &params));
-        else if (kernel) CONFORMANCE_CUDA(cuGraphKernelNodeSetParams(kernel, &params));
-        else CONFORMANCE_CUDA(cuGraphAddKernelNode(&kernel, value, nullptr, 0, &params));
+        } else if (executable) TEST_CUDA(cuGraphExecKernelNodeSetParams(executable, kernel, &params));
+        else if (kernel) TEST_CUDA(cuGraphKernelNodeSetParams(kernel, &params));
+        else TEST_CUDA(cuGraphAddKernelNode(&kernel, value, nullptr, 0, &params));
         const size_t bytes = replay_state_words * sizeof(uint32_t);
         if (runtime) {
             cudaMemcpy3DParms p{}; p.srcPtr = {reinterpret_cast<void*>(static_cast<uintptr_t>(storage.device.value)), bytes, bytes, 1};
@@ -122,9 +122,9 @@ struct replay_graph {
             CUDA_MEMCPY3D p{}; p.srcMemoryType = CU_MEMORYTYPE_DEVICE; p.srcDevice = storage.device.value;
             p.dstMemoryType = CU_MEMORYTYPE_HOST; p.dstHost = storage.destination(slot);
             p.srcPitch = p.dstPitch = p.WidthInBytes = bytes; p.srcHeight = p.dstHeight = p.Height = p.Depth = 1;
-            if (executable) CONFORMANCE_CUDA(cuGraphExecMemcpyNodeSetParams(executable, read, &p, context));
-            else if (read) CONFORMANCE_CUDA(cuGraphMemcpyNodeSetParams(read, &p));
-            else CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&read, value, &kernel, 1, &p, context));
+            if (executable) TEST_CUDA(cuGraphExecMemcpyNodeSetParams(executable, read, &p, context));
+            else if (read) TEST_CUDA(cuGraphMemcpyNodeSetParams(read, &p));
+            else TEST_CUDA(cuGraphAddMemcpyNode(&read, value, &kernel, 1, &p, context));
         }
         // No launch may retain pointers into this caller-owned argument storage.
         count = 0; add = 0; pointer = 0;
@@ -134,12 +134,12 @@ struct replay_executable {
     CUgraphExec value{};
     replay_executable(CUgraph graph, bool runtime) {
         if (runtime) { cudaGraphExec_t result{}; REPLAY_RUNTIME(cudaGraphInstantiateWithFlags(&result, reinterpret_cast<cudaGraph_t>(graph), 0)); value = reinterpret_cast<CUgraphExec>(result); }
-        else CONFORMANCE_CUDA(cuGraphInstantiate(&value, graph, 0));
+        else TEST_CUDA(cuGraphInstantiate(&value, graph, 0));
     }
     ~replay_executable() { if (value) { cuCtxSynchronize(); cuGraphExecDestroy(value); } }
     void launch(CUstream stream, bool runtime) const {
         if (runtime) REPLAY_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(value), reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuGraphLaunch(value, stream));
+        else TEST_CUDA(cuGraphLaunch(value, stream));
     }
 };
 void replay_repeated(CUfunction function, bool runtime) {
@@ -158,7 +158,7 @@ void replay_serialization(CUfunction function, bool runtime) {
     replay_gate gate; replay_storage storage(17); replay_stream first, second;
     replay_graph graph(function, storage, 91, 0x12345678, runtime); replay_executable executable(graph.value, runtime);
     replay_gate_cleanup cleanup{gate};
-    CONFORMANCE_CUDA(cuLaunchHostFunc(first.value, replay_gate::call, &gate)); gate.await();
+    TEST_CUDA(cuLaunchHostFunc(first.value, replay_gate::call, &gate)); gate.await();
     executable.launch(first.value, runtime); executable.launch(second.value, !runtime);
     require(cuStreamQuery(first.value) == CUDA_ERROR_NOT_READY && cuStreamQuery(second.value) == CUDA_ERROR_NOT_READY,
         "same executable launches remain ordered behind its first gated stream");
@@ -174,7 +174,7 @@ void replay_snapshots(CUfunction function, bool runtime) {
     replay_gate gate; replay_storage storage(23); replay_stream first, second;
     replay_graph graph(function, storage, counts[0], addends[0], runtime); replay_executable executable(graph.value, !runtime);
     replay_gate_cleanup cleanup{gate};
-    CONFORMANCE_CUDA(cuLaunchHostFunc(first.value, replay_gate::call, &gate)); gate.await();
+    TEST_CUDA(cuLaunchHostFunc(first.value, replay_gate::call, &gate)); gate.await();
     std::array<std::vector<uint32_t>, counts.size()> snapshots;
     auto expected = storage.initial;
     for (unsigned generation = 0; generation < counts.size(); ++generation) {
@@ -192,14 +192,14 @@ void replay_source_edits(CUfunction function, bool runtime) {
     replay_gate gate; replay_storage before(31), after(73); replay_stream first, second;
     replay_graph source(function, before, 89, 0x31, runtime); replay_executable original(source.value, !runtime);
     replay_gate_cleanup cleanup{gate};
-    CONFORMANCE_CUDA(cuLaunchHostFunc(first.value, replay_gate::call, &gate)); gate.await();
+    TEST_CUDA(cuLaunchHostFunc(first.value, replay_gate::call, &gate)); gate.await();
     original.launch(first.value, runtime);
     source.configure(after, 0, 67, 0xabcdef01, !runtime);
     // This executable lives through gate cleanup even when later work fails.
     // Its destructor must not wait before a held host callback is released.
     CUgraphExec changed{};
     if (runtime) { cudaGraphExec_t result{}; REPLAY_RUNTIME(cudaGraphInstantiateWithFlags(&result, reinterpret_cast<cudaGraph_t>(source.value), 0)); changed = reinterpret_cast<CUgraphExec>(result); }
-    else CONFORMANCE_CUDA(cuGraphInstantiate(&changed, source.value, 0));
+    else TEST_CUDA(cuGraphInstantiate(&changed, source.value, 0));
     struct changed_cleanup {
         CUgraphExec value; replay_gate& gate;
         ~changed_cleanup() { gate.release(); cuCtxSynchronize(); cuGraphExecDestroy(value); }
@@ -207,7 +207,7 @@ void replay_source_edits(CUfunction function, bool runtime) {
     for (unsigned generation = 0; generation < 5; ++generation) {
         original.launch(first.value, generation & 1);
         if (generation & 1) REPLAY_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(changed), reinterpret_cast<cudaStream_t>(second.value)));
-        else CONFORMANCE_CUDA(cuGraphLaunch(changed, second.value));
+        else TEST_CUDA(cuGraphLaunch(changed, second.value));
     }
     before.expect_unused(0); gate.expect_held(); gate.release(); first.synchronize(); second.synchronize();
     auto old_expected = before.initial, new_expected = after.initial;
@@ -232,13 +232,13 @@ void replay_concurrent(CUfunction function, bool runtime) {
     replay_storage first(53), second(97); replay_stream left, right;
     replay_graph a(function, first, 79, 0x13579bdf, runtime), b(function, second, 95, 0x2468ace0, !runtime);
     replay_executable x(a.value, runtime), y(b.value, !runtime);
-    CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+    CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
     replay_thread_start start;
     std::array<std::exception_ptr, 2> errors;
     const auto work = [&](unsigned index, const replay_executable& executable, CUstream stream) {
         struct unbind { ~unbind() { cuCtxSetCurrent(nullptr); } } unbind;
         try {
-            CONFORMANCE_CUDA(cuCtxSetCurrent(context)); start.enter();
+            TEST_CUDA(cuCtxSetCurrent(context)); start.enter();
             for (unsigned generation = 0; generation < 11; ++generation) executable.launch(stream, (generation & 1) == runtime);
         } catch (...) { errors[index] = std::current_exception(); }
     };
@@ -251,7 +251,7 @@ void replay_concurrent(CUfunction function, bool runtime) {
     for (unsigned generation = 0; generation < 11; ++generation) { replay_apply(expected_a, 79, 0x13579bdf); replay_apply(expected_b, 95, 0x2468ace0); }
     first.expect(0, expected_a, "concurrent independent executable A"); second.expect(0, expected_b, "concurrent independent executable B");
     first.expect_unused(1); second.expect_unused(1); first.expect_device(expected_a); second.expect_device(expected_b);
-    CUcontext current{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&current)); require(current == context, "worker replay submissions preserve the main context binding");
+    CUcontext current{}; TEST_CUDA(cuCtxGetCurrent(&current)); require(current == context, "worker replay submissions preserve the main context binding");
 }
 void execute_graph_replay(const loaded_program& program) {
     const auto function = program.function("replay_step");
@@ -264,4 +264,4 @@ void execute_graph_replay(const loaded_program& program) {
     }
 }
 }
-int main(int argc, char** argv) { return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_graph_replay); }
+int main(int argc, char** argv) { return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_graph_replay); }

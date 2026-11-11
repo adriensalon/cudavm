@@ -11,7 +11,7 @@ void check_enable_runtime(cudaError_t result, const char* operation) {
 #define ENABLE_RUNTIME(call) ::cudavm::check_enable_runtime((call), #call)
 struct enable_pinned {
     void* value{};
-    explicit enable_pinned(size_t bytes) { CONFORMANCE_CUDA(cuMemAllocHost(&value, bytes)); }
+    explicit enable_pinned(size_t bytes) { TEST_CUDA(cuMemAllocHost(&value, bytes)); }
     ~enable_pinned() { if (value) cuMemFreeHost(value); }
 };
 struct enable_storage {
@@ -25,8 +25,8 @@ struct enable_storage {
             initial[i + 16] = static_cast<unsigned char>(seed + i * 13 + (i >> 2));
             input[i + 16] = static_cast<unsigned char>(0xf0u - seed + i * 5 + (i >> 1));
         }
-        CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size()));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size()));
+        TEST_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size()));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size()));
         std::memset(output.value, 0xd3, output_size);
     }
     void expect(unsigned mask) const {
@@ -40,13 +40,13 @@ struct enable_storage {
         require(std::memcmp(output.value, expected.data(), expected.size()) == 0,
             "enabled operations and empty disabled dependencies preserve exact bytes and guards mask=" + std::to_string(mask));
         std::vector<unsigned char> preserved(input.size());
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size()));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size()));
         require(preserved == input, "graph copy source and its neighbors remain intact");
     }
 };
 struct enable_stream {
     CUstream value{};
-    enable_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    enable_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~enable_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct enable_graph {
@@ -58,10 +58,10 @@ struct enable_graph {
     enable_graph(enable_storage& storage, bool use_runtime) : runtime(use_runtime) {
         if (runtime) {
             cudaGraph_t value{}; ENABLE_RUNTIME(cudaGraphCreate(&value, 0)); graph = reinterpret_cast<CUgraph>(value);
-        } else CONFORMANCE_CUDA(cuGraphCreate(&graph, 0));
+        } else TEST_CUDA(cuGraphCreate(&graph, 0));
         try {
-            CONFORMANCE_CUDA(cuGraphAddEmptyNode(&root, graph, nullptr, 0));
-            CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+            TEST_CUDA(cuGraphAddEmptyNode(&root, graph, nullptr, 0));
+            CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
             for (unsigned i : {0u, 2u}) {
                 const auto prior = i == 0 ? root : nodes[1];
                 CUDA_MEMSET_NODE_PARAMS parameters{};
@@ -75,7 +75,7 @@ struct enable_graph {
                     cudaGraphNode_t node{}, dependency = reinterpret_cast<cudaGraphNode_t>(prior);
                     ENABLE_RUNTIME(cudaGraphAddMemsetNode(&node, reinterpret_cast<cudaGraph_t>(graph), &dependency, 1, &p));
                     nodes[i] = reinterpret_cast<CUgraphNode>(node);
-                } else CONFORMANCE_CUDA(cuGraphAddMemsetNode(&nodes[i], graph, &prior, 1, &parameters, context));
+                } else TEST_CUDA(cuGraphAddMemsetNode(&nodes[i], graph, &prior, 1, &parameters, context));
                 if (i == 0) {
                     if (runtime) {
                         cudaGraphNode_t node{}, dependency = reinterpret_cast<cudaGraphNode_t>(nodes[0]);
@@ -89,7 +89,7 @@ struct enable_graph {
                         p.srcDevice = storage.source.value + 16 + 31; p.dstDevice = storage.destination.value + 16 + 67;
                         p.srcPitch = p.dstPitch = p.WidthInBytes = 157;
                         p.srcHeight = p.dstHeight = p.Height = p.Depth = 1;
-                        CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&nodes[1], graph, &nodes[0], 1, &p, context));
+                        TEST_CUDA(cuGraphAddMemcpyNode(&nodes[1], graph, &nodes[0], 1, &p, context));
                     }
                 }
             }
@@ -99,8 +99,8 @@ struct enable_graph {
             read.srcPitch = read.dstPitch = read.WidthInBytes = enable_storage::device_size;
             read.srcHeight = read.dstHeight = read.Height = read.Depth = 1;
             CUgraphNode result{};
-            CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&result, graph, &nodes[2], 1, &read, context));
-            CONFORMANCE_CUDA(cuGraphInstantiate(&primary, graph, 0));
+            TEST_CUDA(cuGraphAddMemcpyNode(&result, graph, &nodes[2], 1, &read, context));
+            TEST_CUDA(cuGraphInstantiate(&primary, graph, 0));
             cudaGraphExec_t second{};
             ENABLE_RUNTIME(cudaGraphInstantiateWithFlags(&second, reinterpret_cast<cudaGraph_t>(graph), 0));
             independent = reinterpret_cast<CUgraphExec>(second);
@@ -115,12 +115,12 @@ struct enable_graph {
     void set(CUgraphExec executable, unsigned i, unsigned enabled, bool use_runtime) {
         if (use_runtime) ENABLE_RUNTIME(cudaGraphNodeSetEnabled(reinterpret_cast<cudaGraphExec_t>(executable),
             reinterpret_cast<cudaGraphNode_t>(nodes[i]), enabled));
-        else CONFORMANCE_CUDA(cuGraphNodeSetEnabled(executable, nodes[i], enabled));
+        else TEST_CUDA(cuGraphNodeSetEnabled(executable, nodes[i], enabled));
     }
     void expect(CUgraphExec executable, unsigned mask) const {
         for (unsigned i = 0; i < nodes.size(); ++i) {
             std::array<unsigned, 3> driver{0xdeadbeef, 0xa5a5a5a5, 0x89abcdef}, runtime_output = driver;
-            CONFORMANCE_CUDA(cuGraphNodeGetEnabled(executable, nodes[i], &driver[1]));
+            TEST_CUDA(cuGraphNodeGetEnabled(executable, nodes[i], &driver[1]));
             ENABLE_RUNTIME(cudaGraphNodeGetEnabled(reinterpret_cast<cudaGraphExec_t>(executable),
                 reinterpret_cast<cudaGraphNode_t>(nodes[i]), &runtime_output[1]));
             const std::array<unsigned, 3> expected{0xdeadbeef, (mask >> i) & 1u, 0x89abcdef};
@@ -130,8 +130,8 @@ struct enable_graph {
     void run(CUgraphExec executable, enable_storage& storage, enable_stream& stream, unsigned mask, unsigned seed) {
         storage.reset(seed); expect(executable, mask);
         if (runtime) ENABLE_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(executable), reinterpret_cast<cudaStream_t>(stream.value)));
-        else CONFORMANCE_CUDA(cuGraphLaunch(executable, stream.value));
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+        else TEST_CUDA(cuGraphLaunch(executable, stream.value));
+        TEST_CUDA(cuStreamSynchronize(stream.value));
         storage.expect(mask); expect(executable, mask);
     }
 };
@@ -173,7 +173,7 @@ void graph_enable_independence() {
             graph.run(graph.independent, storage, stream, 7, 113 + mask);
             for (unsigned i : {0u, 2u}) {
                 CUDA_MEMSET_NODE_PARAMS params{};
-                CONFORMANCE_CUDA(cuGraphMemsetNodeGetParams(graph.nodes[i], &params));
+                TEST_CUDA(cuGraphMemsetNodeGetParams(graph.nodes[i], &params));
                 require(params.dst == storage.destination.value + 16 + (i == 0 ? 13 : 200)
                     && params.value == (i == 0 ? 0x26u : 0x89abcdefu)
                     && params.width == (i == 0 ? 109u : 37u) && params.height == 1
@@ -185,12 +185,12 @@ void graph_enable_independence() {
 void graph_enable_validation() {
     for (bool runtime : {false, true}) {
         enable_storage storage; enable_graph graph(storage, runtime); enable_stream stream;
-        CUgraph foreign{}; CONFORMANCE_CUDA(cuGraphCreate(&foreign, 0));
+        CUgraph foreign{}; TEST_CUDA(cuGraphCreate(&foreign, 0));
         struct graph_cleanup { CUgraph value; ~graph_cleanup() { cuGraphDestroy(value); } } cleanup{foreign};
         CUDA_MEMSET_NODE_PARAMS params{}; params.dst = storage.destination.value; params.elementSize = params.width = params.height = 1;
-        CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
         CUgraphNode foreign_node{};
-        CONFORMANCE_CUDA(cuGraphAddMemsetNode(&foreign_node, foreign, nullptr, 0, &params, context));
+        TEST_CUDA(cuGraphAddMemsetNode(&foreign_node, foreign, nullptr, 0, &params, context));
         for (auto node : {graph.root, foreign_node}) {
             std::array<unsigned, 3> driver{0xdeadbeef, 123, 0x89abcdef}, runtime_output = driver;
             require(cuGraphNodeSetEnabled(graph.primary, node, 0) == CUDA_ERROR_INVALID_VALUE, "Driver rejects ineligible/foreign node setter");
@@ -221,5 +221,5 @@ void execute_graph_node_enable() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::enable_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_graph_node_enable);
+    return cudavm::run_test(argc, argv, cudavm::execute_graph_node_enable);
 }

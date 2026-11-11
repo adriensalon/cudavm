@@ -27,9 +27,9 @@ struct accounting_pool {
     CUdevice device{};
     bool runtime;
     explicit accounting_pool(bool use_runtime) : runtime(use_runtime) {
-        CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+        TEST_CUDA(cuCtxGetDevice(&device));
         int supported = 0;
-        CONFORMANCE_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, device));
+        TEST_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, device));
         require(supported != 0, "pool accounting requires advertised memory-pool support");
         if (runtime) {
             cudaMemPoolProps props{}; props.allocType = cudaMemAllocationTypePinned;
@@ -38,34 +38,34 @@ struct accounting_pool {
         } else {
             CUmemPoolProps props{}; props.allocType = CU_MEM_ALLOCATION_TYPE_PINNED;
             props.location.type = CU_MEM_LOCATION_TYPE_DEVICE; props.location.id = device;
-            CONFORMANCE_CUDA(cuMemPoolCreate(&value, &props));
+            TEST_CUDA(cuMemPoolCreate(&value, &props));
         }
     }
     ~accounting_pool() { if (value) cuMemPoolDestroy(value); }
     cudaMemPool_t runtime_value() const { return reinterpret_cast<cudaMemPool_t>(value); }
     template<class T> T get(CUmemPool_attribute attribute) const {
         accounting_output<T> driver, runtime;
-        CONFORMANCE_CUDA(cuMemPoolGetAttribute(value, attribute, driver.data()));
+        TEST_CUDA(cuMemPoolGetAttribute(value, attribute, driver.data()));
         ACCOUNTING_RUNTIME(cudaMemPoolGetAttribute(runtime_value(), static_cast<cudaMemPoolAttr>(attribute), runtime.data()));
         const auto result = driver.get(); require(runtime.get() == result, "Driver/Runtime pool attribute agreement"); return result;
     }
     void set(CUmemPool_attribute attribute, uint64_t setting, bool use_runtime) const {
         if (use_runtime) ACCOUNTING_RUNTIME(cudaMemPoolSetAttribute(runtime_value(), static_cast<cudaMemPoolAttr>(attribute), &setting));
-        else CONFORMANCE_CUDA(cuMemPoolSetAttribute(value, attribute, &setting));
+        else TEST_CUDA(cuMemPoolSetAttribute(value, attribute, &setting));
     }
     void trim(size_t minimum, bool use_runtime) const {
         if (use_runtime) ACCOUNTING_RUNTIME(cudaMemPoolTrimTo(runtime_value(), minimum));
-        else CONFORMANCE_CUDA(cuMemPoolTrimTo(value, minimum));
+        else TEST_CUDA(cuMemPoolTrimTo(value, minimum));
     }
     void destroy() {
-        if (runtime) CONFORMANCE_CUDA(cuMemPoolDestroy(value));
+        if (runtime) TEST_CUDA(cuMemPoolDestroy(value));
         else ACCOUNTING_RUNTIME(cudaMemPoolDestroy(runtime_value()));
         value = nullptr;
     }
 };
 struct accounting_stream {
     CUstream value{};
-    accounting_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    accounting_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~accounting_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct accounted_allocation {
@@ -77,18 +77,18 @@ struct accounted_allocation {
         if (runtime) {
             void* pointer{}; ACCOUNTING_RUNTIME(cudaMallocFromPoolAsync(&pointer, bytes, pool.runtime_value(), reinterpret_cast<cudaStream_t>(stream)));
             value = reinterpret_cast<uintptr_t>(pointer);
-        } else CONFORMANCE_CUDA(cuMemAllocFromPoolAsync(&value, bytes, pool.value, stream));
-        CONFORMANCE_CUDA(cuMemsetD8Async(value, pattern, bytes, stream));
+        } else TEST_CUDA(cuMemAllocFromPoolAsync(&value, bytes, pool.value, stream));
+        TEST_CUDA(cuMemsetD8Async(value, pattern, bytes, stream));
     }
     ~accounted_allocation() { if (value) cuMemFree(value); }
     void retire(CUstream stream, bool runtime) {
         if (runtime) ACCOUNTING_RUNTIME(cudaFreeAsync(reinterpret_cast<void*>(static_cast<uintptr_t>(value)), reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuMemFreeAsync(value, stream));
+        else TEST_CUDA(cuMemFreeAsync(value, stream));
         value = 0;
     }
     void verify() const {
         std::vector<unsigned char> actual(size + 32, 0xe7);
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data() + 16, value, size));
+        TEST_CUDA(cuMemcpyDtoH(actual.data() + 16, value, size));
         for (size_t i = 0; i < actual.size(); ++i)
             require(actual[i] == (i >= 16 && i < size + 16 ? pattern : 0xe7), "live pooled bytes and readback guards");
     }
@@ -122,7 +122,7 @@ void memory_pool_attributes() {
         cudaMemLocation runtime_location{}; runtime_location.type = cudaMemLocationTypeDevice; runtime_location.id = pool.device;
         accounting_output<CUmemAccess_flags> driver_access;
         accounting_output<cudaMemAccessFlags> runtime_access;
-        CONFORMANCE_CUDA(cuMemPoolGetAccess(static_cast<CUmemAccess_flags*>(driver_access.data()), pool.value, &location));
+        TEST_CUDA(cuMemPoolGetAccess(static_cast<CUmemAccess_flags*>(driver_access.data()), pool.value, &location));
         ACCOUNTING_RUNTIME(cudaMemPoolGetAccess(static_cast<cudaMemAccessFlags*>(runtime_access.data()), pool.runtime_value(), &runtime_location));
         require(driver_access.get() == CU_MEM_ACCESS_FLAGS_PROT_READWRITE && runtime_access.get() == cudaMemAccessFlagsProtReadWrite,
             "owning device has read/write pool access");
@@ -131,14 +131,14 @@ void memory_pool_attributes() {
 }
 void memory_pool_accounting_live() {
     for (bool runtime : {false, true}) {
-        device_buffer independent(257); CONFORMANCE_CUDA(cuMemsetD8(independent.value, 0x91, 257));
+        device_buffer independent(257); TEST_CUDA(cuMemsetD8(independent.value, 0x91, 257));
         accounting_pool pool(runtime); pool.set(CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, UINT64_MAX, runtime);
         accounting_stream stream;
         accounted_allocation first(pool, stream.value, 257, 0x39, runtime), second(pool, stream.value, 4093, 0x5b, !runtime);
         struct drain { ~drain() { cuCtxSynchronize(); } } cleanup;
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value)); first.verify(); second.verify();
+        TEST_CUDA(cuStreamSynchronize(stream.value)); first.verify(); second.verify();
         const auto live = sample_accounting(pool, first.size + second.size);
-        first.retire(stream.value, !runtime); CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+        first.retire(stream.value, !runtime); TEST_CUDA(cuStreamSynchronize(stream.value));
         const auto one = sample_accounting(pool, second.size);
         require(one.used < live.used && one.used_high >= live.used_high && one.reserved_high >= live.reserved_high,
             "retired range reduces current usage while peaks remain historical");
@@ -146,7 +146,7 @@ void memory_pool_accounting_live() {
         const auto trimmed = sample_accounting(pool, second.size);
         require(trimmed.used == one.used && trimmed.reserved <= one.reserved, "trimming preserves live usage and cannot increase reservation");
         second.verify();
-        second.retire(stream.value, runtime); CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+        second.retire(stream.value, runtime); TEST_CUDA(cuStreamSynchronize(stream.value));
         const auto idle = sample_accounting(pool, 0);
         require(idle.used == 0 && idle.used_high >= live.used_high, "completed frees retire application usage while retaining peak");
         pool.set(CU_MEMPOOL_ATTR_USED_MEM_HIGH, 0, !runtime);
@@ -156,7 +156,7 @@ void memory_pool_accounting_live() {
         require(!final.used && final.reserved <= idle.reserved, "idle trim cannot resurrect usage or increase reservation");
         pool.destroy();
         std::array<unsigned char, 257> actual{};
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), independent.value, actual.size()));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), independent.value, actual.size()));
         require(std::all_of(actual.begin(), actual.end(), [](auto value) { return value == 0x91; }), "pool retirement preserves ordinary live storage");
     }
 }
@@ -166,9 +166,9 @@ void memory_pool_trim() {
         accounting_stream stream;
         accounted_allocation first(pool, stream.value, 1024 * 1024, 0x39, runtime), second(pool, stream.value, 4093, 0x5b, !runtime);
         struct drain { ~drain() { cuCtxSynchronize(); } } cleanup;
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value)); first.verify(); second.verify();
+        TEST_CUDA(cuStreamSynchronize(stream.value)); first.verify(); second.verify();
         first.retire(stream.value, !runtime); second.retire(stream.value, runtime);
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+        TEST_CUDA(cuStreamSynchronize(stream.value));
         const auto before = sample_accounting(pool, 0);
         require(!before.used && before.reserved > 0 && before.reserved < std::numeric_limits<size_t>::max(), "observed idle reservation retained by threshold");
         pool.trim(size_t(before.reserved + 1), runtime);
@@ -226,5 +226,5 @@ void execute_memory_pool_accounting() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::memory_pool_accounting_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_memory_pool_accounting);
+    return cudavm::run_test(argc, argv, cudavm::execute_memory_pool_accounting);
 }

@@ -15,7 +15,7 @@ CUcontext current_stack_context() {
         CUcontext value{};
         uint64_t suffix = 0xfedcba9876543210;
     } output;
-    CONFORMANCE_CUDA(cuCtxGetCurrent(&output.value));
+    TEST_CUDA(cuCtxGetCurrent(&output.value));
     require(output.prefix == 0x0123456789abcdef && output.suffix == 0xfedcba9876543210,
         "current-context output guards");
     return output.value;
@@ -25,7 +25,7 @@ void expect_stack_context(CUcontext expected, const std::string& operation) {
 }
 void expect_stack_pop(CUcontext expected, CUcontext exposed) {
     CUcontext popped{};
-    CONFORMANCE_CUDA(cuCtxPopCurrent(&popped));
+    TEST_CUDA(cuCtxPopCurrent(&popped));
     require(popped == expected, "pop returns the removed top context");
     expect_stack_context(exposed, "pop exposes predecessor");
 }
@@ -35,7 +35,7 @@ struct stack_contexts {
     std::vector<CUcontext> owned;
     stack_contexts() {
         original = current_stack_context();
-        CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+        TEST_CUDA(cuCtxGetDevice(&device));
     }
     ~stack_contexts() {
         for (auto context : owned) cuCtxDestroy(context);
@@ -44,7 +44,7 @@ struct stack_contexts {
     CUcontext create() {
         const auto preceding = current_stack_context();
         CUcontext context{};
-        CONFORMANCE_CUDA(cuCtxCreate(&context, nullptr, 0, device));
+        TEST_CUDA(cuCtxCreate(&context, nullptr, 0, device));
         owned.push_back(context);
         expect_stack_context(context, "creation pushes new context");
         expect_stack_pop(context, preceding);
@@ -54,17 +54,17 @@ struct stack_contexts {
 void context_stack_transitions() {
     stack_contexts contexts;
     const auto a = contexts.create(), b = contexts.create(), c = contexts.create();
-    CONFORMANCE_CUDA(cuCtxPushCurrent(a)); expect_stack_context(a, "push a");
-    CONFORMANCE_CUDA(cuCtxPushCurrent(b)); expect_stack_context(b, "nested push b");
-    CONFORMANCE_CUDA(cuCtxSetCurrent(c)); expect_stack_context(c, "set replaces b");
+    TEST_CUDA(cuCtxPushCurrent(a)); expect_stack_context(a, "push a");
+    TEST_CUDA(cuCtxPushCurrent(b)); expect_stack_context(b, "nested push b");
+    TEST_CUDA(cuCtxSetCurrent(c)); expect_stack_context(c, "set replaces b");
     expect_stack_pop(c, a);
-    CONFORMANCE_CUDA(cuCtxPushCurrent(a)); expect_stack_context(a, "duplicate push a");
-    CONFORMANCE_CUDA(cuCtxSetCurrent(b)); expect_stack_context(b, "replace duplicate top");
-    CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr)); expect_stack_context(a, "null set removes one top");
-    CONFORMANCE_CUDA(cuCtxPushCurrent(c)); expect_stack_context(c, "push c");
-    CONFORMANCE_CUDA(cuCtxPushCurrent(b)); expect_stack_context(b, "nested push b after c");
+    TEST_CUDA(cuCtxPushCurrent(a)); expect_stack_context(a, "duplicate push a");
+    TEST_CUDA(cuCtxSetCurrent(b)); expect_stack_context(b, "replace duplicate top");
+    TEST_CUDA(cuCtxSetCurrent(nullptr)); expect_stack_context(a, "null set removes one top");
+    TEST_CUDA(cuCtxPushCurrent(c)); expect_stack_context(c, "push c");
+    TEST_CUDA(cuCtxPushCurrent(b)); expect_stack_context(b, "nested push b after c");
     expect_stack_pop(b, c);
-    CONFORMANCE_CUDA(cuCtxSetCurrent(a)); expect_stack_context(a, "replacement creates duplicate a");
+    TEST_CUDA(cuCtxSetCurrent(a)); expect_stack_context(a, "replacement creates duplicate a");
     expect_stack_pop(a, a);
     expect_stack_pop(a, contexts.original);
     expect_stack_context(contexts.original, "balanced stack restores runner");
@@ -83,17 +83,17 @@ void context_stack_empty() {
     stack_thread([&] {
         expect_stack_context(nullptr, "fresh thread");
         for (unsigned repeat = 0; repeat < 3; ++repeat) {
-            CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr));
+            TEST_CUDA(cuCtxSetCurrent(nullptr));
             expect_stack_context(nullptr, "empty set-null is a no-op");
             CUcontext popped{};
             require(cuCtxPopCurrent(&popped) == CUDA_ERROR_INVALID_CONTEXT, "pop of empty stack");
             CUdevice device{};
             require(cuCtxGetDevice(&device) == CUDA_ERROR_INVALID_CONTEXT, "device query with no current context");
-            CONFORMANCE_CUDA(cuCtxSetCurrent(a)); expect_stack_context(a, "set on empty stack");
-            CONFORMANCE_CUDA(cuCtxSetCurrent(b)); expect_stack_context(b, "set replaces sole binding");
+            TEST_CUDA(cuCtxSetCurrent(a)); expect_stack_context(a, "set on empty stack");
+            TEST_CUDA(cuCtxSetCurrent(b)); expect_stack_context(b, "set replaces sole binding");
             expect_stack_pop(b, nullptr);
-            CONFORMANCE_CUDA(cuCtxPushCurrent(a)); expect_stack_context(a, "push on empty stack");
-            CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr)); expect_stack_context(nullptr, "null set removes sole binding");
+            TEST_CUDA(cuCtxPushCurrent(a)); expect_stack_context(a, "push on empty stack");
+            TEST_CUDA(cuCtxSetCurrent(nullptr)); expect_stack_context(nullptr, "null set removes sole binding");
         }
     });
     expect_stack_context(contexts.original, "worker empty-stack operations preserve parent");
@@ -122,13 +122,13 @@ void context_stack_threading() {
     auto work = [&](unsigned index, CUcontext first, CUcontext second) {
         try {
             expect_stack_context(nullptr, "independent worker starts empty");
-            CONFORMANCE_CUDA(cuCtxPushCurrent(first));
+            TEST_CUDA(cuCtxPushCurrent(first));
             gate.enter();
             for (unsigned repeat = 0; repeat < 32; ++repeat) {
                 expect_stack_context(first, "worker retains its top binding");
-                CONFORMANCE_CUDA(cuCtxPushCurrent(second));
+                TEST_CUDA(cuCtxPushCurrent(second));
                 expect_stack_context(second, "worker nested push");
-                CONFORMANCE_CUDA(cuCtxSetCurrent(first));
+                TEST_CUDA(cuCtxSetCurrent(first));
                 expect_stack_pop(first, first);
             }
             expect_stack_pop(first, nullptr);
@@ -138,7 +138,7 @@ void context_stack_threading() {
     struct release_workers { stack_thread_gate& gate; ~release_workers() { gate.release(); } } cleanup{gate};
     gate.await();
     expect_stack_context(contexts.original, "workers preserve parent binding");
-    CONFORMANCE_CUDA(cuCtxPushCurrent(b));
+    TEST_CUDA(cuCtxPushCurrent(b));
     expect_stack_context(b, "parent binds context also used in worker");
     gate.release();
     for (unsigned repeat = 0; repeat < 32; ++repeat) expect_stack_context(b, "parent binding under concurrent worker transitions");
@@ -155,26 +155,26 @@ void context_stack_transfer() {
         for (size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<unsigned char>(i * 73 + generation * 31);
         stack_thread([&] {
             expect_stack_context(nullptr, "receiving thread starts empty");
-            CONFORMANCE_CUDA(cuCtxPushCurrent(owned));
+            TEST_CUDA(cuCtxPushCurrent(owned));
             expect_stack_context(owned, "popped context moves to receiving thread");
-            CONFORMANCE_CUDA(cuMemAlloc(&allocation, expected.size()));
-            CONFORMANCE_CUDA(cuMemcpyHtoD(allocation, expected.data(), expected.size()));
+            TEST_CUDA(cuMemAlloc(&allocation, expected.size()));
+            TEST_CUDA(cuMemcpyHtoD(allocation, expected.data(), expected.size()));
             expect_stack_pop(owned, nullptr);
         });
         expect_stack_context(contexts.original, "context transfer preserves parent binding");
-        CONFORMANCE_CUDA(cuCtxPushCurrent(owned));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data() + 16, allocation, expected.size()));
+        TEST_CUDA(cuCtxPushCurrent(owned));
+        TEST_CUDA(cuMemcpyDtoH(actual.data() + 16, allocation, expected.size()));
         require(std::equal(expected.begin(), expected.end(), actual.begin() + 16), "transferred context retains every allocation byte");
         for (size_t i = 0; i < actual.size(); ++i)
             if (i < 16 || i >= 16 + expected.size()) require(actual[i] == 0xd3, "transferred-context readback guards");
-        CONFORMANCE_CUDA(cuMemFree(allocation));
+        TEST_CUDA(cuMemFree(allocation));
         expect_stack_pop(owned, contexts.original);
     }
 }
 void context_stack_validation() {
     stack_contexts contexts;
     const auto owned = contexts.create();
-    CONFORMANCE_CUDA(cuCtxPushCurrent(owned));
+    TEST_CUDA(cuCtxPushCurrent(owned));
     require(cuCtxGetCurrent(nullptr) == CUDA_ERROR_INVALID_VALUE, "null current-context output");
     expect_stack_context(owned, "rejected current query preserves binding");
     require(cuCtxGetDevice(nullptr) == CUDA_ERROR_INVALID_VALUE, "null current-device output");
@@ -199,5 +199,5 @@ void execute_context_stack() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::context_stack_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_context_stack);
+    return cudavm::run_test(argc, argv, cudavm::execute_context_stack);
 }

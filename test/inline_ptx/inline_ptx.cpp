@@ -20,25 +20,25 @@ void execute_inline_ptx(const loaded_program& program) {
     for (unsigned phase = 0; phase < 2; ++phase) {
         for (unsigned i = 0; i < capacity; ++i)
             input[guards + i] = i < edges.size() ? edges[(i + phase) % edges.size()] : (i * 0x7654321u) ^ (phase * 0x193759bdu);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (unsigned threads : {32u, 71u}) for (unsigned count : {0u, 1u, 33u, capacity}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
             void* arguments[]{&to, &from, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(program.function("inline_results"), (capacity + threads - 1) / threads, 1, 1,
+            TEST_CUDA(cuLaunchKernel(program.function("inline_results"), (capacity + threads - 1) / threads, 1, 1,
                 threads, 1, 1, 0, nullptr, arguments, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
             for (unsigned i = 0; i < count; ++i) {
                 const auto row = inline_ptx_oracle(input[guards + i], i);
                 std::copy(row.begin(), row.end(), expected.begin() + guards + i * fields);
             }
             expect_words(actual, expected, "inline PTX operands, scope, carry, side effects and guards");
-            CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
             expect_words(preserved, input, "inline PTX preserves complete input and guards");
         }
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_inline_ptx);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_inline_ptx);
 }

@@ -18,17 +18,17 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_CXX_COMPILER_ID MATCHES "Clan
             set(backend vulkan)
         endif()
 
-        if(backend STREQUAL "vulkan" AND NOT "vulkan" IN_LIST conformance_backends)
+        if(backend STREQUAL "vulkan" AND NOT "vulkan" IN_LIST test_backends)
             continue()
         endif()
 
-        set(case "conformance.${slice}.${backend}.${mode}")
+        set(case "test.${slice}.${backend}.${mode}")
         add_test(NAME "${case}" COMMAND "${CMAKE_COMMAND}"
             "-Dbuild=${CMAKE_BINARY_DIR}" "-Dconfig=$<CONFIG>" "-Dwork=${CMAKE_CURRENT_BINARY_DIR}/public_sdk"
             "-Dmode=${mode}" "-Dcmake=${CMAKE_COMMAND}" "-Dninja=${CMAKE_MAKE_PROGRAM}" "-Dhost=${public_nvcc_host}"
             -P "${CMAKE_CURRENT_LIST_DIR}/run.cmake")
         set_tests_properties("${case}" PROPERTIES RUN_SERIAL TRUE TIMEOUT 420
             SKIP_REGULAR_EXPRESSION "SKIP: selected Vulkan backend has no available device"
-            LABELS "conformance;${slice};${backend};A01.discovery;C01.options;C01.link;C02.inputs")
+            LABELS "test;${slice};${backend};A01.discovery;C01.options;C01.link;C02.inputs")
     endforeach()
 endif()

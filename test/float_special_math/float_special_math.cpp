@@ -28,5 +28,5 @@ int main(int argc, char** argv) {
     cudavm::float_special_profile = unsigned(selected - profiles.begin());
     const auto source = "#define CUDAVM_FLOAT_SPECIAL_PROFILE " + std::to_string(cudavm::float_special_profile) + "\n" + std::string(cudavm::fixtures.source);
     auto fixtures = cudavm::fixtures; fixtures.source = source;
-    return cudavm::run_conformance(3, argv, fixtures, cudavm::execute_float_special_math);
+    return cudavm::run_test(3, argv, fixtures, cudavm::execute_float_special_math);
 }

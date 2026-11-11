@@ -12,26 +12,26 @@
 namespace cudavm {
 std::string_view ipc_case;
 const char* ipc_executable{};
-std::unique_ptr<conformance_peer> ipc_peer;
+std::unique_ptr<test_peer> ipc_peer;
 constexpr size_t ipc_bytes = 8197, ipc_guard = 37;
 constexpr uint64_t ipc_before = 0x19375928abcdef01, ipc_after = 0xfedcba0129183745;
 void* ipc_pointer(CUdeviceptr value) { return reinterpret_cast<void*>(uintptr_t(value)); }
 void ipc_runtime(cudaError_t result) { require(result == cudaSuccess, std::string("memory IPC Runtime: ") + cudaGetErrorString(result)); }
 void ipc_prerequisite() {
     CUdevice device{}; int uva{}, supported{};
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&uva, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_IPC_EVENT_SUPPORTED, device));
+    TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuDeviceGetAttribute(&uva, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
+    TEST_CUDA(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_IPC_EVENT_SUPPORTED, device));
     require_capability(uva && supported, "memory IPC requires advertised unified addressing and IPC support");
 }
 struct ipc_original {
     CUdeviceptr value{};
     void allocate(bool runtime) {
         if (runtime) { void* pointer{}; ipc_runtime(cudaMalloc(&pointer, ipc_bytes)); value = reinterpret_cast<uintptr_t>(pointer); }
-        else CONFORMANCE_CUDA(cuMemAlloc(&value, ipc_bytes));
+        else TEST_CUDA(cuMemAlloc(&value, ipc_bytes));
     }
     void close(bool runtime) {
-        if (runtime) ipc_runtime(cudaFree(ipc_pointer(value))); else CONFORMANCE_CUDA(cuMemFree(value));
+        if (runtime) ipc_runtime(cudaFree(ipc_pointer(value))); else TEST_CUDA(cuMemFree(value));
         value = 0;
     }
     ~ipc_original() { if (value) cuMemFree(value); }
@@ -43,7 +43,7 @@ CUipcMemHandle ipc_record(CUdeviceptr pointer, bool runtime) {
         ipc_runtime(cudaIpcGetMemHandle(&result.value, ipc_pointer(pointer)));
         require(result.before == ipc_before && result.after == ipc_after, "Runtime IPC record exact output guards");
         static_assert(sizeof(result.value) == sizeof(output.value)); std::memcpy(&output.value, &result.value, sizeof(output.value));
-    } else CONFORMANCE_CUDA(cuIpcGetMemHandle(&output.value, pointer));
+    } else TEST_CUDA(cuIpcGetMemHandle(&output.value, pointer));
     require(output.before == ipc_before && output.after == ipc_after, "Driver IPC record exact output guards");
     return output.value;
 }
@@ -55,9 +55,9 @@ CUdeviceptr ipc_open(CUipcMemHandle record, bool runtime, bool legacy = false) {
         ipc_runtime(cudaIpcOpenMemHandle(&result.value, copy, cudaIpcMemLazyEnablePeerAccess)); output.value = reinterpret_cast<uintptr_t>(result.value);
         require(result.before == uintptr_t(ipc_before) && result.after == uintptr_t(ipc_after), "Runtime IPC pointer exact output guards");
     } else if (legacy) {
-        void* procedure{}; CONFORMANCE_CUDA(cuGetProcAddress("cuIpcOpenMemHandle", &procedure, 4010, 0, nullptr));
-        CONFORMANCE_CUDA(reinterpret_cast<PFN_cuIpcOpenMemHandle_v11000>(procedure)(&output.value, record, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
-    } else CONFORMANCE_CUDA(cuIpcOpenMemHandle(&output.value, record, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
+        void* procedure{}; TEST_CUDA(cuGetProcAddress("cuIpcOpenMemHandle", &procedure, 4010, 0, nullptr));
+        TEST_CUDA(reinterpret_cast<PFN_cuIpcOpenMemHandle_v11000>(procedure)(&output.value, record, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
+    } else TEST_CUDA(cuIpcOpenMemHandle(&output.value, record, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS));
     require(output.before == ipc_before && output.after == ipc_after && output.value, "Driver IPC pointer exact output guards");
     return output.value;
 }
@@ -70,7 +70,7 @@ struct ipc_imported {
     }
     void close(bool runtime) {
         require(references != 0, "test owns an IPC reference");
-        if (runtime) ipc_runtime(cudaIpcCloseMemHandle(ipc_pointer(value))); else CONFORMANCE_CUDA(cuIpcCloseMemHandle(value));
+        if (runtime) ipc_runtime(cudaIpcCloseMemHandle(ipc_pointer(value))); else TEST_CUDA(cuIpcCloseMemHandle(value));
         if (!--references) value = 0;
     }
     ~ipc_imported() { while (references) { --references; cuIpcCloseMemHandle(value); } }
@@ -81,7 +81,7 @@ void ipc_metadata() {
         allocations[i].allocate(i == 0);
         const auto expected = virtual_memory_pattern(ipc_bytes, 113 + i); virtual_memory_write(allocations[i].value, expected, i != 0);
         struct { unsigned before = 0x19375928, value{}, after = 0xfedcba01; } capability;
-        CONFORMANCE_CUDA(cuPointerGetAttribute(&capability.value, CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE, allocations[i].value));
+        TEST_CUDA(cuPointerGetAttribute(&capability.value, CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE, allocations[i].value));
         require(capability.before == 0x19375928 && capability.after == 0xfedcba01 && capability.value == 1, "ordinary allocation IPC capability and exact output");
         auto first = ipc_record(allocations[i].value, false), second = ipc_record(allocations[i].value, true);
         // Records are opaque. Repeated exports are independently valid, without
@@ -121,11 +121,11 @@ void ipc_validation() {
 }
 enum class ipc_profile : unsigned { sharing, references, retirement, context_release, legacy };
 struct ipc_message { unsigned kind{}, phase{}; ipc_profile profile{}; CUuuid uuid{}; size_t bytes{}; };
-void ipc_send(conformance_peer& peer, const ipc_message& message) { peer.send(std::as_bytes(std::span(&message, 1))); }
-ipc_message ipc_receive(conformance_peer& peer) { ipc_message message{}; peer.receive(std::as_writable_bytes(std::span(&message, 1))); return message; }
+void ipc_send(test_peer& peer, const ipc_message& message) { peer.send(std::as_bytes(std::span(&message, 1))); }
+ipc_message ipc_receive(test_peer& peer) { ipc_message message{}; peer.receive(std::as_writable_bytes(std::span(&message, 1))); return message; }
 ipc_message ipc_hello(ipc_profile profile) {
     ipc_message message{1, 0, profile, {}, ipc_bytes}; CUdevice device{};
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device)); CONFORMANCE_CUDA(cuDeviceGetUuid(&message.uuid, device)); return message;
+    TEST_CUDA(cuCtxGetDevice(&device)); TEST_CUDA(cuDeviceGetUuid(&message.uuid, device)); return message;
 }
 size_t ipc_patch_begin(unsigned phase, bool importer) { return ipc_guard + phase * 911 + (importer ? 317 : 0); }
 void ipc_patch(std::vector<unsigned char>& expected, unsigned phase, bool importer) {
@@ -135,7 +135,7 @@ void ipc_patch(std::vector<unsigned char>& expected, unsigned phase, bool import
 void ipc_write_patch(CUdeviceptr pointer, std::vector<unsigned char>& expected, unsigned phase, bool importer, bool runtime) {
     ipc_patch(expected, phase, importer); const auto begin = ipc_patch_begin(phase, importer);
     virtual_memory_write(pointer + begin, std::span<const unsigned char>(expected).subspan(begin, 257), runtime);
-    CONFORMANCE_CUDA(cuCtxSynchronize());
+    TEST_CUDA(cuCtxSynchronize());
 }
 struct ipc_gate {
     CUcontext owner{}; std::mutex mutex; std::condition_variable changed; bool entered{}, released{}, expired{};
@@ -145,7 +145,7 @@ struct ipc_gate {
     }
     void release() { std::lock_guard lock(mutex); released = true; changed.notify_all(); }
     void queue(CUstream stream) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&owner)); CONFORMANCE_CUDA(cuLaunchHostFunc(stream, callback, this));
+        TEST_CUDA(cuCtxGetCurrent(&owner)); TEST_CUDA(cuLaunchHostFunc(stream, callback, this));
         std::unique_lock lock(mutex); require(changed.wait_for(lock, std::chrono::seconds(10), [&] { return entered; }), "IPC retirement host gate starts");
     }
     ~ipc_gate() {
@@ -153,10 +153,10 @@ struct ipc_gate {
     }
 };
 void ipc_pending(ipc_imported& mapping, bool destroy_context) {
-    CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
-    CUstream stream{}; CONFORMANCE_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+    CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
+    CUstream stream{}; TEST_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
     ipc_gate gate; gate.queue(stream);
-    CONFORMANCE_CUDA(cuMemsetD8Async(mapping.value + ipc_guard, 0xd3, 111, stream));
+    TEST_CUDA(cuMemsetD8Async(mapping.value + ipc_guard, 0xd3, 111, stream));
     std::atomic<bool> started{}, done{}; CUresult result = CUDA_ERROR_UNKNOWN; cudaError_t runtime_result = cudaSuccess;
     std::thread retire([&] {
         cuCtxSetCurrent(context); started.store(true, std::memory_order_release);
@@ -171,15 +171,15 @@ void ipc_pending(ipc_imported& mapping, bool destroy_context) {
     // Queries stay callable while retirement waits for the gated command.
     int version{}; const auto query = cuDriverGetVersion(&version);
     int runtime_version{}; const auto runtime_query = destroy_context ? cudaSuccess : cudaDriverGetVersion(&runtime_version);
-    gate.release(); retire.join(); CONFORMANCE_CUDA(result); ipc_runtime(runtime_result); CONFORMANCE_CUDA(query); ipc_runtime(runtime_query);
+    gate.release(); retire.join(); TEST_CUDA(result); ipc_runtime(runtime_result); TEST_CUDA(query); ipc_runtime(runtime_query);
     { std::lock_guard lock(gate.mutex); require(!gate.expired, "unrelated API queries complete before the host gate deadline"); }
     require(blocked && version > 0, "IPC retirement waits for accepted work without holding the Driver lock");
     if (destroy_context) { mapping.value = 0; mapping.references = 0; gate.owner = nullptr; }
-    else { mapping.value = 0; mapping.references = 0; CONFORMANCE_CUDA(cuStreamDestroy(stream)); }
+    else { mapping.value = 0; mapping.references = 0; TEST_CUDA(cuStreamDestroy(stream)); }
 }
 void ipc_concurrent_closes(ipc_imported& mapping, CUipcMemHandle record) {
     mapping.open(record, true); require(mapping.references == 2, "two owned references before concurrent closes");
-    CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context)); const auto pointer = mapping.value;
+    CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context)); const auto pointer = mapping.value;
     std::atomic<bool> ready{}, start{}; CUresult driver_result = CUDA_ERROR_UNKNOWN;
     std::thread close_driver([&] {
         cuCtxSetCurrent(context); ready.store(true, std::memory_order_release);
@@ -189,17 +189,17 @@ void ipc_concurrent_closes(ipc_imported& mapping, CUipcMemHandle record) {
     while (!ready.load(std::memory_order_acquire)) std::this_thread::yield();
     start.store(true, std::memory_order_release); const auto runtime_result = cudaIpcCloseMemHandle(ipc_pointer(pointer)); close_driver.join();
     if (driver_result == CUDA_SUCCESS && runtime_result == cudaSuccess) { mapping.references = 0; mapping.value = 0; }
-    CONFORMANCE_CUDA(driver_result); ipc_runtime(runtime_result);
+    TEST_CUDA(driver_result); ipc_runtime(runtime_result);
     mapping.open(record, false); // No closed pointer is dereferenced.
 }
 void ipc_importer() {
     auto& peer = *ipc_peer; const auto hello = ipc_receive(peer); const auto local = ipc_hello(hello.profile);
     require(hello.kind == 1 && hello.bytes == ipc_bytes && std::memcmp(&hello.uuid, &local.uuid, sizeof(CUuuid)) == 0, "fresh IPC importer physical device identity and extents");
-    CUcontext original{}, dedicated{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&original));
+    CUcontext original{}, dedicated{}; TEST_CUDA(cuCtxGetCurrent(&original));
     if (hello.profile == ipc_profile::context_release) {
-        CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device)); CONFORMANCE_CUDA(cuCtxCreate(&dedicated, nullptr, 0, device));
-        CUcontext popped{}; CONFORMANCE_CUDA(cuCtxPopCurrent(&popped)); require(popped == dedicated, "importer dedicated context creation stack");
-        CONFORMANCE_CUDA(cuCtxSetCurrent(dedicated));
+        CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device)); TEST_CUDA(cuCtxCreate(&dedicated, nullptr, 0, device));
+        CUcontext popped{}; TEST_CUDA(cuCtxPopCurrent(&popped)); require(popped == dedicated, "importer dedicated context creation stack");
+        TEST_CUDA(cuCtxSetCurrent(dedicated));
     }
     std::array<CUipcMemHandle, 2> records{}; std::array<ipc_imported, 2> pointers; std::array<std::vector<unsigned char>, 2> expected;
     for (unsigned i = 0; i < pointers.size(); ++i) {
@@ -238,7 +238,7 @@ void ipc_importer() {
     }
     if (hello.profile == ipc_profile::retirement) ipc_pending(pointers[0], false);
     if (hello.profile == ipc_profile::context_release) {
-        ipc_pending(pointers[0], true); pointers[1].value = 0; pointers[1].references = 0; CONFORMANCE_CUDA(cuCtxSetCurrent(original));
+        ipc_pending(pointers[0], true); pointers[1].value = 0; pointers[1].references = 0; TEST_CUDA(cuCtxSetCurrent(original));
         std::fill_n(expected[0].begin() + ipc_guard, 111, 0xd3);
         pointers[0].open(records[0], true);
         virtual_memory_expect(pointers[0].value, expected[0], "another context imports after the prior importing context retires"); pointers[0].close(false);
@@ -250,7 +250,7 @@ void ipc_processes(ipc_profile profile) {
     for (unsigned i = 0; i < originals.size(); ++i) {
         originals[i].allocate(i != 0); expected[i] = virtual_memory_pattern(ipc_bytes, 113 + i); virtual_memory_write(originals[i].value, expected[i], i == 0);
     }
-    CONFORMANCE_CUDA(cuCtxSynchronize()); conformance_peer peer(ipc_executable, "cuda", "importer"); ipc_send(peer, ipc_hello(profile));
+    TEST_CUDA(cuCtxSynchronize()); test_peer peer(ipc_executable, "cuda", "importer"); ipc_send(peer, ipc_hello(profile));
     for (unsigned i = 0; i < originals.size(); ++i) {
         (void)ipc_record(originals[i].value, i != 0); auto record = ipc_record(originals[i].value, i == 0);
         peer.send(std::as_bytes(std::span(&record, 1)));
@@ -280,15 +280,15 @@ void ipc_discovery() {
     static_assert(sizeof(CUipcMemHandle) == 64 && sizeof(cudaIpcMemHandle_t) == 64);
     for (const char* name : {"cuIpcGetMemHandle", "cuIpcOpenMemHandle", "cuIpcCloseMemHandle"}) {
         void* address{}; CUdriverProcAddressQueryResult status{};
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, 4010, 0, &status)); require(address && status == CU_GET_PROC_ADDRESS_SUCCESS, "IPC procedure introduction");
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, 4009, 0, &status)); require(!address && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "IPC procedure introduction boundary");
+        TEST_CUDA(cuGetProcAddress(name, &address, 4010, 0, &status)); require(address && status == CU_GET_PROC_ADDRESS_SUCCESS, "IPC procedure introduction");
+        TEST_CUDA(cuGetProcAddress(name, &address, 4009, 0, &status)); require(!address && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "IPC procedure introduction boundary");
         cudaDriverEntryPointQueryResult runtime_status{};
         ipc_runtime(cudaGetDriverEntryPointByVersion(name, &address, 4010, 0, &runtime_status)); require(address && runtime_status == cudaDriverEntryPointSuccess, "Runtime discovers Driver IPC procedure");
     }
     void* legacy{}; void* modern{}; void* previous{};
-    CONFORMANCE_CUDA(cuGetProcAddress("cuIpcOpenMemHandle", &legacy, 4010, 0, nullptr));
-    CONFORMANCE_CUDA(cuGetProcAddress("cuIpcOpenMemHandle", &previous, 10999, 0, nullptr));
-    CONFORMANCE_CUDA(cuGetProcAddress("cuIpcOpenMemHandle", &modern, 11000, 0, nullptr));
+    TEST_CUDA(cuGetProcAddress("cuIpcOpenMemHandle", &legacy, 4010, 0, nullptr));
+    TEST_CUDA(cuGetProcAddress("cuIpcOpenMemHandle", &previous, 10999, 0, nullptr));
+    TEST_CUDA(cuGetProcAddress("cuIpcOpenMemHandle", &modern, 11000, 0, nullptr));
     require(legacy == previous && modern != legacy, "IPC legacy and v2 ABI selection");
     CUdeviceptr pointer{}; CUipcMemHandle record{};
     require(reinterpret_cast<PFN_cuIpcOpenMemHandle_v11000>(modern)(&pointer, record, 1) == CUDA_ERROR_NOT_INITIALIZED, "cold discovered IPC open");
@@ -308,10 +308,10 @@ void execute_memory_ipc() {
 }
 int main(int argc, char** argv) {
     cudavm::ipc_executable = argv[0];
-    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_conformance(argc, argv, cudavm::ipc_discovery);
+    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_test(argc, argv, cudavm::ipc_discovery);
     if (argc == 7 && std::string_view(argv[3]) == "--peer") {
-        cudavm::ipc_peer = std::make_unique<cudavm::conformance_peer>(cudavm::conformance_peer::connect(argv[4], argv[5], argv[6])); argc = 3;
+        cudavm::ipc_peer = std::make_unique<cudavm::test_peer>(cudavm::test_peer::connect(argv[4], argv[5], argv[6])); argc = 3;
     }
     if (argc == 3) { cudavm::ipc_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_memory_ipc);
+    return cudavm::run_test(argc, argv, cudavm::execute_memory_ipc);
 }

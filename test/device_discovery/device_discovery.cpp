@@ -24,12 +24,12 @@ template<class T> struct discovery_output {
 };
 CUcontext discovery_current() {
     discovery_output<CUcontext> output;
-    CONFORMANCE_CUDA(cuCtxGetCurrent(&output.value));
+    TEST_CUDA(cuCtxGetCurrent(&output.value));
     return output.get();
 }
 int discovery_count() {
     discovery_output<int> driver, runtime;
-    CONFORMANCE_CUDA(cuDeviceGetCount(&driver.value));
+    TEST_CUDA(cuDeviceGetCount(&driver.value));
     DISCOVERY_RUNTIME(cudaGetDeviceCount(&runtime.value));
     require(driver.get() > 0 && runtime.get() == driver.get(), "Driver and Runtime enumerate the same nonempty inventory");
     return driver.get();
@@ -38,11 +38,11 @@ void discovery_enumeration() {
     const auto context = discovery_current();
     const auto count = discovery_count();
     for (unsigned repeat = 0; repeat < 3; ++repeat) {
-        CONFORMANCE_CUDA(cuInit(0));
+        TEST_CUDA(cuInit(0));
         require(discovery_count() == count, "repeated initialization preserves device count");
         for (int ordinal = 0; ordinal < count; ++ordinal) {
             discovery_output<CUdevice> output;
-            CONFORMANCE_CUDA(cuDeviceGet(&output.value, ordinal));
+            TEST_CUDA(cuDeviceGet(&output.value, ordinal));
             require(output.get() == ordinal, "dense logical device ordinals round-trip");
         }
     }
@@ -50,17 +50,17 @@ void discovery_enumeration() {
 }
 void discovery_versions() {
     discovery_output<int> driver, runtime_driver, runtime, repeated;
-    CONFORMANCE_CUDA(cuDriverGetVersion(&driver.value));
+    TEST_CUDA(cuDriverGetVersion(&driver.value));
     DISCOVERY_RUNTIME(cudaDriverGetVersion(&runtime_driver.value));
     DISCOVERY_RUNTIME(cudaRuntimeGetVersion(&runtime.value));
-    CONFORMANCE_CUDA(cuDriverGetVersion(&repeated.value));
+    TEST_CUDA(cuDriverGetVersion(&repeated.value));
     require(driver.get() >= 1000 && driver.get() % 10 == 0 && repeated.get() == driver.get()
         && runtime_driver.get() == driver.get(), "stable CUDA-encoded Driver version agrees across facades");
     require(runtime.get() == CUDART_VERSION, "Runtime reports its pinned public version");
 }
 std::string discovery_name(CUdevice device, size_t length) {
     std::vector<char> bytes(length + 32, char(0x6b));
-    CONFORMANCE_CUDA(cuDeviceGetName(bytes.data() + 16, static_cast<int>(length), device));
+    TEST_CUDA(cuDeviceGetName(bytes.data() + 16, static_cast<int>(length), device));
     for (size_t i = 0; i < bytes.size(); ++i)
         if (i < 16 || i >= 16 + length) require(bytes[i] == char(0x6b), "device name respects caller buffer length");
     const auto end = std::find(bytes.begin() + 16, bytes.begin() + 16 + length, '\0');
@@ -81,7 +81,7 @@ void discovery_names() {
 }
 int discovery_attribute(CUdevice device, CUdevice_attribute driver_attribute, cudaDeviceAttr runtime_attribute) {
     discovery_output<int> driver, runtime;
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&driver.value, driver_attribute, device));
+    TEST_CUDA(cuDeviceGetAttribute(&driver.value, driver_attribute, device));
     DISCOVERY_RUNTIME(cudaDeviceGetAttribute(&runtime.value, runtime_attribute, device));
     require(driver.get() == runtime.get(), "Driver and Runtime attribute values agree");
     return driver.get();
@@ -94,7 +94,7 @@ void discovery_properties() {
         const auto name_end = std::find(std::begin(properties.name), std::end(properties.name), '\0');
         require(name_end != std::end(properties.name) && std::string(properties.name) == discovery_name(device, 256), "aggregate and individual device names agree");
         discovery_output<size_t> memory;
-        CONFORMANCE_CUDA(cuDeviceTotalMem(&memory.value, device));
+        TEST_CUDA(cuDeviceTotalMem(&memory.value, device));
         require(memory.get() > 0 && properties.totalGlobalMem == memory.get(), "aggregate and individual total memory agree");
         require(properties.maxThreadsPerBlock > 0 && properties.warpSize == 32, "nonzero dispatch size and CUDA logical warp");
         require(properties.maxThreadsPerBlock == discovery_attribute(device, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, cudaDevAttrMaxThreadsPerBlock), "aggregate block limit");
@@ -108,7 +108,7 @@ void discovery_properties() {
             require(properties.maxGridSize[axis] > 0 && properties.maxGridSize[axis] == discovery_attribute(device, grid[axis], runtime_grid[axis]), "aggregate per-axis grid limits");
         }
         discovery_output<int> major, minor;
-        CONFORMANCE_CUDA(cuDeviceComputeCapability(&major.value, &minor.value, device));
+        TEST_CUDA(cuDeviceComputeCapability(&major.value, &minor.value, device));
         require(major.get() == properties.major && minor.get() == properties.minor, "legacy compute capability agrees with aggregate");
     }
 }
@@ -148,14 +148,14 @@ void discovery_state() {
             const auto count = discovery_count();
             for (int device = 0; device < count; ++device) {
                 unsigned flags{}; int active = -1;
-                CONFORMANCE_CUDA(cuDevicePrimaryCtxGetState(device, &flags, &active));
+                TEST_CUDA(cuDevicePrimaryCtxGetState(device, &flags, &active));
                 require(active == 0, "query profile starts without active primary context");
             }
             discovery_enumeration(); discovery_versions(); discovery_names(); discovery_properties();
             require(discovery_current() == nullptr, "queries leave fresh worker unbound");
             for (int device = 0; device < count; ++device) {
                 unsigned flags{}; int active = -1;
-                CONFORMANCE_CUDA(cuDevicePrimaryCtxGetState(device, &flags, &active));
+                TEST_CUDA(cuDevicePrimaryCtxGetState(device, &flags, &active));
                 require(active == 0, "queries do not activate primary contexts");
             }
         } catch (...) { failure = std::current_exception(); }
@@ -179,5 +179,5 @@ void execute_device_discovery() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::device_discovery_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_device_discovery);
+    return cudavm::run_test(argc, argv, cudavm::execute_device_discovery);
 }

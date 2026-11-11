@@ -38,28 +38,28 @@ struct registered_host {
     void register_range() {
         const auto before = storage;
         if (runtime) REGISTRATION_RUNTIME(cudaHostRegister(value, size, flags));
-        else CONFORMANCE_CUDA(cuMemHostRegister(value, size, flags));
+        else TEST_CUDA(cuMemHostRegister(value, size, flags));
         active = true;
         require(storage == before, "registration preserves caller backing and guards");
     }
     void unregister_range(bool use_runtime) {
         if (use_runtime) REGISTRATION_RUNTIME(cudaHostUnregister(value));
-        else CONFORMANCE_CUDA(cuMemHostUnregister(value));
+        else TEST_CUDA(cuMemHostUnregister(value));
         active = false;
     }
 };
 void verify_registration_flags(const registered_host& host) {
     CUdevice device{};
     int unified = 0;
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&unified, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
+    TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuDeviceGetAttribute(&unified, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
     unsigned base = ~0u;
-    CONFORMANCE_CUDA(cuMemHostGetFlags(&base, host.value));
+    TEST_CUDA(cuMemHostGetFlags(&base, host.value));
     require((base & host.flags) == host.flags
         && !(base & ~(host.flags | (unified ? CU_MEMHOSTREGISTER_DEVICEMAP : 0))), "registration flags");
     for (size_t offset : {size_t(0), host.size / 2, host.size - 1}) {
         unsigned driver = ~0u, runtime = ~0u;
-        CONFORMANCE_CUDA(cuMemHostGetFlags(&driver, host.value + offset));
+        TEST_CUDA(cuMemHostGetFlags(&driver, host.value + offset));
         REGISTRATION_RUNTIME(cudaHostGetFlags(&runtime, host.value + offset));
         require(driver == base && runtime == base, "Driver/Runtime interior registration flags");
     }
@@ -85,7 +85,7 @@ void host_registration_ranges() {
 
 struct registration_stream {
     CUstream value{};
-    registration_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    registration_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~registration_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct registration_gate {
@@ -114,11 +114,11 @@ void registration_roundtrip(registered_host& source, registered_host& destinatio
         if (stream) REGISTRATION_RUNTIME(cudaMemcpyAsync(pointer + device_offset, source.value + source_offset,
             bytes, cudaMemcpyHostToDevice, runtime_stream));
         else REGISTRATION_RUNTIME(cudaMemcpy(pointer + device_offset, source.value + source_offset, bytes, cudaMemcpyHostToDevice));
-        if (stream) CONFORMANCE_CUDA(cuMemcpyDtoHAsync(destination.value + destination_offset, device + device_offset, bytes, stream));
-        else CONFORMANCE_CUDA(cuMemcpyDtoH(destination.value + destination_offset, device + device_offset, bytes));
+        if (stream) TEST_CUDA(cuMemcpyDtoHAsync(destination.value + destination_offset, device + device_offset, bytes, stream));
+        else TEST_CUDA(cuMemcpyDtoH(destination.value + destination_offset, device + device_offset, bytes));
     } else {
-        if (stream) CONFORMANCE_CUDA(cuMemcpyHtoDAsync(device + device_offset, source.value + source_offset, bytes, stream));
-        else CONFORMANCE_CUDA(cuMemcpyHtoD(device + device_offset, source.value + source_offset, bytes));
+        if (stream) TEST_CUDA(cuMemcpyHtoDAsync(device + device_offset, source.value + source_offset, bytes, stream));
+        else TEST_CUDA(cuMemcpyHtoD(device + device_offset, source.value + source_offset, bytes));
         if (stream) REGISTRATION_RUNTIME(cudaMemcpyAsync(destination.value + destination_offset, pointer + device_offset,
             bytes, cudaMemcpyDeviceToHost, runtime_stream));
         else REGISTRATION_RUNTIME(cudaMemcpy(destination.value + destination_offset, pointer + device_offset, bytes, cudaMemcpyDeviceToHost));
@@ -137,7 +137,7 @@ void host_registration_transfers() {
             const auto input = source.storage, initial = destination.storage;
             auto expected = initial;
             std::copy_n(source.value + src, bytes, expected.begin() + destination.offset() + dst);
-            CONFORMANCE_CUDA(cuMemsetD8(device.value, 0xd3, extent));
+            TEST_CUDA(cuMemsetD8(device.value, 0xd3, extent));
             registration_gate gate;
             struct cleanup_gate {
                 registration_gate& gate;
@@ -145,7 +145,7 @@ void host_registration_transfers() {
                 ~cleanup_gate() { gate.release(); cuStreamSynchronize(stream); }
             } cleanup{gate, stream.value};
             if (asynchronous) {
-                CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, registration_gate::call, &gate));
+                TEST_CUDA(cuLaunchHostFunc(stream.value, registration_gate::call, &gate));
                 gate.await();
             }
             registration_roundtrip(source, destination, device.value, src, dev, dst, bytes,
@@ -154,7 +154,7 @@ void host_registration_transfers() {
                 require(cuStreamQuery(stream.value) == CUDA_ERROR_NOT_READY, "registered transfer remains pending at gate");
                 require(destination.storage == initial, "pending readback leaves destination unchanged");
                 gate.release();
-                CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+                TEST_CUDA(cuStreamSynchronize(stream.value));
                 require(!gate.expired, "registration transfer gate completion deadline");
             }
             require(source.storage == input, "registered upload source and backing guards");
@@ -162,7 +162,7 @@ void host_registration_transfers() {
             std::vector<unsigned char> actual(extent + 32, 0xe7), expected_device = actual;
             std::fill_n(expected_device.begin() + 16, extent, 0xd3);
             std::copy_n(source.value + src, bytes, expected_device.begin() + 16 + dev);
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data() + 16, device.value, extent));
+            TEST_CUDA(cuMemcpyDtoH(actual.data() + 16, device.value, extent));
             require(actual == expected_device, "registered transfer device bytes and readback guards");
         }
         source.unregister_range(!runtime);
@@ -174,9 +174,9 @@ struct registration_context {
     CUcontext original{}, value{};
     registration_context() {
         CUdevice device{};
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&original));
-        CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-        CONFORMANCE_CUDA(cuCtxCreate(&value, nullptr, CU_CTX_MAP_HOST, device));
+        TEST_CUDA(cuCtxGetCurrent(&original));
+        TEST_CUDA(cuCtxGetDevice(&device));
+        TEST_CUDA(cuCtxCreate(&value, nullptr, CU_CTX_MAP_HOST, device));
     }
     ~registration_context() { if (value) cuCtxDestroy(value); cuCtxSetCurrent(original); }
 };
@@ -187,7 +187,7 @@ void host_registration_portable() {
         {
             registration_context other;
             device_buffer device(host.size);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(device.value, host.value, host.size));
+            TEST_CUDA(cuMemcpyHtoD(device.value, host.value, host.size));
             std::fill_n(host.value, host.size, 0x91);
             REGISTRATION_RUNTIME(cudaMemcpy(host.value, reinterpret_cast<void*>(static_cast<uintptr_t>(device.value)),
                 host.size, cudaMemcpyDeviceToHost));
@@ -257,5 +257,5 @@ void execute_host_registration() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::host_registration_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_host_registration);
+    return cudavm::run_test(argc, argv, cudavm::execute_host_registration);
 }

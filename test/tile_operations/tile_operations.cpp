@@ -27,15 +27,15 @@ void tile_view_case(const loaded_program& program, std::array<unsigned, 3> shape
         std::copy(std::begin(metadata), std::end(metadata), expected.begin() + base);
     }
     device_buffer source(input.size() * 4), destination(initial.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
     auto in = source.value + guards * 4, out = destination.value + guards * 4;
     void* arguments[]{&out, &in, &rows, &columns, &granularity, &mode, &count};
-    CONFORMANCE_CUDA(cuLaunchKernel(program.function("tile_header_views"), blocks, 1, 1,
+    TEST_CUDA(cuLaunchKernel(program.function("tile_header_views"), blocks, 1, 1,
         shape[0], shape[1], shape[2], 0, nullptr, arguments, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
     expect_words(actual, expected, "CUDA tile header extents, layout, span pointer, mapped data and guards mode=" + std::to_string(mode));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
     expect_words(preserved, input, "CUDA tile header view source, gaps, padding and guards");
 }
 void execute_tile_operations(const loaded_program& program) {
@@ -49,5 +49,5 @@ void execute_tile_operations(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_tile_operations);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_tile_operations);
 }

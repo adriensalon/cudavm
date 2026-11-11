@@ -18,9 +18,9 @@ template<class T> struct graph_conditional_output {
 struct graph_conditional_graph {
     CUgraph value{}; CUcontext context{};
     explicit graph_conditional_graph(bool runtime) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        TEST_CUDA(cuCtxGetCurrent(&context));
         if (runtime) { cudaGraph_t result{}; graph_conditional_runtime(cudaGraphCreate(&result, 0)); value = graph_conditional_cast<CUgraph>(result); }
-        else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        else TEST_CUDA(cuGraphCreate(&value, 0));
     }
     ~graph_conditional_graph() { if (value) cuGraphDestroy(value); }
     CUgraphConditionalHandle condition(unsigned initial, bool runtime) {
@@ -28,7 +28,7 @@ struct graph_conditional_graph {
         if (runtime) {
             graph_conditional_output<cudaGraphConditionalHandle> handle;
             graph_conditional_runtime(cudaGraphConditionalHandleCreate(&handle.value, graph_conditional_cast<cudaGraph_t>(value), initial, cudaGraphCondAssignDefault)); result.value = handle.get();
-        } else CONFORMANCE_CUDA(cuGraphConditionalHandleCreate(&result.value, value, context, initial, CU_GRAPH_COND_ASSIGN_DEFAULT));
+        } else TEST_CUDA(cuGraphConditionalHandleCreate(&result.value, value, context, initial, CU_GRAPH_COND_ASSIGN_DEFAULT));
         require(result.get(), "conditional handle publication"); return result.value;
     }
 };
@@ -46,9 +46,9 @@ struct graph_conditional_node {
             require(params.conditional.phGraph_out, "Runtime publishes body array");
             for (unsigned i = 0; i < count; ++i) bodies.push_back(graph_conditional_cast<CUgraph>(params.conditional.phGraph_out[i]));
         } else {
-            CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+            CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
             CUgraphNodeParams params{}; params.type = CU_GRAPH_NODE_TYPE_CONDITIONAL; params.conditional = {condition, kind, count, nullptr, context};
-            CONFORMANCE_CUDA(cuGraphAddNode(&result.value, graph, nullptr, nullptr, 0, &params)); require(params.conditional.phGraph_out, "Driver publishes body array");
+            TEST_CUDA(cuGraphAddNode(&result.value, graph, nullptr, nullptr, 0, &params)); require(params.conditional.phGraph_out, "Driver publishes body array");
             bodies.assign(params.conditional.phGraph_out, params.conditional.phGraph_out + count);
         }
         value = result.get();
@@ -57,7 +57,7 @@ struct graph_conditional_node {
         query();
     }
     void query() const {
-        graph_conditional_output<CUgraphNodeParams> driver; CONFORMANCE_CUDA(cuGraphNodeGetParams(value, &driver.value)); auto p = driver.get();
+        graph_conditional_output<CUgraphNodeParams> driver; TEST_CUDA(cuGraphNodeGetParams(value, &driver.value)); auto p = driver.get();
         graph_conditional_output<cudaGraphNodeParams> runtime; graph_conditional_runtime(cudaGraphNodeGetParams(graph_conditional_cast<cudaGraphNode_t>(value), &runtime.value)); auto q = runtime.get();
         require(p.type == CU_GRAPH_NODE_TYPE_CONDITIONAL && q.type == cudaGraphNodeTypeConditional
             && p.conditional.handle == handle && q.conditional.handle == handle && p.conditional.type == type
@@ -69,7 +69,7 @@ struct graph_conditional_node {
 struct graph_conditional_storage {
     static constexpr size_t bytes = 288;
     device_buffer device{bytes}; unsigned char* host{};
-    graph_conditional_storage() { void* pointer{}; CONFORMANCE_CUDA(cuMemAllocHost(&pointer, bytes + 32)); host = static_cast<unsigned char*>(pointer); }
+    graph_conditional_storage() { void* pointer{}; TEST_CUDA(cuMemAllocHost(&pointer, bytes + 32)); host = static_cast<unsigned char*>(pointer); }
     ~graph_conditional_storage() { if (host) { cuCtxSynchronize(); cuMemFreeHost(host); } }
     void fill(CUgraph body, unsigned value, bool runtime) {
         if (runtime) {
@@ -77,7 +77,7 @@ struct graph_conditional_storage {
             cudaGraphNode_t node{}; graph_conditional_runtime(cudaGraphAddMemsetNode(&node, graph_conditional_cast<cudaGraph_t>(body), nullptr, 0, &p));
         } else {
             CUDA_MEMSET_NODE_PARAMS p{}; p.dst = device.value + 16; p.value = value; p.elementSize = 1; p.width = bytes - 32; p.height = 1;
-            CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context)); CUgraphNode node{}; CONFORMANCE_CUDA(cuGraphAddMemsetNode(&node, body, nullptr, 0, &p, context));
+            CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context)); CUgraphNode node{}; TEST_CUDA(cuGraphAddMemsetNode(&node, body, nullptr, 0, &p, context));
         }
     }
     void copy(CUgraph graph, CUgraphNode dependency, bool runtime) {
@@ -88,12 +88,12 @@ struct graph_conditional_storage {
         } else {
             CUDA_MEMCPY3D p{}; p.srcMemoryType = CU_MEMORYTYPE_DEVICE; p.srcDevice = device.value; p.dstMemoryType = CU_MEMORYTYPE_HOST; p.dstHost = host + 16;
             p.WidthInBytes = p.srcPitch = p.dstPitch = bytes; p.srcHeight = p.dstHeight = p.Height = p.Depth = 1;
-            CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context)); CUgraphNode node{}; CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&node, graph, &dependency, 1, &p, context));
+            CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context)); CUgraphNode node{}; TEST_CUDA(cuGraphAddMemcpyNode(&node, graph, &dependency, 1, &p, context));
         }
     }
-    void reset() { CONFORMANCE_CUDA(cuMemsetD8(device.value, 0xa7, bytes)); std::fill_n(host, bytes + 32, 0x63); }
+    void reset() { TEST_CUDA(cuMemsetD8(device.value, 0xa7, bytes)); std::fill_n(host, bytes + 32, 0x63); }
     void verify(unsigned value) {
-        std::vector<unsigned char> actual(bytes); CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), device.value, bytes));
+        std::vector<unsigned char> actual(bytes); TEST_CUDA(cuMemcpyDtoH(actual.data(), device.value, bytes));
         for (size_t i = 0; i < bytes; ++i) {
             unsigned expected = i < 16 || i >= bytes - 16 ? 0xa7 : value;
             require(actual[i] == expected && host[i + 16] == expected, "conditional complete payload byte=" + std::to_string(i));
@@ -102,18 +102,18 @@ struct graph_conditional_storage {
     }
 };
 void graph_conditional_replay(graph_conditional_graph& graph, graph_conditional_storage& storage, unsigned expected, bool runtime, bool retire = false) {
-    CUgraphExec executable{}; CUstream stream{}; CONFORMANCE_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+    CUgraphExec executable{}; CUstream stream{}; TEST_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
     struct cleanup { CUgraphExec& executable; CUstream stream; ~cleanup() { cuStreamSynchronize(stream); if (executable) cuGraphExecDestroy(executable); cuStreamDestroy(stream); } } owner{executable, stream};
     if (runtime) { cudaGraphExec_t result{}; graph_conditional_runtime(cudaGraphInstantiateWithFlags(&result, graph_conditional_cast<cudaGraph_t>(graph.value), 0)); executable = graph_conditional_cast<CUgraphExec>(result); }
-    else CONFORMANCE_CUDA(cuGraphInstantiate(&executable, graph.value, 0));
-    if (retire) { CONFORMANCE_CUDA(cuGraphDestroy(graph.value)); graph.value = nullptr; }
+    else TEST_CUDA(cuGraphInstantiate(&executable, graph.value, 0));
+    if (retire) { TEST_CUDA(cuGraphDestroy(graph.value)); graph.value = nullptr; }
     for (unsigned replay = 0; replay < 3; ++replay) {
         storage.reset();
         if (runtime) {
             graph_conditional_runtime(cudaGraphUpload(graph_conditional_cast<cudaGraphExec_t>(executable), graph_conditional_cast<cudaStream_t>(stream)));
             graph_conditional_runtime(cudaGraphLaunch(graph_conditional_cast<cudaGraphExec_t>(executable), graph_conditional_cast<cudaStream_t>(stream)));
-        } else { CONFORMANCE_CUDA(cuGraphUpload(executable, stream)); CONFORMANCE_CUDA(cuGraphLaunch(executable, stream)); }
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream)); storage.verify(expected);
+        } else { TEST_CUDA(cuGraphUpload(executable, stream)); TEST_CUDA(cuGraphLaunch(executable, stream)); }
+        TEST_CUDA(cuStreamSynchronize(stream)); storage.verify(expected);
     }
 }
 void graph_conditional_branches() {
@@ -169,16 +169,16 @@ void graph_conditional_validation() {
     require(cuGraphAddNode(&node.value, graph.value, nullptr, nullptr, 0, &invalid) == CUDA_ERROR_INVALID_VALUE && !node.get(), "body array must be output");
     invalid = p; invalid.reserved0[0] = 1;
     require(cuGraphAddNode(&node.value, graph.value, nullptr, nullptr, 0, &invalid) == CUDA_ERROR_INVALID_VALUE && !node.get(), "conditional reserved field");
-    size_t count{}; CONFORMANCE_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(!count, "failed conditional additions leave an empty graph");
+    size_t count{}; TEST_CUDA(cuGraphGetNodes(graph.value, nullptr, &count)); require(!count, "failed conditional additions leave an empty graph");
     graph_conditional_storage storage; storage.fill(graph.value, 0x3d, true);
-    CUgraphNode fill{}; count = 1; CONFORMANCE_CUDA(cuGraphGetNodes(graph.value, &fill, &count)); require(count == 1 && fill, "valid ordinary node repairs the rejected graph");
+    CUgraphNode fill{}; count = 1; TEST_CUDA(cuGraphGetNodes(graph.value, &fill, &count)); require(count == 1 && fill, "valid ordinary node repairs the rejected graph");
     storage.copy(graph.value, fill, true); graph_conditional_replay(graph, storage, 0x3d, false);
 }
 void graph_conditional_discovery() {
     static_assert(std::is_same_v<decltype(&cuGraphConditionalHandleCreate), PFN_cuGraphConditionalHandleCreate_v12030>);
     void* pointer{}; CUdriverProcAddressQueryResult query{};
-    CONFORMANCE_CUDA(cuGetProcAddress("cuGraphConditionalHandleCreate", &pointer, 12029, 0, &query)); require(!pointer && query == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "conditional introduction boundary");
-    CONFORMANCE_CUDA(cuGetProcAddress("cuGraphConditionalHandleCreate", &pointer, 12030, 0, &query)); require(pointer && query == CU_GET_PROC_ADDRESS_SUCCESS, "conditional introduction lookup");
+    TEST_CUDA(cuGetProcAddress("cuGraphConditionalHandleCreate", &pointer, 12029, 0, &query)); require(!pointer && query == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "conditional introduction boundary");
+    TEST_CUDA(cuGetProcAddress("cuGraphConditionalHandleCreate", &pointer, 12030, 0, &query)); require(pointer && query == CU_GET_PROC_ADDRESS_SUCCESS, "conditional introduction lookup");
     void* other{}; cudaDriverEntryPointQueryResult runtime{}; graph_conditional_runtime(cudaGetDriverEntryPointByVersion("cuGraphConditionalHandleCreate", &other, 12030, 0, &runtime));
     require(other == pointer && runtime == cudaDriverEntryPointSuccess, "Runtime discovers conditional Driver procedure");
 }
@@ -197,7 +197,7 @@ void execute_graph_conditionals() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_conformance(argc, argv, cudavm::graph_conditional_discovery);
+    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_test(argc, argv, cudavm::graph_conditional_discovery);
     if (argc == 3) { cudavm::graph_conditional_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_graph_conditionals);
+    return cudavm::run_test(argc, argv, cudavm::execute_graph_conditionals);
 }

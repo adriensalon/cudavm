@@ -74,12 +74,12 @@ void execute_texture_fetch(const loaded_program& program) {
                 }
                 storage.upload(); image_test_texture texture(storage, runtime, CU_TR_ADDRESS_MODE_CLAMP, CU_TR_FILTER_MODE_POINT, false, fetch_normalized);
                 std::vector<uint32_t> actual(guards + count * 4 + guards, 0xa7b96351);
-                device_buffer output(actual.size() * 4); CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, actual.data(), actual.size() * 4));
+                device_buffer output(actual.size() * 4); TEST_CUDA(cuMemcpyHtoD(output.value, actual.data(), actual.size() * 4));
                 auto pointer = output.value + guards * 4; unsigned columns = width, size = count, linear = resource == CU_RESOURCE_TYPE_LINEAR;
                 void* args[]{&texture.value, &pointer, &columns, &size, &channels, &linear};
-                CONFORMANCE_CUDA(cuLaunchKernel(program.function(fetch_normalized ? "fetch_float" : format.kernel),
+                TEST_CUDA(cuLaunchKernel(program.function(fetch_normalized ? "fetch_float" : format.kernel),
                     (count + 63) / 64, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
-                CONFORMANCE_CUDA(cuCtxSynchronize()); CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+                TEST_CUDA(cuCtxSynchronize()); TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
                 for (unsigned i = 0; i < actual.size(); ++i) {
                     uint32_t expected = 0xa7b96351;
                     if (i >= guards && i < guards + count * 4) {
@@ -105,5 +105,5 @@ int main(int argc, char** argv) {
     if (profile != "element" && profile != "normalized" && profile != "half") return 1;
     cudavm::fetch_normalized = profile == "normalized";
     cudavm::fetch_half = profile == "half";
-    return cudavm::run_conformance(argc - 1, argv, cudavm::fixtures, cudavm::execute_texture_fetch);
+    return cudavm::run_test(argc - 1, argv, cudavm::fixtures, cudavm::execute_texture_fetch);
 }

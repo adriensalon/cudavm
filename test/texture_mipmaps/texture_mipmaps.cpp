@@ -15,7 +15,7 @@ struct mip_texture_storage {
             image_runtime(cudaMallocMipmappedArray(&result, &channel, {8, 8, 0}, 4, 0)); value = reinterpret_cast<CUmipmappedArray>(result);
         } else {
             CUDA_ARRAY3D_DESCRIPTOR descriptor{8, 8, 0, CU_AD_FORMAT_FLOAT, 4, 0};
-            CONFORMANCE_CUDA(cuMipmappedArrayCreate(&value, &descriptor, 4));
+            TEST_CUDA(cuMipmappedArrayCreate(&value, &descriptor, 4));
         }
         for (unsigned level = 0; level < 4; ++level) {
             const unsigned width = 8 >> level; std::vector<float> pixels(width * width * 4);
@@ -23,11 +23,11 @@ struct mip_texture_storage {
                 pixels[(y * width + x) * 4 + c] = mip_texture_pixel(level, x, y, c);
             CUDA_MEMCPY2D copy{}; copy.srcMemoryType = CU_MEMORYTYPE_HOST; copy.srcHost = pixels.data();
             copy.srcPitch = copy.WidthInBytes = width * 16; copy.Height = width; copy.dstMemoryType = CU_MEMORYTYPE_ARRAY; copy.dstArray = array(level);
-            CONFORMANCE_CUDA(cuMemcpy2D(&copy));
+            TEST_CUDA(cuMemcpy2D(&copy));
         }
     }
     ~mip_texture_storage() { if (value) cuMipmappedArrayDestroy(value); }
-    CUarray array(unsigned level) const { CUarray result{}; CONFORMANCE_CUDA(cuMipmappedArrayGetLevel(&result, value, level)); return result; }
+    CUarray array(unsigned level) const { CUarray result{}; TEST_CUDA(cuMipmappedArrayGetLevel(&result, value, level)); return result; }
     void verify() const {
         for (unsigned level = 0; level < 4; ++level) {
             const unsigned width = 8 >> level, guard = 16;
@@ -68,19 +68,19 @@ struct mip_texture_object {
                 require(cudaCreateTextureObject(&rejected, &r, &invalid, nullptr) == cudaErrorInvalidValue, "Runtime requires normalized mipmap coordinates");
             }
             image_runtime(cudaCreateTextureObject(&value, &r, &t, nullptr));
-        } else CONFORMANCE_CUDA(cuTexObjectCreate(&value, &resource, &sampler, nullptr));
+        } else TEST_CUDA(cuTexObjectCreate(&value, &resource, &sampler, nullptr));
         CUDA_RESOURCE_DESC driver{}; cudaResourceDesc other{};
-        CONFORMANCE_CUDA(cuTexObjectGetResourceDesc(&driver, value)); image_runtime(cudaGetTextureObjectResourceDesc(&other, value));
+        TEST_CUDA(cuTexObjectGetResourceDesc(&driver, value)); image_runtime(cudaGetTextureObjectResourceDesc(&other, value));
         require(driver.resType == CU_RESOURCE_TYPE_MIPMAPPED_ARRAY && driver.res.mipmap.hMipmappedArray == storage.value
             && other.resType == cudaResourceTypeMipmappedArray && other.res.mipmap.mipmap == reinterpret_cast<cudaMipmappedArray_t>(storage.value), "public mipmap resource identity");
         CUDA_TEXTURE_DESC queried{}; cudaTextureDesc runtime_sampler{};
-        CONFORMANCE_CUDA(cuTexObjectGetTextureDesc(&queried, value)); image_runtime(cudaGetTextureObjectTextureDesc(&runtime_sampler, value));
+        TEST_CUDA(cuTexObjectGetTextureDesc(&queried, value)); image_runtime(cudaGetTextureObjectTextureDesc(&runtime_sampler, value));
         require(queried.mipmapFilterMode == sampler.mipmapFilterMode && queried.minMipmapLevelClamp == sampler.minMipmapLevelClamp
             && queried.maxMipmapLevelClamp == sampler.maxMipmapLevelClamp && runtime_sampler.minMipmapLevelClamp == sampler.minMipmapLevelClamp
             && runtime_sampler.maxMipmapLevelClamp == sampler.maxMipmapLevelClamp, "mipmap sampler queries preserve filter and clamps");
     }
     ~mip_texture_object() { if (value) cuTexObjectDestroy(value); }
-    void close() { CONFORMANCE_CUDA(cuTexObjectDestroy(value)); value = 0; }
+    void close() { TEST_CUDA(cuTexObjectDestroy(value)); value = 0; }
 };
 void execute_texture_mipmaps(const loaded_program& program) {
     const bool gradients = mip_texture_case == "gradients", clamps = mip_texture_case == "clamps";
@@ -109,20 +109,20 @@ void execute_texture_mipmaps(const loaded_program& program) {
         records.resize(records.size() + guards, std::bit_cast<float>(0x4a716395));
         unsigned count = unsigned(expected.size() / 4), use_gradients = gradients;
         device_buffer input(records.size() * 4), output((expected.size() + 2 * guards) * 4);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(input.value, records.data(), records.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(input.value, records.data(), records.size() * 4));
         std::vector<uint32_t> actual(expected.size() + 2 * guards, 0xa7b96351);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, actual.data(), actual.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(output.value, actual.data(), actual.size() * 4));
         auto destination = output.value + guards * 4, samples = input.value + guards * 4;
         void* args[]{&texture.value, &destination, &samples, &count, &use_gradients};
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function("sample_mipmap"), (count + 63) / 64, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
-        if (mip_texture_case == "lifetime") texture.close(); else CONFORMANCE_CUDA(cuCtxSynchronize());
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+        TEST_CUDA(cuLaunchKernel(program.function("sample_mipmap"), (count + 63) / 64, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
+        if (mip_texture_case == "lifetime") texture.close(); else TEST_CUDA(cuCtxSynchronize());
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
         for (unsigned i = 0; i < actual.size(); ++i) {
             const auto wanted = i < guards || i >= guards + expected.size() ? 0xa7b96351 : std::bit_cast<uint32_t>(expected[i - guards]);
             require(actual[i] == wanted, "mipmap LOD/filter/gradient result slot=" + std::to_string(i)
                 + " got=" + std::to_string(actual[i]) + " expected=" + std::to_string(wanted));
         }
-        std::vector<float> preserved(records.size()); CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), input.value, preserved.size() * 4));
+        std::vector<float> preserved(records.size()); TEST_CUDA(cuMemcpyDtoH(preserved.data(), input.value, preserved.size() * 4));
         require(std::memcmp(records.data(), preserved.data(), records.size() * 4) == 0, "mipmap sample records and guards preserved"); storage.verify();
     }
 }
@@ -132,5 +132,5 @@ int main(int argc, char** argv) {
     cudavm::mip_texture_case = argv[3];
     if (cudavm::mip_texture_case != "point" && cudavm::mip_texture_case != "linear" && cudavm::mip_texture_case != "gradients"
         && cudavm::mip_texture_case != "clamps" && cudavm::mip_texture_case != "lifetime" && cudavm::mip_texture_case != "validation") return 1;
-    return cudavm::run_conformance(argc - 1, argv, cudavm::fixtures, cudavm::execute_texture_mipmaps);
+    return cudavm::run_test(argc - 1, argv, cudavm::fixtures, cudavm::execute_texture_mipmaps);
 }

@@ -150,5 +150,5 @@ void execute_cubin_import() {
 }
 int main(int argc, char** argv) {
     if (argc == 2) cudavm::cubin_import_case = argv[1];
-    return cudavm::run_host_conformance(argc, argv, cudavm::execute_cubin_import);
+    return cudavm::run_host_test(argc, argv, cudavm::execute_cubin_import);
 }

@@ -27,7 +27,7 @@ struct surface_array {
         CUDA_ARRAY3D_DESCRIPTOR descriptor{};
         descriptor.Width = width; descriptor.Height = height; descriptor.Format = CU_AD_FORMAT_UNSIGNED_INT32;
         descriptor.NumChannels = channels; descriptor.Flags = CUDA_ARRAY3D_SURFACE_LDST;
-        CONFORMANCE_CUDA(cuArray3DCreate(&value, &descriptor));
+        TEST_CUDA(cuArray3DCreate(&value, &descriptor));
         for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<unsigned char>((i * 53 + channels * 31) ^ (i >> 4));
         transfer(bytes.data(), false);
     }
@@ -38,7 +38,7 @@ struct surface_array {
         copy.dstMemoryType = read ? CU_MEMORYTYPE_HOST : CU_MEMORYTYPE_ARRAY;
         copy.srcArray = copy.dstArray = value; copy.srcHost = copy.dstHost = host;
         copy.srcPitch = copy.dstPitch = copy.WidthInBytes;
-        CONFORMANCE_CUDA(cuMemcpy2D(&copy));
+        TEST_CUDA(cuMemcpy2D(&copy));
     }
     void verify() const {
         std::vector<unsigned char> actual(bytes.size()); transfer(actual.data(), true);
@@ -56,13 +56,13 @@ struct surface_handle {
             surface_runtime(cudaCreateSurfaceObject(&output.value, &descriptor)); descriptor = {};
         } else {
             CUDA_RESOURCE_DESC descriptor{}; descriptor.resType = CU_RESOURCE_TYPE_ARRAY; descriptor.res.array.hArray = array.value;
-            CONFORMANCE_CUDA(cuSurfObjectCreate(&output.value, &descriptor)); descriptor = {};
+            TEST_CUDA(cuSurfObjectCreate(&output.value, &descriptor)); descriptor = {};
         }
         value = output.get(); require(value != 0, "nonnull opaque surface handle");
     }
     ~surface_handle() { if (value) cuSurfObjectDestroy(value); }
     void close() {
-        if (runtime) CONFORMANCE_CUDA(cuSurfObjectDestroy(value));
+        if (runtime) TEST_CUDA(cuSurfObjectDestroy(value));
         else surface_runtime(cudaDestroySurfaceObject(value));
         value = 0;
     }
@@ -70,12 +70,12 @@ struct surface_handle {
 void surface_query(const surface_handle& object, const surface_array& array) {
     surface_output<CUDA_RESOURCE_DESC> driver;
     surface_output<cudaResourceDesc> runtime;
-    CONFORMANCE_CUDA(cuSurfObjectGetResourceDesc(&driver.value, object.value));
+    TEST_CUDA(cuSurfObjectGetResourceDesc(&driver.value, object.value));
     surface_runtime(cudaGetSurfaceObjectResourceDesc(&runtime.value, object.value));
     const auto d = driver.get(); const auto r = runtime.get();
     require(d.resType == CU_RESOURCE_TYPE_ARRAY && d.flags == 0 && d.res.array.hArray == array.value &&
             r.resType == cudaResourceTypeArray && r.res.array.array == reinterpret_cast<cudaArray_t>(array.value), "surface resource identity across facades");
-    CUDA_ARRAY3D_DESCRIPTOR descriptor{}; CONFORMANCE_CUDA(cuArray3DGetDescriptor(&descriptor, array.value));
+    CUDA_ARRAY3D_DESCRIPTOR descriptor{}; TEST_CUDA(cuArray3DGetDescriptor(&descriptor, array.value));
     require(descriptor.Width == array.width && descriptor.Height == array.height && descriptor.Depth == 0 &&
             descriptor.Format == CU_AD_FORMAT_UNSIGNED_INT32 && descriptor.NumChannels == array.channels &&
             descriptor.Flags == CUDA_ARRAY3D_SURFACE_LDST, "surface creation preserves array descriptor");
@@ -98,18 +98,18 @@ void surface_siblings() {
 }
 void surface_contexts() {
     CUcontext original{}; CUdevice device{};
-    CONFORMANCE_CUDA(cuCtxGetCurrent(&original)); CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuCtxGetCurrent(&original)); TEST_CUDA(cuCtxGetDevice(&device));
     surface_array first(1); surface_handle a(first, false);
-    CUcontext other{}; CONFORMANCE_CUDA(cuCtxCreate(&other, nullptr, 0, device));
+    CUcontext other{}; TEST_CUDA(cuCtxCreate(&other, nullptr, 0, device));
     struct context_cleanup { CUcontext other, original; ~context_cleanup() { if (other) cuCtxDestroy(other); cuCtxSetCurrent(original); } } cleanup{other, original};
     {
         surface_array second(4); surface_handle b(second, true);
         surface_query(b, second);
-        CONFORMANCE_CUDA(cuCtxSetCurrent(original)); surface_query(a, first);
-        CONFORMANCE_CUDA(cuCtxSetCurrent(other)); surface_query(b, second); b.close(); second.verify();
+        TEST_CUDA(cuCtxSetCurrent(original)); surface_query(a, first);
+        TEST_CUDA(cuCtxSetCurrent(other)); surface_query(b, second); b.close(); second.verify();
     }
-    CONFORMANCE_CUDA(cuCtxSetCurrent(original));
-    CONFORMANCE_CUDA(cuCtxDestroy(other)); cleanup.other = nullptr;
+    TEST_CUDA(cuCtxSetCurrent(original));
+    TEST_CUDA(cuCtxDestroy(other)); cleanup.other = nullptr;
     surface_query(a, first); a.close(); first.verify();
 }
 void surface_validation() {
@@ -147,5 +147,5 @@ void execute_surface_objects() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::surface_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_surface_objects);
+    return cudavm::run_test(argc, argv, cudavm::execute_surface_objects);
 }

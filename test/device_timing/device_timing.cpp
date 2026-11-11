@@ -19,12 +19,12 @@ void timing_case(const loaded_program& program, unsigned x, unsigned y, unsigned
     for (unsigned i = 0; i < capacity; ++i) input[guards + i] = 0x93b17d5au ^ (i * 0x10203u);
     std::vector<uint32_t> initial(guards * 2 + (capacity + 1) * 16, guard), actual(initial.size());
     device_buffer source(input.size() * 4), destination(initial.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
     auto in = source.value + guards * 4, out = destination.value + guards * 4;
     void* arguments[]{&out, &in, &count, &sleep, &nanoseconds};
-    CONFORMANCE_CUDA(cuLaunchKernel(program.function("timing_samples"), blocks, 1, 1, x, y, 1, 0, nullptr, arguments, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+    TEST_CUDA(cuLaunchKernel(program.function("timing_samples"), blocks, 1, 1, x, y, 1, 0, nullptr, arguments, nullptr));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
     for (unsigned i = 0; i < count; ++i) {
         const auto base = guards + i * 16;
         bool narrow_changed = false, wide_changed = false;
@@ -40,7 +40,7 @@ void timing_case(const loaded_program& program, unsigned x, unsigned y, unsigned
     }
     for (size_t i = 0; i < actual.size(); ++i)
         if (i < guards || i >= guards + count * 16) require(actual[i] == guard, "device timing output guards and inactive records");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
     expect_words(preserved, input, "device timing source and allocation guards are preserved");
 }
 void execute_device_timing(const loaded_program& program) {
@@ -56,5 +56,5 @@ void execute_device_timing(const loaded_program& program) {
 }
 int main(int argc, char** argv) {
     if (argc == 4) { cudavm::timing_profile = argv[3]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_device_timing);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_device_timing);
 }

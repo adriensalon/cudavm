@@ -41,7 +41,7 @@ void execute_device_calls(const loaded_program& program) {
         std::vector<uint32_t> actual(total * 6 + 4), expected(actual.size());
         device_buffer source(input.size() * 8), destination(actual.size() * 4);
         auto in = source.value + 16, out = destination.value + 8;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 8));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 8));
         for (unsigned rounds : {0u, 1u, 4u}) {
             std::vector<std::array<uint32_t, 6>> oracle;
             for (unsigned i = 0; i < total; ++i)
@@ -50,19 +50,19 @@ void execute_device_calls(const loaded_program& program) {
                 std::fill(expected.begin(), expected.end(), guard);
                 for (unsigned i = 0; i < std::min(count, total); ++i)
                     std::copy(oracle[i].begin(), oracle[i].end(), expected.begin() + 2 + i * 6);
-                CONFORMANCE_CUDA(cuMemsetD32(destination.value, guard, actual.size()));
+                TEST_CUDA(cuMemsetD32(destination.value, guard, actual.size()));
                 void* args[]{&out, &in, &count, &rounds};
-                CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-                CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+                TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+                TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
                 expect_words(actual, expected, "device calls threads=" + std::to_string(threads)
                     + " rounds=" + std::to_string(rounds) + " count=" + std::to_string(count));
             }
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 8));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 8));
         require(preserved == input, "device call source words and guards preserved");
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_device_calls);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_device_calls);
 }

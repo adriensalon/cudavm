@@ -74,7 +74,7 @@ struct topology_graph {
     std::vector<topology_edge> edges;
     explicit topology_graph(bool runtime) {
         if (runtime) { cudaGraph_t graph{}; TOPOLOGY_RUNTIME(cudaGraphCreate(&graph, 0)); value = reinterpret_cast<CUgraph>(graph); }
-        else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        else TEST_CUDA(cuGraphCreate(&value, 0));
     }
     ~topology_graph() { if (value) cuGraphDestroy(value); }
     CUgraphNode empty(std::initializer_list<CUgraphNode> dependencies, bool runtime) {
@@ -83,7 +83,7 @@ struct topology_graph {
             std::vector<cudaGraphNode_t> deps; for (auto dependency : dependencies) deps.push_back(reinterpret_cast<cudaGraphNode_t>(dependency));
             cudaGraphNode_t result{}; TOPOLOGY_RUNTIME(cudaGraphAddEmptyNode(&result, reinterpret_cast<cudaGraph_t>(value), deps.data(), deps.size()));
             node = reinterpret_cast<CUgraphNode>(result);
-        } else CONFORMANCE_CUDA(cuGraphAddEmptyNode(&node, value, dependencies.begin(), dependencies.size()));
+        } else TEST_CUDA(cuGraphAddEmptyNode(&node, value, dependencies.begin(), dependencies.size()));
         nodes.push_back(node); for (auto dependency : dependencies) edges.emplace_back(dependency, node);
         return node;
     }
@@ -98,31 +98,31 @@ struct topology_graph {
             std::vector<cudaGraphEdgeData> runtime_data(changes.size());
             if (adding) TOPOLOGY_RUNTIME(cudaGraphAddDependencies(reinterpret_cast<cudaGraph_t>(value), sources.data(), targets.data(), metadata ? runtime_data.data() : nullptr, changes.size()));
             else TOPOLOGY_RUNTIME(cudaGraphRemoveDependencies(reinterpret_cast<cudaGraph_t>(value), sources.data(), targets.data(), metadata ? runtime_data.data() : nullptr, changes.size()));
-        } else if (adding) CONFORMANCE_CUDA(cuGraphAddDependencies(value, from.data(), to.data(), metadata ? data.data() : nullptr, changes.size()));
-        else CONFORMANCE_CUDA(cuGraphRemoveDependencies(value, from.data(), to.data(), metadata ? data.data() : nullptr, changes.size()));
+        } else if (adding) TEST_CUDA(cuGraphAddDependencies(value, from.data(), to.data(), metadata ? data.data() : nullptr, changes.size()));
+        else TEST_CUDA(cuGraphRemoveDependencies(value, from.data(), to.data(), metadata ? data.data() : nullptr, changes.size()));
         for (const auto& edge : changes) { if (adding) edges.push_back(edge); else std::erase(edges, edge); }
     }
     void remove(CUgraphNode node, bool runtime) {
         if (runtime) TOPOLOGY_RUNTIME(cudaGraphDestroyNode(reinterpret_cast<cudaGraphNode_t>(node)));
-        else CONFORMANCE_CUDA(cuGraphDestroyNode(node));
+        else TEST_CUDA(cuGraphDestroyNode(node));
         std::erase(nodes, node); std::erase_if(edges, [&](const auto& edge) { return edge.first == node || edge.second == node; });
     }
     void expect() const {
         std::vector<CUgraphNode> roots;
         for (auto node : nodes) if (std::none_of(edges.begin(), edges.end(), [&](const auto& edge) { return edge.second == node; })) roots.push_back(node);
-        topology_query_nodes<CUgraphNode>(nodes, [&](auto* output, auto* count) { CONFORMANCE_CUDA(cuGraphGetNodes(value, output, count)); });
-        topology_query_nodes<CUgraphNode>(roots, [&](auto* output, auto* count) { CONFORMANCE_CUDA(cuGraphGetRootNodes(value, output, count)); });
+        topology_query_nodes<CUgraphNode>(nodes, [&](auto* output, auto* count) { TEST_CUDA(cuGraphGetNodes(value, output, count)); });
+        topology_query_nodes<CUgraphNode>(roots, [&](auto* output, auto* count) { TEST_CUDA(cuGraphGetRootNodes(value, output, count)); });
         topology_query_nodes<cudaGraphNode_t>(nodes, [&](auto* output, auto* count) { TOPOLOGY_RUNTIME(cudaGraphGetNodes(reinterpret_cast<cudaGraph_t>(value), output, count)); });
         topology_query_nodes<cudaGraphNode_t>(roots, [&](auto* output, auto* count) { TOPOLOGY_RUNTIME(cudaGraphGetRootNodes(reinterpret_cast<cudaGraph_t>(value), output, count)); });
-        topology_query_edges<CUgraphNode, CUgraphEdgeData>(edges, [&](auto* from, auto* to, auto* data, auto* count) { CONFORMANCE_CUDA(cuGraphGetEdges(value, from, to, data, count)); });
+        topology_query_edges<CUgraphNode, CUgraphEdgeData>(edges, [&](auto* from, auto* to, auto* data, auto* count) { TEST_CUDA(cuGraphGetEdges(value, from, to, data, count)); });
         topology_query_edges<cudaGraphNode_t, cudaGraphEdgeData>(edges, [&](auto* from, auto* to, auto* data, auto* count) { TOPOLOGY_RUNTIME(cudaGraphGetEdges(reinterpret_cast<cudaGraph_t>(value), from, to, data, count)); });
         for (auto node : nodes) for (bool dependents : {false, true}) {
             std::vector<CUgraphNode> expected;
             for (const auto& edge : edges) if ((dependents ? edge.first : edge.second) == node) expected.push_back(dependents ? edge.second : edge.first);
             topology_query_nodes<CUgraphNode>(expected, [&](auto* output, auto* count) {
                 std::vector<CUgraphEdgeData> data(output ? *count : 0);
-                if (dependents) CONFORMANCE_CUDA(cuGraphNodeGetDependentNodes(node, output, data.empty() ? nullptr : data.data(), count));
-                else CONFORMANCE_CUDA(cuGraphNodeGetDependencies(node, output, data.empty() ? nullptr : data.data(), count));
+                if (dependents) TEST_CUDA(cuGraphNodeGetDependentNodes(node, output, data.empty() ? nullptr : data.data(), count));
+                else TEST_CUDA(cuGraphNodeGetDependencies(node, output, data.empty() ? nullptr : data.data(), count));
                 for (size_t i = 0; output && i < *count; ++i) { CUgraphEdgeData zero{}; require(std::memcmp(&data[i], &zero, sizeof(zero)) == 0, "neighbor default edge data"); }
             });
             topology_query_nodes<cudaGraphNode_t>(expected, [&](auto* output, auto* count) {
@@ -158,33 +158,33 @@ void graph_topology_edits() {
 void topology_launch(CUgraph graph, bool runtime) {
     CUgraphExec executable{};
     if (runtime) { cudaGraphExec_t result{}; TOPOLOGY_RUNTIME(cudaGraphInstantiateWithFlags(&result, reinterpret_cast<cudaGraph_t>(graph), 0)); executable = reinterpret_cast<CUgraphExec>(result); }
-    else CONFORMANCE_CUDA(cuGraphInstantiate(&executable, graph, 0));
+    else TEST_CUDA(cuGraphInstantiate(&executable, graph, 0));
     struct cleanup { CUgraphExec value; ~cleanup() { cuGraphExecDestroy(value); } } cleanup{executable};
     if (runtime) TOPOLOGY_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(executable), nullptr));
-    else CONFORMANCE_CUDA(cuGraphLaunch(executable, nullptr));
-    CONFORMANCE_CUDA(cuCtxSynchronize());
+    else TEST_CUDA(cuGraphLaunch(executable, nullptr));
+    TEST_CUDA(cuCtxSynchronize());
 }
 void graph_topology_execution() {
     for (bool runtime : {false, true}) {
         device_buffer storage(557);
-        void* output{}; CONFORMANCE_CUDA(cuMemAllocHost(&output, 601));
+        void* output{}; TEST_CUDA(cuMemAllocHost(&output, 601));
         struct cleanup { void* value; ~cleanup() { cuCtxSynchronize(); cuMemFreeHost(value); } } cleanup{output};
         topology_graph graph(runtime);
-        CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
         CUgraphNode read{}, left{}, right{}, root{};
         CUDA_MEMCPY3D copy{}; copy.srcMemoryType = CU_MEMORYTYPE_DEVICE; copy.srcDevice = storage.value;
         copy.dstMemoryType = CU_MEMORYTYPE_HOST; copy.dstHost = static_cast<unsigned char*>(output) + 19;
         copy.srcPitch = copy.dstPitch = copy.WidthInBytes = 557; copy.srcHeight = copy.dstHeight = copy.Height = copy.Depth = 1;
-        CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&read, graph.value, nullptr, 0, &copy, context));
+        TEST_CUDA(cuGraphAddMemcpyNode(&read, graph.value, nullptr, 0, &copy, context));
         const auto fill = [&](CUgraphNode* node, size_t offset, size_t count, unsigned value) {
             CUDA_MEMSET_NODE_PARAMS params{}; params.dst = storage.value + offset; params.value = value; params.elementSize = 1; params.width = count; params.height = 1;
-            CONFORMANCE_CUDA(cuGraphAddMemsetNode(node, graph.value, nullptr, 0, &params, context));
+            TEST_CUDA(cuGraphAddMemsetNode(node, graph.value, nullptr, 0, &params, context));
         };
         fill(&left, 23, 173, 0x35); fill(&right, 257, 211, 0x71); fill(&root, 0, 557, 0xa9);
         graph.nodes = {read, left, right, root}; const auto join = graph.empty({}, runtime);
         graph.change({{join, read}, {left, join}, {right, join}, {root, left}, {root, right}}, true, runtime, true); graph.expect();
         for (unsigned seed : {0u, 0x7du, 0xffu}) {
-            CONFORMANCE_CUDA(cuMemsetD8(storage.value, static_cast<unsigned char>(seed), 557)); std::memset(output, 0xd3, 601);
+            TEST_CUDA(cuMemsetD8(storage.value, static_cast<unsigned char>(seed), 557)); std::memset(output, 0xd3, 601);
             topology_launch(graph.value, !runtime);
             std::vector<unsigned char> expected(601, 0xd3); std::fill_n(expected.begin() + 19, 557, 0xa9);
             std::fill_n(expected.begin() + 42, 173, 0x35); std::fill_n(expected.begin() + 19 + 257, 211, 0x71);
@@ -203,19 +203,19 @@ void graph_topology_cycles() {
     }
 }
 template<class Function> Function topology_procedure(const char* name) {
-    void* pointer{}; CONFORMANCE_CUDA(cuGetProcAddress(name, &pointer, 10000, CU_GET_PROC_ADDRESS_DEFAULT, nullptr));
+    void* pointer{}; TEST_CUDA(cuGetProcAddress(name, &pointer, 10000, CU_GET_PROC_ADDRESS_DEFAULT, nullptr));
     require(pointer, "legacy topology procedure address"); return reinterpret_cast<Function>(pointer);
 }
 void graph_topology_legacy() {
     topology_graph graph(false); auto a = graph.empty({}, false), b = graph.empty({}, true);
-    CONFORMANCE_CUDA(topology_procedure<PFN_cuGraphAddDependencies_v10000>("cuGraphAddDependencies")(graph.value, &a, &b, 1));
+    TEST_CUDA(topology_procedure<PFN_cuGraphAddDependencies_v10000>("cuGraphAddDependencies")(graph.value, &a, &b, 1));
     graph.edges.emplace_back(a, b); graph.expect();
     topology_query_edges<CUgraphNode, CUgraphEdgeData>(graph.edges, [&](auto* from, auto* to, auto* data, auto* count) {
-        CONFORMANCE_CUDA(topology_procedure<PFN_cuGraphGetEdges_v10000>("cuGraphGetEdges")(graph.value, from, to, count));
+        TEST_CUDA(topology_procedure<PFN_cuGraphGetEdges_v10000>("cuGraphGetEdges")(graph.value, from, to, count));
     }, false);
-    topology_query_nodes<CUgraphNode>(std::span<const CUgraphNode>(&a, 1), [&](auto* output, auto* count) { CONFORMANCE_CUDA(topology_procedure<PFN_cuGraphNodeGetDependencies_v10000>("cuGraphNodeGetDependencies")(b, output, count)); });
-    topology_query_nodes<CUgraphNode>(std::span<const CUgraphNode>(&b, 1), [&](auto* output, auto* count) { CONFORMANCE_CUDA(topology_procedure<PFN_cuGraphNodeGetDependentNodes_v10000>("cuGraphNodeGetDependentNodes")(a, output, count)); });
-    CONFORMANCE_CUDA(topology_procedure<PFN_cuGraphRemoveDependencies_v10000>("cuGraphRemoveDependencies")(graph.value, &a, &b, 1));
+    topology_query_nodes<CUgraphNode>(std::span<const CUgraphNode>(&a, 1), [&](auto* output, auto* count) { TEST_CUDA(topology_procedure<PFN_cuGraphNodeGetDependencies_v10000>("cuGraphNodeGetDependencies")(b, output, count)); });
+    topology_query_nodes<CUgraphNode>(std::span<const CUgraphNode>(&b, 1), [&](auto* output, auto* count) { TEST_CUDA(topology_procedure<PFN_cuGraphNodeGetDependentNodes_v10000>("cuGraphNodeGetDependentNodes")(a, output, count)); });
+    TEST_CUDA(topology_procedure<PFN_cuGraphRemoveDependencies_v10000>("cuGraphRemoveDependencies")(graph.value, &a, &b, 1));
     graph.edges.clear(); graph.expect();
 }
 void graph_topology_validation() {
@@ -254,5 +254,5 @@ void execute_graph_topology() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::topology_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_graph_topology);
+    return cudavm::run_test(argc, argv, cudavm::execute_graph_topology);
 }

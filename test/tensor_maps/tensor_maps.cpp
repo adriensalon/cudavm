@@ -54,13 +54,13 @@ struct tensor_map_storage {
     std::vector<unsigned char> input;
     tensor_map_storage() : input(size) {
         for (size_t i = 0; i < size; ++i) input[i] = static_cast<unsigned char>(0x71 + i * 19 + (i >> 6));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(first.value, input.data(), size));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(second.value, input.data(), size));
+        TEST_CUDA(cuMemcpyHtoD(first.value, input.data(), size));
+        TEST_CUDA(cuMemcpyHtoD(second.value, input.data(), size));
     }
     void preserved() const {
         std::vector<unsigned char> output(size);
         for (auto pointer : {first.value, second.value}) {
-            CONFORMANCE_CUDA(cuMemcpyDtoH(output.data(), pointer, size));
+            TEST_CUDA(cuMemcpyDtoH(output.data(), pointer, size));
             require(output == input, "tensor map metadata operations preserve device allocations");
         }
     }
@@ -68,14 +68,14 @@ struct tensor_map_storage {
 std::string_view tensor_map_backend, tensor_map_case;
 bool tensor_map_native_hardware() {
     CUdevice device{}; int major{};
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+    TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
     return tensor_map_backend == "cuda" && major >= 9;
 }
 void tensor_map_discovery() {
     for (const auto* name : {"cuTensorMapEncodeTiled", "cuTensorMapReplaceAddress"}) {
         void* pointer{}; CUdriverProcAddressQueryResult status{};
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &pointer, 12000, 0, &status));
+        TEST_CUDA(cuGetProcAddress(name, &pointer, 12000, 0, &status));
         require(pointer && status == CU_GET_PROC_ADDRESS_SUCCESS, "tensor map introduction-version procedure discovery");
         if (std::string_view(name) == "cuTensorMapEncodeTiled") {
             const auto encode = reinterpret_cast<decltype(&cuTensorMapEncodeTiled)>(pointer);
@@ -84,7 +84,7 @@ void tensor_map_discovery() {
                 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_ERROR_INVALID_VALUE, "tensor encode resolved ABI is callable");
         } else require(reinterpret_cast<decltype(&cuTensorMapReplaceAddress)>(pointer)(nullptr, nullptr) == CUDA_ERROR_INVALID_VALUE,
             "tensor replace resolved ABI is callable");
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &pointer, 11080, 0, &status));
+        TEST_CUDA(cuGetProcAddress(name, &pointer, 11080, 0, &status));
         require(!pointer && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "tensor map entry points require CUDA 12.0");
     }
 }
@@ -103,29 +103,29 @@ void tensor_map_pending(const tensor_map_shape& shape, guarded_tensor_map& outpu
     tensor_map_callback_gate gate;
     struct pending_stream {
         CUstream value{};
-        pending_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+        pending_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
         ~pending_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
     } stream;
     std::promise<CUresult> completion;
     auto result = completion.get_future();
     std::jthread worker;
     struct release_gate { tensor_map_callback_gate& gate; ~release_gate() { gate.release(); } } release{gate};
-    CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
-    CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, tensor_map_callback_gate::callback, &gate));
+    CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
+    TEST_CUDA(cuLaunchHostFunc(stream.value, tensor_map_callback_gate::callback, &gate));
     {
         std::unique_lock lock(gate.mutex);
         require(gate.changed.wait_for(lock, std::chrono::seconds(5), [&] { return gate.entered; }), "tensor map pending-work callback entered");
     }
     worker = std::jthread([&] {
         try {
-            CONFORMANCE_CUDA(cuCtxSetCurrent(context));
+            TEST_CUDA(cuCtxSetCurrent(context));
             const auto status = shape.encode(&output.value);
             completion.set_value(status); cuCtxSetCurrent(nullptr);
         } catch (...) { cuCtxSetCurrent(nullptr); completion.set_exception(std::current_exception()); }
     });
     const bool completed_while_held = result.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
     gate.release(); worker.join();
-    CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+    TEST_CUDA(cuStreamSynchronize(stream.value));
     require(completed_while_held, "host tensor descriptor encoding does not drain an earlier held stream callback");
     require(result.get() == expected, "pending stream work does not change the tensor encoder result");
     output.guards();
@@ -173,7 +173,7 @@ void tensor_map_validation() {
     reject(cuTensorMapReplaceAddress(misaligned, legal.address), "replace misaligned output");
     reject(cuTensorMapReplaceAddress(&output.value, reinterpret_cast<void*>(static_cast<uintptr_t>(storage.second.value + 1))), "replace misaligned address");
     const auto result = legal.encode(&output.value);
-    if (tensor_map_native_hardware() && native_cuda_version() >= 12000) CONFORMANCE_CUDA(result);
+    if (tensor_map_native_hardware() && native_cuda_version() >= 12000) TEST_CUDA(result);
     else {
         require(result == CUDA_ERROR_NOT_SUPPORTED, "legal tensor map control reports unavailable encoder");
         std::puts("Encoding control unavailable; validation checks do not establish successful descriptor encoding.");
@@ -202,7 +202,7 @@ struct native_tensor_map_reference {
         if (!pointer) {
             using resolver = CUresult (CUDAAPI*)(const char*, void**, int, cuuint64_t);
             auto resolve = reinterpret_cast<resolver>(find("cuGetProcAddress"));
-            if (resolve) CONFORMANCE_CUDA(resolve(name, &pointer, 12000, 0));
+            if (resolve) TEST_CUDA(resolve(name, &pointer, 12000, 0));
         }
         require(pointer != nullptr, std::string("native tensor map reference entry point: ") + name);
         return reinterpret_cast<T>(pointer);
@@ -215,8 +215,8 @@ struct native_tensor_map_reference {
     }
     void enter(CUdeviceptr pointer) {
         auto attribute = symbol<decltype(&cuPointerGetAttribute)>("cuPointerGetAttribute"); CUcontext context{};
-        CONFORMANCE_CUDA(attribute(&context, CU_POINTER_ATTRIBUTE_CONTEXT, pointer));
-        CONFORMANCE_CUDA(push(context)); pushed = true;
+        TEST_CUDA(attribute(&context, CU_POINTER_ATTRIBUTE_CONTEXT, pointer));
+        TEST_CUDA(push(context)); pushed = true;
     }
     ~native_tensor_map_reference() {
         if (pushed) { CUcontext prior{}; pop(&prior); }
@@ -236,8 +236,8 @@ void tensor_map_positive() {
         for (unsigned first_stride : {0u, 1u}) {
             tensor_map_shape shape(storage.first.value); shape.rank = rank; shape.type = type; shape.elements[0] = first_stride;
             guarded_tensor_map actual, expected;
-            CONFORMANCE_CUDA(shape.encode(&expected.value, reference.encode));
-            CONFORMANCE_CUDA(shape.encode(&actual.value));
+            TEST_CUDA(shape.encode(&expected.value, reference.encode));
+            TEST_CUDA(shape.encode(&actual.value));
             auto compare = [&] {
                 actual.guards(); expected.guards();
                 require(!std::memcmp(&actual.value, &expected.value, sizeof(CUtensorMap)),
@@ -246,8 +246,8 @@ void tensor_map_positive() {
             compare();
             if (tensor_map_case == "replacement") for (auto pointer : {storage.second.value, storage.first.value}) {
                 auto* address = reinterpret_cast<void*>(static_cast<uintptr_t>(pointer));
-                CONFORMANCE_CUDA(reference.replace(&expected.value, address));
-                CONFORMANCE_CUDA(cuTensorMapReplaceAddress(&actual.value, address)); compare();
+                TEST_CUDA(reference.replace(&expected.value, address));
+                TEST_CUDA(cuTensorMapReplaceAddress(&actual.value, address)); compare();
             }
         }
     storage.preserved();
@@ -260,5 +260,5 @@ void tensor_map_execute() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::tensor_map_backend = argv[1]; cudavm::tensor_map_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::tensor_map_execute);
+    return cudavm::run_test(argc, argv, cudavm::tensor_map_execute);
 }

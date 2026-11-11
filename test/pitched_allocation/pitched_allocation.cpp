@@ -7,7 +7,7 @@ struct pitched_storage {
     CUdeviceptr value{};
     size_t pitch{};
     pitched_storage(size_t width, size_t height, unsigned element) {
-        CONFORMANCE_CUDA(cuMemAllocPitch(&value, &pitch, width, height, element));
+        TEST_CUDA(cuMemAllocPitch(&value, &pitch, width, height, element));
     }
     ~pitched_storage() { if (value) cuMemFree(value); }
 };
@@ -23,10 +23,10 @@ void execute_pitched_allocation() {
         const size_t volume = storage.pitch * rows;
         CUdeviceptr base{};
         size_t extent = 0;
-        CONFORMANCE_CUDA(cuMemGetAddressRange(&base, &extent, storage.value));
+        TEST_CUDA(cuMemGetAddressRange(&base, &extent, storage.value));
         require(base == storage.value && extent >= volume, "pitched allocation contains every requested row");
         std::vector<unsigned char> initial(volume + 32, guard), expected(initial), actual(initial);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(storage.value, initial.data() + 16, volume));
+        TEST_CUDA(cuMemcpyHtoD(storage.value, initial.data() + 16, volume));
         for (unsigned phase = 0; phase < 2; ++phase) {
             const size_t column = phase && width > 7 ? 3 : 0;
             const size_t count = phase && width > 7 ? width - 6 : width;
@@ -35,11 +35,11 @@ void execute_pitched_allocation() {
                 std::vector<unsigned char> payload(count);
                 for (size_t x = 0; x < count; ++x) payload[x] = static_cast<unsigned char>(element * 7 + row * 31 + (x + column) * 13 + phase * 57);
                 const auto preserved = payload;
-                CONFORMANCE_CUDA(cuMemcpyHtoD(storage.value + row * storage.pitch + column, payload.data(), count));
+                TEST_CUDA(cuMemcpyHtoD(storage.value + row * storage.pitch + column, payload.data(), count));
                 require(payload == preserved, "pitched row upload source preservation");
                 std::copy(payload.begin(), payload.end(), expected.begin() + 16 + row * storage.pitch + column);
             }
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data() + 16, storage.value, volume));
+            TEST_CUDA(cuMemcpyDtoH(actual.data() + 16, storage.value, volume));
             const auto context = "pitched allocation width=" + std::to_string(width)
                 + " rows=" + std::to_string(payload_rows) + " hint=" + std::to_string(element)
                 + " pitch=" + std::to_string(storage.pitch) + " phase=" + std::to_string(phase);
@@ -48,14 +48,14 @@ void execute_pitched_allocation() {
             for (size_t row = 0; row < rows; ++row) {
                 CUdeviceptr row_base{};
                 size_t row_extent = 0;
-                CONFORMANCE_CUDA(cuMemGetAddressRange(&row_base, &row_extent, storage.value + row * storage.pitch + width - 1));
+                TEST_CUDA(cuMemGetAddressRange(&row_base, &row_extent, storage.value + row * storage.pitch + width - 1));
                 require(row_base == base && row_extent == extent, context + ": row address identity");
             }
         }
-        CONFORMANCE_CUDA(cuMemFree(storage.value)); storage.value = 0;
+        TEST_CUDA(cuMemFree(storage.value)); storage.value = 0;
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::execute_pitched_allocation);
+    return cudavm::run_test(argc, argv, cudavm::execute_pitched_allocation);
 }

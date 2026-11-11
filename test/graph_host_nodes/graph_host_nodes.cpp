@@ -10,7 +10,7 @@ void check_graph_host_runtime(cudaError_t result, const char* operation) {
 #define GRAPH_HOST_RUNTIME(call) ::cudavm::check_graph_host_runtime((call), #call)
 struct graph_host_pinned {
     void* value{};
-    explicit graph_host_pinned(size_t size) { CONFORMANCE_CUDA(cuMemAllocHost(&value, size)); }
+    explicit graph_host_pinned(size_t size) { TEST_CUDA(cuMemAllocHost(&value, size)); }
     ~graph_host_pinned() { if (value) cuMemFreeHost(value); }
 };
 struct graph_host_storage {
@@ -20,7 +20,7 @@ struct graph_host_storage {
     void reset() {
         std::memset(source.value, 0xa5, device_size);
         std::memset(output.value, 0xc3, output_size);
-        CONFORMANCE_CUDA(cuMemsetD8(device.value, 0x91, device_size));
+        TEST_CUDA(cuMemsetD8(device.value, 0x91, device_size));
     }
 };
 struct graph_host_state {
@@ -62,7 +62,7 @@ struct graph_host_state {
 };
 struct graph_host_stream {
     CUstream value{};
-    graph_host_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    graph_host_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~graph_host_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct host_node_graph {
@@ -74,7 +74,7 @@ struct host_node_graph {
         if (runtime) {
             cudaGraph_t graph{}; GRAPH_HOST_RUNTIME(cudaGraphCreate(&graph, 0));
             value = reinterpret_cast<CUgraph>(graph);
-        } else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        } else TEST_CUDA(cuGraphCreate(&value, 0));
     }
     ~host_node_graph() {
         if (executable) cuGraphExecDestroy(executable);
@@ -88,7 +88,7 @@ struct host_node_graph {
             cudaGraphNode_t node{}, prior = reinterpret_cast<cudaGraphNode_t>(dependency);
             GRAPH_HOST_RUNTIME(cudaGraphAddEmptyNode(&node, runtime_value(), dependency ? &prior : nullptr, dependency ? 1 : 0));
             result = reinterpret_cast<CUgraphNode>(node);
-        } else CONFORMANCE_CUDA(cuGraphAddEmptyNode(&result, value, dependency ? &dependency : nullptr, dependency ? 1 : 0));
+        } else TEST_CUDA(cuGraphAddEmptyNode(&result, value, dependency ? &dependency : nullptr, dependency ? 1 : 0));
         return result;
     }
     CUgraphNode host(CUgraphNode dependency, CUhostFn function, void* argument) {
@@ -100,7 +100,7 @@ struct host_node_graph {
             result = reinterpret_cast<CUgraphNode>(node);
         } else {
             CUDA_HOST_NODE_PARAMS parameters{function, argument};
-            CONFORMANCE_CUDA(cuGraphAddHostNode(&result, value, &dependency, 1, &parameters));
+            TEST_CUDA(cuGraphAddHostNode(&result, value, &dependency, 1, &parameters));
         }
         return result;
     }
@@ -112,14 +112,14 @@ struct host_node_graph {
             else GRAPH_HOST_RUNTIME(cudaGraphHostNodeSetParams(handle, &parameters));
         } else {
             CUDA_HOST_NODE_PARAMS parameters{function, argument};
-            if (live) CONFORMANCE_CUDA(cuGraphExecHostNodeSetParams(executable, node, &parameters));
-            else CONFORMANCE_CUDA(cuGraphHostNodeSetParams(node, &parameters));
+            if (live) TEST_CUDA(cuGraphExecHostNodeSetParams(executable, node, &parameters));
+            else TEST_CUDA(cuGraphHostNodeSetParams(node, &parameters));
         }
     }
     void expect(CUgraphNode node, CUhostFn function, void* argument) {
         struct driver_output { uint64_t before = 0xdeadbeef; CUDA_HOST_NODE_PARAMS params{}; uint64_t after = 0x89abcdef; } a;
         struct runtime_output { uint64_t before = 0xdeadbeef; cudaHostNodeParams params{}; uint64_t after = 0x89abcdef; } b;
-        CONFORMANCE_CUDA(cuGraphHostNodeGetParams(node, &a.params));
+        TEST_CUDA(cuGraphHostNodeGetParams(node, &a.params));
         GRAPH_HOST_RUNTIME(cudaGraphHostNodeGetParams(reinterpret_cast<cudaGraphNode_t>(node), &b.params));
         require(a.before == 0xdeadbeef && a.after == 0x89abcdef && b.before == 0xdeadbeef && b.after == 0x89abcdef,
             "host-node parameter output widths");
@@ -127,9 +127,9 @@ struct host_node_graph {
             && b.params.fn == function && b.params.userData == argument, "both facades retain exact function/data pointers");
     }
     CUgraphNode copy(CUgraphNode dependency, const CUDA_MEMCPY3D& parameters) {
-        CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        CUcontext context{}; TEST_CUDA(cuCtxGetCurrent(&context));
         CUgraphNode result{};
-        CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&result, value, &dependency, 1, &parameters, context));
+        TEST_CUDA(cuGraphAddMemcpyNode(&result, value, &dependency, 1, &parameters, context));
         return result;
     }
     void build(graph_host_storage& storage, graph_host_state& argument) {
@@ -152,7 +152,7 @@ struct host_node_graph {
         inspect = host(downloaded, graph_host_state::inspect, &argument);
         terminal = empty(inspect);
         for (auto node : {root, terminal}) {
-            CUgraphNodeType type{}; CONFORMANCE_CUDA(cuGraphNodeGetType(node, &type));
+            CUgraphNodeType type{}; TEST_CUDA(cuGraphNodeGetType(node, &type));
             require(type == CU_GRAPH_NODE_TYPE_EMPTY, "empty-node type");
         }
         expect(publish, graph_host_state::primary, &argument);
@@ -163,24 +163,24 @@ struct host_node_graph {
             cudaGraphExec_t result{};
             GRAPH_HOST_RUNTIME(cudaGraphInstantiateWithFlags(&result, runtime_value(), 0));
             executable = reinterpret_cast<CUgraphExec>(result);
-        } else CONFORMANCE_CUDA(cuGraphInstantiate(&executable, value, 0));
+        } else TEST_CUDA(cuGraphInstantiate(&executable, value, 0));
     }
     void run(CUstream stream) {
         if (runtime) {
             GRAPH_HOST_RUNTIME(cudaGraphLaunch(runtime_executable(), reinterpret_cast<cudaStream_t>(stream)));
-            CONFORMANCE_CUDA(cuStreamSynchronize(stream));
+            TEST_CUDA(cuStreamSynchronize(stream));
         } else {
-            CONFORMANCE_CUDA(cuGraphLaunch(executable, stream));
+            TEST_CUDA(cuGraphLaunch(executable, stream));
             GRAPH_HOST_RUNTIME(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)));
         }
     }
     void destroy_source() {
-        if (runtime) CONFORMANCE_CUDA(cuGraphDestroy(value));
+        if (runtime) TEST_CUDA(cuGraphDestroy(value));
         else GRAPH_HOST_RUNTIME(cudaGraphDestroy(runtime_value()));
         value = nullptr;
     }
     void destroy_executable() {
-        if (runtime) CONFORMANCE_CUDA(cuGraphExecDestroy(executable));
+        if (runtime) TEST_CUDA(cuGraphExecDestroy(executable));
         else GRAPH_HOST_RUNTIME(cudaGraphExecDestroy(runtime_executable()));
         executable = nullptr;
     }
@@ -278,5 +278,5 @@ void execute_graph_host_nodes() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::graph_host_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_graph_host_nodes);
+    return cudavm::run_test(argc, argv, cudavm::execute_graph_host_nodes);
 }

@@ -71,7 +71,7 @@ void execute_texture_filtering(const loaded_program& program) {
         }
         samples.resize(samples.size() + guards, std::bit_cast<float>(0x4a716395));
         inputs[profile] = std::make_unique<device_buffer>(samples.size() * 4);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(inputs[profile]->value, samples.data(), samples.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(inputs[profile]->value, samples.data(), samples.size() * 4));
     }
     for (auto resource : {CU_RESOURCE_TYPE_ARRAY, CU_RESOURCE_TYPE_PITCH2D}) for (bool runtime : {false, true})
     for (auto mode : {CU_TR_ADDRESS_MODE_WRAP, CU_TR_ADDRESS_MODE_MIRROR, CU_TR_ADDRESS_MODE_CLAMP, CU_TR_ADDRESS_MODE_BORDER})
@@ -85,11 +85,11 @@ void execute_texture_filtering(const loaded_program& program) {
         storage.upload(); image_test_texture texture(storage, runtime, mode, linear ? CU_TR_FILTER_MODE_LINEAR : CU_TR_FILTER_MODE_POINT,
             normalized, false, {-3, 11, 5, -7});
         std::vector<uint32_t> output(guards + count * 4 + guards, 0xa7b96351);
-        device_buffer destination(output.size() * 4); CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, output.data(), output.size() * 4));
+        device_buffer destination(output.size() * 4); TEST_CUDA(cuMemcpyHtoD(destination.value, output.data(), output.size() * 4));
         auto pointer = destination.value + guards * 4, positions = inputs[profile]->value + guards * 4;
         void* args[]{&texture.value, &pointer, &positions, &count};
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function("filter_texture"), (count + 63) / 64, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
-        CONFORMANCE_CUDA(cuCtxSynchronize()); CONFORMANCE_CUDA(cuMemcpyDtoH(output.data(), destination.value, output.size() * 4));
+        TEST_CUDA(cuLaunchKernel(program.function("filter_texture"), (count + 63) / 64, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
+        TEST_CUDA(cuCtxSynchronize()); TEST_CUDA(cuMemcpyDtoH(output.data(), destination.value, output.size() * 4));
         for (unsigned i = 0; i < output.size(); ++i) {
             uint32_t expected = 0xa7b96351;
             if (i >= guards && i < guards + count * 4) {
@@ -114,7 +114,7 @@ void execute_texture_filtering(const loaded_program& program) {
     }
     for (unsigned profile = 0; profile < 2; ++profile) {
         const auto& samples = coordinates[profile]; std::vector<float> preserved(samples.size());
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), inputs[profile]->value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), inputs[profile]->value, preserved.size() * 4));
         require(std::memcmp(preserved.data(), samples.data(), samples.size() * 4) == 0, "filtering preserves every input coordinate and guard");
     }
 }
@@ -124,5 +124,5 @@ int main(int argc, char** argv) {
     const std::string_view profile = argv[3];
     if (profile != "finite" && profile != "special") return 1;
     cudavm::filtering_special = profile == "special";
-    return cudavm::run_conformance(argc - 1, argv, cudavm::fixtures, cudavm::execute_texture_filtering);
+    return cudavm::run_test(argc - 1, argv, cudavm::fixtures, cudavm::execute_texture_filtering);
 }

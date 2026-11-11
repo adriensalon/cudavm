@@ -11,9 +11,9 @@ void check_child_runtime(cudaError_t result, const char* operation) {
 struct child_patch { size_t offset, count; unsigned value; };
 struct child_storage {
     device_buffer device{557}; void* output{};
-    child_storage() { CONFORMANCE_CUDA(cuMemAllocHost(&output, 601)); }
+    child_storage() { TEST_CUDA(cuMemAllocHost(&output, 601)); }
     ~child_storage() { if (output) { cuCtxSynchronize(); cuMemFreeHost(output); } }
-    void reset(unsigned seed) { CONFORMANCE_CUDA(cuMemsetD8(device.value, static_cast<unsigned char>(seed), 557)); std::memset(output, 0xd3, 601); }
+    void reset(unsigned seed) { TEST_CUDA(cuMemsetD8(device.value, static_cast<unsigned char>(seed), 557)); std::memset(output, 0xd3, 601); }
     void expect(unsigned seed, std::initializer_list<child_patch> patches) const {
         std::vector<unsigned char> expected(601, 0xd3);
         std::fill_n(expected.begin() + 19, 557, static_cast<unsigned char>(seed));
@@ -30,16 +30,16 @@ CUDA_MEMSET_NODE_PARAMS child_fill_params(const child_storage& storage, child_pa
 struct child_graph {
     CUgraph value{}; CUcontext context{};
     explicit child_graph(bool runtime) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        TEST_CUDA(cuCtxGetCurrent(&context));
         if (runtime) { cudaGraph_t graph{}; CHILD_RUNTIME(cudaGraphCreate(&graph, 0)); value = reinterpret_cast<CUgraph>(graph); }
-        else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        else TEST_CUDA(cuGraphCreate(&value, 0));
     }
     child_graph(const child_graph&) = delete;
     child_graph& operator=(const child_graph&) = delete;
     ~child_graph() { if (value) cuGraphDestroy(value); }
     void destroy(bool runtime) {
         if (runtime) CHILD_RUNTIME(cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(value)));
-        else CONFORMANCE_CUDA(cuGraphDestroy(value)); value = nullptr;
+        else TEST_CUDA(cuGraphDestroy(value)); value = nullptr;
     }
     CUgraphNode fill(const child_storage& storage, child_patch patch, bool runtime, CUgraphNode dependency = nullptr) const {
         const auto p = child_fill_params(storage, patch); CUgraphNode node{};
@@ -47,7 +47,7 @@ struct child_graph {
             cudaMemsetParams params{reinterpret_cast<void*>(static_cast<uintptr_t>(p.dst)), 0, p.value, 1, p.width, 1};
             auto dep = reinterpret_cast<cudaGraphNode_t>(dependency); cudaGraphNode_t result{};
             CHILD_RUNTIME(cudaGraphAddMemsetNode(&result, reinterpret_cast<cudaGraph_t>(value), dependency ? &dep : nullptr, dependency ? 1 : 0, &params)); node = reinterpret_cast<CUgraphNode>(result);
-        } else CONFORMANCE_CUDA(cuGraphAddMemsetNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, &p, context));
+        } else TEST_CUDA(cuGraphAddMemsetNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, &p, context));
         return node;
     }
     CUgraphNode child(CUgraph source, bool runtime, CUgraphNode dependency = nullptr) const {
@@ -56,16 +56,16 @@ struct child_graph {
             auto dep = reinterpret_cast<cudaGraphNode_t>(dependency); cudaGraphNode_t result{};
             CHILD_RUNTIME(cudaGraphAddChildGraphNode(&result, reinterpret_cast<cudaGraph_t>(value), dependency ? &dep : nullptr, dependency ? 1 : 0, reinterpret_cast<cudaGraph_t>(source)));
             node = reinterpret_cast<CUgraphNode>(result);
-        } else CONFORMANCE_CUDA(cuGraphAddChildGraphNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, source));
+        } else TEST_CUDA(cuGraphAddChildGraphNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, source));
         CUgraphNodeType driver_type{}; cudaGraphNodeType runtime_type{};
-        CONFORMANCE_CUDA(cuGraphNodeGetType(node, &driver_type)); CHILD_RUNTIME(cudaGraphNodeGetType(reinterpret_cast<cudaGraphNode_t>(node), &runtime_type));
+        TEST_CUDA(cuGraphNodeGetType(node, &driver_type)); CHILD_RUNTIME(cudaGraphNodeGetType(reinterpret_cast<cudaGraphNode_t>(node), &runtime_type));
         require(driver_type == CU_GRAPH_NODE_TYPE_GRAPH && runtime_type == cudaGraphNodeTypeGraph, "both surfaces classify child graph nodes");
         return node;
     }
 };
 CUgraph child_owned_graph(CUgraphNode node, CUgraph original) {
     struct guarded_graph { uint64_t prefix = 0x123456789abcdef0; CUgraph value{}; uint64_t suffix = 0xfedcba9876543210; } driver;
-    cudaGraph_t runtime{}; CONFORMANCE_CUDA(cuGraphChildGraphNodeGetGraph(node, &driver.value));
+    cudaGraph_t runtime{}; TEST_CUDA(cuGraphChildGraphNodeGetGraph(node, &driver.value));
     CHILD_RUNTIME(cudaGraphChildGraphNodeGetGraph(reinterpret_cast<cudaGraphNode_t>(node), &runtime));
     require(driver.value && driver.value != original && driver.value == reinterpret_cast<CUgraph>(runtime), "both surfaces return one distinct owned child clone");
     require(driver.prefix == 0x123456789abcdef0 && driver.suffix == 0xfedcba9876543210, "child graph output guards");
@@ -73,7 +73,7 @@ CUgraph child_owned_graph(CUgraphNode node, CUgraph original) {
 }
 CUgraphNode child_cloned_fill(CUgraphNode original, CUgraph graph) {
     CUgraphNode driver{}; cudaGraphNode_t runtime{};
-    CONFORMANCE_CUDA(cuGraphNodeFindInClone(&driver, original, graph));
+    TEST_CUDA(cuGraphNodeFindInClone(&driver, original, graph));
     CHILD_RUNTIME(cudaGraphNodeFindInClone(&runtime, reinterpret_cast<cudaGraphNode_t>(original), reinterpret_cast<cudaGraph_t>(graph)));
     require(driver && driver != original && driver == reinterpret_cast<CUgraphNode>(runtime), "owned child maps its original fill to a distinct node");
     return driver;
@@ -83,10 +83,10 @@ void child_set_fill(CUgraphNode node, const child_storage& storage, child_patch 
     if (runtime) {
         cudaMemsetParams params{reinterpret_cast<void*>(static_cast<uintptr_t>(p.dst)), 0, p.value, 1, p.width, 1};
         CHILD_RUNTIME(cudaGraphMemsetNodeSetParams(reinterpret_cast<cudaGraphNode_t>(node), &params));
-    } else CONFORMANCE_CUDA(cuGraphMemsetNodeSetParams(node, &p));
+    } else TEST_CUDA(cuGraphMemsetNodeSetParams(node, &p));
 }
 void child_expect_fill(CUgraphNode node, const child_storage& storage, child_patch patch) {
-    CUDA_MEMSET_NODE_PARAMS p{}; CONFORMANCE_CUDA(cuGraphMemsetNodeGetParams(node, &p)); const auto expected = child_fill_params(storage, patch);
+    CUDA_MEMSET_NODE_PARAMS p{}; TEST_CUDA(cuGraphMemsetNodeGetParams(node, &p)); const auto expected = child_fill_params(storage, patch);
     require(p.dst == expected.dst && p.width == expected.width && p.height == 1 && p.elementSize == 1 && p.value == expected.value, "independent child fill parameter snapshot");
 }
 struct child_parent {
@@ -98,21 +98,21 @@ struct child_parent {
         CUDA_MEMCPY3D copy{}; copy.srcMemoryType = CU_MEMORYTYPE_DEVICE; copy.srcDevice = storage.device.value;
         copy.dstMemoryType = CU_MEMORYTYPE_HOST; copy.dstHost = static_cast<unsigned char*>(storage.output) + 19;
         copy.srcPitch = copy.dstPitch = copy.WidthInBytes = 557; copy.srcHeight = copy.dstHeight = copy.Height = copy.Depth = 1;
-        CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&read, graph.value, &tail, 1, &copy, graph.context));
+        TEST_CUDA(cuGraphAddMemcpyNode(&read, graph.value, &tail, 1, &copy, graph.context));
     }
 };
 struct child_executable {
     CUgraphExec value{};
     child_executable(CUgraph graph, bool runtime) {
         if (runtime) { cudaGraphExec_t result{}; CHILD_RUNTIME(cudaGraphInstantiateWithFlags(&result, reinterpret_cast<cudaGraph_t>(graph), 0)); value = reinterpret_cast<CUgraphExec>(result); }
-        else CONFORMANCE_CUDA(cuGraphInstantiate(&value, graph, 0));
+        else TEST_CUDA(cuGraphInstantiate(&value, graph, 0));
     }
     ~child_executable() { if (value) { cuCtxSynchronize(); cuGraphExecDestroy(value); } }
     void run(child_storage& storage, unsigned seed, std::initializer_list<child_patch> patches, bool runtime) const {
         storage.reset(seed);
         if (runtime) CHILD_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(value), nullptr));
-        else CONFORMANCE_CUDA(cuGraphLaunch(value, nullptr));
-        CONFORMANCE_CUDA(cuCtxSynchronize()); storage.expect(seed, patches);
+        else TEST_CUDA(cuGraphLaunch(value, nullptr));
+        TEST_CUDA(cuCtxSynchronize()); storage.expect(seed, patches);
     }
 };
 void graph_child_nodes_snapshot() {
@@ -158,7 +158,7 @@ void graph_child_nodes_nested() {
         middle.fill(storage, {125, 87, 0x3d}, !runtime, child);
         child_parent parent(storage, middle.value, runtime);
         const auto owned = child_owned_graph(parent.child, middle.value);
-        size_t count = 0; CONFORMANCE_CUDA(cuGraphGetNodes(owned, nullptr, &count)); require(count == 3, "middle child retains all nested nodes");
+        size_t count = 0; TEST_CUDA(cuGraphGetNodes(owned, nullptr, &count)); require(count == 3, "middle child retains all nested nodes");
         child_executable executable(parent.graph.value, !runtime);
         for (unsigned seed : {0u, 0x7du, 0xffu}) executable.run(storage, seed, {{17, 53, 0x99}, {43, 137, 0xab}, {125, 87, 0x3d}}, runtime);
     }
@@ -171,7 +171,7 @@ void graph_child_nodes_executable() {
         const auto copied = child_cloned_fill(fill, child_owned_graph(parent.child, source.value));
         child_executable changed(parent.graph.value, runtime), independent(parent.graph.value, !runtime);
         if (runtime) CHILD_RUNTIME(cudaGraphExecChildGraphNodeSetParams(reinterpret_cast<cudaGraphExec_t>(changed.value), reinterpret_cast<cudaGraphNode_t>(parent.child), reinterpret_cast<cudaGraph_t>(replacement.value)));
-        else CONFORMANCE_CUDA(cuGraphExecChildGraphNodeSetParams(changed.value, parent.child, replacement.value));
+        else TEST_CUDA(cuGraphExecChildGraphNodeSetParams(changed.value, parent.child, replacement.value));
         child_expect_fill(copied, storage, {43, 137, 0xab}); child_expect_fill(fill, storage, {43, 137, 0xab});
         replacement.destroy(runtime);
         for (unsigned seed : {0u, 0x7du, 0xffu}) {
@@ -195,7 +195,7 @@ void graph_child_nodes_validation() {
     const auto foreign_node = foreign.fill(storage, {43, 137, 0xab}, true);
     child_parent parent(storage, empty.value, true);
     const auto owned = child_owned_graph(parent.child, empty.value);
-    size_t count = 1; CONFORMANCE_CUDA(cuGraphGetNodes(owned, nullptr, &count)); require(count == 0, "empty child clone has no nodes");
+    size_t count = 1; TEST_CUDA(cuGraphGetNodes(owned, nullptr, &count)); require(count == 0, "empty child clone has no nodes");
     CUgraph output{}; CUgraphNode node{}; cudaGraphNode_t runtime_node{}; cudaGraph_t runtime_graph{};
     require(cuGraphChildGraphNodeGetGraph(parent.child, nullptr) == CUDA_ERROR_INVALID_VALUE, "null Driver child graph output");
     require(cudaGraphChildGraphNodeGetGraph(reinterpret_cast<cudaGraphNode_t>(parent.child), nullptr) == cudaErrorInvalidValue, "null Runtime child graph output");
@@ -223,5 +223,5 @@ void execute_graph_child_nodes() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::child_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_graph_child_nodes);
+    return cudavm::run_test(argc, argv, cudavm::execute_graph_child_nodes);
 }

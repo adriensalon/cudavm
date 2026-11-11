@@ -125,5 +125,5 @@ void execute_nvfatbin_lifecycle() {
 }
 int main(int argc, char** argv) {
     if (argc == 2) cudavm::fatbin_case = argv[1];
-    return cudavm::run_host_conformance(argc, argv, cudavm::execute_nvfatbin_lifecycle);
+    return cudavm::run_host_test(argc, argv, cudavm::execute_nvfatbin_lifecycle);
 }

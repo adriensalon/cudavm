@@ -71,7 +71,7 @@ void execute_integer_dpx(const loaded_program& program) {
     std::vector<uint32_t> initial((capacity + 3) * integer_dpx_fields + guards * 2, guard), actual(initial.size()), expected(initial);
     for (unsigned i = 0; i < capacity; ++i) std::copy(values[i].begin(), values[i].end(), input.begin() + guards + i * 3);
     device_buffer source(input.size() * 4), output(initial.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
     auto from = source.value + guards * 4, to = output.value + guards * 4;
     for (unsigned threads : {33u, 128u}) for (unsigned count : {0u, 1u, 37u, capacity}) {
         expected = initial;
@@ -79,17 +79,17 @@ void execute_integer_dpx(const loaded_program& program) {
             const auto row = integer_dpx_oracle(values[i]);
             std::copy(row.begin(), row.end(), expected.begin() + guards + i * integer_dpx_fields);
         }
-        CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, initial.data(), initial.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(output.value, initial.data(), initial.size() * 4));
         void* arguments[]{&to, &from, &count};
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function("integer_dpx_values"), (capacity + threads - 1) / threads,
+        TEST_CUDA(cuLaunchKernel(program.function("integer_dpx_values"), (capacity + threads - 1) / threads,
             1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
         expect_words(actual, expected, "DPX threads=" + std::to_string(threads) + " count=" + std::to_string(count));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "DPX complete source preservation");
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_integer_dpx);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_integer_dpx);
 }

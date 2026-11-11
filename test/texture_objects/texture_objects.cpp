@@ -29,10 +29,10 @@ struct texture_backing {
         if (type == CU_RESOURCE_TYPE_ARRAY) {
             CUDA_ARRAY3D_DESCRIPTOR descriptor{}; descriptor.Width = width; descriptor.Height = height;
             descriptor.Format = CU_AD_FORMAT_UNSIGNED_INT32; descriptor.NumChannels = channels;
-            CONFORMANCE_CUDA(cuArray3DCreate(&array, &descriptor)); pitch = width * channels * 4;
+            TEST_CUDA(cuArray3DCreate(&array, &descriptor)); pitch = width * channels * 4;
         } else if (type == CU_RESOURCE_TYPE_PITCH2D)
-            CONFORMANCE_CUDA(cuMemAllocPitch(&pointer, &pitch, width * channels * 4, height, 16));
-        else { pitch = width * channels * 4; CONFORMANCE_CUDA(cuMemAlloc(&pointer, pitch * height)); }
+            TEST_CUDA(cuMemAllocPitch(&pointer, &pitch, width * channels * 4, height, 16));
+        else { pitch = width * channels * 4; TEST_CUDA(cuMemAlloc(&pointer, pitch * height)); }
         bytes.resize(pitch * height);
         for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<unsigned char>((i * 37 + 53) ^ (i >> 5));
         transfer(bytes.data(), false);
@@ -40,15 +40,15 @@ struct texture_backing {
     ~texture_backing() { if (array) cuArrayDestroy(array); if (pointer) cuMemFree(pointer); }
     void transfer(void* host, bool read) const {
         if (!array) {
-            if (read) CONFORMANCE_CUDA(cuMemcpyDtoH(host, pointer, bytes.size()));
-            else CONFORMANCE_CUDA(cuMemcpyHtoD(pointer, host, bytes.size()));
+            if (read) TEST_CUDA(cuMemcpyDtoH(host, pointer, bytes.size()));
+            else TEST_CUDA(cuMemcpyHtoD(pointer, host, bytes.size()));
             return;
         }
         CUDA_MEMCPY2D copy{}; copy.WidthInBytes = pitch; copy.Height = height;
         copy.srcMemoryType = read ? CU_MEMORYTYPE_ARRAY : CU_MEMORYTYPE_HOST;
         copy.dstMemoryType = read ? CU_MEMORYTYPE_HOST : CU_MEMORYTYPE_ARRAY;
         copy.srcArray = copy.dstArray = array; copy.srcHost = copy.dstHost = host;
-        copy.srcPitch = copy.dstPitch = pitch; CONFORMANCE_CUDA(cuMemcpy2D(&copy));
+        copy.srcPitch = copy.dstPitch = pitch; TEST_CUDA(cuMemcpy2D(&copy));
     }
     void verify() const {
         std::vector<unsigned char> actual(bytes.size()); transfer(actual.data(), true);
@@ -91,14 +91,14 @@ struct texture_handle {
             sampler.maxAnisotropy = 1;
             for (auto& mode : sampler.addressMode) mode = CU_TR_ADDRESS_MODE_CLAMP;
             sampler.borderColor[0] = 1.25f; sampler.borderColor[1] = -2.5f; sampler.borderColor[2] = 3.75f; sampler.borderColor[3] = -0.0f;
-            CONFORMANCE_CUDA(cuTexObjectCreate(&output.value, &resource, &sampler, nullptr));
+            TEST_CUDA(cuTexObjectCreate(&output.value, &resource, &sampler, nullptr));
             resource = {}; sampler = {};
         }
         value = output.get(); require(value != 0, "created texture is a nonnull opaque handle");
     }
     ~texture_handle() { if (value) cuTexObjectDestroy(value); }
     void close() {
-        if (runtime) CONFORMANCE_CUDA(cuTexObjectDestroy(value));
+        if (runtime) TEST_CUDA(cuTexObjectDestroy(value));
         else texture_runtime(cudaDestroyTextureObject(value));
         value = 0;
     }
@@ -106,7 +106,7 @@ struct texture_handle {
 void texture_query(const texture_handle& object, const texture_backing& backing) {
     texture_output<CUDA_RESOURCE_DESC> driver_resource;
     texture_output<cudaResourceDesc> runtime_resource;
-    CONFORMANCE_CUDA(cuTexObjectGetResourceDesc(&driver_resource.value, object.value));
+    TEST_CUDA(cuTexObjectGetResourceDesc(&driver_resource.value, object.value));
     texture_runtime(cudaGetTextureObjectResourceDesc(&runtime_resource.value, object.value));
     const auto d = driver_resource.get(); const auto r = runtime_resource.get();
     require(d.resType == backing.type && d.flags == 0 && r.resType == static_cast<cudaResourceType>(backing.type), "texture resource kind and flags");
@@ -125,7 +125,7 @@ void texture_query(const texture_handle& object, const texture_backing& backing)
     if (!backing.array) require(channel.x == 32 && channel.y == (backing.channels >= 2 ? 32 : 0) && channel.z == (backing.channels == 4 ? 32 : 0) && channel.w == (backing.channels == 4 ? 32 : 0) && channel.f == cudaChannelFormatKindUnsigned, "Runtime texture channels");
     texture_output<CUDA_TEXTURE_DESC> driver_sampler;
     texture_output<cudaTextureDesc> runtime_sampler;
-    CONFORMANCE_CUDA(cuTexObjectGetTextureDesc(&driver_sampler.value, object.value));
+    TEST_CUDA(cuTexObjectGetTextureDesc(&driver_sampler.value, object.value));
     texture_runtime(cudaGetTextureObjectTextureDesc(&runtime_sampler.value, object.value));
     const auto ds = driver_sampler.get(); const auto rs = runtime_sampler.get();
     require(ds.flags == (CU_TRSF_READ_AS_INTEGER | (object.normalized ? CU_TRSF_NORMALIZED_COORDINATES : 0)) &&
@@ -161,19 +161,19 @@ void texture_siblings() {
 }
 void texture_contexts() {
     CUcontext original{}; CUdevice device{};
-    CONFORMANCE_CUDA(cuCtxGetCurrent(&original)); CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuCtxGetCurrent(&original)); TEST_CUDA(cuCtxGetDevice(&device));
     texture_backing first(CU_RESOURCE_TYPE_ARRAY); texture_handle a(first, false);
-    CUcontext other{}; CONFORMANCE_CUDA(cuCtxCreate(&other, nullptr, 0, device));
+    CUcontext other{}; TEST_CUDA(cuCtxCreate(&other, nullptr, 0, device));
     struct context_cleanup { CUcontext other, original; ~context_cleanup() { if (other) cuCtxDestroy(other); cuCtxSetCurrent(original); } } cleanup{other, original};
     {
         texture_backing second(CU_RESOURCE_TYPE_ARRAY, 4); texture_handle b(second, true, 1);
         texture_query(b, second);
-        CONFORMANCE_CUDA(cuCtxSetCurrent(original)); texture_query(a, first);
-        CONFORMANCE_CUDA(cuCtxSetCurrent(other)); texture_query(b, second);
+        TEST_CUDA(cuCtxSetCurrent(original)); texture_query(a, first);
+        TEST_CUDA(cuCtxSetCurrent(other)); texture_query(b, second);
         b.close(); second.verify();
     }
-    CONFORMANCE_CUDA(cuCtxSetCurrent(original));
-    CONFORMANCE_CUDA(cuCtxDestroy(other)); cleanup.other = nullptr;
+    TEST_CUDA(cuCtxSetCurrent(original));
+    TEST_CUDA(cuCtxDestroy(other)); cleanup.other = nullptr;
     texture_query(a, first); a.close(); first.verify();
 }
 void texture_validation() {
@@ -221,5 +221,5 @@ void execute_texture_objects() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::texture_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_texture_objects);
+    return cudavm::run_test(argc, argv, cudavm::execute_texture_objects);
 }

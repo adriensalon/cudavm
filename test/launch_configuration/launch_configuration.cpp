@@ -26,7 +26,7 @@ struct launch_configuration_gate {
 };
 struct configured_stream {
     CUstream value{};
-    configured_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    configured_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~configured_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 void configured_runtime(cudaError_t status) {
@@ -38,8 +38,8 @@ void configured_launch(CUfunction function, CUkernel kernel, bool runtime, bool 
     std::vector<uint32_t> input(words, guard), expected(words, guard), actual(words);
     for (unsigned i = 0; i < total; ++i) input[guards + i] = 0xfffffff0u + i * 0x1020305u;
     device_buffer source(words * 4), output(words * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), words * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), words * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), words * 4));
+    TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), words * 4));
     configured_stream stream;
     launch_configuration_gate gate;
     auto from = source.value + guards * 4, to = output.value + guards * 4;
@@ -68,21 +68,21 @@ void configured_launch(CUfunction function, CUkernel kernel, bool runtime, bool 
         config.numAttrs = 0; config.attrs = reinterpret_cast<CUlaunchAttribute*>(uintptr_t(1));
         runtime_config.numAttrs = 0; runtime_config.attrs = reinterpret_cast<cudaLaunchAttribute*>(uintptr_t(1));
     }
-    CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, launch_configuration_gate::hold, &gate)); gate.await();
+    TEST_CUDA(cuLaunchHostFunc(stream.value, launch_configuration_gate::hold, &gate)); gate.await();
     if (runtime) configured_runtime(cudaLaunchKernelExC(&runtime_config, reinterpret_cast<const void*>(kernel), args));
-    else CONFORMANCE_CUDA(cuLaunchKernelEx(&config, function, packed ? nullptr : args, packed ? extra : nullptr));
+    else TEST_CUDA(cuLaunchKernelEx(&config, function, packed ? nullptr : args, packed ? extra : nullptr));
     require(cuStreamQuery(stream.value) == CUDA_ERROR_NOT_READY, "accepted extended launch remains pending behind gate");
     config.gridDimX = config.blockDimY = 0; config.numAttrs = 1; config.attrs = attributes;
     runtime_config.gridDim.x = runtime_config.blockDim.y = 0; runtime_config.numAttrs = 1; runtime_config.attrs = runtime_attributes;
     attributes[0].id = static_cast<CUlaunchAttributeID>(999);
     runtime_attributes[0].id = static_cast<cudaLaunchAttributeID>(999);
     count = 0; to = from = 0; packet.fill(0); packet_bytes = 0; args[0] = args[1] = args[2] = nullptr;
-    gate.release(); CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+    gate.release(); TEST_CUDA(cuStreamSynchronize(stream.value));
     require(!gate.expired, "snapshot gate released before deadline");
     for (unsigned i = 0; i < total - 5; ++i) expected[guards + i] = input[guards + i] + i + blocks;
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, words * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, words * 4));
     expect_words(actual, expected, "extended launch preserves accepted geometry, attributes and arguments");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), source.value, words * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), source.value, words * 4));
     expect_words(actual, input, "extended launch source and guard preservation");
 }
 void configured_validation(CUfunction function, CUkernel kernel) {
@@ -90,14 +90,14 @@ void configured_validation(CUfunction function, CUkernel kernel) {
     const std::array<uint32_t, 6> expected{guard, guard, guard, guard, guard, guard};
     std::array<uint32_t, 6> actual{};
     device_buffer source(sizeof(expected)), output(sizeof(expected));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, expected.data(), sizeof(expected)));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), sizeof(expected)));
+    TEST_CUDA(cuMemcpyHtoD(source.value, expected.data(), sizeof(expected)));
+    TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), sizeof(expected)));
     auto from = source.value + 4, to = output.value + 4; unsigned count = 1;
     void* args[]{&to, &from, &count};
     CUlaunchConfig config{1, 1, 1, 1, 1, 1, 0, nullptr, nullptr, 0};
     auto rejected = [&](CUresult status) {
         require(status == CUDA_ERROR_INVALID_VALUE, "invalid extended descriptor rejected with exact Driver status");
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
         expect_words(actual, expected, "invalid extended launch preserves all output");
     };
     rejected(cuLaunchKernelEx(nullptr, function, args, nullptr));
@@ -108,7 +108,7 @@ void configured_validation(CUfunction function, CUkernel kernel) {
         *grids[axis] = 0; rejected(cuLaunchKernelEx(&config, function, args, nullptr)); *grids[axis] = 1;
         *blocks[axis] = 0; rejected(cuLaunchKernelEx(&config, function, args, nullptr)); *blocks[axis] = 1;
     }
-    int maximum = 0; CONFORMANCE_CUDA(cuFuncGetAttribute(&maximum, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function));
+    int maximum = 0; TEST_CUDA(cuFuncGetAttribute(&maximum, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function));
     config.blockDimX = unsigned(maximum) + 1; rejected(cuLaunchKernelEx(&config, function, args, nullptr)); config.blockDimX = 1;
     config.sharedMemBytes = std::numeric_limits<unsigned>::max(); rejected(cuLaunchKernelEx(&config, function, args, nullptr)); config.sharedMemBytes = 0;
     rejected(cuLaunchKernelEx(&config, function, nullptr, nullptr));
@@ -124,12 +124,12 @@ void configured_validation(CUfunction function, CUkernel kernel) {
         require(cudaLaunchKernelExC(&runtime, token, args) == cudaErrorInvalidConfiguration && cudaGetLastError() == cudaErrorInvalidConfiguration, "Runtime invalid geometry translation");
         runtime.blockDim.x = 1; runtime.numAttrs = 1;
         require(cudaLaunchKernelExC(&runtime, token, args) == cudaErrorInvalidValue && cudaGetLastError() == cudaErrorInvalidValue, "Runtime missing attributes validation");
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
         expect_words(actual, expected, "rejected Runtime descriptors preserve all output");
     }
     config.numAttrs = 0; config.attrs = nullptr;
-    CONFORMANCE_CUDA(cuLaunchKernelEx(&config, function, args, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
+    TEST_CUDA(cuLaunchKernelEx(&config, function, args, nullptr));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
     auto repaired = expected; repaired[1] = guard + 1;
     expect_words(actual, repaired, "legal extended launch after rejected configurations");
 }
@@ -145,5 +145,5 @@ void execute_launch_configuration(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_launch_configuration);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_launch_configuration);
 }

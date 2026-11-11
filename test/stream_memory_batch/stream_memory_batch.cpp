@@ -6,22 +6,22 @@
 namespace cudavm {
 constexpr size_t memory_batch_bytes = 128, memory_batch_slot_bytes = 160, memory_batch_offset = 13, memory_batch_slots = 3;
 struct memory_batch_stream {
-    CUstream value{}; memory_batch_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    CUstream value{}; memory_batch_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~memory_batch_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
-    void synchronize() const { CONFORMANCE_CUDA(cuStreamSynchronize(value)); }
+    void synchronize() const { TEST_CUDA(cuStreamSynchronize(value)); }
 };
 struct memory_batch_storage {
     device_buffer device{memory_batch_bytes}; void* host{}; std::vector<unsigned char> initial;
     memory_batch_storage() : initial(memory_batch_bytes) {
         for (size_t i = 0; i < initial.size(); ++i) initial[i] = static_cast<unsigned char>(i * 37 + 13);
-        CONFORMANCE_CUDA(cuMemAllocHost(&host, memory_batch_slots * memory_batch_slot_bytes));
+        TEST_CUDA(cuMemAllocHost(&host, memory_batch_slots * memory_batch_slot_bytes));
         try { reset(); } catch (...) { cuMemFreeHost(host); host = nullptr; throw; }
     }
     ~memory_batch_storage() { if (host) { cuCtxSynchronize(); cuMemFreeHost(host); } }
-    void reset() { CONFORMANCE_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size())); std::memset(host, 0xd3, memory_batch_slots * memory_batch_slot_bytes); }
+    void reset() { TEST_CUDA(cuMemcpyHtoD(device.value, initial.data(), initial.size())); std::memset(host, 0xd3, memory_batch_slots * memory_batch_slot_bytes); }
     void read(CUstream stream, unsigned slot) const {
         require(slot < memory_batch_slots, "bounded batch readback slot");
-        CONFORMANCE_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(host) + slot * memory_batch_slot_bytes + memory_batch_offset, device.value, memory_batch_bytes, stream));
+        TEST_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(host) + slot * memory_batch_slot_bytes + memory_batch_offset, device.value, memory_batch_bytes, stream));
     }
     void expect(unsigned slot, std::span<const unsigned char> bytes) const {
         std::vector<unsigned char> expected(memory_batch_slot_bytes, 0xd3); std::copy(bytes.begin(), bytes.end(), expected.begin() + memory_batch_offset);
@@ -57,7 +57,7 @@ void memory_batch_ordering() {
     memory_batch_storage storage; memory_batch_stream stream;
     for (unsigned variant = 0; variant < 3; ++variant) {
         storage.reset(); auto ops = memory_batch_operations(storage, variant);
-        CONFORMANCE_CUDA(cuStreamBatchMemOp(stream.value, static_cast<unsigned>(ops.size()), ops.data(), 0)); std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
+        TEST_CUDA(cuStreamBatchMemOp(stream.value, static_cast<unsigned>(ops.size()), ops.data(), 0)); std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
         storage.read(stream.value, 0); stream.synchronize(); auto expected = storage.initial; memory_batch_expected(expected, variant); storage.expect(0, expected); storage.untouched(1);
     }
 }
@@ -66,7 +66,7 @@ void memory_batch_ownership() {
     std::array<std::vector<unsigned char>, 3> snapshots;
     for (unsigned variant = 0; variant < 3; ++variant) {
         {
-            auto ops = memory_batch_operations(storage, variant); CONFORMANCE_CUDA(cuStreamBatchMemOp(stream.value, static_cast<unsigned>(ops.size()), ops.data(), 0));
+            auto ops = memory_batch_operations(storage, variant); TEST_CUDA(cuStreamBatchMemOp(stream.value, static_cast<unsigned>(ops.size()), ops.data(), 0));
             std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
         }
         storage.read(stream.value, variant); memory_batch_expected(expected, variant); snapshots[variant] = expected;
@@ -78,7 +78,7 @@ void memory_batch_boundaries() {
     for (unsigned count : {0u, 1u, 255u}) {
         storage.reset(); std::vector<CUstreamBatchMemOpParams> ops;
         for (unsigned i = 0; i < count; ++i) ops.push_back(memory_batch_write(storage.device.value + 124, 0x81234500u + i));
-        CONFORMANCE_CUDA(cuStreamBatchMemOp(stream.value, count, count ? ops.data() : nullptr, 0)); std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
+        TEST_CUDA(cuStreamBatchMemOp(stream.value, count, count ? ops.data() : nullptr, 0)); std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{});
         storage.read(stream.value, 0); stream.synchronize(); auto expected = storage.initial;
         if (count) { const uint32_t last = 0x81234500u + count - 1; std::memcpy(expected.data() + 124, &last, sizeof(last)); }
         storage.expect(0, expected); storage.untouched(1);
@@ -104,7 +104,7 @@ void memory_batch_validation() {
         if (invalid == 12) { count = 0; flags = 1; }
         require(cuStreamBatchMemOp(stream.value, count, null ? nullptr : ops.data(), flags) == CUDA_ERROR_INVALID_VALUE, "invalid batch rejects before publishing its first valid operation");
         storage.read(stream.value, 0); stream.synchronize(); storage.expect(0, storage.initial); storage.untouched(1);
-        ops = memory_batch_operations(storage, 1); CONFORMANCE_CUDA(cuStreamBatchMemOp(stream.value, static_cast<unsigned>(ops.size()), ops.data(), 0));
+        ops = memory_batch_operations(storage, 1); TEST_CUDA(cuStreamBatchMemOp(stream.value, static_cast<unsigned>(ops.size()), ops.data(), 0));
         std::fill(ops.begin(), ops.end(), CUstreamBatchMemOpParams{}); storage.read(stream.value, 1); stream.synchronize(); auto expected = storage.initial; memory_batch_expected(expected, 1); storage.expect(1, expected); storage.untouched(2);
     }
 }
@@ -118,5 +118,5 @@ void execute_memory_batch() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc != 3) return 1; cudavm::memory_batch_case = argv[2]; return cudavm::run_conformance(2, argv, cudavm::execute_memory_batch);
+    if (argc != 3) return 1; cudavm::memory_batch_case = argv[2]; return cudavm::run_test(2, argv, cudavm::execute_memory_batch);
 }

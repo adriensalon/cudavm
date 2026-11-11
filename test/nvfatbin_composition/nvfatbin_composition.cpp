@@ -196,5 +196,5 @@ void execute_nvfatbin_composition() {
 }
 int main(int argc, char** argv) {
     if (argc == 2) cudavm::nvfatbin_composition_case = argv[1];
-    return cudavm::run_host_conformance(argc, argv, cudavm::execute_nvfatbin_composition);
+    return cudavm::run_host_test(argc, argv, cudavm::execute_nvfatbin_composition);
 }

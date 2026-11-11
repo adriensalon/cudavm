@@ -22,18 +22,18 @@ CUresult peer_copy_ptds_sync();
 void copy_runtime(cudaError_t status) { require(status == cudaSuccess, std::string("peer copy Runtime: ") + cudaGetErrorString(status)); }
 struct copy_current {
     CUcontext previous{};
-    explicit copy_current(CUcontext context) { CONFORMANCE_CUDA(cuCtxGetCurrent(&previous)); CONFORMANCE_CUDA(cuCtxSetCurrent(context)); }
+    explicit copy_current(CUcontext context) { TEST_CUDA(cuCtxGetCurrent(&previous)); TEST_CUDA(cuCtxSetCurrent(context)); }
     ~copy_current() { cuCtxSetCurrent(previous); }
 };
 struct copy_context {
     CUcontext value{};
     int device;
     explicit copy_context(int ordinal) : device(ordinal) {
-        CONFORMANCE_CUDA(cuCtxCreate(&value, nullptr, 0, device)); CUcontext popped{};
-        CONFORMANCE_CUDA(cuCtxPopCurrent(&popped)); require(popped == value, "peer copy context creation stack");
+        TEST_CUDA(cuCtxCreate(&value, nullptr, 0, device)); CUcontext popped{};
+        TEST_CUDA(cuCtxPopCurrent(&popped)); require(popped == value, "peer copy context creation stack");
     }
     ~copy_context() { if (value) cuCtxDestroy(value); }
-    void current() const { CONFORMANCE_CUDA(cuCtxSetCurrent(value)); }
+    void current() const { TEST_CUDA(cuCtxSetCurrent(value)); }
 };
 std::vector<unsigned char> copy_pattern(size_t bytes, unsigned seed) {
     std::vector<unsigned char> result(bytes);
@@ -46,7 +46,7 @@ struct copy_buffer {
     CUdeviceptr value{};
     std::vector<unsigned char> expected;
     copy_buffer(const copy_context& context, size_t bytes, unsigned seed) : owner(context.value), device(context.device), expected(copy_pattern(bytes, seed)) {
-        copy_current scope(owner); CONFORMANCE_CUDA(cuMemAlloc(&value, bytes)); CONFORMANCE_CUDA(cuMemcpyHtoD(value, expected.data(), expected.size()));
+        copy_current scope(owner); TEST_CUDA(cuMemAlloc(&value, bytes)); TEST_CUDA(cuMemcpyHtoD(value, expected.data(), expected.size()));
     }
     ~copy_buffer() { if (value) { copy_current scope(owner); cuMemFree(value); } }
     void expect(bool runtime = false) const { copy_current scope(owner); virtual_memory_expect(value, expected, "peer copy complete allocation/padding/guards", runtime); }
@@ -55,13 +55,13 @@ struct copy_buffer {
 struct copy_stream {
     CUcontext owner;
     CUstream value{};
-    explicit copy_stream(const copy_context& context) : owner(context.value) { copy_current scope(owner); CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    explicit copy_stream(const copy_context& context) : owner(context.value) { copy_current scope(owner); TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~copy_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
-    void sync() const { CONFORMANCE_CUDA(cuStreamSynchronize(value)); }
+    void sync() const { TEST_CUDA(cuStreamSynchronize(value)); }
 };
 struct copy_event {
     CUevent value{};
-    explicit copy_event(const copy_context& owner) { copy_current scope(owner.value); CONFORMANCE_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
+    explicit copy_event(const copy_context& owner) { copy_current scope(owner.value); TEST_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
     ~copy_event() { if (value) cuEventDestroy(value); }
 };
 struct copy_gate {
@@ -73,9 +73,9 @@ struct copy_gate {
     }
     void wait() { std::unique_lock lock(mutex); require(changed.wait_for(lock, std::chrono::seconds(10), [&] { return entered; }), "peer copy host gate starts"); }
     void queue(CUstream stream) {
-        CONFORMANCE_CUDA(cuStreamGetCtx(stream, &owner));
+        TEST_CUDA(cuStreamGetCtx(stream, &owner));
         copy_current scope(owner);
-        CONFORMANCE_CUDA(cuLaunchHostFunc(stream, callback, this));
+        TEST_CUDA(cuLaunchHostFunc(stream, callback, this));
     }
     void release() { std::lock_guard lock(mutex); open = true; changed.notify_all(); }
     ~copy_gate() {
@@ -95,13 +95,13 @@ void copy_returns(const copy_context& context, const std::function<void()>& acti
     require(returned, "device peer copy returns while participating host work is gated"); if (error) std::rethrow_exception(error);
 }
 void copy_linear(bool runtime, bool async, copy_buffer& to, size_t destination, const copy_buffer& from, size_t source, size_t bytes, CUstream stream = nullptr) {
-    CUcontext before{}, after{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&before));
+    CUcontext before{}, after{}; TEST_CUDA(cuCtxGetCurrent(&before));
     if (runtime) {
         if (async) copy_runtime(cudaMemcpyPeerAsync(to.pointer(destination), to.device, from.pointer(source), from.device, bytes, reinterpret_cast<cudaStream_t>(stream)));
         else copy_runtime(cudaMemcpyPeer(to.pointer(destination), to.device, from.pointer(source), from.device, bytes));
-    } else if (async) CONFORMANCE_CUDA(cuMemcpyPeerAsync(to.value + destination, to.owner, from.value + source, from.owner, bytes, stream));
-    else CONFORMANCE_CUDA(cuMemcpyPeer(to.value + destination, to.owner, from.value + source, from.owner, bytes));
-    CONFORMANCE_CUDA(cuCtxGetCurrent(&after)); require(before == after, "peer copy preserves caller current context");
+    } else if (async) TEST_CUDA(cuMemcpyPeerAsync(to.value + destination, to.owner, from.value + source, from.owner, bytes, stream));
+    else TEST_CUDA(cuMemcpyPeer(to.value + destination, to.owner, from.value + source, from.owner, bytes));
+    TEST_CUDA(cuCtxGetCurrent(&after)); require(before == after, "peer copy preserves caller current context");
     std::copy_n(from.expected.begin() + source, bytes, to.expected.begin() + destination);
 }
 cudaMemcpy3DPeerParms copy_runtime_volume(const CUDA_MEMCPY3D_PEER& p, int source_device, int destination_device, size_t element) {
@@ -121,9 +121,9 @@ void copy_volume(bool runtime, bool async, const CUDA_MEMCPY3D_PEER& p, int sour
         else if (async) copy_runtime(cudaMemcpy3DPeerAsync(&descriptor, reinterpret_cast<cudaStream_t>(stream)));
         else copy_runtime(cudaMemcpy3DPeer(&descriptor));
         std::memset(&descriptor, 0x8d, sizeof(descriptor));
-    } else if (ptds) CONFORMANCE_CUDA(peer_copy_ptds_driver_3d(&p, async));
-    else if (async) CONFORMANCE_CUDA(cuMemcpy3DPeerAsync(&p, stream));
-    else CONFORMANCE_CUDA(cuMemcpy3DPeer(&p));
+    } else if (ptds) TEST_CUDA(peer_copy_ptds_driver_3d(&p, async));
+    else if (async) TEST_CUDA(cuMemcpy3DPeerAsync(&p, stream));
+    else TEST_CUDA(cuMemcpy3DPeer(&p));
 }
 void copy_expected(std::vector<unsigned char>& to, const std::vector<unsigned char>& from, const CUDA_MEMCPY3D_PEER& p, size_t to_base, size_t from_base,
                    size_t to_pitch, size_t to_height, size_t from_pitch, size_t from_height) {
@@ -173,14 +173,14 @@ struct copy_array {
     copy_array(const copy_context& context, size_t w, size_t h, size_t d, CUarray_format format, unsigned channels, size_t bytes_per_element, unsigned seed)
         : owner(context.value), device(context.device), width(w), height(h), depth(d), element(bytes_per_element), expected(copy_pattern(w * h * d * bytes_per_element, seed)) {
         copy_current scope(owner); CUDA_ARRAY3D_DESCRIPTOR descriptor{}; descriptor.Width = w; descriptor.Height = h; descriptor.Depth = d; descriptor.Format = format; descriptor.NumChannels = channels;
-        CONFORMANCE_CUDA(cuArray3DCreate(&value, &descriptor)); transfer(expected.data(), true);
+        TEST_CUDA(cuArray3DCreate(&value, &descriptor)); transfer(expected.data(), true);
     }
     ~copy_array() { if (value) { copy_current scope(owner); cuArrayDestroy(value); } }
     void transfer(void* host, bool upload) const {
         copy_current scope(owner); CUDA_MEMCPY3D p{}; p.WidthInBytes = width * element; p.Height = height; p.Depth = depth;
         if (upload) { p.srcMemoryType = CU_MEMORYTYPE_HOST; p.srcHost = host; p.srcPitch = width * element; p.srcHeight = height; p.dstMemoryType = CU_MEMORYTYPE_ARRAY; p.dstArray = value; }
         else { p.dstMemoryType = CU_MEMORYTYPE_HOST; p.dstHost = host; p.dstPitch = width * element; p.dstHeight = height; p.srcMemoryType = CU_MEMORYTYPE_ARRAY; p.srcArray = value; }
-        CONFORMANCE_CUDA(cuMemcpy3D(&p));
+        TEST_CUDA(cuMemcpy3D(&p));
     }
     void expect() const {
         std::vector<unsigned char> actual(expected.size() + 32, 0xd7); transfer(actual.data() + 16, false);
@@ -223,33 +223,33 @@ void copy_streams(int device) {
     copy_context a(device), b(device), c(device); copy_buffer from(a, 1024, 107), to(b, 1024, 109);
     copy_stream sa(a), sb(b), sc(c); c.current();
     for (auto* stream : {&sa, &sb, &sc}) for (bool runtime : {false, true}) { copy_linear(runtime, true, to, 73, from, 47, 113, stream->value); stream->sync(); to.expect(runtime); from.expect(!runtime); }
-    CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr));
+    TEST_CUDA(cuCtxSetCurrent(nullptr));
     auto status = cuMemcpyPeerAsync(to.value + 19, b.value, from.value + 7, a.value, 37, sa.value);
-    auto synchronized = cuStreamSynchronize(sa.value); CUcontext after{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&after)); c.current();
-    CONFORMANCE_CUDA(status); CONFORMANCE_CUDA(synchronized); require(!after, "explicit Driver peer stream needs no current context");
+    auto synchronized = cuStreamSynchronize(sa.value); CUcontext after{}; TEST_CUDA(cuCtxGetCurrent(&after)); c.current();
+    TEST_CUDA(status); TEST_CUDA(synchronized); require(!after, "explicit Driver peer stream needs no current context");
     std::copy_n(from.expected.begin() + 7, 37, to.expected.begin() + 19); to.expect(); from.expect();
 }
 void copy_ptds(int device) {
     copy_context a(device), b(device), c(device); copy_buffer from(a, 1024, 113), to(b, 1024, 127); c.current();
-    CONFORMANCE_CUDA(peer_copy_ptds_driver(to.value + 37, b.value, from.value + 43, a.value, 151, false));
+    TEST_CUDA(peer_copy_ptds_driver(to.value + 37, b.value, from.value + 43, a.value, 151, false));
     std::copy_n(from.expected.begin() + 43, 151, to.expected.begin() + 37); to.expect(); from.expect();
     CUDA_MEMCPY3D_PEER p{}; p.srcMemoryType = p.dstMemoryType = CU_MEMORYTYPE_DEVICE; p.srcDevice = from.value; p.dstDevice = to.value;
     p.srcContext = a.value; p.dstContext = b.value; p.srcPitch = p.dstPitch = 1024; p.srcXInBytes = 79; p.dstXInBytes = 257; p.WidthInBytes = 137; p.Height = p.Depth = 1;
     for (bool runtime : {false, true}) { copy_volume(runtime, false, p, device, device, 1, nullptr, true); std::copy_n(from.expected.begin() + 79, 137, to.expected.begin() + 257); to.expect(); }
     copy_gate gate; gate.owner = c.value; CUresult accepted{};
-    std::thread other([&] { accepted = cuCtxSetCurrent(c.value); if (accepted == CUDA_SUCCESS) accepted = peer_copy_ptds_gate(copy_gate::callback, &gate); }); other.join(); CONFORMANCE_CUDA(accepted);
+    std::thread other([&] { accepted = cuCtxSetCurrent(c.value); if (accepted == CUDA_SUCCESS) accepted = peer_copy_ptds_gate(copy_gate::callback, &gate); }); other.join(); TEST_CUDA(accepted);
     try {
         gate.wait();
         for (bool runtime : {false, true}) {
             copy_returns(c, [&] {
                 if (runtime) copy_runtime(peer_copy_ptds_runtime(to.pointer(451), device, from.pointer(5), device, 71));
-                else CONFORMANCE_CUDA(peer_copy_ptds_driver(to.value + 451, b.value, from.value + 5, a.value, 71, true));
-                CONFORMANCE_CUDA(peer_copy_ptds_sync());
+                else TEST_CUDA(peer_copy_ptds_driver(to.value + 451, b.value, from.value + 5, a.value, 71, true));
+                TEST_CUDA(peer_copy_ptds_sync());
             }, [&] { gate.release(); });
             std::copy_n(from.expected.begin() + 5, 71, to.expected.begin() + 451);
         }
         for (bool runtime : {false, true}) {
-            copy_returns(c, [&] { copy_volume(runtime, true, p, device, device, 1, nullptr, true); CONFORMANCE_CUDA(peer_copy_ptds_sync()); }, [&] { gate.release(); });
+            copy_returns(c, [&] { copy_volume(runtime, true, p, device, device, 1, nullptr, true); TEST_CUDA(peer_copy_ptds_sync()); }, [&] { gate.release(); });
             std::copy_n(from.expected.begin() + 79, 137, to.expected.begin() + 257);
         }
         to.expect(); from.expect();
@@ -261,7 +261,7 @@ struct copy_host {
     void* value{};
     size_t bytes;
     copy_host(const copy_context& context, size_t size) : owner(context.value), bytes(size) {
-        copy_current scope(owner); CONFORMANCE_CUDA(cuMemAllocHost(&value, bytes + 32)); std::memset(value, 0xa7, bytes + 32);
+        copy_current scope(owner); TEST_CUDA(cuMemAllocHost(&value, bytes + 32)); std::memset(value, 0xa7, bytes + 32);
     }
     ~copy_host() { if (value) cuMemFreeHost(value); }
     void* payload() const { return static_cast<unsigned char*>(value) + 16; }
@@ -279,15 +279,15 @@ void copy_plain_ordering(int device) {
         gate.queue(blocked[gated]->value);
         try {
             gate.wait();
-            { copy_current scope(a.value); CONFORMANCE_CUDA(cuMemsetD8Async(from.value + 43, 0x51, 1001, sa.value)); }
+            { copy_current scope(a.value); TEST_CUDA(cuMemsetD8Async(from.value + 43, 0x51, 1001, sa.value)); }
             std::fill_n(from.expected.begin() + 43, 1001, 0x51);
-            { copy_current scope(b.value); CONFORMANCE_CUDA(cuMemsetD8Async(to.value + 71, 0x23, 1001, sb.value)); }
+            { copy_current scope(b.value); TEST_CUDA(cuMemsetD8Async(to.value + 71, 0x23, 1001, sb.value)); }
             std::fill_n(to.expected.begin() + 71, 1001, 0x23);
             c.current(); copy_returns(c, [&] { copy_linear(runtime, false, to, 71, from, 43, 1001); }, [&] { gate.release(); });
-            { copy_current scope(a.value); CONFORMANCE_CUDA(cuMemsetD8Async(from.value + 43, 0x96, 1001, sa.value)); }
+            { copy_current scope(a.value); TEST_CUDA(cuMemsetD8Async(from.value + 43, 0x96, 1001, sa.value)); }
             std::fill_n(from.expected.begin() + 43, 1001, 0x96);
-            { copy_current scope(b.value); CONFORMANCE_CUDA(cuMemcpyDtoHAsync(snapshot.payload(), to.value, to.expected.size(), sb.value)); CONFORMANCE_CUDA(cuEventRecord(finished.value, sb.value)); }
-            CONFORMANCE_CUDA(cuMemsetD8Async(marker.value + 17, 0x83, 127, sc.value)); std::fill_n(marker.expected.begin() + 17, 127, 0x83);
+            { copy_current scope(b.value); TEST_CUDA(cuMemcpyDtoHAsync(snapshot.payload(), to.value, to.expected.size(), sb.value)); TEST_CUDA(cuEventRecord(finished.value, sb.value)); }
+            TEST_CUDA(cuMemsetD8Async(marker.value + 17, 0x83, 127, sc.value)); std::fill_n(marker.expected.begin() + 17, 127, 0x83);
             auto observation = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
             while (std::chrono::steady_clock::now() < observation) {
                 require(cuEventQuery(finished.value) == CUDA_ERROR_NOT_READY, "future endpoint work remains behind the gated plain peer copy"); std::this_thread::yield();
@@ -303,13 +303,13 @@ void copy_async_ordering(int device) {
         source_gate.queue(sa.value); destination_gate.queue(sb.value);
         try {
             source_gate.wait(); destination_gate.wait();
-            { copy_current scope(a.value); CONFORMANCE_CUDA(cuMemsetD8Async(from.value + 43, 0x67, 1001, sa.value)); CONFORMANCE_CUDA(cuEventRecord(produced.value, sa.value)); }
-            std::fill_n(from.expected.begin() + 43, 1001, 0x67); c.current(); CONFORMANCE_CUDA(cuStreamWaitEvent(sc.value, produced.value, 0));
+            { copy_current scope(a.value); TEST_CUDA(cuMemsetD8Async(from.value + 43, 0x67, 1001, sa.value)); TEST_CUDA(cuEventRecord(produced.value, sa.value)); }
+            std::fill_n(from.expected.begin() + 43, 1001, 0x67); c.current(); TEST_CUDA(cuStreamWaitEvent(sc.value, produced.value, 0));
             copy_returns(c, [&] { copy_linear(runtime, true, to, 71, from, 43, 1001, sc.value); }, [&] { source_gate.release(); destination_gate.release(); });
             source_gate.release();
             copy_returns(c, [&] {
                 copy_linear(!runtime, true, snapshot, 0, to, 0, to.expected.size(), sc.value);
-                CONFORMANCE_CUDA(cuMemcpyDtoHAsync(host.payload(), snapshot.value, snapshot.expected.size(), sc.value)); sc.sync();
+                TEST_CUDA(cuMemcpyDtoHAsync(host.payload(), snapshot.value, snapshot.expected.size(), sc.value)); sc.sync();
             }, [&] { destination_gate.release(); });
             host.expect(to.expected); from.expect(); destination_gate.release(); to.expect(runtime); snapshot.expect(!runtime);
         } catch (...) { source_gate.release(); destination_gate.release(); throw; }
@@ -350,7 +350,7 @@ void copy_retirement(int device) {
 }
 void copy_validation(int device) {
     copy_context a(device), b(device), c(device); copy_buffer from(a, 4099, 181), to(b, 4099, 191); copy_stream stream(c); c.current();
-    int count{}; CONFORMANCE_CUDA(cuDeviceGetCount(&count));
+    int count{}; TEST_CUDA(cuDeviceGetCount(&count));
     for (int invalid : {-1, count}) {
         require(cudaMemcpyPeer(to.pointer(), invalid, from.pointer(), device, 1) == cudaErrorInvalidDevice, "invalid Runtime destination device");
         require(cudaMemcpyPeerAsync(to.pointer(), device, from.pointer(), invalid, 1, reinterpret_cast<cudaStream_t>(stream.value)) == cudaErrorInvalidDevice, "invalid Runtime source device");
@@ -391,9 +391,9 @@ void copy_validation(int device) {
     copy_expected(to.expected, from.expected, repaired, copy_guard, copy_guard, 101, 8, 83, 7);
     copy_volume(true, true, repaired, device, device, 1, stream.value); stream.sync(); to.expect(); from.expect(true);
 }
-std::string copy_device_name(int device) { char name[256]{}; CONFORMANCE_CUDA(cuDeviceGetName(name, sizeof(name), device)); return name; }
+std::string copy_device_name(int device) { char name[256]{}; TEST_CUDA(cuDeviceGetName(name, sizeof(name), device)); return name; }
 void copy_devices(bool mixed) {
-    int count{}; CONFORMANCE_CUDA(cuDeviceGetCount(&count)); unsigned exercised = 0;
+    int count{}; TEST_CUDA(cuDeviceGetCount(&count)); unsigned exercised = 0;
     for (int source = 0; source < count; ++source) for (int destination = 0; destination < count; ++destination) {
         if (source == destination) continue;
         const auto a_name = copy_device_name(source), b_name = copy_device_name(destination);
@@ -407,22 +407,22 @@ void copy_devices(bool mixed) {
 void copy_discovery() {
     for (const char* name : {"cuMemcpyPeer", "cuMemcpyPeerAsync", "cuMemcpy3DPeer", "cuMemcpy3DPeerAsync"}) for (auto flags : {CU_GET_PROC_ADDRESS_LEGACY_STREAM, CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM}) {
         const int version = flags == CU_GET_PROC_ADDRESS_LEGACY_STREAM ? 4000 : 7000; void* address{}; CUdriverProcAddressQueryResult result{};
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, version, flags, &result)); require(address && result == CU_GET_PROC_ADDRESS_SUCCESS, "peer copy procedure introduction");
+        TEST_CUDA(cuGetProcAddress(name, &address, version, flags, &result)); require(address && result == CU_GET_PROC_ADDRESS_SUCCESS, "peer copy procedure introduction");
         if (flags == CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM) {
-            void* legacy{}; CONFORMANCE_CUDA(cuGetProcAddress(name, &legacy, 4000, CU_GET_PROC_ADDRESS_LEGACY_STREAM, nullptr));
+            void* legacy{}; TEST_CUDA(cuGetProcAddress(name, &legacy, 4000, CU_GET_PROC_ADDRESS_LEGACY_STREAM, nullptr));
             require(address != legacy, "per-thread peer copy procedure has its own entry");
-            CONFORMANCE_CUDA(cuGetProcAddress(name, &address, 6999, flags, &result)); require(!address && result == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "pre-PTDS request cannot substitute legacy stream semantics");
+            TEST_CUDA(cuGetProcAddress(name, &address, 6999, flags, &result)); require(!address && result == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "pre-PTDS request cannot substitute legacy stream semantics");
             cudaDriverEntryPointQueryResult runtime_result{};
             copy_runtime(cudaGetDriverEntryPointByVersion(name, &address, 6999, flags, &runtime_result));
             require(!address && runtime_result == cudaDriverEntryPointVersionNotSufficent, "Runtime peer PTDS introduction boundary");
         }
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, 3999, flags, &result)); require(!address && result == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "peer copy procedure version boundary");
+        TEST_CUDA(cuGetProcAddress(name, &address, 3999, flags, &result)); require(!address && result == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "peer copy procedure version boundary");
     }
-    void* address{}; CONFORMANCE_CUDA(cuGetProcAddress("cuMemcpyPeer", &address, 4000, CU_GET_PROC_ADDRESS_LEGACY_STREAM, nullptr));
+    void* address{}; TEST_CUDA(cuGetProcAddress("cuMemcpyPeer", &address, 4000, CU_GET_PROC_ADDRESS_LEGACY_STREAM, nullptr));
     require(reinterpret_cast<PFN_cuMemcpyPeer_v4000>(address)(0, nullptr, 0, nullptr, 0) == CUDA_ERROR_NOT_INITIALIZED, "cold peer copy procedure");
 }
 void execute_peer_copy() {
-    CUcontext original{}; CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&original)); CONFORMANCE_CUDA(cuCtxGetDevice(&device)); copy_current restore(original);
+    CUcontext original{}; CUdevice device{}; TEST_CUDA(cuCtxGetCurrent(&original)); TEST_CUDA(cuCtxGetDevice(&device)); copy_current restore(original);
     if (copy_case == "linear" || copy_case == "geometry" || copy_case == "arrays") {
         copy_context a(device), b(device), c(device); c.current();
         if (copy_case == "linear") copy_linear_pair(a, b, c, true);
@@ -439,7 +439,7 @@ void execute_peer_copy() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_conformance(argc, argv, cudavm::copy_discovery);
+    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_test(argc, argv, cudavm::copy_discovery);
     if (argc == 3) { cudavm::copy_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_peer_copy);
+    return cudavm::run_test(argc, argv, cudavm::execute_peer_copy);
 }

@@ -49,13 +49,13 @@ void execute_float_comparison(const loaded_program& program) {
         std::vector<uint32_t> actual(total * fields + 2), expected(actual.size(), guard);
         device_buffer source(input.size() * 4), destination(actual.size() * 4);
         auto in = source.value + 4, out = destination.value + 4;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
             void* args[]{&out, &in, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+            TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
             for (unsigned i = 0; i < std::min(total, count); ++i) {
                 const uint32_t a = input[1 + i * 2], b = input[2 + i * 2];
                 const auto row = float_comparison_expected(a, b);
@@ -80,12 +80,12 @@ void execute_float_comparison(const loaded_program& program) {
             expect_words(actual, expected, "float comparison threads=" + std::to_string(threads)
                 + " count=" + std::to_string(count));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "float comparison source preservation");
     }
 }
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_float_comparison);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_float_comparison);
 }

@@ -53,18 +53,18 @@ void lto_results_case(const loaded_program& program) {
         for (unsigned i = 0; i < capacity; ++i) input[guards + i] = values[i % std::size(values)] ^ (i * 0x10001u);
         std::vector<uint32_t> initial(guards * 2 + capacity + 1, guard), actual(initial.size());
         device_buffer source(input.size() * 4), destination(initial.size() * 4);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         auto in = source.value + guards * 4, out = destination.value + guards * 4;
         for (unsigned count : {0u, 1u, capacity - 1, capacity, capacity + 7}) {
             auto expected = initial;
             for (unsigned i = 0; i < std::min(count, capacity); ++i)
                 expected[guards + i] = uint32_t(uint64_t(input[guards + i]) * 9 + 37);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
             void* arguments[]{&out, &in, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(program.function("lto_results"), blocks, 1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+            TEST_CUDA(cuLaunchKernel(program.function("lto_results"), blocks, 1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
             expect_words(actual, expected, "genuine NVIDIA LTO cross-unit unsigned results, guards and inactive records");
-            CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
             expect_words(preserved, input, "genuine NVIDIA LTO preserves input allocation and guards");
         }
     }
@@ -146,7 +146,7 @@ void lto_format_case() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "format") return cudavm::run_host_conformance(argc, argv, cudavm::lto_format_case);
+    if (argc == 2 && std::string_view(argv[1]) == "format") return cudavm::run_host_test(argc, argv, cudavm::lto_format_case);
     if (argc == 3) { cudavm::lto_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_lto_ir_import, 0, cudavm::probe_execution);
+    return cudavm::run_test(argc, argv, cudavm::execute_lto_ir_import, 0, cudavm::probe_execution);
 }

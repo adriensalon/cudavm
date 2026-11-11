@@ -22,18 +22,18 @@ struct completion_stream {
             cudaStream_t stream{};
             COMPLETION_RUNTIME(cudaStreamCreateWithFlags(&stream, flags));
             value = reinterpret_cast<CUstream>(stream);
-        } else CONFORMANCE_CUDA(cuStreamCreate(&value, flags));
+        } else TEST_CUDA(cuStreamCreate(&value, flags));
     }
     ~completion_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
     cudaStream_t runtime_value() const { return reinterpret_cast<cudaStream_t>(value); }
     void destroy() {
-        if (runtime) CONFORMANCE_CUDA(cuStreamDestroy(value));
+        if (runtime) TEST_CUDA(cuStreamDestroy(value));
         else COMPLETION_RUNTIME(cudaStreamDestroy(runtime_value()));
         value = nullptr;
     }
     void synchronize(bool use_runtime) {
         if (use_runtime) COMPLETION_RUNTIME(cudaStreamSynchronize(runtime_value()));
-        else CONFORMANCE_CUDA(cuStreamSynchronize(value));
+        else TEST_CUDA(cuStreamSynchronize(value));
     }
     void expect_ready(bool ready) const {
         require(cuStreamQuery(value) == (ready ? CUDA_SUCCESS : CUDA_ERROR_NOT_READY), "Driver stream completion state");
@@ -43,7 +43,7 @@ struct completion_stream {
 struct completion_host_buffer {
     static constexpr size_t size = 512;
     void* value{};
-    completion_host_buffer() { CONFORMANCE_CUDA(cuMemAllocHost(&value, size)); }
+    completion_host_buffer() { TEST_CUDA(cuMemAllocHost(&value, size)); }
     ~completion_host_buffer() { if (value) cuMemFreeHost(value); }
     unsigned char* data() const { return static_cast<unsigned char*>(value); }
     void expect(std::span<const unsigned char> expected, const std::string& operation) const {
@@ -54,7 +54,7 @@ struct completion_host_buffer {
 };
 struct completion_event {
     CUevent value{};
-    completion_event() { CONFORMANCE_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
+    completion_event() { TEST_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING)); }
     ~completion_event() { if (value) cuEventDestroy(value); }
 };
 struct completion_gate {
@@ -92,9 +92,9 @@ void completion_transfer(completion_stream& stream, const completion_host_buffer
     if (stream.runtime) {
         COMPLETION_RUNTIME(cudaMemcpyAsync(reinterpret_cast<void*>(static_cast<uintptr_t>(device + dev)),
             source.data() + src, bytes, cudaMemcpyHostToDevice, stream.runtime_value()));
-        CONFORMANCE_CUDA(cuMemcpyDtoHAsync(destination.data() + dst, device + dev, bytes, stream.value));
+        TEST_CUDA(cuMemcpyDtoHAsync(destination.data() + dst, device + dev, bytes, stream.value));
     } else {
-        CONFORMANCE_CUDA(cuMemcpyHtoDAsync(device + dev, source.data() + src, bytes, stream.value));
+        TEST_CUDA(cuMemcpyHtoDAsync(device + dev, source.data() + src, bytes, stream.value));
         COMPLETION_RUNTIME(cudaMemcpyAsync(destination.data() + dst,
             reinterpret_cast<void*>(static_cast<uintptr_t>(device + dev)), bytes, cudaMemcpyDeviceToHost, stream.runtime_value()));
     }
@@ -108,7 +108,7 @@ void verify_completion_transfer(const completion_host_buffer& source, const comp
     std::vector<unsigned char> actual(completion_host_buffer::size + 32, 0xe7), expected_device = actual;
     std::fill_n(expected_device.begin() + 16, completion_host_buffer::size, 0xa9);
     std::copy_n(input.begin() + 17, bytes, expected_device.begin() + 16 + 23);
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data() + 16, device, completion_host_buffer::size));
+    TEST_CUDA(cuMemcpyDtoH(actual.data() + 16, device, completion_host_buffer::size));
     require(actual == expected_device, "completed device bytes and readback guards");
 }
 void stream_completion_pending() {
@@ -124,12 +124,12 @@ void stream_completion_pending() {
             ++generation;
             std::memcpy(source.value, input.data(), input.size());
             std::memcpy(destination.value, untouched.data(), untouched.size());
-            CONFORMANCE_CUDA(cuMemsetD8(device.value, 0xa9, completion_host_buffer::size));
+            TEST_CUDA(cuMemsetD8(device.value, 0xa9, completion_host_buffer::size));
             stream.expect_ready(true);
             completion_gate gate;
             completion_gate_cleanup cleanup{gate};
             if (runtime) COMPLETION_RUNTIME(cudaLaunchHostFunc(stream.runtime_value(), completion_gate::call, &gate));
-            else CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, completion_gate::call, &gate));
+            else TEST_CUDA(cuLaunchHostFunc(stream.value, completion_gate::call, &gate));
             gate.await();
             completion_transfer(stream, source, destination, device.value, bytes);
             stream.expect_ready(false);
@@ -153,12 +153,12 @@ void stream_completion_retirement() {
         for (size_t i = 0; i < input.size(); ++i) input[i] = static_cast<unsigned char>((i * 73 + 19) ^ (i >> 4));
         std::memcpy(source.value, input.data(), input.size());
         std::memcpy(destination.value, untouched.data(), untouched.size());
-        CONFORMANCE_CUDA(cuMemsetD8(device.value, 0xa9, completion_host_buffer::size));
+        TEST_CUDA(cuMemsetD8(device.value, 0xa9, completion_host_buffer::size));
         completion_gate gate;
         completion_gate_cleanup cleanup{gate};
-        CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, completion_gate::call, &gate)); gate.await();
+        TEST_CUDA(cuLaunchHostFunc(stream.value, completion_gate::call, &gate)); gate.await();
         completion_transfer(stream, source, destination, device.value, 257);
-        CONFORMANCE_CUDA(cuEventRecord(completed.value, stream.value));
+        TEST_CUDA(cuEventRecord(completed.value, stream.value));
         stream.expect_ready(false);
         stream.destroy();
         // A blocking destroy would wait for gate expiry, violating retirement.
@@ -169,10 +169,10 @@ void stream_completion_retirement() {
         require(cuEventQuery(completed.value) == CUDA_ERROR_NOT_READY, "retired stream completion marker remains pending");
         destination.expect(untouched, "retired pending stream retains destination bytes");
         gate.release();
-        if (runtime) CONFORMANCE_CUDA(cuEventSynchronize(completed.value));
+        if (runtime) TEST_CUDA(cuEventSynchronize(completed.value));
         else COMPLETION_RUNTIME(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(completed.value)));
         require(!gate.expired, "retired stream callback state remains alive through completion");
-        CONFORMANCE_CUDA(cuEventQuery(completed.value));
+        TEST_CUDA(cuEventQuery(completed.value));
         verify_completion_transfer(source, destination, device.value, input, 257);
     }
 }
@@ -213,5 +213,5 @@ void execute_stream_completion() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::stream_completion_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_stream_completion);
+    return cudavm::run_test(argc, argv, cudavm::execute_stream_completion);
 }

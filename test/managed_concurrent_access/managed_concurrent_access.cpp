@@ -32,7 +32,7 @@ struct concurrent_storage {
             void* pointer{}; const auto status = cudaMallocManaged(&pointer, bytes, cudaMemAttachGlobal);
             require(status == cudaSuccess, std::string("Runtime concurrent managed allocation: ") + cudaGetErrorString(status));
             value = reinterpret_cast<uintptr_t>(pointer);
-        } else CONFORMANCE_CUDA(cuMemAllocManaged(&value, bytes, CU_MEM_ATTACH_GLOBAL));
+        } else TEST_CUDA(cuMemAllocManaged(&value, bytes, CU_MEM_ATTACH_GLOBAL));
         page = (value + page_size * 2 - 1) & ~(CUdeviceptr(page_size) - 1);
         expected.assign(bytes / sizeof(uint32_t), concurrent_guard);
         std::fill_n(host(), expected.size(), concurrent_guard);
@@ -56,7 +56,7 @@ void concurrent_rounds(const loaded_program& program, bool runtime, unsigned rou
     std::atomic_ref<uint32_t> ready(control.payload()[0]), acknowledged(control.payload()[1]),
         cancel(control.payload()[2]), entered(control.payload()[3]);
     require(ready.is_lock_free() && acknowledged.is_lock_free() && entered.is_lock_free(), "lock-free managed control atomics");
-    CUstream stream{}; CONFORMANCE_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+    CUstream stream{}; TEST_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
     struct stream_guard { CUstream value; ~stream_guard() { cuStreamDestroy(value); } } cleanup{stream};
     auto mailbox = control.page, from = source.page, to = destination.page;
     unsigned words = unsigned(source.page_size / sizeof(uint32_t)), publication = handoff ? 1 : 0;
@@ -65,7 +65,7 @@ void concurrent_rounds(const loaded_program& program, bool runtime, unsigned rou
         const auto result = cudaLaunchKernel(reinterpret_cast<const void*>(program.library_kernel("managed_participant")),
             dim3(1), dim3(1), args, 0, reinterpret_cast<cudaStream_t>(stream));
         require(result == cudaSuccess, std::string("Runtime managed participant launch: ") + cudaGetErrorString(result));
-    } else CONFORMANCE_CUDA(cuLaunchKernel(program.function("managed_participant"), 1, 1, 1, 1, 1, 1, 0, stream, args, nullptr));
+    } else TEST_CUDA(cuLaunchKernel(program.function("managed_participant"), 1, 1, 1, 1, 1, 1, 0, stream, args, nullptr));
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     auto await = [&](std::atomic_ref<uint32_t> flag, uint32_t expected, const char* label) {
         while (flag.load(std::memory_order_acquire) != expected) {
@@ -89,7 +89,7 @@ void concurrent_rounds(const loaded_program& program, bool runtime, unsigned rou
             concurrent_require(source.payload()[word] == source.expected[source.offset() + word], cancel, "managed CPU source preserved");
         }
     }
-    CONFORMANCE_CUDA(cuStreamSynchronize(stream));
+    TEST_CUDA(cuStreamSynchronize(stream));
     control.expected[control.offset()] = control.expected[control.offset() + 1] = rounds;
     control.expected[control.offset() + 3] = 1;
     control.verify("managed control and complete guards");
@@ -99,9 +99,9 @@ void concurrent_rounds(const loaded_program& program, bool runtime, unsigned rou
 void execute_managed_concurrent_access(const loaded_program& program) {
     require(concurrent_profile == "disjoint" || concurrent_profile == "handoff", "known concurrent managed profile");
     CUdevice device{}; int managed{}, concurrent{};
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&managed, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&concurrent, CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS, device));
+    TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuDeviceGetAttribute(&managed, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, device));
+    TEST_CUDA(cuDeviceGetAttribute(&concurrent, CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS, device));
     require_capability(managed && concurrent, "concurrent managed profile requires managed memory and concurrent managed access");
     require_capability(std::atomic_ref<uint32_t>::is_always_lock_free, "host ABI lacks lock-free 32-bit atomic references");
     for (bool runtime : {false, true}) for (unsigned rounds : {0u, 1u, 17u}) for (unsigned seed : {0u, 0x87654321u})
@@ -111,5 +111,5 @@ void execute_managed_concurrent_access(const loaded_program& program) {
 int main(int argc, char** argv) {
     if (argc != 4) { std::cerr << "usage: <executable> <backend> cu <disjoint|handoff>\n"; return 1; }
     cudavm::concurrent_profile = argv[3];
-    return cudavm::run_conformance(3, argv, cudavm::fixtures, cudavm::execute_managed_concurrent_access);
+    return cudavm::run_test(3, argv, cudavm::fixtures, cudavm::execute_managed_concurrent_access);
 }

@@ -40,13 +40,13 @@ void execute_integer_bit_operations(const loaded_program& program) {
         }
         device_buffer source(input.size() * sizeof(uint32_t)), destination(expected.size() * sizeof(uint32_t));
         auto in = source.value + 2 * sizeof(uint32_t), out = destination.value + sizeof(uint32_t);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * sizeof(uint32_t)));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * sizeof(uint32_t)));
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * sizeof(uint32_t)));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * sizeof(uint32_t)));
             void* args[]{&out, &in, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * sizeof(uint32_t)));
+            TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * sizeof(uint32_t)));
             for (unsigned i = 0; i < std::min(total, count); ++i) {
                 const auto value = corpus[i % corpus.size()];
                 const bit_observation narrow(uint32_t(value), 32), wide(value, 64);
@@ -58,12 +58,12 @@ void execute_integer_bit_operations(const loaded_program& program) {
             expect_words(actual, expected, "bit operations threads=" + std::to_string(threads)
                 + " count=" + std::to_string(count));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * sizeof(uint32_t)));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * sizeof(uint32_t)));
         expect_words(preserved, input, "bit-operation input preservation");
     }
 }
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_integer_bit_operations);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_integer_bit_operations);
 }

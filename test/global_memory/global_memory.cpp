@@ -31,19 +31,19 @@ void execute_global_memory(const loaded_program& program) {
         std::vector<unsigned char> expected(input.size(), guard), actual(expected.size());
         device_buffer source(input.size()), destination(expected.size());
         auto in = source.value + prefix;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size()));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size()));
         for (bool byte_access : {false, true})
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size()));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size()));
             // Neighboring byte stores deliberately share transport words and
             // start at an interior, unaligned byte address.
             const unsigned output_prefix = prefix + unsigned(byte_access);
             auto out = destination.value + output_prefix;
             void* args[]{&out, &in, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(byte_access ? neighbors : mixed,
+            TEST_CUDA(cuLaunchKernel(byte_access ? neighbors : mixed,
                 blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size()));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size()));
             for (unsigned i = 0; i < std::min(total, count); ++i) {
                 if (byte_access) {
                     expected[output_prefix + i] = input[prefix + i] ^ 0x5a;
@@ -62,12 +62,12 @@ void execute_global_memory(const loaded_program& program) {
             expect_memory_bytes(actual, expected, std::string(byte_access ? "neighbor bytes" : "mixed widths")
                 + " threads=" + std::to_string(threads) + " count=" + std::to_string(count));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size()));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size()));
         expect_memory_bytes(preserved, input, "global-memory source preservation");
     }
 }
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_global_memory);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_global_memory);
 }

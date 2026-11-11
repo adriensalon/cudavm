@@ -37,8 +37,8 @@ struct allocated_host {
     size_t size;
     host_allocator_case allocator;
     allocated_host(size_t bytes, host_allocator_case kind) : size(bytes), allocator(kind) {
-        if (kind.api == 0) CONFORMANCE_CUDA(cuMemAllocHost(&value, bytes));
-        else if (kind.api == 1) CONFORMANCE_CUDA(cuMemHostAlloc(&value, bytes, kind.flags));
+        if (kind.api == 0) TEST_CUDA(cuMemAllocHost(&value, bytes));
+        else if (kind.api == 1) TEST_CUDA(cuMemHostAlloc(&value, bytes, kind.flags));
         else if (kind.api == 2) HOST_RUNTIME(cudaMallocHost(&value, bytes));
         else HOST_RUNTIME(cudaHostAlloc(&value, bytes, host_runtime_flags(kind.flags)));
         require(value != nullptr, std::string(kind.name) + ": nonempty allocation publishes a pointer");
@@ -54,7 +54,7 @@ struct allocated_host {
     unsigned char* data() const { return static_cast<unsigned char*>(value); }
     void destroy(bool runtime) {
         if (runtime) HOST_RUNTIME(cudaFreeHost(value));
-        else CONFORMANCE_CUDA(cuMemFreeHost(value));
+        else TEST_CUDA(cuMemFreeHost(value));
         value = nullptr;
     }
 };
@@ -73,10 +73,10 @@ std::vector<unsigned char> host_pattern(size_t size, unsigned seed) {
 void verify_host_flags(const allocated_host& buffer) {
     CUdevice device{};
     int unified = 0;
-    CONFORMANCE_CUDA(cuCtxGetDevice(&device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&unified, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
+    TEST_CUDA(cuCtxGetDevice(&device));
+    TEST_CUDA(cuDeviceGetAttribute(&unified, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
     unsigned base_flags = ~0u;
-    CONFORMANCE_CUDA(cuMemHostGetFlags(&base_flags, buffer.value));
+    TEST_CUDA(cuMemHostGetFlags(&base_flags, buffer.value));
     // A native UVA allocation can additionally report implicit device mapping.
     const unsigned permitted = buffer.allocator.flags | (unified ? CU_MEMHOSTALLOC_DEVICEMAP : 0);
     require((base_flags & buffer.allocator.flags) == buffer.allocator.flags && !(base_flags & ~permitted),
@@ -84,7 +84,7 @@ void verify_host_flags(const allocated_host& buffer) {
         + " reported=" + std::to_string(base_flags) + " unified=" + std::to_string(unified));
     for (size_t offset : {size_t(0), buffer.size / 2, buffer.size - 1}) {
         unsigned driver_flags = ~0u, runtime_flags = ~0u;
-        CONFORMANCE_CUDA(cuMemHostGetFlags(&driver_flags, buffer.data() + offset));
+        TEST_CUDA(cuMemHostGetFlags(&driver_flags, buffer.data() + offset));
         HOST_RUNTIME(cudaHostGetFlags(&runtime_flags, buffer.data() + offset));
         require(driver_flags == base_flags && runtime_flags == host_runtime_flags(base_flags),
             "Driver/Runtime flags agree throughout the requested allocation");
@@ -115,7 +115,7 @@ void host_allocation_storage() {
 
 struct host_transfer_stream {
     CUstream value{};
-    host_transfer_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    host_transfer_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~host_transfer_stream() {
         if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); }
     }
@@ -131,12 +131,12 @@ void host_roundtrip(const allocated_host& source, allocated_host& destination, d
             source.data() + source_offset, bytes, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream)));
         else HOST_RUNTIME(cudaMemcpy(static_cast<unsigned char*>(device_pointer) + device_offset,
             source.data() + source_offset, bytes, cudaMemcpyHostToDevice));
-        if (stream) CONFORMANCE_CUDA(cuMemcpyDtoHAsync(destination.data() + destination_offset,
+        if (stream) TEST_CUDA(cuMemcpyDtoHAsync(destination.data() + destination_offset,
             device.value + device_offset, bytes, stream));
-        else CONFORMANCE_CUDA(cuMemcpyDtoH(destination.data() + destination_offset, device.value + device_offset, bytes));
+        else TEST_CUDA(cuMemcpyDtoH(destination.data() + destination_offset, device.value + device_offset, bytes));
     } else {
-        if (stream) CONFORMANCE_CUDA(cuMemcpyHtoDAsync(device.value + device_offset, source.data() + source_offset, bytes, stream));
-        else CONFORMANCE_CUDA(cuMemcpyHtoD(device.value + device_offset, source.data() + source_offset, bytes));
+        if (stream) TEST_CUDA(cuMemcpyHtoDAsync(device.value + device_offset, source.data() + source_offset, bytes, stream));
+        else TEST_CUDA(cuMemcpyHtoD(device.value + device_offset, source.data() + source_offset, bytes));
         if (stream) HOST_RUNTIME(cudaMemcpyAsync(destination.data() + destination_offset,
             static_cast<unsigned char*>(device_pointer) + device_offset, bytes, cudaMemcpyDeviceToHost,
             reinterpret_cast<cudaStream_t>(stream)));
@@ -158,17 +158,17 @@ void host_allocation_transfers() {
             const auto input = host_pattern(extent, 7);
             std::copy(input.begin(), input.end(), source.data());
             std::fill_n(destination.data(), extent, guard);
-            CONFORMANCE_CUDA(cuMemsetD8(device.value, guard, extent));
+            TEST_CUDA(cuMemsetD8(device.value, guard, extent));
             host_roundtrip(source, destination, device, source_offset, device_offset, destination_offset,
                 bytes, runtime_upload, asynchronous ? stream.value : nullptr);
-            if (asynchronous) CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+            if (asynchronous) TEST_CUDA(cuStreamSynchronize(stream.value));
             auto expected_host = std::vector<unsigned char>(extent, guard), expected_device = expected_host;
             std::copy_n(input.begin() + source_offset, bytes, expected_host.begin() + destination_offset);
             std::copy_n(input.begin() + source_offset, bytes, expected_device.begin() + device_offset);
             expect_host_bytes(destination, expected_host, std::string(allocator.name) + ": readback and host guards");
             expect_host_bytes(source, input, "pinned upload source preservation");
             std::vector<unsigned char> actual(extent + 32, guard);
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data() + 16, device.value, extent));
+            TEST_CUDA(cuMemcpyDtoH(actual.data() + 16, device.value, extent));
             std::vector<unsigned char> guarded_expected(extent + 32, guard);
             std::copy(expected_device.begin(), expected_device.end(), guarded_expected.begin() + 16);
             require(actual == guarded_expected, "device payload, untouched bytes and readback guards");
@@ -219,13 +219,13 @@ void host_allocation_lifetime() {
         std::copy(input.begin(), input.end(), source.data());
         std::copy(expected.begin(), expected.end(), survivor.data());
         if (allocator.api >= 2) HOST_RUNTIME(cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream.value), host_transfer_gate::call, &gate));
-        else CONFORMANCE_CUDA(cuLaunchHostFunc(stream.value, host_transfer_gate::call, &gate));
+        else TEST_CUDA(cuLaunchHostFunc(stream.value, host_transfer_gate::call, &gate));
         gate.await();
         host_roundtrip(source, survivor, device, 16, 19, 23, extent - 64, allocator.api >= 2, stream.value);
         require(cuStreamQuery(stream.value) == CUDA_ERROR_NOT_READY, "controlled pending use of pinned allocations");
         expect_host_bytes(survivor, expected, "readback cannot pass the closed stream gate");
         gate.release();
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+        TEST_CUDA(cuStreamSynchronize(stream.value));
         { std::lock_guard lock(gate.mutex); require(!gate.expired, "host transfer gate completion deadline"); }
         std::copy_n(input.begin() + 16, extent - 64, expected.begin() + 23);
         expect_host_bytes(source, input, "pending upload retains source bytes through completion");
@@ -248,7 +248,7 @@ void host_allocation_validation() {
     for (unsigned flags : {8u, 0x80000000u, 0xffffffffu}) {
         void* output{};
         auto status = cuMemHostAlloc(&output, 64, flags);
-        if (status == CUDA_SUCCESS) CONFORMANCE_CUDA(cuMemFreeHost(output));
+        if (status == CUDA_SUCCESS) TEST_CUDA(cuMemFreeHost(output));
         require(status == CUDA_ERROR_INVALID_VALUE, "invalid Driver allocation flags");
         output = nullptr;
         const auto result = cudaHostAlloc(&output, 64, flags);
@@ -288,5 +288,5 @@ void execute_host_allocation() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::host_allocation_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_host_allocation);
+    return cudavm::run_test(argc, argv, cudavm::execute_host_allocation);
 }

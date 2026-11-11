@@ -21,16 +21,16 @@ struct dependency_stream {
             cudaStream_t stream{};
             DEPENDENCY_RUNTIME(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
             value = reinterpret_cast<CUstream>(stream);
-        } else CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING));
+        } else TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING));
     }
     ~dependency_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
     void wait(CUevent event, bool runtime) {
         if (runtime) DEPENDENCY_RUNTIME(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(value), reinterpret_cast<cudaEvent_t>(event), 0));
-        else CONFORMANCE_CUDA(cuStreamWaitEvent(value, event, 0));
+        else TEST_CUDA(cuStreamWaitEvent(value, event, 0));
     }
     void synchronize(bool runtime) {
         if (runtime) DEPENDENCY_RUNTIME(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(value)));
-        else CONFORMANCE_CUDA(cuStreamSynchronize(value));
+        else TEST_CUDA(cuStreamSynchronize(value));
     }
 };
 struct dependency_event {
@@ -41,15 +41,15 @@ struct dependency_event {
             cudaEvent_t event{};
             DEPENDENCY_RUNTIME(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             value = reinterpret_cast<CUevent>(event);
-        } else CONFORMANCE_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING));
+        } else TEST_CUDA(cuEventCreate(&value, CU_EVENT_DISABLE_TIMING));
     }
     ~dependency_event() { if (value) cuEventDestroy(value); }
     void record(CUstream stream) {
         if (runtime) DEPENDENCY_RUNTIME(cudaEventRecord(reinterpret_cast<cudaEvent_t>(value), reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuEventRecord(value, stream));
+        else TEST_CUDA(cuEventRecord(value, stream));
     }
     void destroy() {
-        if (runtime) CONFORMANCE_CUDA(cuEventDestroy(value));
+        if (runtime) TEST_CUDA(cuEventDestroy(value));
         else DEPENDENCY_RUNTIME(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(value)));
         value = nullptr;
     }
@@ -60,20 +60,20 @@ struct dependency_storage {
     void* readback{};
     std::vector<unsigned char> input = std::vector<unsigned char>(size);
     dependency_storage() {
-        CONFORMANCE_CUDA(cuMemAllocHost(&readback, size + 32));
+        TEST_CUDA(cuMemAllocHost(&readback, size + 32));
         std::memset(readback, 0xd3, size + 32);
         for (size_t i = 0; i < size; ++i) input[i] = static_cast<unsigned char>((i * 73 + 19) ^ (i >> 4));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), size));
-        CONFORMANCE_CUDA(cuMemsetD8(destination.value, 0xa9, size));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), size));
+        TEST_CUDA(cuMemsetD8(destination.value, 0xa9, size));
     }
     ~dependency_storage() { if (readback) cuMemFreeHost(readback); }
-    void produce(CUstream stream, size_t bytes) { CONFORMANCE_CUDA(cuMemsetD8Async(source.value + 17, 0x5b, bytes, stream)); }
+    void produce(CUstream stream, size_t bytes) { TEST_CUDA(cuMemsetD8Async(source.value + 17, 0x5b, bytes, stream)); }
     void consume(CUstream stream, size_t bytes, bool runtime) {
         if (runtime) DEPENDENCY_RUNTIME(cudaMemcpyAsync(reinterpret_cast<void*>(static_cast<uintptr_t>(destination.value + 23)),
             reinterpret_cast<void*>(static_cast<uintptr_t>(source.value + 17)), bytes, cudaMemcpyDeviceToDevice,
             reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuMemcpyDtoDAsync(destination.value + 23, source.value + 17, bytes, stream));
-        CONFORMANCE_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(readback) + 16, destination.value, size, stream));
+        else TEST_CUDA(cuMemcpyDtoDAsync(destination.value + 23, source.value + 17, bytes, stream));
+        TEST_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(readback) + 16, destination.value, size, stream));
     }
     void expect_readback(size_t bytes, bool produced) const {
         auto source_expected = input;
@@ -92,7 +92,7 @@ struct dependency_storage {
         auto expected = input;
         if (produced) std::fill_n(expected.begin() + 17, bytes, 0x5b);
         std::vector<unsigned char> actual(size);
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), source.value, size));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), source.value, size));
         require(actual == expected, "event producer bytes and untouched source neighbors");
     }
 };
@@ -126,7 +126,7 @@ void event_dependencies_unrecorded() {
         storage.consume(stream.value, 257, !runtime);
         stream.synchronize(runtime);
         storage.verify(257, false);
-        CONFORMANCE_CUDA(cuEventQuery(event.value));
+        TEST_CUDA(cuEventQuery(event.value));
         event.destroy();
     }
 }
@@ -138,12 +138,12 @@ void event_dependencies_ordered(bool cross_stream) {
         dependency_event event(runtime);
         dependency_gate gate, unused;
         dependency_cleanup cleanup{gate, unused};
-        if (cross_stream) { CONFORMANCE_CUDA(cuLaunchHostFunc(producer.value, dependency_gate::call, &gate)); gate.await(); }
+        if (cross_stream) { TEST_CUDA(cuLaunchHostFunc(producer.value, dependency_gate::call, &gate)); gate.await(); }
         storage.produce(producer.value, bytes);
         event.record(producer.value);
         const auto target = cross_stream ? consumer.value : producer.value;
         if (runtime_wait) DEPENDENCY_RUNTIME(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(target), reinterpret_cast<cudaEvent_t>(event.value), 0));
-        else CONFORMANCE_CUDA(cuStreamWaitEvent(target, event.value, 0));
+        else TEST_CUDA(cuStreamWaitEvent(target, event.value, 0));
         storage.consume(target, bytes, !runtime);
         if (cross_stream) {
             require(cuStreamQuery(producer.value) == CUDA_ERROR_NOT_READY && cuStreamQuery(consumer.value) == CUDA_ERROR_NOT_READY,
@@ -166,20 +166,20 @@ void event_dependencies_generation() {
         dependency_event event(runtime), consumed(!runtime);
         dependency_gate first, second;
         dependency_cleanup cleanup{first, second};
-        CONFORMANCE_CUDA(cuLaunchHostFunc(producer.value, dependency_gate::call, &first)); first.await();
+        TEST_CUDA(cuLaunchHostFunc(producer.value, dependency_gate::call, &first)); first.await();
         storage.produce(producer.value, 257); event.record(producer.value);
         consumer.wait(event.value, runtime_wait);
         storage.consume(consumer.value, 257, runtime);
         consumed.record(consumer.value);
-        CONFORMANCE_CUDA(cuLaunchHostFunc(consumer.value, dependency_gate::call, &second));
+        TEST_CUDA(cuLaunchHostFunc(consumer.value, dependency_gate::call, &second));
         event.record(consumer.value);
         first.release();
         second.await();
-        CONFORMANCE_CUDA(cuEventQuery(consumed.value));
+        TEST_CUDA(cuEventQuery(consumed.value));
         require(cuEventQuery(event.value) == CUDA_ERROR_NOT_READY, "accepted wait uses old generation while newest record remains pending");
         storage.expect_readback(257, true);
         second.release();
-        CONFORMANCE_CUDA(cuEventSynchronize(event.value));
+        TEST_CUDA(cuEventSynchronize(event.value));
         require(!first.expired && !second.expired, "wait generation gate deadlines");
         storage.verify(257, true);
         event.destroy(); consumed.destroy();
@@ -192,7 +192,7 @@ void event_dependencies_retirement() {
         dependency_event event(runtime);
         dependency_gate gate, unused;
         dependency_cleanup cleanup{gate, unused};
-        CONFORMANCE_CUDA(cuLaunchHostFunc(producer.value, dependency_gate::call, &gate)); gate.await();
+        TEST_CUDA(cuLaunchHostFunc(producer.value, dependency_gate::call, &gate)); gate.await();
         storage.produce(producer.value, 257); event.record(producer.value);
         consumer.wait(event.value, runtime_wait);
         storage.consume(consumer.value, 257, !runtime);
@@ -216,7 +216,7 @@ void event_dependencies_validation() {
             == cudaErrorInvalidValue, "invalid Runtime wait flags");
     }
     stream.wait(event.value, true); stream.synchronize(false);
-    CONFORMANCE_CUDA(cuEventQuery(event.value)); event.destroy();
+    TEST_CUDA(cuEventQuery(event.value)); event.destroy();
 }
 std::string_view event_dependencies_case = "all";
 void execute_event_dependencies() {
@@ -233,5 +233,5 @@ void execute_event_dependencies() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::event_dependencies_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_event_dependencies);
+    return cudavm::run_test(argc, argv, cudavm::execute_event_dependencies);
 }

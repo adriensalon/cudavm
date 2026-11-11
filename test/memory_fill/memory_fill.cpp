@@ -4,32 +4,32 @@
 namespace cudavm {
 struct fill_stream {
     CUstream value{};
-    fill_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    fill_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~fill_stream() { if (value) cuStreamDestroy(value); }
 };
 void linear_fill(CUdeviceptr pointer, unsigned bytes, uint32_t pattern, size_t count, bool asynchronous, CUstream stream) {
     if (bytes == 1) {
-        if (asynchronous) CONFORMANCE_CUDA(cuMemsetD8Async(pointer, static_cast<unsigned char>(pattern), count, stream));
-        else CONFORMANCE_CUDA(cuMemsetD8(pointer, static_cast<unsigned char>(pattern), count));
+        if (asynchronous) TEST_CUDA(cuMemsetD8Async(pointer, static_cast<unsigned char>(pattern), count, stream));
+        else TEST_CUDA(cuMemsetD8(pointer, static_cast<unsigned char>(pattern), count));
     } else if (bytes == 2) {
-        if (asynchronous) CONFORMANCE_CUDA(cuMemsetD16Async(pointer, static_cast<unsigned short>(pattern), count, stream));
-        else CONFORMANCE_CUDA(cuMemsetD16(pointer, static_cast<unsigned short>(pattern), count));
+        if (asynchronous) TEST_CUDA(cuMemsetD16Async(pointer, static_cast<unsigned short>(pattern), count, stream));
+        else TEST_CUDA(cuMemsetD16(pointer, static_cast<unsigned short>(pattern), count));
     } else {
-        if (asynchronous) CONFORMANCE_CUDA(cuMemsetD32Async(pointer, pattern, count, stream));
-        else CONFORMANCE_CUDA(cuMemsetD32(pointer, pattern, count));
+        if (asynchronous) TEST_CUDA(cuMemsetD32Async(pointer, pattern, count, stream));
+        else TEST_CUDA(cuMemsetD32(pointer, pattern, count));
     }
 }
 void pitched_fill(CUdeviceptr pointer, size_t pitch, unsigned bytes, uint32_t pattern,
                   size_t width, size_t height, bool asynchronous, CUstream stream) {
     if (bytes == 1) {
-        if (asynchronous) CONFORMANCE_CUDA(cuMemsetD2D8Async(pointer, pitch, static_cast<unsigned char>(pattern), width, height, stream));
-        else CONFORMANCE_CUDA(cuMemsetD2D8(pointer, pitch, static_cast<unsigned char>(pattern), width, height));
+        if (asynchronous) TEST_CUDA(cuMemsetD2D8Async(pointer, pitch, static_cast<unsigned char>(pattern), width, height, stream));
+        else TEST_CUDA(cuMemsetD2D8(pointer, pitch, static_cast<unsigned char>(pattern), width, height));
     } else if (bytes == 2) {
-        if (asynchronous) CONFORMANCE_CUDA(cuMemsetD2D16Async(pointer, pitch, static_cast<unsigned short>(pattern), width, height, stream));
-        else CONFORMANCE_CUDA(cuMemsetD2D16(pointer, pitch, static_cast<unsigned short>(pattern), width, height));
+        if (asynchronous) TEST_CUDA(cuMemsetD2D16Async(pointer, pitch, static_cast<unsigned short>(pattern), width, height, stream));
+        else TEST_CUDA(cuMemsetD2D16(pointer, pitch, static_cast<unsigned short>(pattern), width, height));
     } else {
-        if (asynchronous) CONFORMANCE_CUDA(cuMemsetD2D32Async(pointer, pitch, pattern, width, height, stream));
-        else CONFORMANCE_CUDA(cuMemsetD2D32(pointer, pitch, pattern, width, height));
+        if (asynchronous) TEST_CUDA(cuMemsetD2D32Async(pointer, pitch, pattern, width, height, stream));
+        else TEST_CUDA(cuMemsetD2D32(pointer, pitch, pattern, width, height));
     }
 }
 void expect_fill_bytes(const std::vector<unsigned char>& actual, const std::vector<unsigned char>& expected,
@@ -53,10 +53,10 @@ void execute_memory_fill() {
             for (size_t element = 0; element < count; ++element)
                 for (unsigned byte = 0; byte < bytes; ++byte)
                     expected[16 + element * bytes + byte] = static_cast<unsigned char>(pattern >> (byte * 8));
-            CONFORMANCE_CUDA(cuMemcpyHtoD(storage.value, initial.data(), initial.size()));
+            TEST_CUDA(cuMemcpyHtoD(storage.value, initial.data(), initial.size()));
             linear_fill(storage.value + 16, bytes, pattern, count, asynchronous, stream.value);
-            if (asynchronous) CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), storage.value, actual.size()));
+            if (asynchronous) TEST_CUDA(cuStreamSynchronize(stream.value));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), storage.value, actual.size()));
             expect_fill_bytes(actual, expected, "linear fill bytes=" + std::to_string(bytes)
                 + " count=" + std::to_string(count) + " pattern=" + std::to_string(pattern)
                 + " async=" + std::to_string(asynchronous));
@@ -78,21 +78,21 @@ void execute_memory_fill() {
                 for (unsigned byte = 0; byte < bytes; ++byte)
                     expected[16 + (row + y) * pitch + (column + x) * bytes + byte]
                         = static_cast<unsigned char>(pattern >> (byte * 8));
-            CONFORMANCE_CUDA(cuMemcpyHtoD(pitched.value, initial.data(), initial.size()));
+            TEST_CUDA(cuMemcpyHtoD(pitched.value, initial.data(), initial.size()));
             pitched_fill(pitched.value + 16 + row * pitch + column * bytes, pitch, bytes,
                 pattern, width, height, asynchronous, stream.value);
-            if (asynchronous) CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), pitched.value, actual.size()));
+            if (asynchronous) TEST_CUDA(cuStreamSynchronize(stream.value));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), pitched.value, actual.size()));
             expect_fill_bytes(actual, expected, "pitched fill bytes=" + std::to_string(bytes)
                 + " column=" + std::to_string(column) + " row=" + std::to_string(row)
                 + " width=" + std::to_string(width) + " height=" + std::to_string(height)
                 + " pattern=" + std::to_string(pattern) + " async=" + std::to_string(asynchronous));
         }
     }
-    CONFORMANCE_CUDA(cuStreamDestroy(stream.value));
+    TEST_CUDA(cuStreamDestroy(stream.value));
     stream.value = nullptr;
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::execute_memory_fill);
+    return cudavm::run_test(argc, argv, cudavm::execute_memory_fill);
 }

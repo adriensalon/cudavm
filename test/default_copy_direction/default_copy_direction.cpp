@@ -22,7 +22,7 @@ const char* direction_name(direction_kind kind) {
 void* direction_pointer(CUdeviceptr value) { return reinterpret_cast<void*>(static_cast<uintptr_t>(value)); }
 struct direction_stream {
     CUstream value{};
-    direction_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    direction_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~direction_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
 };
 struct direction_storage {
@@ -33,12 +33,12 @@ struct direction_storage {
             backing.resize(kind == direction_kind::registered ? 4 * 65536 : bytes, 0xeb); host = backing.data();
             if (kind == direction_kind::registered) {
                 host = reinterpret_cast<void*>(((reinterpret_cast<uintptr_t>(host) + 65535) & ~uintptr_t(65535)) + 13);
-                if (runtime) DIRECTION_RUNTIME(cudaHostRegister(host, bytes, cudaHostRegisterDefault)); else CONFORMANCE_CUDA(cuMemHostRegister(host, bytes, 0));
+                if (runtime) DIRECTION_RUNTIME(cudaHostRegister(host, bytes, cudaHostRegisterDefault)); else TEST_CUDA(cuMemHostRegister(host, bytes, 0));
             }
             address = reinterpret_cast<uintptr_t>(host);
         } else if (kind == direction_kind::pinned || kind == direction_kind::mapped_host || kind == direction_kind::mapped_device) {
             const unsigned flags = kind == direction_kind::pinned ? 0 : CU_MEMHOSTALLOC_DEVICEMAP;
-            if (runtime) DIRECTION_RUNTIME(cudaHostAlloc(&host, bytes, flags)); else CONFORMANCE_CUDA(cuMemHostAlloc(&host, bytes, flags));
+            if (runtime) DIRECTION_RUNTIME(cudaHostAlloc(&host, bytes, flags)); else TEST_CUDA(cuMemHostAlloc(&host, bytes, flags));
             address = reinterpret_cast<uintptr_t>(host);
             if (kind == direction_kind::mapped_device) {
                 if (runtime) { void* result{}; const auto status = cudaHostGetDevicePointer(&result, host, 0); if (status != cudaSuccess) { cudaFreeHost(host); host = nullptr; check_direction_runtime(status, "cudaHostGetDevicePointer"); } address = reinterpret_cast<uintptr_t>(result); }
@@ -47,14 +47,14 @@ struct direction_storage {
         } else if (kind == direction_kind::pitched) {
             size_t pitch{};
             if (runtime) { void* result{}; DIRECTION_RUNTIME(cudaMallocPitch(&result, &pitch, 191, 4)); address = reinterpret_cast<uintptr_t>(result); }
-            else CONFORMANCE_CUDA(cuMemAllocPitch(&address, &pitch, 191, 4, 16));
+            else TEST_CUDA(cuMemAllocPitch(&address, &pitch, 191, 4, 16));
             bytes = pitch * 4;
         } else if (kind == direction_kind::managed) {
             if (runtime) { DIRECTION_RUNTIME(cudaMallocManaged(&host, bytes, cudaMemAttachGlobal)); address = reinterpret_cast<uintptr_t>(host); }
-            else { CONFORMANCE_CUDA(cuMemAllocManaged(&address, bytes, CU_MEM_ATTACH_GLOBAL)); host = direction_pointer(address); }
+            else { TEST_CUDA(cuMemAllocManaged(&address, bytes, CU_MEM_ATTACH_GLOBAL)); host = direction_pointer(address); }
         } else {
             if (runtime) { void* result{}; DIRECTION_RUNTIME(cudaMalloc(&result, bytes)); address = reinterpret_cast<uintptr_t>(result); }
-            else CONFORMANCE_CUDA(cuMemAlloc(&address, bytes));
+            else TEST_CUDA(cuMemAlloc(&address, bytes));
         }
         backing_expected = backing;
     }
@@ -68,12 +68,12 @@ struct direction_storage {
     direction_storage& operator=(const direction_storage&) = delete;
     void initialize(const std::vector<unsigned char>& data) {
         require(data.size() == bytes, "direction fixture initialization extent");
-        if (host) std::memcpy(host, data.data(), bytes); else CONFORMANCE_CUDA(cuMemcpyHtoD(address, data.data(), bytes));
+        if (host) std::memcpy(host, data.data(), bytes); else TEST_CUDA(cuMemcpyHtoD(address, data.data(), bytes));
         backing_expected = backing;
     }
     void expect(const std::vector<unsigned char>& expected, const std::string& context) const {
         std::vector<unsigned char> actual(bytes);
-        if (host) std::memcpy(actual.data(), host, bytes); else CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), address, bytes));
+        if (host) std::memcpy(actual.data(), host, bytes); else TEST_CUDA(cuMemcpyDtoH(actual.data(), address, bytes));
         for (size_t i = 0; i < bytes; ++i) require(actual[i] == expected[i], context + ": byte " + std::to_string(i));
         if (!backing.empty()) {
             auto all = backing_expected; const auto offset = static_cast<unsigned char*>(host) - backing.data();
@@ -108,10 +108,10 @@ void direction_pairs(std::vector<direction_kind> kinds, bool asynchronous, bool 
             const auto context = std::string(direction_name(source_kind)) + " -> " + direction_name(destination_kind)
                 + " runtime=" + std::to_string(runtime) + " async=" + std::to_string(asynchronous) + " bytes=" + std::to_string(bytes);
             const auto status = direction_copy(runtime, asynchronous, destination.address + to, source.address + from, bytes, stream.value);
-            if (status != CUDA_SUCCESS) { std::cout << context << std::endl; CONFORMANCE_CUDA(status); }
+            if (status != CUDA_SUCCESS) { std::cout << context << std::endl; TEST_CUDA(status); }
             // Even synchronous device copies may be asynchronous with respect to
             // the host. Complete before directly inspecting managed/mapped bytes.
-            CONFORMANCE_CUDA(cuCtxSynchronize());
+            TEST_CUDA(cuCtxSynchronize());
             destination.expect(expected, context + " destination"); source.expect(input, context + " source preservation"); seed += 59;
         }
     }
@@ -125,11 +125,11 @@ void direction_chain() {
         auto a = initial_a, b = initial_b, h = initial_h;
         std::copy_n(source.begin() + 17, 613, a.begin() + 31); std::copy_n(a.begin() + 31, 613, b.begin() + 13);
         std::copy_n(b.begin() + 83, 193, a.begin() + 411); std::copy_n(a.begin() + 19, 701, h.begin() + 23);
-        CONFORMANCE_CUDA(direction_copy(false, true, first.address + 31, input.address + 17, 613, stream.value));
-        CONFORMANCE_CUDA(direction_copy(true, true, second.address + 13, first.address + 31, 613, stream.value));
-        CONFORMANCE_CUDA(direction_copy(false, true, first.address + 411, second.address + 83, 193, stream.value));
-        CONFORMANCE_CUDA(direction_copy(true, true, output.address + 23, first.address + 19, 701, stream.value));
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
+        TEST_CUDA(direction_copy(false, true, first.address + 31, input.address + 17, 613, stream.value));
+        TEST_CUDA(direction_copy(true, true, second.address + 13, first.address + 31, 613, stream.value));
+        TEST_CUDA(direction_copy(false, true, first.address + 411, second.address + 83, 193, stream.value));
+        TEST_CUDA(direction_copy(true, true, output.address + 23, first.address + 19, 701, stream.value));
+        TEST_CUDA(cuStreamSynchronize(stream.value));
         input.expect(source, "chain input"); first.expect(a, "chain first device"); second.expect(b, "chain second device"); output.expect(h, "chain output");
     }
 }
@@ -142,14 +142,14 @@ void direction_validation() {
         require(direction_copy(runtime, asynchronous, 0, source.address, 1, stream.value) == CUDA_ERROR_INVALID_VALUE, "null nonempty destination");
         require(direction_copy(runtime, asynchronous, destination.address, source.address + source.bytes - 3, 4, stream.value) == CUDA_ERROR_INVALID_VALUE, "source overrun");
         require(direction_copy(runtime, asynchronous, destination.address + destination.bytes - 3, source.address, 4, stream.value) == CUDA_ERROR_INVALID_VALUE, "destination overrun");
-        CONFORMANCE_CUDA(cuStreamSynchronize(stream.value)); source.expect(input, "rejected copy source"); destination.expect(initial, "rejected copy destination");
-        CONFORMANCE_CUDA(direction_copy(runtime, asynchronous, destination.address + 29, source.address + 17, 631, stream.value)); CONFORMANCE_CUDA(cuCtxSynchronize());
+        TEST_CUDA(cuStreamSynchronize(stream.value)); source.expect(input, "rejected copy source"); destination.expect(initial, "rejected copy destination");
+        TEST_CUDA(direction_copy(runtime, asynchronous, destination.address + 29, source.address + 17, 631, stream.value)); TEST_CUDA(cuCtxSynchronize());
         auto expected = initial; std::copy_n(input.begin() + 17, 631, expected.begin() + 29); destination.expect(expected, "repaired copy destination"); source.expect(input, "repaired copy source");
     }
 }
 std::string direction_case = "all";
 void execute_default_copy_direction() {
-    CUdevice device{}; int unified{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device)); CONFORMANCE_CUDA(cuDeviceGetAttribute(&unified, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
+    CUdevice device{}; int unified{}; TEST_CUDA(cuCtxGetDevice(&device)); TEST_CUDA(cuDeviceGetAttribute(&unified, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
     require_capability(unified != 0, "default copy direction requires unified addressing");
     bool selected = false;
     const auto run = [&](const char* name, auto execute) { if (direction_case == "all" || direction_case == name) { std::cout << "case=" << name << std::endl; execute(); selected = true; } };
@@ -157,11 +157,11 @@ void execute_default_copy_direction() {
     run("asynchronous", [] { direction_pairs({direction_kind::pinned, direction_kind::device, direction_kind::pitched}, true); });
     run("registered", [] { for (bool async : {false, true}) direction_pairs({direction_kind::registered, direction_kind::pinned, direction_kind::device}, async, true); });
     run("mapped", [&] {
-        int mapping{}; CONFORMANCE_CUDA(cuDeviceGetAttribute(&mapping, CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY, device)); require_capability(mapping != 0, "mapped default copies require host mapping");
+        int mapping{}; TEST_CUDA(cuDeviceGetAttribute(&mapping, CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY, device)); require_capability(mapping != 0, "mapped default copies require host mapping");
         for (bool async : {false, true}) direction_pairs({direction_kind::mapped_host, direction_kind::mapped_device, direction_kind::device}, async);
     });
     run("managed", [&] {
-        int managed{}; CONFORMANCE_CUDA(cuDeviceGetAttribute(&managed, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, device)); require_capability(managed != 0, "managed default copies require managed memory");
+        int managed{}; TEST_CUDA(cuDeviceGetAttribute(&managed, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, device)); require_capability(managed != 0, "managed default copies require managed memory");
         for (bool async : {false, true}) direction_pairs({direction_kind::managed, direction_kind::pinned, direction_kind::device}, async, true);
     });
     run("chain", direction_chain); run("validation", direction_validation);
@@ -170,5 +170,5 @@ void execute_default_copy_direction() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::direction_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_default_copy_direction, CU_CTX_MAP_HOST);
+    return cudavm::run_test(argc, argv, cudavm::execute_default_copy_direction, CU_CTX_MAP_HOST);
 }

@@ -16,13 +16,13 @@ struct copy_2d_endpoint {
     CUarray array{};
     std::vector<unsigned char> expected;
     explicit copy_2d_endpoint(unsigned type) : kind(type), pitch(type == 0 ? copy_2d_host_pitch : copy_2d_width), prefix(type == 0 ? 16 : 0) {
-        if (kind == 0) CONFORMANCE_CUDA(cuMemAllocHost(&host, pitch * copy_2d_rows + 32));
-        else if (kind == 1) CONFORMANCE_CUDA(cuMemAllocPitch(&device, &pitch, copy_2d_width, copy_2d_rows, 4));
+        if (kind == 0) TEST_CUDA(cuMemAllocHost(&host, pitch * copy_2d_rows + 32));
+        else if (kind == 1) TEST_CUDA(cuMemAllocPitch(&device, &pitch, copy_2d_width, copy_2d_rows, 4));
         else {
             CUDA_ARRAY_DESCRIPTOR descriptor{};
             descriptor.Width = copy_2d_width / 4; descriptor.Height = copy_2d_rows;
             descriptor.Format = CU_AD_FORMAT_UNSIGNED_INT16; descriptor.NumChannels = 2;
-            CONFORMANCE_CUDA(cuArrayCreate(&array, &descriptor));
+            TEST_CUDA(cuArrayCreate(&array, &descriptor));
         }
         require(pitch >= copy_2d_width && pitch <= (std::numeric_limits<size_t>::max() - 32) / copy_2d_rows, "2D endpoint pitch extent");
         expected.resize(pitch * copy_2d_rows + prefix * 2);
@@ -57,37 +57,37 @@ struct copy_2d_endpoint {
         for (size_t y = 0; y < copy_2d_rows; ++y) for (size_t x = 0; x < copy_2d_width; ++x)
             expected[prefix + y * pitch + x] = copy_2d_pattern(x, y, is_source);
         if (kind == 0) std::copy(expected.begin(), expected.end(), static_cast<unsigned char*>(host));
-        else if (kind == 1) CONFORMANCE_CUDA(cuMemcpyHtoD(device, expected.data(), expected.size()));
+        else if (kind == 1) TEST_CUDA(cuMemcpyHtoD(device, expected.data(), expected.size()));
         else {
             CUDA_MEMCPY2D operation{};
             operation.srcMemoryType = CU_MEMORYTYPE_HOST; operation.srcHost = expected.data(); operation.srcPitch = pitch;
             destination(operation); operation.WidthInBytes = copy_2d_width; operation.Height = copy_2d_rows;
-            CONFORMANCE_CUDA(cuMemcpy2D(&operation));
+            TEST_CUDA(cuMemcpy2D(&operation));
         }
     }
     void verify(const std::string& context) const {
         std::vector<unsigned char> actual(expected.size(), copy_2d_guard);
         if (kind == 0) std::copy_n(static_cast<unsigned char*>(host), actual.size(), actual.begin());
-        else if (kind == 1) CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), device, actual.size()));
+        else if (kind == 1) TEST_CUDA(cuMemcpyDtoH(actual.data(), device, actual.size()));
         else {
             CUDA_MEMCPY2D operation{};
             source(operation); operation.dstMemoryType = CU_MEMORYTYPE_HOST; operation.dstHost = actual.data(); operation.dstPitch = pitch;
             operation.WidthInBytes = copy_2d_width; operation.Height = copy_2d_rows;
-            CONFORMANCE_CUDA(cuMemcpy2D(&operation));
+            TEST_CUDA(cuMemcpy2D(&operation));
         }
         for (size_t i = 0; i < actual.size(); ++i)
             if (actual[i] != expected[i]) throw std::runtime_error(context + ": byte " + std::to_string(i)
                 + " got " + std::to_string(actual[i]) + ", expected " + std::to_string(expected[i]));
     }
     void close() {
-        if (host) { CONFORMANCE_CUDA(cuMemFreeHost(host)); host = nullptr; }
-        if (device) { CONFORMANCE_CUDA(cuMemFree(device)); device = 0; }
-        if (array) { CONFORMANCE_CUDA(cuArrayDestroy(array)); array = nullptr; }
+        if (host) { TEST_CUDA(cuMemFreeHost(host)); host = nullptr; }
+        if (device) { TEST_CUDA(cuMemFree(device)); device = 0; }
+        if (array) { TEST_CUDA(cuArrayDestroy(array)); array = nullptr; }
     }
 };
 struct copy_2d_stream {
     CUstream value{};
-    copy_2d_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    copy_2d_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~copy_2d_stream() { if (value) cuStreamDestroy(value); }
 };
 void execute_memory_copy_2d() {
@@ -112,9 +112,9 @@ void execute_memory_copy_2d() {
             operation.dstXInBytes = destination_x; operation.dstY = destination_y;
             operation.WidthInBytes = width; operation.Height = height;
             if (asynchronous) {
-                CONFORMANCE_CUDA(cuMemcpy2DAsync(&operation, stream.value));
-                CONFORMANCE_CUDA(cuStreamSynchronize(stream.value));
-            } else CONFORMANCE_CUDA(cuMemcpy2D(&operation));
+                TEST_CUDA(cuMemcpy2DAsync(&operation, stream.value));
+                TEST_CUDA(cuStreamSynchronize(stream.value));
+            } else TEST_CUDA(cuMemcpy2D(&operation));
             const auto context = "2D copy source=" + std::to_string(source_kind) + " destination=" + std::to_string(destination_kind)
                 + " sx=" + std::to_string(source_x) + " sy=" + std::to_string(source_y)
                 + " dx=" + std::to_string(destination_x) + " dy=" + std::to_string(destination_y)
@@ -124,9 +124,9 @@ void execute_memory_copy_2d() {
         }
         destination.close(); source.close();
     }
-    CONFORMANCE_CUDA(cuStreamDestroy(stream.value)); stream.value = nullptr;
+    TEST_CUDA(cuStreamDestroy(stream.value)); stream.value = nullptr;
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::execute_memory_copy_2d);
+    return cudavm::run_test(argc, argv, cudavm::execute_memory_copy_2d);
 }

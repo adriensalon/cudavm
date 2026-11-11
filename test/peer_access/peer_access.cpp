@@ -15,7 +15,7 @@ constexpr size_t peer_guard = 9, peer_count = 1031, peer_total = peer_guard + pe
 void peer_runtime(cudaError_t status) { require(status == cudaSuccess, std::string("peer Runtime: ") + cudaGetErrorString(status)); }
 struct peer_current {
     CUcontext previous{};
-    explicit peer_current(CUcontext value) { CONFORMANCE_CUDA(cuCtxGetCurrent(&previous)); CONFORMANCE_CUDA(cuCtxSetCurrent(value)); }
+    explicit peer_current(CUcontext value) { TEST_CUDA(cuCtxGetCurrent(&previous)); TEST_CUDA(cuCtxSetCurrent(value)); }
     ~peer_current() { cuCtxSetCurrent(previous); }
 };
 struct peer_context {
@@ -23,29 +23,29 @@ struct peer_context {
     int device;
     bool primary;
     peer_context(int ordinal, bool use_primary = false) : device(ordinal), primary(use_primary) {
-        if (primary) CONFORMANCE_CUDA(cuDevicePrimaryCtxRetain(&value, device));
+        if (primary) TEST_CUDA(cuDevicePrimaryCtxRetain(&value, device));
         else {
-            CONFORMANCE_CUDA(cuCtxCreate(&value, nullptr, 0, device)); CUcontext popped{};
-            CONFORMANCE_CUDA(cuCtxPopCurrent(&popped)); require(popped == value, "peer context creation restores the preceding stack");
+            TEST_CUDA(cuCtxCreate(&value, nullptr, 0, device)); CUcontext popped{};
+            TEST_CUDA(cuCtxPopCurrent(&popped)); require(popped == value, "peer context creation restores the preceding stack");
         }
     }
     ~peer_context() { if (value) { if (primary) cuDevicePrimaryCtxRelease(device); else cuCtxDestroy(value); } }
-    void current() const { CONFORMANCE_CUDA(cuCtxSetCurrent(value)); }
+    void current() const { TEST_CUDA(cuCtxSetCurrent(value)); }
 };
 struct peer_buffer {
     CUcontext owner{};
     CUdeviceptr value{};
-    explicit peer_buffer(CUcontext context) : owner(context) { peer_current scope(owner); CONFORMANCE_CUDA(cuMemAlloc(&value, peer_total * sizeof(uint32_t))); }
+    explicit peer_buffer(CUcontext context) : owner(context) { peer_current scope(owner); TEST_CUDA(cuMemAlloc(&value, peer_total * sizeof(uint32_t))); }
     ~peer_buffer() { if (value) { CUcontext previous{}; cuCtxGetCurrent(&previous); cuCtxSetCurrent(owner); cuMemFree(value); cuCtxSetCurrent(previous); } }
     void write(std::span<const uint32_t> words, bool runtime = false) const {
         peer_current scope(owner);
         if (runtime) peer_runtime(cudaMemcpy(reinterpret_cast<void*>(uintptr_t(value)), words.data(), words.size_bytes(), cudaMemcpyHostToDevice));
-        else CONFORMANCE_CUDA(cuMemcpyHtoD(value, words.data(), words.size_bytes()));
+        else TEST_CUDA(cuMemcpyHtoD(value, words.data(), words.size_bytes()));
     }
     void expect(std::span<const uint32_t> expected, bool runtime = false) const {
         peer_current scope(owner); std::vector<uint32_t> actual(expected.size() + 8, 0x8d7a3e91);
         if (runtime) peer_runtime(cudaMemcpy(actual.data() + 4, reinterpret_cast<void*>(uintptr_t(value)), expected.size_bytes(), cudaMemcpyDeviceToHost));
-        else CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data() + 4, value, expected.size_bytes()));
+        else TEST_CUDA(cuMemcpyDtoH(actual.data() + 4, value, expected.size_bytes()));
         for (size_t i = 0; i < actual.size(); ++i) {
             const auto wanted = i < 4 || i >= expected.size() + 4 ? 0x8d7a3e91 : expected[i - 4];
             require(actual[i] == wanted, "peer full payload/output guards at word " + std::to_string(i));
@@ -82,33 +82,33 @@ void peer_expected(std::vector<uint32_t>& remote, std::vector<uint32_t>& local, 
 void peer_launch(const loaded_program& program, const peer_buffer& remote, const peer_buffer& local, uint32_t salt, CUstream stream = nullptr) {
     auto r = remote.value + peer_guard * sizeof(uint32_t), l = local.value + peer_guard * sizeof(uint32_t); unsigned count = peer_count;
     void* parameters[]{&r, &l, &count, &salt};
-    CONFORMANCE_CUDA(cuLaunchKernel(program.function("peer_update"), unsigned((peer_count + 63) / 64), 1, 1, 64, 1, 1, 0, stream, parameters, nullptr));
+    TEST_CUDA(cuLaunchKernel(program.function("peer_update"), unsigned((peer_count + 63) / 64), 1, 1, 64, 1, 1, 0, stream, parameters, nullptr));
 }
-int peer_devices() { int count{}; CONFORMANCE_CUDA(cuDeviceGetCount(&count)); return count; }
+int peer_devices() { int count{}; TEST_CUDA(cuDeviceGetCount(&count)); return count; }
 int peer_can(int source, int target) {
     struct { uint32_t before = peer_before; int value = -1; uint32_t after = peer_after; } driver, runtime;
-    CONFORMANCE_CUDA(cuDeviceCanAccessPeer(&driver.value, source, target)); peer_runtime(cudaDeviceCanAccessPeer(&runtime.value, source, target));
+    TEST_CUDA(cuDeviceCanAccessPeer(&driver.value, source, target)); peer_runtime(cudaDeviceCanAccessPeer(&runtime.value, source, target));
     require(driver.before == peer_before && driver.after == peer_after && runtime.before == peer_before && runtime.after == peer_after, "peer capability output width");
     require((driver.value == 0 || driver.value == 1) && driver.value == runtime.value, "Driver/Runtime peer capability agreement"); return driver.value;
 }
 void peer_topology() {
-    CUcontext original{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&original)); const auto count = peer_devices();
+    CUcontext original{}; TEST_CUDA(cuCtxGetCurrent(&original)); const auto count = peer_devices();
     for (int source = 0; source < count; ++source) for (int target = 0; target < count; ++target) {
         const auto accessible = peer_can(source, target);
         if (source == target) { require(!accessible, "self device is not a peer topology edge"); continue; }
         for (int attr = 1; attr <= 4; ++attr) {
             struct { uint32_t before = peer_before; int value = -1; uint32_t after = peer_after; } d, r;
-            CONFORMANCE_CUDA(cuDeviceGetP2PAttribute(&d.value, static_cast<CUdevice_P2PAttribute>(attr), source, target));
+            TEST_CUDA(cuDeviceGetP2PAttribute(&d.value, static_cast<CUdevice_P2PAttribute>(attr), source, target));
             peer_runtime(cudaDeviceGetP2PAttribute(&r.value, static_cast<cudaDeviceP2PAttr>(attr), source, target));
             require(d.before == peer_before && d.after == peer_after && r.before == peer_before && r.after == peer_after, "peer attribute exact output extent");
             require(d.value == r.value && d.value >= 0 && (attr == 1 || d.value <= 1), "peer attribute value and facade agreement");
             if (attr == CU_DEVICE_P2P_ATTRIBUTE_ACCESS_SUPPORTED) require(d.value == accessible, "peer access attribute agrees with directed topology");
         }
     }
-    CUcontext after{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&after)); require(after == original, "topology queries preserve current context");
+    CUcontext after{}; TEST_CUDA(cuCtxGetCurrent(&after)); require(after == original, "topology queries preserve current context");
 }
 void peer_validation() {
-    auto count = peer_devices(); CUcontext original{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&original)); CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+    auto count = peer_devices(); CUcontext original{}; TEST_CUDA(cuCtxGetCurrent(&original)); CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device));
     int output{}; unsigned capability{}; CUatomicOperation op = CU_ATOMIC_OPERATION_INTEGER_ADD;
     cudaAtomicOperation runtime_op = cudaAtomicOperationIntegerAdd;
     require(cuDeviceCanAccessPeer(nullptr, device, device) == CUDA_ERROR_INVALID_VALUE && cudaDeviceCanAccessPeer(nullptr, device, device) == cudaErrorInvalidValue, "null peer topology outputs");
@@ -133,12 +133,12 @@ void peer_validation() {
     require(cuDeviceGetP2PAtomicCapabilities(&capability, &op, 1, device, device) == CUDA_ERROR_INVALID_DEVICE && cudaDeviceGetP2PAtomicCapabilities(&capability, &runtime_op, 1, device, device) == cudaErrorInvalidDevice, "atomic links reject identical devices");
     require(cuCtxEnablePeerAccess(original, 0) == CUDA_ERROR_INVALID_CONTEXT && cuCtxDisablePeerAccess(original) == CUDA_ERROR_INVALID_CONTEXT, "self context controls");
     require(cudaDeviceEnablePeerAccess(device, 0) == cudaErrorInvalidDevice && cudaDeviceDisablePeerAccess(device) == cudaErrorInvalidDevice, "Runtime self device controls");
-    peer_context other(device); CONFORMANCE_CUDA(cuCtxSetCurrent(original));
+    peer_context other(device); TEST_CUDA(cuCtxSetCurrent(original));
     require(cuCtxEnablePeerAccess(other.value, 1) == CUDA_ERROR_INVALID_VALUE && cudaDeviceEnablePeerAccess(device, 1) == cudaErrorInvalidValue, "reserved peer flags");
     require(cuCtxEnablePeerAccess(nullptr, 0) == CUDA_ERROR_INVALID_CONTEXT && cuCtxDisablePeerAccess(nullptr) == CUDA_ERROR_INVALID_CONTEXT, "missing peer context");
-    CONFORMANCE_CUDA(cuCtxSetCurrent(nullptr));
+    TEST_CUDA(cuCtxSetCurrent(nullptr));
     auto enable = cuCtxEnablePeerAccess(other.value, 0), disable = cuCtxDisablePeerAccess(other.value);
-    CONFORMANCE_CUDA(cuCtxSetCurrent(original)); require(enable == CUDA_ERROR_INVALID_CONTEXT && disable == CUDA_ERROR_INVALID_CONTEXT, "Driver peer controls require a current context");
+    TEST_CUDA(cuCtxSetCurrent(original)); require(enable == CUDA_ERROR_INVALID_CONTEXT && disable == CUDA_ERROR_INVALID_CONTEXT, "Driver peer controls require a current context");
     peer_buffer repaired(original); const auto expected = peer_words(13); repaired.write(expected); repaired.expect(expected, true);
 }
 void peer_unsupported() {
@@ -160,28 +160,28 @@ void peer_atomics() {
     constexpr unsigned n = CU_ATOMIC_OPERATION_MAX;
     for (int source = 0; source < count; ++source) for (int target = 0; target < count; ++target) if (source != target) {
         int partial{}, runtime_partial{};
-        CONFORMANCE_CUDA(cuDeviceGetP2PAttribute(&partial, CU_DEVICE_P2P_ATTRIBUTE_ONLY_PARTIAL_NATIVE_ATOMIC_SUPPORTED, source, target));
+        TEST_CUDA(cuDeviceGetP2PAttribute(&partial, CU_DEVICE_P2P_ATTRIBUTE_ONLY_PARTIAL_NATIVE_ATOMIC_SUPPORTED, source, target));
         peer_runtime(cudaDeviceGetP2PAttribute(&runtime_partial, cudaDevP2PAttrOnlyPartialNativeAtomicSupported, source, target));
         require(partial == runtime_partial && (partial == 0 || partial == 1), "partial native atomic link metadata");
         std::array<CUatomicOperation, n> operations{}; std::array<cudaAtomicOperation, n> runtime_operations{};
         for (unsigned i = 0; i < n; ++i) { operations[i] = static_cast<CUatomicOperation>(i); runtime_operations[i] = static_cast<cudaAtomicOperation>(i); }
         std::array<unsigned, n + 2> driver{}, runtime{}; driver.fill(peer_before); runtime.fill(peer_before);
-        CONFORMANCE_CUDA(cuDeviceGetP2PAtomicCapabilities(driver.data() + 1, operations.data(), n, source, target));
+        TEST_CUDA(cuDeviceGetP2PAtomicCapabilities(driver.data() + 1, operations.data(), n, source, target));
         peer_runtime(cudaDeviceGetP2PAtomicCapabilities(runtime.data() + 1, runtime_operations.data(), n, source, target));
         require(driver.front() == peer_before && driver.back() == peer_before && runtime.front() == peer_before && runtime.back() == peer_before, "atomic capability batch extent guards");
         require(driver == runtime, "atomic operation bitmasks agree through both facades");
         std::reverse(operations.begin(), operations.end()); std::array<unsigned, n> reversed{};
-        CONFORMANCE_CUDA(cuDeviceGetP2PAtomicCapabilities(reversed.data(), operations.data(), n, source, target));
+        TEST_CUDA(cuDeviceGetP2PAtomicCapabilities(reversed.data(), operations.data(), n, source, target));
         for (unsigned i = 0; i < n; ++i) {
             unsigned single{}; auto op = static_cast<CUatomicOperation>(i);
-            CONFORMANCE_CUDA(cuDeviceGetP2PAtomicCapabilities(&single, &op, 1, source, target));
+            TEST_CUDA(cuDeviceGetP2PAtomicCapabilities(&single, &op, 1, source, target));
             require(single == driver[i + 1] && single == reversed[n - 1 - i] && !(single & ~127u), "single and reordered atomic capability association");
         }
     }
 }
 void peer_fixture_device(int device) {
-    int unified{}, major{}; CONFORMANCE_CUDA(cuDeviceGetAttribute(&unified, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+    int unified{}, major{}; TEST_CUDA(cuDeviceGetAttribute(&unified, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
+    TEST_CUDA(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
     require_capability(unified && major >= 6, "peer execution fixture requires UVA and sm_60 or newer");
 }
 std::vector<std::pair<int, int>> peer_pairs() {
@@ -191,10 +191,10 @@ std::vector<std::pair<int, int>> peer_pairs() {
     require_capability(!result.empty(), "peer dereference requires an advertised directed pair of distinct native devices"); return result;
 }
 void peer_local() {
-    CUdevice device{}; CUcontext context{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device)); CONFORMANCE_CUDA(cuCtxGetCurrent(&context)); peer_fixture_device(device);
+    CUdevice device{}; CUcontext context{}; TEST_CUDA(cuCtxGetDevice(&device)); TEST_CUDA(cuCtxGetCurrent(&context)); peer_fixture_device(device);
     for (bool library : {false, true}) {
         loaded_program program(peer_ptx, library); peer_buffer remote(context), local(context); auto r = peer_words(17), l = peer_words(23);
-        remote.write(r); local.write(l, true); peer_launch(program, remote, local, 0x93278451); CONFORMANCE_CUDA(cuCtxSynchronize());
+        remote.write(r); local.write(l, true); peer_launch(program, remote, local, 0x93278451); TEST_CUDA(cuCtxSynchronize());
         peer_expected(r, l, 0x93278451); remote.expect(r, true); local.expect(l);
     }
 }
@@ -205,24 +205,24 @@ void peer_visibility() {
             peer_context a(source), b(target, runtime); a.current(); loaded_program program(peer_ptx, library);
             peer_buffer before(b.value), local(a.value); auto r = peer_words(29), l = peer_words(31); before.write(r, runtime); local.write(l, !runtime);
             require(cuCtxDisablePeerAccess(b.value) == CUDA_ERROR_PEER_ACCESS_NOT_ENABLED, "fresh peer edge is disabled");
-            if (runtime) peer_runtime(cudaDeviceEnablePeerAccess(target, 0)); else CONFORMANCE_CUDA(cuCtxEnablePeerAccess(b.value, 0));
+            if (runtime) peer_runtime(cudaDeviceEnablePeerAccess(target, 0)); else TEST_CUDA(cuCtxEnablePeerAccess(b.value, 0));
             require(cuCtxEnablePeerAccess(b.value, 0) == CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED, "duplicate Driver enable");
             if (runtime) require(cudaDeviceEnablePeerAccess(target, 0) == cudaErrorPeerAccessAlreadyEnabled, "Runtime observes Driver peer state");
             { peer_current reverse(b.value); require(cuCtxDisablePeerAccess(a.value) == CUDA_ERROR_PEER_ACCESS_NOT_ENABLED, "peer edge is unidirectional"); }
             peer_buffer after(b.value); auto r2 = peer_words(37); after.write(r2);
             for (auto* remote : {&before, &after}) {
                 auto& expected = remote == &before ? r : r2;
-                peer_launch(program, *remote, local, 0xc1375928); CONFORMANCE_CUDA(cuCtxSynchronize()); peer_expected(expected, l, 0xc1375928);
+                peer_launch(program, *remote, local, 0xc1375928); TEST_CUDA(cuCtxSynchronize()); peer_expected(expected, l, 0xc1375928);
                 remote->expect(expected, true); local.expect(l);
             }
-            CONFORMANCE_CUDA(cuCtxDisablePeerAccess(b.value));
+            TEST_CUDA(cuCtxDisablePeerAccess(b.value));
             require(cuCtxDisablePeerAccess(b.value) == CUDA_ERROR_PEER_ACCESS_NOT_ENABLED, "repeated disable");
             if (runtime) {
                 require(cudaDeviceDisablePeerAccess(target) == cudaErrorPeerAccessNotEnabled, "Runtime observes disabled Driver edge");
-                CONFORMANCE_CUDA(cuCtxEnablePeerAccess(b.value, 0)); peer_runtime(cudaDeviceDisablePeerAccess(target)); peer_runtime(cudaDeviceEnablePeerAccess(target, 0));
-            } else CONFORMANCE_CUDA(cuCtxEnablePeerAccess(b.value, 0));
-            peer_launch(program, before, local, 0x57a31928); CONFORMANCE_CUDA(cuCtxSynchronize()); peer_expected(r, l, 0x57a31928); before.expect(r); after.expect(r2); local.expect(l, true);
-            CONFORMANCE_CUDA(cuCtxDisablePeerAccess(b.value));
+                TEST_CUDA(cuCtxEnablePeerAccess(b.value, 0)); peer_runtime(cudaDeviceDisablePeerAccess(target)); peer_runtime(cudaDeviceEnablePeerAccess(target, 0));
+            } else TEST_CUDA(cuCtxEnablePeerAccess(b.value, 0));
+            peer_launch(program, before, local, 0x57a31928); TEST_CUDA(cuCtxSynchronize()); peer_expected(r, l, 0x57a31928); before.expect(r); after.expect(r2); local.expect(l, true);
+            TEST_CUDA(cuCtxDisablePeerAccess(b.value));
         }
     }
 }
@@ -240,9 +240,9 @@ void peer_lifetime() {
     for (auto [source, target] : peer_pairs()) for (bool destroy : {false, true}) {
         peer_fixture_device(source); peer_fixture_device(target); peer_context a(source), b(target); a.current();
         loaded_program program(peer_ptx, destroy); peer_buffer remote(b.value), local(a.value); auto r = peer_words(43), l = peer_words(47);
-        remote.write(r); local.write(l); CONFORMANCE_CUDA(cuCtxEnablePeerAccess(b.value, 0));
-        CUstream stream{}; CONFORMANCE_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING)); peer_gate gate;
-        CONFORMANCE_CUDA(cuLaunchHostFunc(stream, peer_gate::callback, &gate));
+        remote.write(r); local.write(l); TEST_CUDA(cuCtxEnablePeerAccess(b.value, 0));
+        CUstream stream{}; TEST_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING)); peer_gate gate;
+        TEST_CUDA(cuLaunchHostFunc(stream, peer_gate::callback, &gate));
         try { peer_launch(program, remote, local, 0x712893a5, stream); gate.wait(); }
         catch (...) { gate.release(); cuStreamSynchronize(stream); cuStreamDestroy(stream); throw; }
         std::atomic<bool> started{}, done{}; CUresult status = CUDA_ERROR_UNKNOWN;
@@ -262,12 +262,12 @@ void peer_lifetime() {
             require(!done.load(std::memory_order_acquire), "peer retirement waits for already accepted foreign work");
         } catch (...) { gate.release(); retirement.join(); cuStreamSynchronize(stream); cuStreamDestroy(stream); throw; }
         gate.release(); retirement.join(); remote.value = 0; if (destroy) b.value = nullptr;
-        CONFORMANCE_CUDA(status); CONFORMANCE_CUDA(cuStreamSynchronize(stream)); CONFORMANCE_CUDA(cuStreamDestroy(stream));
+        TEST_CUDA(status); TEST_CUDA(cuStreamSynchronize(stream)); TEST_CUDA(cuStreamDestroy(stream));
         peer_expected(r, l, 0x712893a5); local.expect(l, true);
-        if (!destroy) CONFORMANCE_CUDA(cuCtxDisablePeerAccess(b.value));
+        if (!destroy) TEST_CUDA(cuCtxDisablePeerAccess(b.value));
         peer_context replacement(target); a.current(); peer_buffer fresh(replacement.value); auto f = peer_words(53); fresh.write(f);
-        CONFORMANCE_CUDA(cuCtxEnablePeerAccess(replacement.value, 0)); peer_launch(program, fresh, local, 0x193871a5); CONFORMANCE_CUDA(cuCtxSynchronize());
-        peer_expected(f, l, 0x193871a5); fresh.expect(f); local.expect(l); CONFORMANCE_CUDA(cuCtxDisablePeerAccess(replacement.value));
+        TEST_CUDA(cuCtxEnablePeerAccess(replacement.value, 0)); peer_launch(program, fresh, local, 0x193871a5); TEST_CUDA(cuCtxSynchronize());
+        peer_expected(f, l, 0x193871a5); fresh.expect(f); local.expect(l); TEST_CUDA(cuCtxDisablePeerAccess(replacement.value));
     }
 }
 void peer_limits() {
@@ -283,29 +283,29 @@ void peer_limits() {
                 peer_fixture_device(source); peer_fixture_device(peers.front()->device);
                 loaded_program program(peer_ptx, false); peer_buffer local(a.value), remote(enabled.front());
                 auto l = peer_words(61), r = peer_words(67); local.write(l); remote.write(r);
-                peer_launch(program, remote, local, 0x193785a1); CONFORMANCE_CUDA(cuCtxSynchronize());
+                peer_launch(program, remote, local, 0x193785a1); TEST_CUDA(cuCtxSynchronize());
                 peer_expected(r, l, 0x193785a1); remote.expect(r); local.expect(l);
                 require(cuCtxDisablePeerAccess(handle) == CUDA_ERROR_PEER_ACCESS_NOT_ENABLED, "rejected peer has no mapping");
-                CONFORMANCE_CUDA(cuCtxDisablePeerAccess(enabled.back())); enabled.pop_back();
-                CONFORMANCE_CUDA(cuCtxEnablePeerAccess(handle, 0)); enabled.push_back(handle); break;
+                TEST_CUDA(cuCtxDisablePeerAccess(enabled.back())); enabled.pop_back();
+                TEST_CUDA(cuCtxEnablePeerAccess(handle, 0)); enabled.push_back(handle); break;
             }
-            CONFORMANCE_CUDA(status); enabled.push_back(handle);
+            TEST_CUDA(status); enabled.push_back(handle);
         }
-        for (auto handle : enabled) CONFORMANCE_CUDA(cuCtxDisablePeerAccess(handle));
+        for (auto handle : enabled) TEST_CUDA(cuCtxDisablePeerAccess(handle));
     }
     require_capability(exhausted, "available topology does not exhaust native peer connection admission");
 }
 void peer_discovery() {
     for (auto [name, version] : std::array<std::pair<const char*, int>, 5>{{{"cuDeviceCanAccessPeer", 4000}, {"cuCtxEnablePeerAccess", 4000}, {"cuCtxDisablePeerAccess", 4000}, {"cuDeviceGetP2PAttribute", 8000}, {"cuDeviceGetP2PAtomicCapabilities", 13000}}}) {
         void* address{}; CUdriverProcAddressQueryResult result{};
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, version, 0, &result)); require(address && result == CU_GET_PROC_ADDRESS_SUCCESS, "peer procedure introduction boundary");
-        CONFORMANCE_CUDA(cuGetProcAddress(name, &address, version - 1, 0, &result)); require(!address && result == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "peer procedure pre-introduction lookup");
+        TEST_CUDA(cuGetProcAddress(name, &address, version, 0, &result)); require(address && result == CU_GET_PROC_ADDRESS_SUCCESS, "peer procedure introduction boundary");
+        TEST_CUDA(cuGetProcAddress(name, &address, version - 1, 0, &result)); require(!address && result == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "peer procedure pre-introduction lookup");
     }
-    void* address{}; CONFORMANCE_CUDA(cuGetProcAddress("cuDeviceCanAccessPeer", &address, 4000, 0, nullptr));
+    void* address{}; TEST_CUDA(cuGetProcAddress("cuDeviceCanAccessPeer", &address, 4000, 0, nullptr));
     require(reinterpret_cast<PFN_cuDeviceCanAccessPeer_v4000>(address)(nullptr, 0, 0) == CUDA_ERROR_NOT_INITIALIZED, "cold peer procedure behavior");
 }
 void execute_peer_access() {
-    CUcontext original{}; CONFORMANCE_CUDA(cuCtxGetCurrent(&original)); peer_current restore(original);
+    CUcontext original{}; TEST_CUDA(cuCtxGetCurrent(&original)); peer_current restore(original);
     if (peer_case == "topology") peer_topology();
     else if (peer_case == "validation") peer_validation();
     else if (peer_case == "unsupported") peer_unsupported();
@@ -318,7 +318,7 @@ void execute_peer_access() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_conformance(argc, argv, cudavm::peer_discovery);
+    if (argc == 2 && std::string_view(argv[1]) == "discovery") return cudavm::run_host_test(argc, argv, cudavm::peer_discovery);
     if (argc == 3) { cudavm::peer_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_peer_access);
+    return cudavm::run_test(argc, argv, cudavm::execute_peer_access);
 }

@@ -27,7 +27,7 @@ void program_image_roundtrip_producers() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "producers") return cudavm::run_host_conformance(argc, argv, cudavm::program_image_roundtrip_producers);
+    if (argc == 2 && std::string_view(argv[1]) == "producers") return cudavm::run_host_test(argc, argv, cudavm::program_image_roundtrip_producers);
     if (argc == 3) { cudavm::program_image_roundtrip_case = argv[2]; argc = 2; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_program_image_roundtrip, 0, cudavm::probe_execution);
+    return cudavm::run_test(argc, argv, cudavm::execute_program_image_roundtrip, 0, cudavm::probe_execution);
 }

@@ -29,12 +29,12 @@ template<class Query, class Get> program_image_bytes program_image_result(Query 
     }
     return {first.begin() + 16, first.end() - 16};
 }
-#ifndef CUDAVM_CONFORMANCE_HOST_ONLY
+#ifndef CUDAVM_TEST_HOST_ONLY
 inline void program_image_runtime_status(cudaError_t status) {
     require(status == cudaSuccess, std::string("program Runtime status ") + cudaGetErrorString(status));
 }
 #endif
-#ifdef CUDAVM_CONFORMANCE_NVJITLINK
+#ifdef CUDAVM_TEST_NVJITLINK
 inline program_image_bytes program_image_linked_result(const linker_fixture_program& linker, bool lto = false) {
     return program_image_result([&](size_t* size) {
         linker.check(lto ? nvJitLinkGetLinkedLTOIRSize(linker.value, size) : nvJitLinkGetLinkedCubinSize(linker.value, size), "public linked result size");
@@ -43,7 +43,7 @@ inline program_image_bytes program_image_linked_result(const linker_fixture_prog
     });
 }
 #endif
-#ifdef CUDAVM_CONFORMANCE_NVRTC
+#ifdef CUDAVM_TEST_NVRTC
 inline program_image_bytes program_image_nvrtc_produce(std::string_view producer) {
     require(producer == "nvrtc_cubin" || producer == "nvrtc_rdc" || producer == "nvrtc_lto", "known public NVRTC image producer");
     compiler_fixture_program program(std::string(module_loading_source), "program_image.cu");
@@ -72,7 +72,7 @@ struct program_image_file {
     void cleanup() const { std::error_code error; std::filesystem::remove(path, error); std::filesystem::remove(root, error); }
     program_image_file(const program_image_file&) = delete;
 };
-#ifdef CUDAVM_CONFORMANCE_NVJITLINK
+#ifdef CUDAVM_TEST_NVJITLINK
 inline program_image_bytes program_image_link(program_image_bytes input, nvJitLinkInputType kind, bool file, bool relocatable = false) {
     std::vector<std::string> options{"-arch=sm_75", "-lto", "-O0"}; if (relocatable) options.push_back("-r");
     linker_fixture_program linker(options);
@@ -87,7 +87,7 @@ inline program_image_bytes program_image_link(program_image_bytes input, nvJitLi
 }
 #endif
 
-#ifndef CUDAVM_CONFORMANCE_HOST_ONLY
+#ifndef CUDAVM_TEST_HOST_ONLY
 struct program_image_loaded {
     CUmodule module{}; CUlibrary library{}; bool runtime = false;
     program_image_loaded(const program_image_bytes& image, unsigned route) : runtime(route == 5 || route == 6) {
@@ -98,14 +98,14 @@ struct program_image_loaded {
         std::unique_ptr<program_image_file> input_file;
         if (file) input_file = std::make_unique<program_image_file>(input);
         auto path = input_file ? input_file->path.string() : std::string();
-        if (route == 0) CONFORMANCE_CUDA(cuModuleLoadData(&module_output.value, input.data()));
-        else if (route == 1) CONFORMANCE_CUDA(cuModuleLoadDataEx(&module_output.value, input.data(), 0, nullptr, nullptr));
-        else if (route == 2) CONFORMANCE_CUDA(cuModuleLoad(&module_output.value, path.c_str()));
-        else if (route == 3) CONFORMANCE_CUDA(cuLibraryLoadData(&library_output.value, input.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
-        else if (route == 4) CONFORMANCE_CUDA(cuLibraryLoadFromFile(&library_output.value, path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+        if (route == 0) TEST_CUDA(cuModuleLoadData(&module_output.value, input.data()));
+        else if (route == 1) TEST_CUDA(cuModuleLoadDataEx(&module_output.value, input.data(), 0, nullptr, nullptr));
+        else if (route == 2) TEST_CUDA(cuModuleLoad(&module_output.value, path.c_str()));
+        else if (route == 3) TEST_CUDA(cuLibraryLoadData(&library_output.value, input.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+        else if (route == 4) TEST_CUDA(cuLibraryLoadFromFile(&library_output.value, path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
         else if (route == 5) program_image_runtime_status(cudaLibraryLoadData(&runtime_output.value, input.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
         else if (route == 6) program_image_runtime_status(cudaLibraryLoadFromFile(&runtime_output.value, path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
-        else CONFORMANCE_CUDA(cuModuleLoadFatBinary(&module_output.value, input.data()));
+        else TEST_CUDA(cuModuleLoadFatBinary(&module_output.value, input.data()));
         module = module_output.get(); library = runtime ? reinterpret_cast<CUlibrary>(runtime_output.get()) : library_output.get();
         require((route < 3 || route == 7) ? module != nullptr : library != nullptr, "public loader publishes guarded program handle");
         std::fill(input.begin(), input.end(), 0x57); std::fill(path.begin(), path.end(), '!');
@@ -115,52 +115,52 @@ struct program_image_loaded {
     program_image_loaded(const program_image_loaded&) = delete;
     CUfunction function(const char* name) const {
         program_image_output<CUfunction> output;
-        if (module) CONFORMANCE_CUDA(cuModuleGetFunction(&output.value, module, name));
-        else { CUkernel kernel{}; CONFORMANCE_CUDA(cuLibraryGetKernel(&kernel, library, name)); CONFORMANCE_CUDA(cuKernelGetFunction(&output.value, kernel)); }
+        if (module) TEST_CUDA(cuModuleGetFunction(&output.value, module, name));
+        else { CUkernel kernel{}; TEST_CUDA(cuLibraryGetKernel(&kernel, library, name)); TEST_CUDA(cuKernelGetFunction(&output.value, kernel)); }
         require(output.get() != nullptr, "public program function lookup"); return output.value;
     }
     CUdeviceptr global(const char* name) const {
         program_image_output<CUdeviceptr> pointer; program_image_output<size_t> size;
-        if (module) CONFORMANCE_CUDA(cuModuleGetGlobal(&pointer.value, &size.value, module, name));
-        else CONFORMANCE_CUDA(cuLibraryGetGlobal(&pointer.value, &size.value, library, name));
+        if (module) TEST_CUDA(cuModuleGetGlobal(&pointer.value, &size.value, module, name));
+        else TEST_CUDA(cuLibraryGetGlobal(&pointer.value, &size.value, library, name));
         require(pointer.get() && size.get() == 4, "public program scalar storage address/extent"); return pointer.value;
     }
     void launch(const char* name, void** parameters) const {
         if (runtime) {
             cudaKernel_t kernel{}; program_image_runtime_status(cudaLibraryGetKernel(&kernel, reinterpret_cast<cudaLibrary_t>(library), name));
             program_image_runtime_status(cudaLaunchKernel(reinterpret_cast<const void*>(kernel), dim3(1), dim3(31), parameters, 0, nullptr));
-        } else CONFORMANCE_CUDA(cuLaunchKernel(function(name), 1, 1, 1, 31, 1, 1, 0, nullptr, parameters, nullptr));
+        } else TEST_CUDA(cuLaunchKernel(function(name), 1, 1, 1, 31, 1, 1, 0, nullptr, parameters, nullptr));
     }
 };
 inline void program_image_execute(const program_image_loaded& program) {
     constexpr unsigned capacity = 17, guards = 7; constexpr uint32_t guard = 0xa95b371d;
     const auto seed_address = program.global("module_seed"), bias_address = program.global("module_bias");
     std::array<uint32_t, 3> seed{guard, guard, guard}, bias{guard, guard, guard};
-    CONFORMANCE_CUDA(cuMemcpyDtoH(seed.data() + 1, seed_address, 4)); CONFORMANCE_CUDA(cuMemcpyDtoH(bias.data() + 1, bias_address, 4));
+    TEST_CUDA(cuMemcpyDtoH(seed.data() + 1, seed_address, 4)); TEST_CUDA(cuMemcpyDtoH(bias.data() + 1, bias_address, 4));
     require(seed == std::array<uint32_t, 3>{guard, 13, guard} && bias == std::array<uint32_t, 3>{guard, 29, guard}, "public program copied storage initializers and host guards");
     std::vector<uint32_t> input(capacity + 2 * guards, guard), expected(input.size()), actual(input.size()), preserved(input.size());
     constexpr std::array<uint32_t, 4> edges{0, 0xffffffff, 0x80000000, 0x7fffffff};
     for (unsigned i = 0; i < capacity; ++i) input[guards + i] = i < edges.size() ? edges[i] : i * 0x193759bdu;
     device_buffer source(input.size() * 4), output(input.size() * 4); auto in = source.value + guards * 4, out = output.value + guards * 4;
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
     for (uint32_t seed_value : {13u, 0xfffffff1u}) {
-        CONFORMANCE_CUDA(cuMemcpyHtoD(seed_address, &seed_value, 4));
+        TEST_CUDA(cuMemcpyHtoD(seed_address, &seed_value, 4));
         for (bool beta : {false, true}) for (unsigned count : {0u, 1u, capacity}) {
-            std::fill(expected.begin(), expected.end(), guard); CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+            std::fill(expected.begin(), expected.end(), guard); TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
             void* parameters[]{&out, &in, &count}; program.launch(beta ? "module_beta" : "module_alpha", parameters);
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
             for (unsigned i = 0; i < count; ++i) expected[guards + i] = module_boundary_expected(beta, input[guards + i], seed_value, i);
             expect_words(actual, expected, "public program image route results and complete output guards");
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(seed.data() + 1, seed_address, 4)); CONFORMANCE_CUDA(cuMemcpyDtoH(bias.data() + 1, bias_address, 4));
+        TEST_CUDA(cuMemcpyDtoH(seed.data() + 1, seed_address, 4)); TEST_CUDA(cuMemcpyDtoH(bias.data() + 1, bias_address, 4));
         require(seed == std::array<uint32_t, 3>{guard, seed_value, guard} && bias == std::array<uint32_t, 3>{guard, 29, guard}, "public program route preserves module inputs");
     }
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4)); expect_words(preserved, input, "public program image route preserves source and guards");
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4)); expect_words(preserved, input, "public program image route preserves source and guards");
 }
 inline void program_image_load_all(const program_image_bytes& image, bool fatbinary = false) {
     for (unsigned route = 0; route < (fatbinary ? 8u : 7u); ++route) {
         std::cout << "program_image loader=" << route << std::endl;
-        program_image_loaded program(image, route); program_image_execute(program); CONFORMANCE_CUDA(cuCtxSynchronize());
+        program_image_loaded program(image, route); program_image_execute(program); TEST_CUDA(cuCtxSynchronize());
     }
 }
 #endif

@@ -10,15 +10,15 @@ void architecture_case(const loaded_program& program, std::array<unsigned, 3> sh
     std::vector<uint32_t> initial(guards * 2 + (capacity + 1) * 16, guard), expected(initial), actual(initial.size());
     const auto kernel = program.function("architecture_state");
     int static_bytes = -1;
-    CONFORMANCE_CUDA(cuFuncGetAttribute(&static_bytes, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel));
+    TEST_CUDA(cuFuncGetAttribute(&static_bytes, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel));
     require(static_bytes >= 64 * 4, "architecture fixture retains its volatile static shared allocation");
     device_buffer source(input.size() * 4), destination(initial.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
     auto in = source.value + guards * 4, out = destination.value + guards * 4;
     void* arguments[]{&out, &in, &count, &dynamic_bytes};
-    CONFORMANCE_CUDA(cuLaunchKernel(kernel, 2, 2, 1, shape[0], shape[1], shape[2], dynamic_bytes, nullptr, arguments, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+    TEST_CUDA(cuLaunchKernel(kernel, 2, 2, 1, shape[0], shape[1], shape[2], dynamic_bytes, nullptr, arguments, nullptr));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
     for (unsigned i = 0; i < count; ++i) {
         const auto base = guards + i * 16;
         require(actual[base + 1] && actual[base] < actual[base + 1], "native SM identifier lies below the identifier-space bound");
@@ -35,7 +35,7 @@ void architecture_case(const loaded_program& program, std::array<unsigned, 3> sh
             ^ (dynamic_bytes ? (input[guards + i] & 255u) << 16 : 0u);
     }
     expect_words(actual, expected, "architecture register data, shared accesses, guards, padding and inactive records");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
     expect_words(preserved, input, "architecture intrinsic source values and guards are preserved");
 }
 void execute_architecture_intrinsics(const loaded_program& program) {
@@ -47,5 +47,5 @@ void execute_architecture_intrinsics(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_architecture_intrinsics);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_architecture_intrinsics);
 }

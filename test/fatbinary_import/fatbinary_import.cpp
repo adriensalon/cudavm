@@ -50,25 +50,25 @@ template<class Program> void fatbinary_execute_image(const Program& program) {
     constexpr uint32_t guard = 0xa95b371d;
     const auto seed_address = program.global("seed", 4), bias_address = program.global("bias", 4);
     std::array<uint32_t, 3> seed_words{guard, guard, guard}, bias_words{guard, guard, guard};
-    CONFORMANCE_CUDA(cuMemcpyDtoH(seed_words.data() + 1, seed_address, 4));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(bias_words.data() + 1, bias_address, 4));
+    TEST_CUDA(cuMemcpyDtoH(seed_words.data() + 1, seed_address, 4));
+    TEST_CUDA(cuMemcpyDtoH(bias_words.data() + 1, bias_address, 4));
     require(seed_words == std::array<uint32_t, 3>{guard, 13, guard}
         && bias_words == std::array<uint32_t, 3>{guard, 5, guard}, "NVIDIA container global/constant initialization and host guards");
     device_buffer output(37 * 4); auto out = output.value + 13 * 4;
     std::array<uint32_t, 37> expected, actual;
     for (unsigned phase = 0; phase < 2; ++phase) {
         const uint32_t seed = phase ? 0xfffffff1u : 13u, bias = phase ? 29u : 5u;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(seed_address, &seed, 4)); CONFORMANCE_CUDA(cuMemcpyHtoD(bias_address, &bias, 4));
+        TEST_CUDA(cuMemcpyHtoD(seed_address, &seed, 4)); TEST_CUDA(cuMemcpyHtoD(bias_address, &bias, 4));
         for (unsigned add : {0u, 1u, 17u, 0x7fffffffu, 0x80000000u, 0xffffffffu}) {
-            expected.fill(guard); CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), sizeof(expected)));
+            expected.fill(guard); TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), sizeof(expected)));
             void* parameters[]{&out, &add};
-            CONFORMANCE_CUDA(cuLaunchKernel(program.function("entry"), 1, 1, 1, 1, 1, 1, 0, nullptr, parameters, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
+            TEST_CUDA(cuLaunchKernel(program.function("entry"), 1, 1, 1, 1, 1, 1, 0, nullptr, parameters, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, sizeof(actual)));
             expected[13] = seed + bias + add + 7u;
             expect_words(actual, expected, "NVIDIA container selected program result and entire output guards");
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(seed_words.data() + 1, seed_address, 4));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(bias_words.data() + 1, bias_address, 4));
+        TEST_CUDA(cuMemcpyDtoH(seed_words.data() + 1, seed_address, 4));
+        TEST_CUDA(cuMemcpyDtoH(bias_words.data() + 1, bias_address, 4));
         require(seed_words == std::array<uint32_t, 3>{guard, seed, guard}
             && bias_words == std::array<uint32_t, 3>{guard, bias, guard}, "NVIDIA container preserves symbol inputs and host guards");
     }
@@ -77,14 +77,14 @@ struct fatbinary_module {
     CUmodule value{};
     explicit fatbinary_module(const void* image, decltype(&cuModuleLoadFatBinary) loader = cuModuleLoadFatBinary) {
         struct { uint64_t before = 0x193759bd; CUmodule value{}; uint64_t after = 0xabcdef01; } output;
-        CONFORMANCE_CUDA(loader(&output.value, image)); value = output.value;
+        TEST_CUDA(loader(&output.value, image)); value = output.value;
         require(output.before == 0x193759bd && output.after == 0xabcdef01 && value, "fatbinary module load output guards");
     }
     ~fatbinary_module() { if (value) cuModuleUnload(value); }
     fatbinary_module(const fatbinary_module&) = delete;
-    CUfunction function(const char* name) const { CUfunction function{}; CONFORMANCE_CUDA(cuModuleGetFunction(&function, value, name)); return function; }
+    CUfunction function(const char* name) const { CUfunction function{}; TEST_CUDA(cuModuleGetFunction(&function, value, name)); return function; }
     CUdeviceptr global(const char* name, size_t expected) const {
-        CUdeviceptr pointer{}; size_t size{}; CONFORMANCE_CUDA(cuModuleGetGlobal(&pointer, &size, value, name));
+        CUdeviceptr pointer{}; size_t size{}; TEST_CUDA(cuModuleGetGlobal(&pointer, &size, value, name));
         require(pointer && size == expected, "fatbinary module symbol address and extent"); return pointer;
     }
 };
@@ -92,7 +92,7 @@ void fatbinary_execute_copy(fatbinary_bytes bytes) {
     for (bool library : {false, true}) {
         auto temporary = bytes; loaded_program program(temporary.data(), library);
         std::fill(temporary.begin(), temporary.end(), 0x57);
-        fatbinary_execute_image(program); CONFORMANCE_CUDA(cuCtxSynchronize());
+        fatbinary_execute_image(program); TEST_CUDA(cuCtxSynchronize());
     }
 }
 void execute_fatbinary_import() {
@@ -100,23 +100,23 @@ void execute_fatbinary_import() {
         // Only native CUDA needs this architecture prerequisite. Shader profiles
         // execute the PTX member through their common IR import path.
         CUdevice device{}; char name[256]{}; int major{}, minor{};
-        CONFORMANCE_CUDA(cuCtxGetDevice(&device)); CONFORMANCE_CUDA(cuDeviceGetName(name, sizeof(name), device));
+        TEST_CUDA(cuCtxGetDevice(&device)); TEST_CUDA(cuDeviceGetName(name, sizeof(name), device));
         if (std::string_view(name).ends_with(" (CUDA)")) {
-            CONFORMANCE_CUDA(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
-            CONFORMANCE_CUDA(cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+            TEST_CUDA(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+            TEST_CUDA(cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
             require_capability(major == 7 && minor == 5, "NVIDIA fatbinary native cubin execution profile requires SM75");
         }
         if (fatbinary_import_case == "load_fatbinary") {
             void* entry{}; CUdriverProcAddressQueryResult status{};
-            CONFORMANCE_CUDA(cuGetProcAddress("cuModuleLoadFatBinary", &entry, 1999, CU_GET_PROC_ADDRESS_DEFAULT, &status));
+            TEST_CUDA(cuGetProcAddress("cuModuleLoadFatBinary", &entry, 1999, CU_GET_PROC_ADDRESS_DEFAULT, &status));
             require(!entry && status == CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT, "fatbinary loader rejects procedure revisions before its introduction");
-            CONFORMANCE_CUDA(cuGetProcAddress("cuModuleLoadFatBinary", &entry, 2000, CU_GET_PROC_ADDRESS_DEFAULT, &status));
+            TEST_CUDA(cuGetProcAddress("cuModuleLoadFatBinary", &entry, 2000, CU_GET_PROC_ADDRESS_DEFAULT, &status));
             require(entry && status == CU_GET_PROC_ADDRESS_SUCCESS, "fatbinary module loader is available through its pinned ABI revision");
             const auto resolved = reinterpret_cast<decltype(&cuModuleLoadFatBinary)>(entry);
             for (bool compressed : {false, true}) {
                 auto input = fatbinary_input(compressed); fatbinary_module program(input.data(), compressed ? resolved : cuModuleLoadFatBinary);
                 std::fill(input.begin(), input.end(), 0x57);
-                fatbinary_execute_image(program); CONFORMANCE_CUDA(cuCtxSynchronize());
+                fatbinary_execute_image(program); TEST_CUDA(cuCtxSynchronize());
             }
             CUmodule rejected{};
             require(cuModuleLoadFatBinary(nullptr, fatbinary_plain) == CUDA_ERROR_INVALID_VALUE
@@ -210,7 +210,7 @@ void fatbinary_import_host() {
 }
 }
 int main(int argc, char** argv) {
-    if (argc == 2) { cudavm::fatbinary_import_case = argv[1]; return cudavm::run_host_conformance(argc, argv, cudavm::fatbinary_import_host); }
+    if (argc == 2) { cudavm::fatbinary_import_case = argv[1]; return cudavm::run_host_test(argc, argv, cudavm::fatbinary_import_host); }
     if (argc == 3) { cudavm::fatbinary_import_case = argv[2]; argc = 2; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_fatbinary_import, 0, cudavm::probe_execution);
+    return cudavm::run_test(argc, argv, cudavm::execute_fatbinary_import, 0, cudavm::probe_execution);
 }

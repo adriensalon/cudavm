@@ -38,18 +38,18 @@ void execute_async_copy(const loaded_program& program) {
         device_buffer source(input.size() * 4), output(expected.size() * 4);
         auto from = source.value + guards * 4, to = output.value + guards * 4;
         std::vector<uint32_t> initialized(expected.size(), guard);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
-        CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, initialized.data(), initialized.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(output.value, initialized.data(), initialized.size() * 4));
         void* args[]{&to, &from, &rounds, &count, &seed};
         const auto name = "async_copy_" + std::to_string(bytes) + "_" + std::to_string(zfill);
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function(name.c_str()), blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+        TEST_CUDA(cuLaunchKernel(program.function(name.c_str()), blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
         expect_words(actual, expected, "copy sizes, every zero-fill extent, aligned offsets, peer visibility and guards");
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "async copy source and allocation preservation");
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_async_copy);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_async_copy);
 }

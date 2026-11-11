@@ -30,14 +30,14 @@ void execute_control_flow(const loaded_program& program) {
             input[i + 1] = i % 17 == 0 ? 0u : (i & 255u) | (i % 2 ? 0xffffff00u : 0u);
         device_buffer source(input.size() * sizeof(uint32_t)), destination(expected.size() * sizeof(uint32_t));
         auto in = source.value + sizeof(uint32_t), out = destination.value + sizeof(uint32_t);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * sizeof(uint32_t)));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * sizeof(uint32_t)));
         for (uint32_t seed : {0u, 0x80000000u, 0xffffffffu})
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * sizeof(uint32_t)));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * sizeof(uint32_t)));
             void* args[]{&out, &in, &count, &seed};
-            CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * sizeof(uint32_t)));
+            TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * sizeof(uint32_t)));
             for (unsigned i = 0; i < std::min(total, count); ++i) {
                 if (!input[i + 1]) continue;
                 const auto values = control_flow_expected(input[i + 1], seed);
@@ -46,12 +46,12 @@ void execute_control_flow(const loaded_program& program) {
             expect_words(actual, expected, "branch/loop threads=" + std::to_string(threads)
                 + " count=" + std::to_string(count) + " seed=" + std::to_string(seed));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * sizeof(uint32_t)));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * sizeof(uint32_t)));
         expect_words(preserved, input, "control-flow input preservation");
     }
 }
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_control_flow);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_control_flow);
 }

@@ -40,36 +40,36 @@ void execute_device_assert(const loaded_program& program) {
         constexpr uint32_t guard = 0xa1b2c3d4;
         constexpr unsigned guards = 4, capacity = 40;
         CUdeviceptr allocation = 0;
-        CONFORMANCE_CUDA(cuMemAlloc(&allocation, (capacity + guards * 2) * 4));
+        TEST_CUDA(cuMemAlloc(&allocation, (capacity + guards * 2) * 4));
         auto output = allocation + guards * 4;
         auto function = program.function("assert_checked");
         CUstream stream{};
         CUevent done{};
-        CONFORMANCE_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
-        CONFORMANCE_CUDA(cuEventCreate(&done, CU_EVENT_DISABLE_TIMING));
+        TEST_CUDA(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+        TEST_CUDA(cuEventCreate(&done, CU_EVENT_DISABLE_TIMING));
         std::vector<uint32_t> expected(capacity + guards * 2, guard), actual(expected.size());
         unsigned fail = 0;
         for (unsigned count : {0u, 1u, 17u, 39u}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(allocation, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(allocation, expected.data(), expected.size() * 4));
             void* args[]{&output, &count, &fail};
             if (assert_library) {
                 const auto kernel = program.library_kernel("assert_checked");
                 require(cudaLaunchKernel(reinterpret_cast<const void*>(kernel), dim3(3), dim3(13), args, 0,
                     reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess, "Runtime launches clean assertion kernel");
-            } else CONFORMANCE_CUDA(cuLaunchKernel(function, 3, 1, 1, 13, 1, 1, 0, stream, args, nullptr));
-            CONFORMANCE_CUDA(cuStreamSynchronize(stream));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), allocation, actual.size() * 4));
+            } else TEST_CUDA(cuLaunchKernel(function, 3, 1, 1, 13, 1, 1, 0, stream, args, nullptr));
+            TEST_CUDA(cuStreamSynchronize(stream));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), allocation, actual.size() * 4));
             for (unsigned i = 0; i < count; ++i) expected[guards + i] = i * 37 + count;
             expect_words(actual, expected, "nonfailing assertion branch, inactive rows and allocation guards");
         }
         require(cudaGetLastError() == cudaSuccess, "clean Runtime status before assertion");
         unsigned count = 17; fail = 1;
         void* args[]{&output, &count, &fail};
-        CONFORMANCE_CUDA(cuLaunchHostFunc(stream, assert_gate::hold, &gate));
+        TEST_CUDA(cuLaunchHostFunc(stream, assert_gate::hold, &gate));
         gate.await();
-        CONFORMANCE_CUDA(cuLaunchKernel(function, 3, 1, 1, 13, 1, 1, 0, stream, args, nullptr));
-        CONFORMANCE_CUDA(cuEventRecord(done, stream));
+        TEST_CUDA(cuLaunchKernel(function, 3, 1, 1, 13, 1, 1, 0, stream, args, nullptr));
+        TEST_CUDA(cuEventRecord(done, stream));
         require(cuEventQuery(done) == CUDA_ERROR_NOT_READY, "assertion event remains pending behind the gate");
         gate.release();
         require(cuStreamSynchronize(stream) == CUDA_ERROR_ASSERT, "assertion faults the producing stream");
@@ -99,14 +99,14 @@ int main(int argc, char** argv) {
         cudavm::assert_library = std::string_view(argv[2]) == "library";
         char source_importer[] = "cu";
         char* arguments[]{argv[0], argv[1], source_importer};
-        return cudavm::run_conformance(3, arguments, cudavm::fixtures, cudavm::execute_device_assert);
+        return cudavm::run_test(3, arguments, cudavm::fixtures, cudavm::execute_device_assert);
     }
     try {
         cudavm::require(argc == 3 && std::string_view(argv[2]) == "cu", "usage: <executable> <backend> cu");
         const std::array<std::string_view, 5> backends{"cuda", "vulkan", "directx", "opencl", "opengl"};
         cudavm::require(std::find(backends.begin(), backends.end(), argv[1]) != backends.end(), "known backend");
         for (const char* loader : {"module", "library"}) {
-            const auto child = cudavm::run_conformance_child(argv[0], argv[1], loader, true);
+            const auto child = cudavm::run_test_child(argv[0], argv[1], loader, true);
             std::cout << child.output;
             if (child.status != 0) return child.status;
             for (const char* token : {"device_assert exact witness", "device_assert.cu:75", "assert_checked"})

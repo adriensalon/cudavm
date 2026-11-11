@@ -38,16 +38,16 @@ void wmma_case(const loaded_program& program, unsigned mode, unsigned control, u
     }
     device_buffer left(a.size() * 2), right(b.size() * 2), initial(c.size() * 4), destination(expected.size() * 4);
     std::vector<uint32_t> empty(expected.size(), float_guard), preserved(c.size());
-    CONFORMANCE_CUDA(cuMemcpyHtoD(left.value, a.data(), a.size() * 2));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(right.value, b.data(), b.size() * 2));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(initial.value, c.data(), c.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, empty.data(), empty.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(left.value, a.data(), a.size() * 2));
+    TEST_CUDA(cuMemcpyHtoD(right.value, b.data(), b.size() * 2));
+    TEST_CUDA(cuMemcpyHtoD(initial.value, c.data(), c.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(destination.value, empty.data(), empty.size() * 4));
     auto ap = left.value + half_guards * 2, bp = right.value + half_guards * 2;
     auto cp = initial.value + float_guards * 4, out = destination.value + float_guards * 4;
     void* arguments[]{&out, &ap, &bp, &cp, &half_stride, &float_stride, &control, &rounds};
     constexpr const char* kernels[]{"wmma_rr", "wmma_rc", "wmma_cr", "wmma_cc"};
-    CONFORMANCE_CUDA(cuLaunchKernel(program.function(kernels[mode]), blocks, 1, 1, 16, warps * 2, 1, 0, nullptr, arguments, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+    TEST_CUDA(cuLaunchKernel(program.function(kernels[mode]), blocks, 1, 1, 16, warps * 2, 1, 0, nullptr, arguments, nullptr));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
     // WMMA accumulation rounding is unspecified; either sign of an exact zero
     // is valid. With no multiply, fragment negation prescribes the sign exactly.
     if (rounds) for (size_t i = 0; i < actual.size(); ++i)
@@ -56,10 +56,10 @@ void wmma_case(const loaded_program& program, unsigned mode, unsigned control, u
         + " control=" + std::to_string(control) + " rounds=" + std::to_string(rounds) + " warps=" + std::to_string(warps)
         + (fractional ? " fractional accumulator" : ""));
     for (auto pair : {std::pair{left.value, &a}, std::pair{right.value, &b}}) {
-        CONFORMANCE_CUDA(cuMemcpyDtoH(half_copy.data(), pair.first, half_copy.size() * 2));
+        TEST_CUDA(cuMemcpyDtoH(half_copy.data(), pair.first, half_copy.size() * 2));
         require(half_copy == *pair.second, "WMMA half inputs, row padding and guards are preserved");
     }
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), initial.value, preserved.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), initial.value, preserved.size() * 4));
     expect_words(preserved, c, "WMMA accumulator source, padding and guards are preserved");
 }
 void wmma_fill_case(const loaded_program& program) {
@@ -69,10 +69,10 @@ void wmma_fill_case(const loaded_program& program) {
     device_buffer destination(initial.size() * 4);
     auto output = destination.value + guards * 4;
     for (unsigned bits : {0x3fa00000u, 0x7f800000u, 0xff800000u, 0x7fc12345u}) for (unsigned saturate : {0u, 1u}) {
-        CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
         void* arguments[]{&output, &bits, &saturate};
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function("wmma_fill"), 1, 1, 1, 32, 1, 1, 0, nullptr, arguments, nullptr));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+        TEST_CUDA(cuLaunchKernel(program.function("wmma_fill"), 1, 1, 1, 32, 1, 1, 0, nullptr, arguments, nullptr));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
         for (size_t i = 0; i < actual.size(); ++i) {
             if (i < guards || i >= guards + stride * 16 || (i - guards) % stride >= 16)
                 require(actual[i] == guard, "WMMA filled fragments preserve output padding and guards");
@@ -106,5 +106,5 @@ void execute_wmma_operations(const loaded_program& program) {
 }
 int main(int argc, char** argv) {
     if (argc == 4) { cudavm::wmma_profile = argv[3]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_wmma_operations);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_wmma_operations);
 }

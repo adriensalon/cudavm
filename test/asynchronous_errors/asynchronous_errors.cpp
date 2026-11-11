@@ -31,18 +31,18 @@ void asynchronous_probe() {
  .reg .u64 p; ld.param.u64 p,[output]; st.global.u32 [p],0x43564d31; ret;
 })";
     CUmodule module{};
-    CONFORMANCE_CUDA(cuModuleLoadData(&module, ptx));
+    TEST_CUDA(cuModuleLoadData(&module, ptx));
     CUfunction function{};
-    CONFORMANCE_CUDA(cuModuleGetFunction(&function, module, "probe"));
+    TEST_CUDA(cuModuleGetFunction(&function, module, "probe"));
     {
         device_buffer output(4);
         void* args[]{&output.value};
-        CONFORMANCE_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr));
+        TEST_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr));
         uint32_t actual = 0;
-        CONFORMANCE_CUDA(cuMemcpyDtoH(&actual, output.value, 4));
+        TEST_CUDA(cuMemcpyDtoH(&actual, output.value, 4));
         require(actual == 0x43564d31, "independent execution probe result");
     }
-    CONFORMANCE_CUDA(cuModuleUnload(module));
+    TEST_CUDA(cuModuleUnload(module));
 }
 struct asynchronous_gate {
     std::mutex mutex;
@@ -98,42 +98,42 @@ extern "C" __global__ void deferred_assert(unsigned* output, unsigned fail) {
         CUlibrary library{};
         CUfunction function{};
         if (asynchronous_error_case == "library") {
-            CONFORMANCE_CUDA(cuLibraryLoadData(&library, image.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+            TEST_CUDA(cuLibraryLoadData(&library, image.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
             CUkernel kernel{};
-            CONFORMANCE_CUDA(cuLibraryGetKernel(&kernel, library, "deferred_assert"));
-            CONFORMANCE_CUDA(cuKernelGetFunction(&function, kernel));
+            TEST_CUDA(cuLibraryGetKernel(&kernel, library, "deferred_assert"));
+            TEST_CUDA(cuKernelGetFunction(&function, kernel));
         } else {
-            CONFORMANCE_CUDA(cuModuleLoadData(&module, image.data()));
-            CONFORMANCE_CUDA(cuModuleGetFunction(&function, module, "deferred_assert"));
+            TEST_CUDA(cuModuleLoadData(&module, image.data()));
+            TEST_CUDA(cuModuleGetFunction(&function, module, "deferred_assert"));
         }
         CUstream producer{}, consumer{};
         CUevent ready{};
-        CONFORMANCE_CUDA(cuStreamCreate(&producer, CU_STREAM_NON_BLOCKING));
-        CONFORMANCE_CUDA(cuStreamCreate(&consumer, CU_STREAM_NON_BLOCKING));
-        CONFORMANCE_CUDA(cuEventCreate(&ready, CU_EVENT_DISABLE_TIMING));
+        TEST_CUDA(cuStreamCreate(&producer, CU_STREAM_NON_BLOCKING));
+        TEST_CUDA(cuStreamCreate(&consumer, CU_STREAM_NON_BLOCKING));
+        TEST_CUDA(cuEventCreate(&ready, CU_EVENT_DISABLE_TIMING));
         CUdeviceptr output = 0;
-        CONFORMANCE_CUDA(cuMemAlloc(&output, 4));
+        TEST_CUDA(cuMemAlloc(&output, 4));
         unsigned fail = 0;
         void* args[]{&output, &fail};
-        CONFORMANCE_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, producer, args, nullptr));
-        CONFORMANCE_CUDA(cuStreamSynchronize(producer));
+        TEST_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, producer, args, nullptr));
+        TEST_CUDA(cuStreamSynchronize(producer));
         uint32_t actual = 0;
-        CONFORMANCE_CUDA(cuMemcpyDtoH(&actual, output, 4));
+        TEST_CUDA(cuMemcpyDtoH(&actual, output, 4));
         require(actual == 0x1234abcd, "same kernel completes normally before fault submission");
         ASYNC_RUNTIME(cudaGetLastError());
         // Callback userdata must survive even a broken completion implementation
         // that reports an error before the callback returns. This disposable
         // process owns the state until immediate exit, including failure paths.
         auto& gate = *new asynchronous_gate;
-        CONFORMANCE_CUDA(cuLaunchHostFunc(producer, asynchronous_gate::hold, &gate));
+        TEST_CUDA(cuLaunchHostFunc(producer, asynchronous_gate::hold, &gate));
         gate.await();
         fail = 1;
         auto& downstream_calls = *new std::atomic<unsigned>{0};
         try {
-            CONFORMANCE_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, producer, args, nullptr));
-            CONFORMANCE_CUDA(cuEventRecord(ready, producer));
-            CONFORMANCE_CUDA(cuStreamWaitEvent(consumer, ready, 0));
-            CONFORMANCE_CUDA(cuLaunchHostFunc(consumer, [](void* value) { ++*static_cast<std::atomic<unsigned>*>(value); }, &downstream_calls));
+            TEST_CUDA(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, producer, args, nullptr));
+            TEST_CUDA(cuEventRecord(ready, producer));
+            TEST_CUDA(cuStreamWaitEvent(consumer, ready, 0));
+            TEST_CUDA(cuLaunchHostFunc(consumer, [](void* value) { ++*static_cast<std::atomic<unsigned>*>(value); }, &downstream_calls));
             require(cuStreamQuery(producer) == CUDA_ERROR_NOT_READY, "fault remains pending behind gate");
             require(cuEventQuery(ready) == CUDA_ERROR_NOT_READY, "fault event remains pending behind gate");
             require(cudaStreamQuery(reinterpret_cast<cudaStream_t>(consumer)) == cudaErrorNotReady, "dependent stream remains pending");
@@ -169,5 +169,5 @@ extern "C" __global__ void deferred_assert(unsigned* output, unsigned fail) {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::asynchronous_error_case = argv[2]; --argc; }
-    cudavm::run_isolated_fault_conformance(argc, argv, cudavm::execute_asynchronous_errors, cudavm::asynchronous_probe);
+    cudavm::run_isolated_fault_test(argc, argv, cudavm::execute_asynchronous_errors, cudavm::asynchronous_probe);
 }

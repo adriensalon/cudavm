@@ -150,5 +150,5 @@ int main(int argc, char** argv) {
     cudavm::half2_profile = unsigned(selected - profiles.begin());
     const auto source = "#define CUDAVM_HALF2_PROFILE " + std::to_string(cudavm::half2_profile) + "\n" + std::string(cudavm::fixtures.source);
     auto fixtures = cudavm::fixtures; fixtures.source = source;
-    return cudavm::run_conformance(3, argv, fixtures, cudavm::execute_half2_operations);
+    return cudavm::run_test(3, argv, fixtures, cudavm::execute_half2_operations);
 }

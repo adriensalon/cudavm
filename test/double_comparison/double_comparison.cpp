@@ -88,13 +88,13 @@ void execute_double_comparison(const loaded_program& program) {
         std::vector<uint32_t> actual(total * fields + 4), expected(actual.size(), guard);
         device_buffer source(input.size() * 4), destination(actual.size() * 4);
         auto in = source.value + 8, out = destination.value + 8;
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (unsigned count : {0u, 1u, total / 2 + 1, total, total + 7}) {
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(destination.value, expected.data(), expected.size() * 4));
             void* args[]{&out, &in, &count};
-            CONFORMANCE_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+            TEST_CUDA(cuLaunchKernel(kernel, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
             for (unsigned i = 0; i < std::min(total, count); ++i) {
                 const uint64_t a = comparison_word_pair(input, 2 + i * 6), b = comparison_word_pair(input, 4 + i * 6);
                 const uint32_t c = input[6 + i * 6];
@@ -129,12 +129,12 @@ void execute_double_comparison(const loaded_program& program) {
             }
             expect_words(actual, expected, "double comparison threads=" + std::to_string(threads) + " count=" + std::to_string(count));
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "double comparison source preservation");
     }
 }
 }
 
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_double_comparison);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_double_comparison);
 }

@@ -100,5 +100,5 @@ void execute_public_types() {
 }
 int main(int argc, char** argv) {
     if (argc == 2) cudavm::public_types_case = argv[1];
-    return cudavm::run_host_conformance(argc, argv, cudavm::execute_public_types);
+    return cudavm::run_host_test(argc, argv, cudavm::execute_public_types);
 }

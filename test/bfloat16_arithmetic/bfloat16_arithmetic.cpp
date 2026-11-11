@@ -88,5 +88,5 @@ int main(int argc, char** argv) {
     const auto source = "#define CUDAVM_BFLOAT16_PROFILE " + std::to_string(cudavm::bfloat16_arithmetic_profile) + "\n"
         + std::string(cudavm::fixtures.source);
     auto fixtures = cudavm::fixtures; fixtures.source = source;
-    return cudavm::run_conformance(3, argv, fixtures, cudavm::execute_bfloat16_arithmetic);
+    return cudavm::run_test(3, argv, fixtures, cudavm::execute_bfloat16_arithmetic);
 }

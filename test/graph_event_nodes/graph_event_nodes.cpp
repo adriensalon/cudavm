@@ -13,9 +13,9 @@ void check_graph_event_runtime(cudaError_t result, const char* operation) {
 #define GRAPH_EVENT_RUNTIME(call) ::cudavm::check_graph_event_runtime((call), #call)
 struct graph_event_storage {
     device_buffer device{557}; void* output{};
-    graph_event_storage() { CONFORMANCE_CUDA(cuMemAllocHost(&output, 601)); }
+    graph_event_storage() { TEST_CUDA(cuMemAllocHost(&output, 601)); }
     ~graph_event_storage() { if (output) { cuCtxSynchronize(); cuMemFreeHost(output); } }
-    void reset() { CONFORMANCE_CUDA(cuMemsetD8(device.value, 0x91, 557)); clear_output(); }
+    void reset() { TEST_CUDA(cuMemsetD8(device.value, 0x91, 557)); clear_output(); }
     void clear_output() { std::memset(output, 0xd3, 601); }
     void expect(bool produced, bool copied = true) const {
         std::vector<unsigned char> expected(601, 0xd3);
@@ -25,30 +25,30 @@ struct graph_event_storage {
         }
         require(std::memcmp(output, expected.data(), expected.size()) == 0, "graph event visibility, untouched bytes and readback guards");
     }
-    void read(CUstream stream) const { CONFORMANCE_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(output) + 19, device.value, 557, stream)); }
-    void produce(CUstream stream) const { CONFORMANCE_CUDA(cuMemsetD8Async(device.value + 23, 0x71, 389, stream)); }
+    void read(CUstream stream) const { TEST_CUDA(cuMemcpyDtoHAsync(static_cast<unsigned char*>(output) + 19, device.value, 557, stream)); }
+    void produce(CUstream stream) const { TEST_CUDA(cuMemsetD8Async(device.value + 23, 0x71, 389, stream)); }
 };
 struct graph_event_stream {
     CUstream value{};
-    graph_event_stream() { CONFORMANCE_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
+    graph_event_stream() { TEST_CUDA(cuStreamCreate(&value, CU_STREAM_NON_BLOCKING)); }
     ~graph_event_stream() { if (value) { cuStreamSynchronize(value); cuStreamDestroy(value); } }
-    void synchronize() const { CONFORMANCE_CUDA(cuStreamSynchronize(value)); }
+    void synchronize() const { TEST_CUDA(cuStreamSynchronize(value)); }
 };
 struct graph_event_handle {
     CUevent value{};
     explicit graph_event_handle(bool runtime, bool timing = false) {
         const unsigned flags = timing ? 0 : CU_EVENT_DISABLE_TIMING;
         if (runtime) { cudaEvent_t event{}; GRAPH_EVENT_RUNTIME(cudaEventCreateWithFlags(&event, flags)); value = reinterpret_cast<CUevent>(event); }
-        else CONFORMANCE_CUDA(cuEventCreate(&value, flags));
+        else TEST_CUDA(cuEventCreate(&value, flags));
     }
     ~graph_event_handle() { if (value) cuEventDestroy(value); }
     void record(CUstream stream, bool runtime) const {
         if (runtime) GRAPH_EVENT_RUNTIME(cudaEventRecord(reinterpret_cast<cudaEvent_t>(value), reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuEventRecord(value, stream));
+        else TEST_CUDA(cuEventRecord(value, stream));
     }
     void destroy(bool runtime) {
         if (runtime) GRAPH_EVENT_RUNTIME(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(value)));
-        else CONFORMANCE_CUDA(cuEventDestroy(value)); value = nullptr;
+        else TEST_CUDA(cuEventDestroy(value)); value = nullptr;
     }
 };
 struct graph_event_gate {
@@ -70,9 +70,9 @@ struct graph_event_gate_cleanup {
 struct graph_event_graph {
     CUgraph value{}; CUcontext context{};
     explicit graph_event_graph(bool runtime) {
-        CONFORMANCE_CUDA(cuCtxGetCurrent(&context));
+        TEST_CUDA(cuCtxGetCurrent(&context));
         if (runtime) { cudaGraph_t graph{}; GRAPH_EVENT_RUNTIME(cudaGraphCreate(&graph, 0)); value = reinterpret_cast<CUgraph>(graph); }
-        else CONFORMANCE_CUDA(cuGraphCreate(&value, 0));
+        else TEST_CUDA(cuGraphCreate(&value, 0));
     }
     ~graph_event_graph() { if (value) cuGraphDestroy(value); }
     CUgraphNode event(CUevent event, bool record, bool runtime, CUgraphNode dependency = nullptr) const {
@@ -82,41 +82,41 @@ struct graph_event_graph {
             if (record) GRAPH_EVENT_RUNTIME(cudaGraphAddEventRecordNode(&result, reinterpret_cast<cudaGraph_t>(value), dependency ? &dep : nullptr, dependency ? 1 : 0, reinterpret_cast<cudaEvent_t>(event)));
             else GRAPH_EVENT_RUNTIME(cudaGraphAddEventWaitNode(&result, reinterpret_cast<cudaGraph_t>(value), dependency ? &dep : nullptr, dependency ? 1 : 0, reinterpret_cast<cudaEvent_t>(event)));
             node = reinterpret_cast<CUgraphNode>(result);
-        } else if (record) CONFORMANCE_CUDA(cuGraphAddEventRecordNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, event));
-        else CONFORMANCE_CUDA(cuGraphAddEventWaitNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, event));
+        } else if (record) TEST_CUDA(cuGraphAddEventRecordNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, event));
+        else TEST_CUDA(cuGraphAddEventWaitNode(&node, value, dependency ? &dependency : nullptr, dependency ? 1 : 0, event));
         return node;
     }
     CUgraphNode fill(const graph_event_storage& storage) const {
         CUDA_MEMSET_NODE_PARAMS p{}; p.dst = storage.device.value + 23; p.value = 0x71; p.elementSize = 1; p.width = 389; p.height = 1;
-        CUgraphNode node{}; CONFORMANCE_CUDA(cuGraphAddMemsetNode(&node, value, nullptr, 0, &p, context)); return node;
+        CUgraphNode node{}; TEST_CUDA(cuGraphAddMemsetNode(&node, value, nullptr, 0, &p, context)); return node;
     }
     CUgraphNode read(const graph_event_storage& storage, CUgraphNode dependency) const {
         CUDA_MEMCPY3D p{}; p.srcMemoryType = CU_MEMORYTYPE_DEVICE; p.srcDevice = storage.device.value;
         p.dstMemoryType = CU_MEMORYTYPE_HOST; p.dstHost = static_cast<unsigned char*>(storage.output) + 19;
         p.srcPitch = p.dstPitch = p.WidthInBytes = 557; p.srcHeight = p.dstHeight = p.Height = p.Depth = 1;
-        CUgraphNode node{}; CONFORMANCE_CUDA(cuGraphAddMemcpyNode(&node, value, &dependency, 1, &p, context)); return node;
+        CUgraphNode node{}; TEST_CUDA(cuGraphAddMemcpyNode(&node, value, &dependency, 1, &p, context)); return node;
     }
 };
 struct graph_event_executable {
     CUgraphExec value{};
     graph_event_executable(CUgraph graph, bool runtime) {
         if (runtime) { cudaGraphExec_t result{}; GRAPH_EVENT_RUNTIME(cudaGraphInstantiateWithFlags(&result, reinterpret_cast<cudaGraph_t>(graph), 0)); value = reinterpret_cast<CUgraphExec>(result); }
-        else CONFORMANCE_CUDA(cuGraphInstantiate(&value, graph, 0));
+        else TEST_CUDA(cuGraphInstantiate(&value, graph, 0));
     }
     ~graph_event_executable() { if (value) { cuCtxSynchronize(); cuGraphExecDestroy(value); } }
     void launch(CUstream stream, bool runtime) const {
         if (runtime) GRAPH_EVENT_RUNTIME(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(value), reinterpret_cast<cudaStream_t>(stream)));
-        else CONFORMANCE_CUDA(cuGraphLaunch(value, stream));
+        else TEST_CUDA(cuGraphLaunch(value, stream));
     }
 };
 void graph_event_expect(CUgraphNode node, CUevent expected, bool record) {
     struct guarded_event { uint64_t prefix = 0x123456789abcdef0; CUevent value{}; uint64_t suffix = 0xfedcba9876543210; } driver;
     cudaEvent_t runtime{};
     if (record) {
-        CONFORMANCE_CUDA(cuGraphEventRecordNodeGetEvent(node, &driver.value));
+        TEST_CUDA(cuGraphEventRecordNodeGetEvent(node, &driver.value));
         GRAPH_EVENT_RUNTIME(cudaGraphEventRecordNodeGetEvent(reinterpret_cast<cudaGraphNode_t>(node), &runtime));
     } else {
-        CONFORMANCE_CUDA(cuGraphEventWaitNodeGetEvent(node, &driver.value));
+        TEST_CUDA(cuGraphEventWaitNodeGetEvent(node, &driver.value));
         GRAPH_EVENT_RUNTIME(cudaGraphEventWaitNodeGetEvent(reinterpret_cast<cudaGraphNode_t>(node), &runtime));
     }
     require(driver.value == expected && reinterpret_cast<CUevent>(runtime) == expected && driver.prefix == 0x123456789abcdef0
@@ -129,10 +129,10 @@ void graph_event_set(CUgraphNode node, CUevent event, bool record, bool runtime,
         else if (executable) GRAPH_EVENT_RUNTIME(cudaGraphExecEventWaitNodeSetEvent(x, n, e));
         else if (record) GRAPH_EVENT_RUNTIME(cudaGraphEventRecordNodeSetEvent(n, e));
         else GRAPH_EVENT_RUNTIME(cudaGraphEventWaitNodeSetEvent(n, e));
-    } else if (executable && record) CONFORMANCE_CUDA(cuGraphExecEventRecordNodeSetEvent(executable, node, event));
-    else if (executable) CONFORMANCE_CUDA(cuGraphExecEventWaitNodeSetEvent(executable, node, event));
-    else if (record) CONFORMANCE_CUDA(cuGraphEventRecordNodeSetEvent(node, event));
-    else CONFORMANCE_CUDA(cuGraphEventWaitNodeSetEvent(node, event));
+    } else if (executable && record) TEST_CUDA(cuGraphExecEventRecordNodeSetEvent(executable, node, event));
+    else if (executable) TEST_CUDA(cuGraphExecEventWaitNodeSetEvent(executable, node, event));
+    else if (record) TEST_CUDA(cuGraphEventRecordNodeSetEvent(node, event));
+    else TEST_CUDA(cuGraphEventWaitNodeSetEvent(node, event));
 }
 void graph_event_nodes_recording() {
     for (bool runtime : {false, true}) {
@@ -141,18 +141,18 @@ void graph_event_nodes_recording() {
         const auto fill = graph.fill(storage), read = graph.read(storage, fill), record = graph.event(event.value, true, runtime, read);
         graph_event_expect(record, event.value, true);
         CUDA_HOST_NODE_PARAMS p{graph_event_gate::call, &gate}; CUgraphNode host{};
-        CONFORMANCE_CUDA(cuGraphAddHostNode(&host, graph.value, &record, 1, &p));
+        TEST_CUDA(cuGraphAddHostNode(&host, graph.value, &record, 1, &p));
         graph_event_executable executable(graph.value, !runtime);
         graph_event_gate_cleanup cleanup{gate};
         storage.reset(); executable.launch(producer.value, runtime); gate.await();
-        CONFORMANCE_CUDA(cuEventSynchronize(event.value)); gate.expect_held();
+        TEST_CUDA(cuEventSynchronize(event.value)); gate.expect_held();
         require(cuStreamQuery(producer.value) == CUDA_ERROR_NOT_READY, "graph remains pending after its event record completes");
         storage.expect(true);
         // The readback is mandated before the held callback. Release it before
         // requesting any independent GPU progress, as host-function rules require.
         gate.release(); producer.synchronize(); storage.clear_output();
         if (runtime) GRAPH_EVENT_RUNTIME(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(consumer.value), reinterpret_cast<cudaEvent_t>(event.value), 0));
-        else CONFORMANCE_CUDA(cuStreamWaitEvent(consumer.value, event.value, 0));
+        else TEST_CUDA(cuStreamWaitEvent(consumer.value, event.value, 0));
         storage.read(consumer.value); consumer.synchronize(); storage.expect(true);
         require(!gate.expired, "record-node gate deadline");
     }
@@ -166,7 +166,7 @@ void graph_event_waiting(bool retirement) {
         graph_event_gate_cleanup cleanup{gate};
         storage.reset(); executable.launch(consumer.value, runtime); consumer.synchronize(); storage.expect(false);
         storage.clear_output();
-        CONFORMANCE_CUDA(cuLaunchHostFunc(producer.value, graph_event_gate::call, &gate)); gate.await();
+        TEST_CUDA(cuLaunchHostFunc(producer.value, graph_event_gate::call, &gate)); gate.await();
         storage.produce(producer.value); event.record(producer.value, !runtime);
         require(cuEventQuery(event.value) == CUDA_ERROR_NOT_READY, "external producer record is pending");
         executable.launch(consumer.value, !runtime);
@@ -190,12 +190,12 @@ void graph_event_record_selection(bool runtime, bool executable_setter) {
     storage.reset();
     original.launch(stream.value, runtime); stream.synchronize(); storage.expect(true);
     float elapsed = -1;
-    CONFORMANCE_CUDA(cuEventElapsedTime(&elapsed, first.value, first.value));
+    TEST_CUDA(cuEventElapsedTime(&elapsed, first.value, first.value));
     require(elapsed == 0, "original executable records its retained event");
     require(cuEventElapsedTime(&elapsed, second.value, second.value) == CUDA_ERROR_INVALID_HANDLE,
         "replacement event remains unrecorded by the independent executable");
     storage.clear_output(); changed.launch(stream.value, !runtime); stream.synchronize(); storage.expect(true);
-    CONFORMANCE_CUDA(cuEventElapsedTime(&elapsed, second.value, second.value));
+    TEST_CUDA(cuEventElapsedTime(&elapsed, second.value, second.value));
     require(elapsed == 0, "changed executable records its replacement event");
 }
 void graph_event_wait_selection(bool runtime, bool executable_setter) {
@@ -210,7 +210,7 @@ void graph_event_wait_selection(bool runtime, bool executable_setter) {
     graph_event_gate_cleanup cleanup{gate};
     storage.reset();
     original.launch(consumer.value, runtime); consumer.synchronize(); storage.expect(false);
-    CONFORMANCE_CUDA(cuLaunchHostFunc(producer.value, graph_event_gate::call, &gate)); gate.await();
+    TEST_CUDA(cuLaunchHostFunc(producer.value, graph_event_gate::call, &gate)); gate.await();
     storage.produce(producer.value); second.record(producer.value, !runtime);
     storage.clear_output(); changed.launch(consumer.value, !runtime);
     require(cuStreamQuery(consumer.value) == CUDA_ERROR_NOT_READY, "replacement wait selects the pending external generation"); storage.expect(false, false);
@@ -254,5 +254,5 @@ void execute_graph_event_nodes() {
 }
 int main(int argc, char** argv) {
     if (argc == 3) { cudavm::graph_event_case = argv[2]; --argc; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_graph_event_nodes);
+    return cudavm::run_test(argc, argv, cudavm::execute_graph_event_nodes);
 }

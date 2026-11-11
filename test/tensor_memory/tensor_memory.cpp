@@ -15,15 +15,15 @@ void tensor_memory_case(const loaded_program& program, std::array<unsigned, 3> s
                 ^ ((round + 1) * 0x5917ab3du) ^ (column * 0x1020304u);
         }
     device_buffer source(input.size() * 4), destination(initial.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(destination.value, initial.data(), initial.size() * 4));
     auto in = source.value + guards * 4, out = destination.value + guards * 4;
     void* arguments[]{&out, &in, &count, &columns, &rounds};
-    CONFORMANCE_CUDA(cuLaunchKernel(program.function("tensor_memory_exchange"), blocks, 1, 1,
+    TEST_CUDA(cuLaunchKernel(program.function("tensor_memory_exchange"), blocks, 1, 1,
         shape[0], shape[1], shape[2], 0, nullptr, arguments, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), destination.value, actual.size() * 4));
     expect_words(actual, expected, "TMEM allocation/store/load completion, independent rows/columns/CTAs, guards and inactive records");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
+    TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, input.size() * 4));
     expect_words(preserved, input, "TMEM source values and allocation guards are preserved");
 }
 void execute_tensor_memory(const loaded_program& program) {
@@ -33,5 +33,5 @@ void execute_tensor_memory(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_tensor_memory);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_tensor_memory);
 }

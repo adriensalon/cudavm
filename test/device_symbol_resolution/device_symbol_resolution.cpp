@@ -28,7 +28,7 @@ void add_symbol_units(const linker_fixture_program& linker, const symbol_units& 
 template<class T> T symbol_read(CUdeviceptr address) {
     struct { std::array<unsigned char, 16> before; T value{}; std::array<unsigned char, 16> after; } output;
     output.before.fill(0xa9); output.after.fill(0x37);
-    CONFORMANCE_CUDA(cuMemcpyDtoH(&output.value, address, sizeof(T)));
+    TEST_CUDA(cuMemcpyDtoH(&output.value, address, sizeof(T)));
     require(std::all_of(output.before.begin(), output.before.end(), [](auto byte) { return byte == 0xa9; })
         && std::all_of(output.after.begin(), output.after.end(), [](auto byte) { return byte == 0x37; }), "device symbol read exact output guards");
     return output.value;
@@ -107,33 +107,33 @@ void execute_symbol_program(const loaded_program& program, bool strong) {
     for (unsigned phase = 0; phase < 2; ++phase) {
         if (state.value_address && phase) {
             state.value = 0xffffffe7u; state.bias = 0x193759bdu;
-            CONFORMANCE_CUDA(cuMemcpyHtoD(state.value_address, &state.value, 4));
-            CONFORMANCE_CUDA(cuMemcpyHtoD(state.bias_address, &state.bias, 4));
+            TEST_CUDA(cuMemcpyHtoD(state.value_address, &state.value, 4));
+            TEST_CUDA(cuMemcpyHtoD(state.bias_address, &state.bias, 4));
         }
         if (state.values_address && phase) {
             for (unsigned i = 0; i < state.table.size(); ++i) state.table[i] = 0xfffffff0u + i * 0x193759bdu;
-            CONFORMANCE_CUDA(cuMemcpyHtoD(state.values_address, state.table.data(), sizeof(state.table)));
+            TEST_CUDA(cuMemcpyHtoD(state.values_address, state.table.data(), sizeof(state.table)));
         }
         for (unsigned i = 0; i < capacity; ++i)
             input[guards + i] = i < edges.size() ? edges[(i + phase) % edges.size()] : (i * 0x7654321u) ^ (phase * 0x193759bdu);
-        CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
         for (const auto threads : sizes) for (unsigned count : {0u, 1u, 33u, capacity}) {
             if (state.counter_address) {
                 state.counter = phase ? 0xffffffe7u : 17u;
-                CONFORMANCE_CUDA(cuMemcpyHtoD(state.counter_address, &state.counter, 4));
+                TEST_CUDA(cuMemcpyHtoD(state.counter_address, &state.counter, 4));
             }
             std::fill(expected.begin(), expected.end(), guard);
-            CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
+            TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), expected.size() * 4));
             void* arguments[]{&to, &from, &count};
             const auto blocks = state.counter_address ? 1u : (capacity + threads - 1) / threads;
-            CONFORMANCE_CUDA(cuLaunchKernel(program.function("symbol_results"), blocks, 1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
-            CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+            TEST_CUDA(cuLaunchKernel(program.function("symbol_results"), blocks, 1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
+            TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
             for (unsigned i = 0; i < count; ++i) {
                 const auto row = device_symbol_oracle(input[guards + i], i, state);
                 std::copy(row.begin(), row.end(), expected.begin() + guards + i * fields);
             }
             expect_words(actual, expected, "device symbol resolution values, identities, addresses and complete output guards");
-            CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+            TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
             expect_words(preserved, input, "device symbols preserve input and guards");
             verify_symbol_state(state);
         }
@@ -150,7 +150,7 @@ void execute_device_symbol_resolution() {
         }
         for (bool library : {false, true}) {
             loaded_program program(image.data(), library);
-            execute_symbol_program(program, strong); CONFORMANCE_CUDA(cuCtxSynchronize());
+            execute_symbol_program(program, strong); TEST_CUDA(cuCtxSynchronize());
         }
     }
 }
@@ -181,9 +181,9 @@ void symbol_link_failures() {
 }
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "sources")
-        return cudavm::run_host_conformance(argc, argv, cudavm::symbol_source_check);
+        return cudavm::run_host_test(argc, argv, cudavm::symbol_source_check);
     if (argc == 2 && std::string_view(argv[1]) == "failures")
-        return cudavm::run_host_conformance(argc, argv, cudavm::symbol_link_failures);
+        return cudavm::run_host_test(argc, argv, cudavm::symbol_link_failures);
     if (argc == 3) { cudavm::device_symbol_case = argv[2]; argc = 2; }
-    return cudavm::run_conformance(argc, argv, cudavm::execute_device_symbol_resolution, 0, cudavm::probe_execution);
+    return cudavm::run_test(argc, argv, cudavm::execute_device_symbol_resolution, 0, cudavm::probe_execution);
 }

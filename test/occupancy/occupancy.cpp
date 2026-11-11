@@ -6,19 +6,19 @@
 namespace cudavm {
 int occupancy_device_attribute(CUdevice device, CUdevice_attribute attribute) {
     int value = -1;
-    CONFORMANCE_CUDA(cuDeviceGetAttribute(&value, attribute, device));
+    TEST_CUDA(cuDeviceGetAttribute(&value, attribute, device));
     require(value > 0, "native residency resource is positive");
     return value;
 }
 int occupancy_function_attribute(CUfunction function, CUfunction_attribute attribute) {
     int value = -1;
-    CONFORMANCE_CUDA(cuFuncGetAttribute(&value, attribute, function));
+    TEST_CUDA(cuFuncGetAttribute(&value, attribute, function));
     require(value >= 0, "function resource is nonnegative");
     return value;
 }
 int occupancy_blocks(CUfunction function, int block, size_t shared, unsigned flags = 0) {
     struct { uint32_t before = 0x12345678; int value = -1; uint32_t after = 0x87654321; } result;
-    CONFORMANCE_CUDA(cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(&result.value, function, block, shared, flags));
+    TEST_CUDA(cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(&result.value, function, block, shared, flags));
     require(result.before == 0x12345678 && result.after == 0x87654321 && result.value >= 0, "occupancy output bounds and sign");
     return result.value;
 }
@@ -30,19 +30,19 @@ void occupancy_launch(CUfunction function, int grid, int block, unsigned shared)
     std::vector<uint32_t> input(words, guard), expected(words, guard), actual(words);
     for (size_t i = 0; i < total; ++i) input[guards + i] = 0xfffffff0u + uint32_t(i) * 0x7654321u;
     device_buffer source(words * 4), output(words * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), words * 4));
-    CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, expected.data(), words * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), words * 4));
+    TEST_CUDA(cuMemcpyHtoD(output.value, expected.data(), words * 4));
     unsigned count = unsigned(total - 1);
     auto from = source.value + guards * 4, to = output.value + guards * 4;
     void* args[]{&to, &from, &count};
-    CONFORMANCE_CUDA(cuLaunchKernel(function, unsigned(grid), 1, 1, unsigned(block), 1, 1, shared, nullptr, args, nullptr));
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, words * 4));
+    TEST_CUDA(cuLaunchKernel(function, unsigned(grid), 1, 1, unsigned(block), 1, 1, shared, nullptr, args, nullptr));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, words * 4));
     for (size_t i = 0; i < count; ++i) {
         const size_t group = i / unsigned(block), peer = group * unsigned(block) + unsigned(block) - 1 - i % unsigned(block);
         expected[guards + i] = (peer < count ? input[guards + peer] : 0u) + uint32_t(group) + 7;
     }
     expect_words(actual, expected, "occupancy-recommended launch results and guards");
-    CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), source.value, words * 4));
+    TEST_CUDA(cuMemcpyDtoH(actual.data(), source.value, words * 4));
     expect_words(actual, input, "occupancy-recommended launch source preservation");
 }
 CUfunction occupancy_callback_function{};
@@ -67,7 +67,7 @@ void occupancy_potential(CUfunction function, CUdevice device, bool callback, un
     occupancy_callback_function = function; occupancy_callback_device = device;
     occupancy_callback_calls = 0; occupancy_callback_valid = true;
     int grid = -1, block = -1;
-    CONFORMANCE_CUDA(cuOccupancyMaxPotentialBlockSizeWithFlags(&grid, &block, function,
+    TEST_CUDA(cuOccupancyMaxPotentialBlockSizeWithFlags(&grid, &block, function,
         callback ? occupancy_dynamic_bytes : nullptr, callback ? std::numeric_limits<size_t>::max() : fixed_shared, limit, flags));
     require(block > 0 && block <= cap && grid > 0, "potential configuration respects requested ceiling");
     if (callback) require(occupancy_callback_calls > 0 && occupancy_callback_valid, "sizing callback reenters queries with legal block sizes");
@@ -82,7 +82,7 @@ void occupancy_potential(CUfunction function, CUdevice device, bool callback, un
     require(int64_t(grid) == int64_t(active) * processors, "minimum occupancy grid follows native per-SM residency");
     if (!flags && !callback) {
         int plain_grid = -1, plain_block = -1;
-        CONFORMANCE_CUDA(cuOccupancyMaxPotentialBlockSize(&plain_grid, &plain_block, function, nullptr, fixed_shared, limit));
+        TEST_CUDA(cuOccupancyMaxPotentialBlockSize(&plain_grid, &plain_block, function, nullptr, fixed_shared, limit));
         require(grid == plain_grid && block == plain_block, "default potential flags agree with unflagged API");
     }
     occupancy_launch(function, grid, block, unsigned(bytes(block)));
@@ -90,7 +90,7 @@ void occupancy_potential(CUfunction function, CUdevice device, bool callback, un
 void execute_occupancy(const loaded_program& program) {
     const auto function = program.function("mixed_exchange");
     const auto kernel = program.library_kernel("mixed_exchange");
-    CUdevice device{}; CONFORMANCE_CUDA(cuCtxGetDevice(&device));
+    CUdevice device{}; TEST_CUDA(cuCtxGetDevice(&device));
     const int maximum = occupancy_function_attribute(function, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK);
     const int static_shared = occupancy_function_attribute(function, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES);
     const int dynamic_maximum = occupancy_function_attribute(function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES);
@@ -102,7 +102,7 @@ void execute_occupancy(const loaded_program& program) {
         int previous = std::numeric_limits<int>::max();
         for (size_t bytes : {size_t(0), size_t(64), size_t(1024), size_t(dynamic_maximum)}) {
             int plain = -1;
-            CONFORMANCE_CUDA(cuOccupancyMaxActiveBlocksPerMultiprocessor(&plain, function, block, bytes));
+            TEST_CUDA(cuOccupancyMaxActiveBlocksPerMultiprocessor(&plain, function, block, bytes));
             const int active = occupancy_blocks(function, block, bytes);
             require(active == plain && active <= previous && active <= sm_blocks
                 && int64_t(active) * block <= sm_threads
@@ -122,7 +122,7 @@ void execute_occupancy(const loaded_program& program) {
     }
     const int target = occupancy_blocks(function, 128, 512);
     size_t budget = 999;
-    CONFORMANCE_CUDA(cuOccupancyAvailableDynamicSMemPerBlock(&budget, function, target, 128));
+    TEST_CUDA(cuOccupancyAvailableDynamicSMemPerBlock(&budget, function, target, 128));
     require(budget >= 512 && uint64_t(target) * (budget + unsigned(static_shared)) <= unsigned(sm_shared), "inverse shared budget respects physical capacity");
     require(occupancy_blocks(function, 128, std::min(budget, size_t(dynamic_maximum))) >= target, "inverse shared budget preserves requested residency");
     if (kernel) {
@@ -151,5 +151,5 @@ void execute_occupancy(const loaded_program& program) {
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_occupancy);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_occupancy);
 }

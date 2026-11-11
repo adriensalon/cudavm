@@ -42,13 +42,13 @@ void execute_bfloat16_comparison(const loaded_program& program) {
     std::copy(values.begin(), values.end(), input.begin() + guards);
     std::vector<uint32_t> initial((capacity + 3) * fields + guards * 2, guard), actual(initial.size());
     device_buffer source(input.size() * 4), output(initial.size() * 4);
-    CONFORMANCE_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
+    TEST_CUDA(cuMemcpyHtoD(source.value, input.data(), input.size() * 4));
     auto from = source.value + guards * 4, to = output.value + guards * 4;
     for (unsigned count : {0u, 33u, capacity}) {
-        CONFORMANCE_CUDA(cuMemcpyHtoD(output.value, initial.data(), initial.size() * 4));
+        TEST_CUDA(cuMemcpyHtoD(output.value, initial.data(), initial.size() * 4));
         void* arguments[]{&to, &from, &count};
-        CONFORMANCE_CUDA(cuLaunchKernel(program.function("compare_bfloat16"), blocks, 1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
-        CONFORMANCE_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
+        TEST_CUDA(cuLaunchKernel(program.function("compare_bfloat16"), blocks, 1, 1, threads, 1, 1, 0, nullptr, arguments, nullptr));
+        TEST_CUDA(cuMemcpyDtoH(actual.data(), output.value, actual.size() * 4));
         for (size_t i = 0; i < actual.size(); ++i) if (i < guards || i >= guards + size_t(count) * fields)
             if (actual[i] != guard) throw std::runtime_error("bfloat16 comparison output guards/inactive records");
         for (unsigned record = 0; record < count; ++record) {
@@ -63,11 +63,11 @@ void execute_bfloat16_comparison(const loaded_program& program) {
                     + " field=" + std::to_string(field) + " got=" + std::to_string(got) + " expected=" + std::to_string(expected[field]));
             }
         }
-        CONFORMANCE_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
+        TEST_CUDA(cuMemcpyDtoH(preserved.data(), source.value, preserved.size() * 4));
         expect_words(preserved, input, "bfloat16 comparison preserves complete input and guards");
     }
 }
 }
 int main(int argc, char** argv) {
-    return cudavm::run_conformance(argc, argv, cudavm::fixtures, cudavm::execute_bfloat16_comparison);
+    return cudavm::run_test(argc, argv, cudavm::fixtures, cudavm::execute_bfloat16_comparison);
 }
