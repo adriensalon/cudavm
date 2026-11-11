@@ -1,0 +1,45 @@
+.version 6.0
+.target sm_50
+.address_size 64
+
+.visible .entry perf_global_read(.param .u64 input, .param .u64 indices, .param .u64 output,
+                                .param .u32 count, .param .u32 mode) {
+    .reg .b64 %source, %table, %destination, %offset;
+    .reg .b32 %block, %width, %lane, %index, %address, %count, %mode, %mask, %value, %bias;
+    .reg .pred %condition;
+    ld.param.u64 %source, [input];
+    ld.param.u64 %table, [indices];
+    ld.param.u64 %destination, [output];
+    ld.param.u32 %count, [count];
+    ld.param.u32 %mode, [mode];
+    mov.u32 %block, %ctaid.x;
+    mov.u32 %width, %ntid.x;
+    mov.u32 %lane, %tid.x;
+    mad.lo.u32 %index, %block, %width, %lane;
+    setp.ge.u32 %condition, %index, %count;
+    @%condition bra finished;
+    mov.u32 %address, %index;
+    setp.eq.u32 %condition, %mode, 0;
+    @%condition bra read;
+    setp.eq.u32 %condition, %mode, 1;
+    @!%condition bra indirect;
+    mul.lo.u32 %address, %index, 17;
+    sub.u32 %mask, %count, 1;
+    and.b32 %address, %address, %mask;
+    bra read;
+indirect:
+    mul.wide.u32 %offset, %index, 4;
+    add.u64 %table, %table, %offset;
+    ld.global.u32 %address, [%table];
+read:
+    mul.wide.u32 %offset, %address, 4;
+    add.u64 %source, %source, %offset;
+    ld.global.u32 %value, [%source];
+    mad.lo.u32 %bias, %index, 0x9e3779b9, 0x85ebca6b;
+    xor.b32 %value, %value, %bias;
+    mul.wide.u32 %offset, %index, 4;
+    add.u64 %destination, %destination, %offset;
+    st.global.u32 [%destination], %value;
+finished:
+    ret;
+}

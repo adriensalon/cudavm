@@ -49,6 +49,9 @@ void perf_require(bool condition, const std::string& message);
 void perf_expect_bytes(std::span<const unsigned char> actual, std::span<const unsigned char> expected,
                        std::string_view context);
 std::vector<unsigned char> perf_input_bytes(size_t bytes, uint32_t seed);
+std::vector<uint32_t> perf_input_words(size_t count, uint32_t seed);
+void perf_expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> expected,
+                       std::string_view context);
 
 #ifdef CUDAVM_PERF_CUDA
 struct perf_driver_error : std::runtime_error {
@@ -90,9 +93,21 @@ struct perf_primary_context {
 struct perf_device_buffer {
     CUdeviceptr value{};
     explicit perf_device_buffer(size_t bytes);
+    perf_device_buffer(size_t width_bytes, size_t rows, size_t& pitch);
     ~perf_device_buffer();
     perf_device_buffer(const perf_device_buffer&) = delete;
     perf_device_buffer& operator=(const perf_device_buffer&) = delete;
+    void close();
+};
+
+struct perf_guarded_words {
+    static constexpr size_t guard_words = 16;
+    std::vector<uint32_t> initial;
+    perf_device_buffer storage;
+    explicit perf_guarded_words(std::span<const uint32_t> payload);
+    CUdeviceptr data() const;
+    void reset() const;
+    void expect(std::span<const uint32_t> payload, std::string_view context) const;
     void close();
 };
 

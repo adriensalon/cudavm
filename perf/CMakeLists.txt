@@ -136,3 +136,7 @@ cudavm_add_perf_slice(stream_synchronization CASES idle_stream idle_context subm
 cudavm_add_perf_slice(host_allocation CASES alloc_free_4k alloc_free_64k register_unregister_4k register_unregister_64k WARMUP 1 SAMPLES 5 ITERATIONS 4)
 cudavm_add_perf_slice(graph_lifecycle CASES build_4 build_32 instantiate_4 instantiate_32 capture_4 capture_32 WARMUP 1 SAMPLES 5 ITERATIONS 4)
 cudavm_add_perf_slice(graph_replay CASES graph_4 graph_16 submissions_4 submissions_16 WARMUP 1 SAMPLES 5 ITERATIONS 4)
+cudavm_add_perf_slice(memory_copy_layout CASES linear_64k linear_4m pitched_2d_64k pitched_2d_4m pitched_3d_64k pitched_3d_4m WARMUP 1 SAMPLES 5 ITERATIONS 2)
+cudavm_add_perf_slice(global_memory CASES contiguous_small contiguous_large strided_small strided_large indirect_small indirect_large WARMUP 1 SAMPLES 5 ITERATIONS 4)
+cudavm_add_perf_slice(arithmetic_throughput CASES chain_32 chain_256 independent_32 independent_256 WARMUP 1 SAMPLES 5 ITERATIONS 2)
+cudavm_add_perf_slice(reduction CASES resident_small resident_large WARMUP 1 SAMPLES 5 ITERATIONS 2)

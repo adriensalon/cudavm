@@ -1,0 +1,71 @@
+.version 6.0
+.target sm_50
+.address_size 64
+
+.visible .entry perf_integer_mix(.param .u64 input, .param .u64 output, .param .u32 count,
+                                .param .u32 rounds, .param .u32 independent) {
+    .reg .b64 %source, %destination, %offset;
+    .reg .b32 %block, %width, %lane, %index, %count, %rounds, %independent, %round, %a, %b, %c, %d, %mix;
+    .reg .pred %condition;
+    ld.param.u64 %source, [input];
+    ld.param.u64 %destination, [output];
+    ld.param.u32 %count, [count];
+    ld.param.u32 %rounds, [rounds];
+    ld.param.u32 %independent, [independent];
+    mov.u32 %block, %ctaid.x;
+    mov.u32 %width, %ntid.x;
+    mov.u32 %lane, %tid.x;
+    mad.lo.u32 %index, %block, %width, %lane;
+    setp.ge.u32 %condition, %index, %count;
+    @%condition bra finished;
+    mul.wide.u32 %offset, %index, 4;
+    add.u64 %source, %source, %offset;
+    ld.global.u32 %a, [%source];
+    xor.b32 %b, %a, 0x9e3779b9;
+    xor.b32 %c, %a, 0x85ebca6b;
+    xor.b32 %d, %a, 0xc2b2ae35;
+    mov.u32 %round, 0;
+loop:
+    setp.ge.u32 %condition, %round, %rounds;
+    @%condition bra write;
+    setp.eq.u32 %condition, %independent, 0;
+    @%condition bra chain;
+    shr.u32 %mix, %a, 13;
+    mad.lo.u32 %a, %a, 1664525, 1013904223;
+    xor.b32 %a, %a, %mix;
+    shr.u32 %mix, %b, 13;
+    mad.lo.u32 %b, %b, 1664525, 1013904223;
+    xor.b32 %b, %b, %mix;
+    shr.u32 %mix, %c, 13;
+    mad.lo.u32 %c, %c, 1664525, 1013904223;
+    xor.b32 %c, %c, %mix;
+    shr.u32 %mix, %d, 13;
+    mad.lo.u32 %d, %d, 1664525, 1013904223;
+    xor.b32 %d, %d, %mix;
+    bra advance;
+chain:
+    shr.u32 %mix, %a, 13;
+    mad.lo.u32 %b, %a, 1664525, 1013904223;
+    xor.b32 %b, %b, %mix;
+    shr.u32 %mix, %b, 13;
+    mad.lo.u32 %c, %b, 1664525, 1013904223;
+    xor.b32 %c, %c, %mix;
+    shr.u32 %mix, %c, 13;
+    mad.lo.u32 %d, %c, 1664525, 1013904223;
+    xor.b32 %d, %d, %mix;
+    shr.u32 %mix, %d, 13;
+    mad.lo.u32 %a, %d, 1664525, 1013904223;
+    xor.b32 %a, %a, %mix;
+advance:
+    add.u32 %round, %round, 1;
+    bra loop;
+write:
+    mul.wide.u32 %offset, %index, 16;
+    add.u64 %destination, %destination, %offset;
+    st.global.u32 [%destination], %a;
+    st.global.u32 [%destination+4], %b;
+    st.global.u32 [%destination+8], %c;
+    st.global.u32 [%destination+12], %d;
+finished:
+    ret;
+}

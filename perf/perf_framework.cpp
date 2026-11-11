@@ -115,6 +115,26 @@ std::vector<unsigned char> perf_input_bytes(size_t bytes, uint32_t seed) {
     return result;
 }
 
+std::vector<uint32_t> perf_input_words(size_t count, uint32_t seed) {
+    std::vector<uint32_t> result(count);
+    for (auto& value : result) {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        value = seed;
+    }
+    return result;
+}
+
+void perf_expect_words(std::span<const uint32_t> actual, std::span<const uint32_t> expected,
+                       std::string_view context) {
+    perf_require(actual.size() == expected.size(), std::string(context) + ": word extent");
+    for (size_t index = 0; index < actual.size(); ++index)
+        if (actual[index] != expected[index])
+            throw std::runtime_error(std::string(context) + ": word " + std::to_string(index)
+                + " got " + std::to_string(actual[index]) + ", expected " + std::to_string(expected[index]));
+}
+
 #ifdef CUDAVM_PERF_CUDA
 perf_driver_error::perf_driver_error(CUresult status, const std::string& message)
     : std::runtime_error(message), result(status) {}
@@ -212,10 +232,33 @@ void perf_primary_context::close() {
 }
 
 perf_device_buffer::perf_device_buffer(size_t bytes) { PERF_CUDA(cuMemAlloc(&value, bytes)); }
+perf_device_buffer::perf_device_buffer(size_t width_bytes, size_t rows, size_t& pitch) {
+    PERF_CUDA(cuMemAllocPitch(&value, &pitch, width_bytes, rows, sizeof(uint32_t)));
+}
 perf_device_buffer::~perf_device_buffer() { if (value) cuMemFree(value); }
 void perf_device_buffer::close() {
     if (value) { PERF_CUDA(cuMemFree(value)); value = 0; }
 }
+
+perf_guarded_words::perf_guarded_words(std::span<const uint32_t> payload)
+    : initial(payload.size() + 2 * guard_words, 0xa5a5a5a5), storage(initial.size() * sizeof(uint32_t)) {
+    std::copy(payload.begin(), payload.end(), initial.begin() + guard_words);
+    reset();
+}
+CUdeviceptr perf_guarded_words::data() const { return storage.value + guard_words * sizeof(uint32_t); }
+void perf_guarded_words::reset() const {
+    PERF_CUDA(cuMemcpyHtoD(storage.value, initial.data(), initial.size() * sizeof(uint32_t)));
+}
+void perf_guarded_words::expect(std::span<const uint32_t> payload, std::string_view context) const {
+    perf_require(payload.size() + 2 * guard_words == initial.size(), std::string(context) + ": guarded payload extent");
+    std::vector<uint32_t> actual(initial.size());
+    PERF_CUDA(cuMemcpyDtoH(actual.data(), storage.value, actual.size() * sizeof(uint32_t)));
+    const std::span<const uint32_t> view(actual), original(initial);
+    perf_expect_words(view.first(guard_words), original.first(guard_words), std::string(context) + " prefix guard");
+    perf_expect_words(view.subspan(guard_words, payload.size()), payload, context);
+    perf_expect_words(view.last(guard_words), original.last(guard_words), std::string(context) + " suffix guard");
+}
+void perf_guarded_words::close() { storage.close(); }
 
 perf_stream::perf_stream(unsigned flags) { PERF_CUDA(cuStreamCreate(&value, flags)); }
 perf_stream::~perf_stream() { if (value) cuStreamDestroy(value); }
