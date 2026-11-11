@@ -243,6 +243,44 @@ void perf_host_buffer::close() {
     if (value) { PERF_CUDA(cuMemFreeHost(value)); value = nullptr; }
 }
 
+perf_host_registration::perf_host_registration(void* pointer, size_t bytes) {
+    PERF_CUDA(cuMemHostRegister(pointer, bytes, 0));
+    value = pointer;
+}
+perf_host_registration::~perf_host_registration() {
+    if (value) { cuCtxSynchronize(); cuMemHostUnregister(value); }
+}
+void perf_host_registration::close() {
+    if (value) { PERF_CUDA(cuMemHostUnregister(value)); value = nullptr; }
+}
+
+perf_graph::perf_graph() { PERF_CUDA(cuGraphCreate(&value, 0)); }
+perf_graph::perf_graph(CUstream stream, const std::function<void()>& record) {
+    PERF_CUDA(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
+    try {
+        record();
+        PERF_CUDA(cuStreamEndCapture(stream, &value));
+    } catch (...) {
+        CUgraph abandoned{};
+        cuStreamEndCapture(stream, &abandoned);
+        if (abandoned) cuGraphDestroy(abandoned);
+        throw;
+    }
+}
+perf_graph::~perf_graph() { if (value) cuGraphDestroy(value); }
+void perf_graph::close() {
+    if (value) { PERF_CUDA(cuGraphDestroy(value)); value = nullptr; }
+}
+
+perf_graph_exec::perf_graph_exec(CUgraph graph) { PERF_CUDA(cuGraphInstantiate(&value, graph, 0)); }
+perf_graph_exec::~perf_graph_exec() {
+    if (value) { cuCtxSynchronize(); cuGraphExecDestroy(value); }
+}
+void perf_graph_exec::launch(CUstream stream) const { PERF_CUDA(cuGraphLaunch(value, stream)); }
+void perf_graph_exec::close() {
+    if (value) { PERF_CUDA(cuGraphExecDestroy(value)); value = nullptr; }
+}
+
 perf_module::perf_module(const void* image) { PERF_CUDA(cuModuleLoadData(&value, image)); }
 perf_module::~perf_module() { if (value) cuModuleUnload(value); }
 CUfunction perf_module::function(const char* name) const {

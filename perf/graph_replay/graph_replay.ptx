@@ -1,0 +1,25 @@
+.version 6.0
+.target sm_50
+.address_size 64
+
+.visible .entry perf_graph_step(.param .u64 output, .param .u32 count) {
+    .reg .pred %outside;
+    .reg .b32 %block, %width, %lane, %index, %count, %value, %increment;
+    .reg .b64 %pointer, %offset;
+    ld.param.u64 %pointer, [output];
+    ld.param.u32 %count, [count];
+    mov.u32 %block, %ctaid.x;
+    mov.u32 %width, %ntid.x;
+    mov.u32 %lane, %tid.x;
+    mad.lo.u32 %index, %block, %width, %lane;
+    setp.ge.u32 %outside, %index, %count;
+    @%outside bra done;
+    mul.wide.u32 %offset, %index, 4;
+    add.u64 %pointer, %pointer, %offset;
+    ld.global.u32 %value, [%pointer];
+    mad.lo.u32 %increment, %index, 7, 3;
+    add.u32 %value, %value, %increment;
+    st.global.u32 [%pointer], %value;
+done:
+    ret;
+}

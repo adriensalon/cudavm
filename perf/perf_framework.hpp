@@ -128,6 +128,35 @@ struct perf_host_buffer {
     void close();
 };
 
+struct perf_host_registration {
+    void* value{};
+    explicit perf_host_registration(void* pointer, size_t bytes);
+    ~perf_host_registration();
+    perf_host_registration(const perf_host_registration&) = delete;
+    perf_host_registration& operator=(const perf_host_registration&) = delete;
+    void close();
+};
+
+struct perf_graph {
+    CUgraph value{};
+    perf_graph();
+    perf_graph(CUstream stream, const std::function<void()>& record);
+    ~perf_graph();
+    perf_graph(const perf_graph&) = delete;
+    perf_graph& operator=(const perf_graph&) = delete;
+    void close();
+};
+
+struct perf_graph_exec {
+    CUgraphExec value{};
+    explicit perf_graph_exec(CUgraph graph);
+    ~perf_graph_exec();
+    perf_graph_exec(const perf_graph_exec&) = delete;
+    perf_graph_exec& operator=(const perf_graph_exec&) = delete;
+    void launch(CUstream stream) const;
+    void close();
+};
+
 struct perf_module {
     CUmodule value{};
     explicit perf_module(const void* image);

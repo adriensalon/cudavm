@@ -132,3 +132,7 @@ cudavm_add_perf_slice(stream_lifecycle CASES blocking non_blocking WARMUP 1 SAMP
 cudavm_add_perf_slice(event_timing CASES create_timed create_disabled record_timed record_disabled elapsed_query WARMUP 1 SAMPLES 5 ITERATIONS 4)
 cudavm_add_perf_slice(module_loading CASES module library WARMUP 1 SAMPLES 3)
 cudavm_add_perf_slice(vector_transform CASES resident_small resident_large pageable_small pageable_large pinned_small WARMUP 1 SAMPLES 5 ITERATIONS 4)
+cudavm_add_perf_slice(stream_synchronization CASES idle_stream idle_context submitted_stream submitted_context event_handoff WARMUP 1 SAMPLES 5 ITERATIONS 8)
+cudavm_add_perf_slice(host_allocation CASES alloc_free_4k alloc_free_64k register_unregister_4k register_unregister_64k WARMUP 1 SAMPLES 5 ITERATIONS 4)
+cudavm_add_perf_slice(graph_lifecycle CASES build_4 build_32 instantiate_4 instantiate_32 capture_4 capture_32 WARMUP 1 SAMPLES 5 ITERATIONS 4)
+cudavm_add_perf_slice(graph_replay CASES graph_4 graph_16 submissions_4 submissions_16 WARMUP 1 SAMPLES 5 ITERATIONS 4)
